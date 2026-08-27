@@ -81,3 +81,19 @@ input; every output has exactly one successful producer.
 - Cross-artifact-type provenance policies beyond the generic
   activity/role model (e.g., ensemble-member fan-in, variable/slice
   mappings) beyond what Section 4.8 of the Phase 0 plan requires.
+
+## Implementation clarification (Phase 0 build)
+
+Plan Section 3's exact file tree lists `storage/postgres/{database,
+models,repositories}.py` but omits a file for the PostgreSQL
+`IdempotencyLock` implementation that Section 4.9's prose explicitly
+requires ("The PostgreSQL `IdempotencyLock` maps the first signed 64
+bits of the digest to `pg_advisory_lock`..."). Rather than force that
+connection-lifecycle-sensitive logic into `repositories.py` (whose
+methods all operate on a shared `Session`, while the advisory lock
+needs its own dedicated, non-transactional connection held for the
+duration of a multi-step transformation attempt), it is implemented in
+a new `storage/postgres/idempotency_lock.py`, consistent with Section
+3's `storage.postgres -> storage.interfaces, contracts, common`
+dependency rule and its own package. Flagged for Codex review as a
+plan-tree completion, not a scope expansion.
