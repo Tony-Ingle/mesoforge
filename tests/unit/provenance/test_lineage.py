@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from mesoforge.common.errors import LineageViolation
+from mesoforge.common.errors import InvalidIdentifier, LineageViolation
 from mesoforge.provenance.lineage import (
     ActivityEdge,
     build_lineage_graph,
@@ -119,3 +119,78 @@ class TestLineageGraphModel:
         graph = build_lineage_graph(root_artifact_id=_ART_A, edges=())
         with pytest.raises(Exception):  # noqa: B017 - pydantic frozen model error
             graph.root_artifact_id = _ART_B  # type: ignore[misc]
+
+
+class TestActivityEdgeRejectsMalformedRuntimeValues:
+    """Direct model-construction probes reproducing the Codex-review
+    finding: ``ActivityEdge`` must reject malformed activity/artifact
+    IDs, not silently accept an unrestricted str."""
+
+    def test_rejects_malformed_activity_id(self) -> None:
+        with pytest.raises(Exception):  # noqa: B017 - pydantic ValidationError
+            ActivityEdge(
+                activity_id="bad-activity", artifact_id=_ART_A, role="primary", direction="input"
+            )
+
+    def test_rejects_malformed_artifact_id(self) -> None:
+        with pytest.raises(Exception):  # noqa: B017 - pydantic ValidationError
+            ActivityEdge(
+                activity_id=_ACT_1, artifact_id="bad-artifact", role="primary", direction="input"
+            )
+
+
+class TestBuildLineageGraphRejectsMalformedRuntimeValues:
+    """Direct function-call probes reproducing the Codex-review finding:
+    ``build_lineage_graph(root_artifact_id="not-an-artifact-id", ...)``
+    must fail closed with ``InvalidIdentifier``, not silently succeed."""
+
+    def test_rejects_malformed_root_artifact_id(self) -> None:
+        with pytest.raises(InvalidIdentifier):
+            build_lineage_graph(root_artifact_id="not-an-artifact-id", edges=())
+
+    def test_reproduction_malformed_root_and_edge_fails_closed(self) -> None:
+        """Exact reproduction from the Codex review: a malformed root
+        artifact ID together with an ``ActivityEdge`` built from
+        malformed activity/artifact IDs must both be rejected."""
+        with pytest.raises(Exception):  # noqa: B017 - pydantic ValidationError
+            build_lineage_graph(
+                root_artifact_id="not-an-artifact-id",
+                edges=(
+                    ActivityEdge(
+                        activity_id="bad-activity",
+                        artifact_id="bad-artifact",
+                        role="primary",
+                        direction="input",
+                    ),
+                ),
+            )
+
+    def test_valid_round_trip_still_succeeds(self) -> None:
+        edges = (
+            ActivityEdge(activity_id=_ACT_1, artifact_id=_ART_A, role="primary", direction="input"),
+            ActivityEdge(
+                activity_id=_ACT_1, artifact_id=_ART_B, role="primary", direction="output"
+            ),
+        )
+        graph = build_lineage_graph(root_artifact_id=_ART_B, edges=edges)
+        assert graph.root_artifact_id == _ART_B
+        assert set(graph.artifact_nodes) == {_ART_A, _ART_B}
+        assert graph.activity_nodes == (_ACT_1,)
+
+
+class TestDetectCycleRejectsMalformedRuntimeValues:
+    def test_rejects_malformed_proposed_input_artifact_id(self) -> None:
+        with pytest.raises(InvalidIdentifier):
+            detect_cycle(
+                proposed_input_artifact_id="not-an-artifact-id",
+                proposed_output_artifact_id=_ART_A,
+                edges=(),
+            )
+
+    def test_rejects_malformed_proposed_output_artifact_id(self) -> None:
+        with pytest.raises(InvalidIdentifier):
+            detect_cycle(
+                proposed_input_artifact_id=_ART_A,
+                proposed_output_artifact_id="not-an-artifact-id",
+                edges=(),
+            )

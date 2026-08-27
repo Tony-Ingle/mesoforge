@@ -468,7 +468,7 @@ class ArtifactService:
             activity_version=request.activity_version,
             ordered_inputs=ordered_inputs,
             configuration_digest=request.configuration_digest,
-            parameters_digest=str(parameters_digest),
+            parameters_digest=parameters_digest,
             code_revision=request.code_revision,
             environment_digest=request.environment_digest,
             output_schema=request.output_artifact_schema_version,

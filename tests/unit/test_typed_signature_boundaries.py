@@ -38,6 +38,8 @@ from mesoforge.common.identifiers import (
     GridId,
     RunId,
 )
+from mesoforge.provenance import lineage as lineage_module
+from mesoforge.provenance import services as provenance_services_module
 from mesoforge.storage import interfaces as interfaces_module
 from mesoforge.storage import s3 as s3_module
 from mesoforge.storage.postgres import idempotency_lock as lock_module
@@ -66,11 +68,31 @@ _ALLOWED_PLAIN_STR_NAMES = frozenset(
 _IDENTIFIER_NAME_SUFFIXES = ("_id", "_digest")
 _IDENTIFIER_EXACT_NAMES = frozenset({"digest"})
 
+# Aggregate parameter/field names that hold a bare tuple of identifiers
+# (not identifier-suffixed themselves) -- final re-review HIGH finding:
+# the suffix heuristic alone misses ``ids``/``artifact_nodes``/
+# ``activity_nodes``, which is exactly how the unrestricted-str
+# regression in ``provenance.lineage`` escaped the original static
+# audit. Their annotations must resolve to a typed identifier (or a
+# tuple/union composition of one), exactly like a normal identifier
+# parameter.
+_AGGREGATE_IDENTIFIER_NAMES = frozenset({"ids", "artifact_nodes", "activity_nodes"})
+
+# Parameter/field names that hold an ordered tuple of ``(role, artifact_id)``
+# pairs -- the ``role`` element legitimately stays a bare ``str``, but the
+# second element of every pair must be a typed identifier. Handled by a
+# dedicated shape check (``_annotation_is_typed_role_id_pairs``) rather
+# than the generic all-typed-args heuristic, which would otherwise also
+# demand ``role`` be typed and produce a false failure.
+_ROLE_IDENTIFIER_PAIR_NAMES = frozenset({"ordered_inputs"})
+
 
 def _looks_like_identifier(name: str) -> bool:
     if name in _ALLOWED_PLAIN_STR_NAMES:
         return False
     if name in _IDENTIFIER_EXACT_NAMES:
+        return True
+    if name in _AGGREGATE_IDENTIFIER_NAMES or name in _ROLE_IDENTIFIER_PAIR_NAMES:
         return True
     return any(name.endswith(suffix) for suffix in _IDENTIFIER_NAME_SUFFIXES)
 
@@ -101,6 +123,30 @@ def _annotation_contains_bare_str(annotation: object) -> bool:
     return any(_annotation_contains_bare_str(a) for a in typing.get_args(annotation))
 
 
+def _annotation_is_typed_role_id_pairs(annotation: object) -> bool:
+    """True if ``annotation`` is ``tuple[tuple[str, <TypedId>], ...]``
+    (or a ``tuple[tuple[str, <TypedId>], ...] | None``): an ordered
+    sequence of ``(role, artifact_id)`` pairs where ``role`` stays a
+    bare ``str`` by design but the second element must be one of the
+    typed identifier classes with no bare ``str`` fallback."""
+    origin = typing.get_origin(annotation)
+    if origin is None:
+        return False
+    args = [a for a in typing.get_args(annotation) if a is not type(None)]
+    # tuple[tuple[str, ArtifactId], ...] -> args = (tuple[str, ArtifactId], Ellipsis)
+    pair_types = [a for a in args if a is not Ellipsis]
+    if len(pair_types) != 1:
+        return False
+    pair_type = pair_types[0]
+    if typing.get_origin(pair_type) is not tuple:
+        return False
+    pair_args = typing.get_args(pair_type)
+    if len(pair_args) != 2:
+        return False
+    role_type, id_type = pair_args
+    return role_type is str and id_type in _TYPED_IDENTIFIER_CLASSES
+
+
 def _assert_identifier_params_typed(
     func: object, *, label: str, owner_globalns: dict[str, object] | None = None
 ) -> list[str]:
@@ -121,6 +167,13 @@ def _assert_identifier_params_typed(
         annotation = hints.get(param_name)
         if annotation is None:
             failures.append(f"{label}: parameter {param_name!r} has no resolvable annotation")
+            continue
+        if param_name in _ROLE_IDENTIFIER_PAIR_NAMES:
+            if not _annotation_is_typed_role_id_pairs(annotation):
+                failures.append(
+                    f"{label}: parameter {param_name!r} annotation {annotation!r} is not "
+                    "tuple[tuple[str, <TypedId>], ...]"
+                )
             continue
         if _annotation_contains_bare_str(annotation) or not _annotation_uses_typed_identifier(
             annotation
@@ -379,3 +432,96 @@ class TestConfigurationServiceInjectedProtocolUsesTypedIdentifiers:
             owner_globalns=vars(configuration_module),
         )
         assert not failures, "\n".join(failures)
+
+
+class TestProvenanceServicesPublicBoundaryUsesTypedIdentifiers:
+    """``provenance.services``: the public, non-Pydantic-mediated
+    ``compute_idempotency_digest`` function boundary must be typed (HIGH
+    finding: the earlier remediation left ``ordered_inputs``,
+    ``configuration_digest``, ``parameters_digest``, ``code_revision``,
+    and ``environment_digest`` as unrestricted ``str``/``tuple[str, str]``
+    with no boundary reconstruction, so a direct runtime call with
+    malformed values succeeded)."""
+
+    def test_compute_idempotency_digest_uses_typed_identifiers(self) -> None:
+        failures = _assert_identifier_params_typed(
+            provenance_services_module.compute_idempotency_digest,
+            label="compute_idempotency_digest",
+            owner_globalns=vars(provenance_services_module),
+        )
+        assert not failures, "\n".join(failures)
+
+
+class TestProvenanceLineagePublicBoundaryUsesTypedIdentifiers:
+    """``provenance.lineage``: every public model/function boundary must
+    use typed ``ArtifactId``/``ActivityId``, including aggregate field
+    names (``root_artifact_id``, ``artifact_nodes``, ``activity_nodes``)
+    that the original suffix-only heuristic could not detect (HIGH
+    finding: ``ActivityEdge``, ``LineageEdgeView``, ``LineageGraph``,
+    ``build_lineage_graph``, and ``detect_cycle`` were all left
+    string-typed)."""
+
+    def test_activity_edge_and_lineage_edge_view_use_typed_fields(self) -> None:
+        all_failures: list[str] = []
+        for model_cls in (lineage_module.ActivityEdge, lineage_module.LineageEdgeView):
+            hints = typing.get_type_hints(model_cls, globalns=vars(lineage_module))
+            for attr_name, annotation in hints.items():
+                if not _looks_like_identifier(attr_name):
+                    continue
+                if _annotation_contains_bare_str(
+                    annotation
+                ) or not _annotation_uses_typed_identifier(annotation):
+                    all_failures.append(
+                        f"{model_cls.__name__}.{attr_name}: annotation {annotation!r} "
+                        "is not a typed identifier/digest class"
+                    )
+        assert not all_failures, "\n".join(all_failures)
+
+    def test_lineage_graph_uses_typed_fields_including_aggregate_names(self) -> None:
+        hints = typing.get_type_hints(lineage_module.LineageGraph, globalns=vars(lineage_module))
+        all_failures: list[str] = []
+        for attr_name in ("root_artifact_id", "artifact_nodes", "activity_nodes"):
+            annotation = hints[attr_name]
+            if _annotation_contains_bare_str(annotation) or not _annotation_uses_typed_identifier(
+                annotation
+            ):
+                all_failures.append(
+                    f"LineageGraph.{attr_name}: annotation {annotation!r} is not a typed "
+                    "identifier class"
+                )
+        assert not all_failures, "\n".join(all_failures)
+
+    def test_build_lineage_graph_and_detect_cycle_use_typed_identifiers(self) -> None:
+        all_failures: list[str] = []
+        for func, label in (
+            (lineage_module.build_lineage_graph, "build_lineage_graph"),
+            (lineage_module.detect_cycle, "detect_cycle"),
+        ):
+            all_failures.extend(
+                _assert_identifier_params_typed(
+                    func, label=label, owner_globalns=vars(lineage_module)
+                )
+            )
+        assert not all_failures, "\n".join(all_failures)
+
+
+class TestStorageLineageReaderUsesTypedIdentifiers:
+    """``storage.interfaces.LineageReader`` exposes ``LineageGraph``,
+    which must itself be typed (final re-review HIGH finding: this
+    storage-facing value boundary remained string-typed via
+    ``provenance.lineage`` even though the protocol method signature
+    itself already used ``ArtifactId``)."""
+
+    def test_lineage_reader_return_type_is_fully_typed(self) -> None:
+        hints = typing.get_type_hints(interfaces_module.LineageGraph, globalns=vars(lineage_module))
+        all_failures: list[str] = []
+        for attr_name in ("root_artifact_id", "artifact_nodes", "activity_nodes"):
+            annotation = hints[attr_name]
+            if _annotation_contains_bare_str(annotation) or not _annotation_uses_typed_identifier(
+                annotation
+            ):
+                all_failures.append(
+                    f"LineageGraph.{attr_name}: annotation {annotation!r} is not a typed "
+                    "identifier class"
+                )
+        assert not all_failures, "\n".join(all_failures)
