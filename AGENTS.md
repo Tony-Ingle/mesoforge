@@ -102,3 +102,41 @@ For significant changes:
 - Forecast inputs, adjustments, outputs, and verification results must be reproducible.
 - Model guidance provenance must be retained.
 - Numerical verification determines whether an AI adjustment actually adds value.
+
+## Default Git Workflow
+
+Unless the user explicitly says otherwise:
+
+- Never make substantive changes directly on `main`.
+- Create a descriptive feature branch for all code or documentation changes.
+- Use an isolated Git worktree for implementation tasks when practical.
+- Commit completed work with a clear commit message.
+- Push the branch to `origin`.
+- Do not merge into `main`.
+- Report the branch name, commit SHA, tests run, and any unresolved issues.
+
+### Codex
+
+Codex owns architecture, planning, and review.
+
+When Codex makes architecture or documentation changes:
+- create a `codex/<short-description>` branch
+- commit and push the changes
+- do not merge
+
+When reviewing Claude work:
+- review the actual diff and tests
+- request changes if needed
+- do not modify the implementation unless explicitly asked
+
+### Claude
+
+Claude owns implementation.
+
+For implementation tasks:
+- create/use a `claude/<short-description>` branch or Kanban worktree
+- implement the approved design
+- run tests
+- commit and push
+- request review from Codex
+- do not merge
