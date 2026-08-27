@@ -52,3 +52,15 @@ forbidden_modules =
     sqlalchemy
     psycopg
     alembic
+
+[importlinter:contract:storage-interfaces-thin]
+name = storage.interfaces contains protocols/contract types only, no infra imports
+type = forbidden
+source_modules =
+    mesoforge.storage.interfaces
+forbidden_modules =
+    boto3
+    sqlalchemy
+    psycopg
+    alembic
+    h5netcdf
