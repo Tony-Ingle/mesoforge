@@ -83,3 +83,21 @@ psycopg, Alembic, boto3, NumPy, xarray, h5netcdf, pyproj). This keeps
 `common` foundational and dependency-free with respect to the rest of the
 codebase while remaining implementable. Flagged for Codex review rather
 than silently narrowing scope.
+
+A second layering tension surfaced in Task 5: plan Section 3 places
+`contracts -> common` only, while plan Section 4.6 requires
+`contracts/datasets.py` to validate an `xarray.Dataset` against
+`GridDefinition` and `VariableDefinition`, both of which the plan's own
+Section 3 file layout puts in `catalog` (`catalog -> contracts`, not the
+reverse). Rather than invert the declared dependency direction or move
+the grid/variable models into `contracts`, `contracts/datasets.py` defines
+minimal structural-typing `Protocol`s (`GridLike`, `VariableLike`)
+declaring only the attributes dataset validation actually reads;
+`catalog.grids.GridDefinition` and `catalog.variables.VariableDefinition`
+satisfy them structurally with zero import in either direction. The
+`import-linter` layering contract is therefore satisfied exactly as
+written, and callers (e.g. `application`, which already depends on both
+`catalog` and `contracts`) pass real `GridDefinition`/`VariableDefinition`
+instances into `validate_canonical_dataset` without either package needing
+to know about the other's concrete types. Flagged for Codex review rather
+than silently choosing a dependency direction.
