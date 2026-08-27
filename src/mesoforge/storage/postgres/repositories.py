@@ -501,17 +501,18 @@ class PostgresActivityRepository:
 
 
 def _run_row_to_manifest(row: RunRow) -> RunManifest:
-    # Prefer the relational run_selected_inputs join table (ordinal order
-    # preserved via ORDER BY ordinal) over the legacy selected_inputs
-    # JSONB column, which is retained only for backward read
-    # compatibility (Codex review t_9bb13e2b finding 5).
-    if row.selected_input_rows:
-        ordered_ids = tuple(
-            ArtifactId(f"art_{r.artifact_id}")
-            for r in sorted(row.selected_input_rows, key=lambda r: r.ordinal)
-        )
-    else:
-        ordered_ids = tuple(ArtifactId(a) for a in row.selected_inputs.get("artifact_ids", []))
+    # The relational run_selected_inputs join table (ordinal order
+    # preserved via ORDER BY ordinal) is the ONLY source of selected
+    # input references -- the legacy runs.selected_inputs JSONB column
+    # and its fail-open fallback read path were removed by migration
+    # 0003_drop_legacy_selection_json (Codex review t_f569c45c
+    # finding 5: a run claiming selected inputs must never load from
+    # unconstrained JSON). A run with zero selected inputs (an empty
+    # tuple) is legitimately possible and is not a fallback condition.
+    ordered_ids = tuple(
+        ArtifactId(f"art_{r.artifact_id}")
+        for r in sorted(row.selected_input_rows, key=lambda r: r.ordinal)
+    )
     return RunManifest(
         run_id=RunId(f"run_{row.id}"),
         forecast_issue_time=row.forecast_issue_time,
@@ -544,10 +545,6 @@ class PostgresRunRepository:
             environment_digest=manifest.environment_digest,
             lockfile_digest=manifest.lockfile_digest,
             random_seed=manifest.random_seed,
-            # Retained for backward read compatibility only; the
-            # authoritative, relationally-integral selection lives in
-            # run_selected_inputs below (finding 5).
-            selected_inputs={"artifact_ids": list(manifest.selected_input_artifact_ids)},
         )
         for ordinal, artifact_id in enumerate(manifest.selected_input_artifact_ids):
             row.selected_input_rows.append(

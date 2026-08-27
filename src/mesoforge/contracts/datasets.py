@@ -163,15 +163,19 @@ def _validate_interval_bounds(
         return
 
     bounds_array = dataset[bounds_name]
+    shape_ok = True
     if bounds_array.dims != ("lead_time", "bounds"):
         errors.append(
             f"{bounds_name!r} must have dimensions ('lead_time', 'bounds'), got "
             f"{bounds_array.dims!r}"
         )
-    elif dataset.sizes.get("bounds") != 2:
+        shape_ok = False
+    if dataset.sizes.get("bounds") != 2:
         errors.append(f"{bounds_name!r} 'bounds' dimension must have length 2")
+        shape_ok = False
 
-    if str(bounds_array.dtype) != "datetime64[ns]":
+    dtype_ok = str(bounds_array.dtype) == "datetime64[ns]"
+    if not dtype_ok:
         errors.append(f"{bounds_name!r} must be datetime64[ns], got {bounds_array.dtype}")
 
     closure = data_array.attrs.get("interval_closure")
@@ -185,6 +189,41 @@ def _validate_interval_bounds(
             f"data variable {variable_id!r} has unknown interval_closure {closure!r}; "
             f"expected one of {sorted(_KNOWN_INTERVAL_CLOSURES)}"
         )
+
+    # --- per-lead finite/non-NaT start < end, and required relationship
+    # to valid_time (Codex review t_f569c45c finding 2: interval bounds
+    # validation accepted reversed, zero-length, NaT, and unrelated
+    # bounds -- fail-closed on all four below). ---
+    if not (shape_ok and dtype_ok):
+        return
+
+    bounds_values = bounds_array.values
+    starts = bounds_values[:, 0]
+    ends = bounds_values[:, 1]
+    is_nat = np.isnat(starts) | np.isnat(ends)
+    if np.any(is_nat):
+        errors.append(
+            f"{bounds_name!r} contains NaT bound(s); every interval start/end must be a "
+            "finite, non-NaT datetime64[ns] value"
+        )
+
+    finite_rows = ~is_nat
+    if np.any(finite_rows) and np.any(starts[finite_rows] >= ends[finite_rows]):
+        errors.append(
+            f"{bounds_name!r} must have start < end for every lead; found a reversed or "
+            "zero-length interval"
+        )
+
+    if "valid_time" in dataset.coords or "valid_time" in dataset.variables:
+        valid_time_values = dataset["valid_time"].values
+        if len(valid_time_values) == len(ends):
+            related_rows = finite_rows & (ends != valid_time_values)
+            if np.any(related_rows):
+                errors.append(
+                    f"{bounds_name!r} interval end must equal this variable's valid_time "
+                    "for every lead; found an interval unrelated to the variable's valid/"
+                    "lead time"
+                )
 
 
 def validate_canonical_dataset(
@@ -268,10 +307,17 @@ def validate_canonical_dataset(
             if not np.array_equal(dataset["x"].values, np.asarray(grid.x_coordinates)):
                 errors.append("dataset 'x' coordinates do not match the referenced grid")
 
-    for extra_dim in declared_dims:
-        extra_dim_name = str(extra_dim)
-        if extra_dim_name not in _KNOWN_TOP_LEVEL_DIMS and not extra_dim_name.endswith("bounds"):
-            errors.append(f"undeclared dimension {extra_dim_name!r}")
+    # Dimension-set enforcement is deferred until after the per-variable
+    # loop below: the exact allowed dimension set is derived from the
+    # dimensions actually declared/used by real data variables, quality
+    # masks, and interval-bounds variables -- not merely "any known
+    # top-level dimension name" or "anything ending in the literal
+    # substring 'bounds'" (Codex review t_f569c45c finding 2, which
+    # found an unused 'member' dimension and an arbitrary '*bounds'
+    # dimension were both silently accepted). ``used_extra_dims``
+    # accumulates the dimensions that are genuinely earned by a
+    # declared variable/mask/bounds pairing.
+    used_extra_dims: set[str] = set()
 
     data_var_names = [
         name
@@ -291,6 +337,10 @@ def validate_canonical_dataset(
                 errors.append(f"data variable {variable_id!r} missing required attribute {attr!r}")
         if any(attr not in data_array.attrs for attr in _REQUIRED_VARIABLE_ATTRS):
             continue
+
+        used_extra_dims.update(
+            str(d) for d in data_array.dims if str(d) not in {"lead_time", "y", "x"}
+        )
 
         expected_dtype = _DTYPE_MAP[variable_def.dtype]
         if data_array.dtype != expected_dtype:
@@ -341,6 +391,9 @@ def validate_canonical_dataset(
             errors.append(f"quality mask {mask_name!r} referenced by {variable_id!r} not found")
             continue
         mask_array = dataset[mask_name]
+        used_extra_dims.update(
+            str(d) for d in mask_array.dims if str(d) not in {"lead_time", "y", "x"}
+        )
         if mask_array.dims != data_array.dims:
             errors.append(f"quality mask {mask_name!r} dimensions do not match {variable_id!r}")
         if mask_array.dtype != np.dtype("uint16"):
@@ -377,8 +430,26 @@ def validate_canonical_dataset(
 
         # --- interval bounds/closure ---
         if variable_def.interval_required:
+            used_extra_dims.add("bounds")
             _validate_interval_bounds(
                 dataset=dataset, variable_id=variable_id, data_array=data_array, errors=errors
+            )
+
+    # A dimension is permitted only if it is exactly one of the fixed
+    # baseline dims (lead_time/y/x, exempted above) or was actually
+    # earned by a declared data variable, its quality mask, or an
+    # interval-bounds variable in the loop above -- never merely because
+    # its name happens to be in the global known-dimension vocabulary
+    # (member/level/location) or happens to end in the substring
+    # "bounds".
+    for extra_dim in declared_dims:
+        extra_dim_name = str(extra_dim)
+        if extra_dim_name not in _KNOWN_TOP_LEVEL_DIMS and extra_dim_name != "bounds":
+            errors.append(f"undeclared dimension {extra_dim_name!r}")
+        elif extra_dim_name not in used_extra_dims:
+            errors.append(
+                f"dimension {extra_dim_name!r} is declared on the dataset but not used by any "
+                "data variable, quality mask, or interval-bounds variable"
             )
 
     if errors:

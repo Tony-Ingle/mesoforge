@@ -219,3 +219,44 @@ class TestS3ArtifactObjectStoreFailClosedConcurrency:
         second = store.put_if_absent(str(digest), payload, "application/octet-stream")
         assert second.storage_uri == first.storage_uri
         assert second.byte_size == len(payload)
+
+    def test_corrupted_existing_object_is_rejected_not_silently_trusted(self) -> None:
+        """The regression this test must prove: an EXISTING object whose
+        actual bytes have been corrupted since it was written (e.g. by
+        an out-of-band process, bit rot, or a compromised backend) must
+        never be reported as a successful put_if_absent for the ORIGINAL
+        digest -- verification, not same-byte idempotency, is what
+        exercises the fast path's hash-verification branch.
+
+        Bytes are corrupted directly via the underlying S3 client (never
+        through put_if_absent, which always hashes its own input and
+        would just reject a mismatched digest at the call site) so this
+        genuinely exercises the "existing object whose stored bytes no
+        longer match the key it's stored under" fast path in
+        S3ArtifactObjectStore.put_if_absent.
+        """
+        store = _make_store()
+        payload = _unique_bytes()
+        digest = Digest.of_bytes(payload)
+        original = store.put_if_absent(str(digest), payload, "application/octet-stream")
+
+        key = store._key_from_uri(original.storage_uri)
+        corrupted_payload = _unique_bytes()
+        assert corrupted_payload != payload
+        store._client.put_object(
+            Bucket=store._bucket,
+            Key=key,
+            Body=corrupted_payload,
+            ContentType="application/octet-stream",
+        )
+
+        # get_verified against the original digest now fails, proving
+        # the object at the key genuinely no longer matches its digest.
+        with pytest.raises(IntegrityError):
+            store.get_verified(original.storage_uri, str(digest))
+
+        # put_if_absent's existing-object fast path must re-verify and
+        # surface the same corruption -- never silently report success
+        # because a same-named key merely exists.
+        with pytest.raises(IntegrityError):
+            store.put_if_absent(str(digest), payload, "application/octet-stream")

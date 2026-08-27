@@ -158,7 +158,11 @@ class TestExecuteTransformation:
         kwargs: dict[str, object] = dict(
             activity_type="unit-conversion",
             activity_version="1.0.0",
-            inputs=(TransformationInputRef(role="primary", artifact_id="art_placeholder"),),
+            inputs=(
+                TransformationInputRef(
+                    role="primary", artifact_id="art_00000000-0000-0000-0000-000000000000"
+                ),
+            ),
             output_role="primary",
             output_artifact_type="synthetic-derived",
             output_artifact_schema_version="synthetic-derived.v1",
@@ -183,7 +187,7 @@ class TestExecuteTransformation:
             def serialize(self, value: bytes) -> bytes:
                 return value
 
-        result = service.execute_transformation(
+        result = service.execute_raw_transformation(
             request,
             transform=lambda data: str(float(data) + 273.15).encode(),
             serializer=_Serializer(),
@@ -204,14 +208,14 @@ class TestExecuteTransformation:
             def serialize(self, value: bytes) -> bytes:
                 return value
 
-        first = service.execute_transformation(
+        first = service.execute_raw_transformation(
             request,
             transform=lambda data: data,
             serializer=_Serializer(),
             input_loader=lambda payload: payload,
             output_validator=lambda _output: None,
         )
-        second = service.execute_transformation(
+        second = service.execute_raw_transformation(
             request,
             transform=lambda data: data,
             serializer=_Serializer(),
@@ -237,7 +241,7 @@ class TestExecuteTransformation:
                 return value
 
         with pytest.raises(IntegrityError):
-            service.execute_transformation(
+            service.execute_raw_transformation(
                 request,
                 transform=lambda data: data,
                 serializer=_Serializer(),
@@ -262,7 +266,7 @@ class TestExecuteTransformation:
             raise ValueError("transform exploded")
 
         with pytest.raises(ValueError, match="transform exploded"):
-            service.execute_transformation(
+            service.execute_raw_transformation(
                 request,
                 transform=_boom,
                 serializer=_Serializer(),
@@ -290,7 +294,7 @@ class TestExecuteTransformation:
             raise ValueError("contract violated")
 
         with pytest.raises(ValueError, match="contract violated"):
-            service.execute_transformation(
+            service.execute_raw_transformation(
                 request,
                 transform=lambda data: data,
                 serializer=_Serializer(),
@@ -317,7 +321,7 @@ class TestExecuteTransformation:
                 return value
 
         with pytest.raises(ValueError, match="does not match"):
-            service.execute_transformation(
+            service.execute_raw_transformation(
                 request,
                 transform=lambda data: data,
                 serializer=_Serializer(),
@@ -341,7 +345,7 @@ class TestExecuteTransformation:
                 return value
 
         with pytest.raises(NotFound):
-            service.execute_transformation(
+            service.execute_raw_transformation(
                 request,
                 transform=lambda data: data,
                 serializer=_Serializer(),
@@ -363,7 +367,7 @@ class TestExecuteTransformation:
             def serialize(self, value: bytes) -> bytes:
                 return value
 
-        result = service.execute_transformation(
+        result = service.execute_raw_transformation(
             request,
             transform=lambda data: data,
             serializer=_Serializer(),
@@ -389,7 +393,7 @@ class TestExecuteTransformation:
         def _run() -> None:
             try:
                 results.append(
-                    service.execute_transformation(
+                    service.execute_raw_transformation(
                         request,
                         transform=lambda data: data,
                         serializer=_Serializer(),
@@ -476,7 +480,7 @@ class TestCreateRun:
             def serialize(self, value: bytes) -> bytes:
                 return value
 
-        derived_result = service.execute_transformation(
+        derived_result = service.execute_raw_transformation(
             request,
             transform=lambda data: data,
             serializer=_Serializer(),
@@ -543,3 +547,116 @@ class TestCreateRun:
             source_b.artifact_id,
         )
         assert len(uow_factory.runs) == 1
+
+
+class TestCanonicalTransformationValidationMandatory:
+    """Finding 1 (Codex review t_f569c45c): the canonical
+    ``execute_transformation`` API must not allow callers to omit
+    scientific input validation. ``input_validator`` is a required
+    keyword argument with no default -- a caller that tries to omit it
+    gets a ``TypeError`` from Python itself, before the service ever
+    runs. Callers that genuinely transform non-dataset payloads must use
+    the differently-named ``execute_raw_transformation`` instead."""
+
+    def _transformation_request(self, **overrides: object) -> TransformationRequest:
+        kwargs: dict[str, object] = dict(
+            activity_type="unit-conversion",
+            activity_version="1.0.0",
+            inputs=(
+                TransformationInputRef(
+                    role="primary", artifact_id="art_00000000-0000-0000-0000-000000000000"
+                ),
+            ),
+            output_role="primary",
+            output_artifact_type="synthetic-derived",
+            output_artifact_schema_version="synthetic-derived.v1",
+            output_media_type="application/octet-stream",
+            configuration_snapshot_id="cfg_sha256_" + "a" * 64,
+            configuration_digest="sha256:" + "a" * 64,
+            code_revision="a" * 40,
+            environment_digest="sha256:" + "b" * 64,
+        )
+        kwargs.update(overrides)
+        return TransformationRequest(**kwargs)
+
+    def test_execute_transformation_requires_input_validator_keyword(self, service_and_uow) -> None:
+        service, uow_factory, _ = service_and_uow
+        source = service.register_source(_source_request(), b"10.0")
+        request = self._transformation_request(
+            inputs=(TransformationInputRef(role="primary", artifact_id=source.artifact_id),)
+        )
+
+        class _Serializer:
+            def serialize(self, value: bytes) -> bytes:
+                return value
+
+        with pytest.raises(TypeError):
+            # input_validator intentionally omitted: this must fail at
+            # the call site (missing required keyword argument), never
+            # silently skip scientific validation.
+            service.execute_transformation(  # type: ignore[call-arg]
+                request,
+                transform=lambda data: data,
+                serializer=_Serializer(),
+                input_loader=lambda payload: payload,
+                output_validator=lambda _output: None,
+            )
+
+    def test_execute_transformation_runs_supplied_input_validator(self, service_and_uow) -> None:
+        service, uow_factory, _ = service_and_uow
+        source = service.register_source(_source_request(), b"10.0")
+        request = self._transformation_request(
+            inputs=(TransformationInputRef(role="primary", artifact_id=source.artifact_id),)
+        )
+
+        class _Serializer:
+            def serialize(self, value: bytes) -> bytes:
+                return value
+
+        validated_payloads: list[bytes] = []
+
+        def _reject_all(dataset: bytes) -> None:
+            validated_payloads.append(dataset)
+            raise ValueError("malformed scientific dataset")
+
+        with pytest.raises(ValueError, match="malformed scientific dataset"):
+            service.execute_transformation(
+                request,
+                transform=lambda data: data,
+                serializer=_Serializer(),
+                input_loader=lambda payload: payload,
+                output_validator=lambda _output: None,
+                input_validator=_reject_all,
+            )
+        # the validator ran (and rejected) before transform ever could;
+        # since validation happens before the started activity is even
+        # created (step 4 precedes step 5), no activity row exists at
+        # all for the rejected request.
+        assert validated_payloads == [b"10.0"]
+        assert len(uow_factory.activities) == 0
+
+    def test_execute_raw_transformation_has_no_input_validator_parameter(
+        self, service_and_uow
+    ) -> None:
+        """execute_raw_transformation's signature has no input_validator
+        parameter at all -- passing one is a TypeError, proving the two
+        APIs cannot be confused with each other."""
+        service, uow_factory, _ = service_and_uow
+        source = service.register_source(_source_request(), b"10.0")
+        request = self._transformation_request(
+            inputs=(TransformationInputRef(role="primary", artifact_id=source.artifact_id),)
+        )
+
+        class _Serializer:
+            def serialize(self, value: bytes) -> bytes:
+                return value
+
+        with pytest.raises(TypeError):
+            service.execute_raw_transformation(  # type: ignore[call-arg]
+                request,
+                transform=lambda data: data,
+                serializer=_Serializer(),
+                input_loader=lambda payload: payload,
+                output_validator=lambda _output: None,
+                input_validator=lambda _dataset: None,
+            )

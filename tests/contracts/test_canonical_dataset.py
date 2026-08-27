@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import xarray as xr
 
 from mesoforge.catalog.grids import GridDefinition
 from mesoforge.contracts.datasets import CanonicalDatasetError, validate_canonical_dataset
@@ -253,3 +254,118 @@ class TestCanonicalDatasetScientificMutations:
         )
         with pytest.raises(CanonicalDatasetError, match="interval"):
             _validate(dataset, variable=variable)
+
+
+def _interval_required_variable():
+    from mesoforge.catalog.variables import VariableDefinition
+
+    return VariableDefinition(
+        variable_id="air_temperature_2m",
+        standard_name="air_temperature",
+        canonical_unit_id="degC",
+        dtype="float32",
+        temporal_semantics="average",
+        spatial_support="cell_mean",
+        vertical_definition_id="height-agl-2m",
+        allowed_dimension_variants=(("lead_time", "y", "x"),),
+        missing_value_policy="nan_with_quality_mask",
+        interval_required=True,
+    )
+
+
+def _build_dataset_with_bounds(bounds_values: np.ndarray) -> xr.Dataset:
+    """Build the synthetic dataset with an accumulation-style
+    air_temperature_2m and a matching (lead_time, bounds)
+    air_temperature_2m_interval_bounds variable set to ``bounds_values``
+    (shape (n_leads, 2), datetime64[ns])."""
+    dataset = build_synthetic_dataset()
+    dataset["air_temperature_2m"].attrs["temporal_semantics"] = "average"
+    dataset["air_temperature_2m"].attrs["interval_closure"] = "left_open_right_closed"
+    dataset["air_temperature_2m_interval_bounds"] = (
+        ("lead_time", "bounds"),
+        bounds_values.astype("datetime64[ns]"),
+    )
+    return dataset
+
+
+class TestCanonicalDatasetIntervalBoundsFailClosed:
+    """Finding 2 (Codex review t_f569c45c): interval bounds validation
+    must reject reversed, zero-length, NaT, and unrelated bounds -- not
+    merely check shape/dtype/closure."""
+
+    def _valid_time_values(self, dataset) -> np.ndarray:
+        return dataset["valid_time"].values.copy()
+
+    def test_accepts_well_formed_bounds(self) -> None:
+        base = build_synthetic_dataset()
+        valid_times = base["valid_time"].values
+        starts = valid_times - np.timedelta64(1, "h")
+        bounds = np.stack([starts, valid_times], axis=1)
+        dataset = _build_dataset_with_bounds(bounds)
+        _validate(dataset, variable=_interval_required_variable())
+
+    def test_rejects_reversed_bounds(self) -> None:
+        base = build_synthetic_dataset()
+        valid_times = base["valid_time"].values
+        starts = valid_times - np.timedelta64(1, "h")
+        # reversed: start after end
+        bounds = np.stack([valid_times, starts], axis=1)
+        dataset = _build_dataset_with_bounds(bounds)
+        with pytest.raises(CanonicalDatasetError, match="start < end"):
+            _validate(dataset, variable=_interval_required_variable())
+
+    def test_rejects_zero_length_bounds(self) -> None:
+        base = build_synthetic_dataset()
+        valid_times = base["valid_time"].values
+        bounds = np.stack([valid_times, valid_times], axis=1)
+        dataset = _build_dataset_with_bounds(bounds)
+        with pytest.raises(CanonicalDatasetError, match="start < end"):
+            _validate(dataset, variable=_interval_required_variable())
+
+    def test_rejects_nat_bounds(self) -> None:
+        base = build_synthetic_dataset()
+        valid_times = base["valid_time"].values
+        starts = valid_times - np.timedelta64(1, "h")
+        bounds = np.stack([starts, valid_times], axis=1).astype("datetime64[ns]")
+        bounds[0, 1] = np.datetime64("NaT", "ns")
+        dataset = _build_dataset_with_bounds(bounds)
+        with pytest.raises(CanonicalDatasetError, match="NaT"):
+            _validate(dataset, variable=_interval_required_variable())
+
+    def test_rejects_bounds_unrelated_to_valid_time(self) -> None:
+        base = build_synthetic_dataset()
+        valid_times = base["valid_time"].values
+        starts = valid_times - np.timedelta64(1, "h")
+        # ends deliberately do not equal valid_time (unrelated bounds)
+        unrelated_ends = valid_times + np.timedelta64(3, "h")
+        bounds = np.stack([starts, unrelated_ends], axis=1)
+        dataset = _build_dataset_with_bounds(bounds)
+        with pytest.raises(CanonicalDatasetError, match="valid_time"):
+            _validate(dataset, variable=_interval_required_variable())
+
+
+class TestCanonicalDatasetDimensionSetFailClosed:
+    """Finding 2 (Codex review t_f569c45c): the exact allowed dimension
+    set must be derived from declared variables/masks/bounds -- an
+    unused known top-level dimension (member/level/location) or an
+    arbitrary dimension whose name merely ends in 'bounds' must be
+    rejected, not silently accepted."""
+
+    def test_rejects_unused_known_top_level_dimension(self) -> None:
+        dataset = build_synthetic_dataset()
+        # Add a 'member' dimension/coordinate that no data variable,
+        # quality mask, or bounds variable actually uses.
+        dataset = dataset.assign_coords(member=("member", np.array([0, 1])))
+        dataset["_unused_member_dim_holder"] = (("member",), np.zeros(2))
+        with pytest.raises(CanonicalDatasetError, match="member"):
+            _validate(dataset)
+
+    def test_rejects_arbitrary_dimension_named_like_bounds(self) -> None:
+        dataset = build_synthetic_dataset()
+        # A dimension whose name merely ends with 'bounds' but is not
+        # the literal 'bounds' support dimension earned by an
+        # interval-bounds variable must still be rejected.
+        dataset = dataset.assign_coords(member_bounds=("member_bounds", np.array([0, 1])))
+        dataset["_unused_member_bounds_holder"] = (("member_bounds",), np.zeros(2))
+        with pytest.raises(CanonicalDatasetError, match="member_bounds"):
+            _validate(dataset)

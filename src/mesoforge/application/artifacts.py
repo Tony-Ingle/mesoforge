@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 
 import jcs
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from mesoforge.common.errors import IntegrityError
 from mesoforge.common.identifiers import (
@@ -20,6 +20,7 @@ from mesoforge.common.identifiers import (
     ConfigurationSnapshotId,
     Digest,
     RunId,
+    validate_code_revision,
 )
 from mesoforge.common.time import UtcInstant
 from mesoforge.contracts.artifacts import ArtifactManifest, Availability, SourceIdentity
@@ -109,7 +110,16 @@ class _IdempotencyLockLike(Protocol):
 class SourceRegistrationRequest(BaseModel):
     """Caller-owned request to register an external source artifact. The
     caller never supplies source_registration_digest -- the service
-    computes it from the named identity fields."""
+    computes it from the named identity fields.
+
+    ID/digest fields use the typed ``common.identifiers`` types directly
+    (Codex review t_f569c45c finding 3: the public request boundary must
+    not accept an unrestricted ``str`` for
+    configuration_snapshot_id/configuration_digest/environment_digest/
+    run_id/expected_content_digest/code_revision) so a malformed value
+    is rejected by Pydantic at construction time, before the request
+    ever reaches the service body.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -119,29 +129,39 @@ class SourceRegistrationRequest(BaseModel):
     artifact_type: str
     artifact_schema_version: str
     media_type: str
-    expected_content_digest: str | None = None
+    expected_content_digest: Digest | None = None
     created_at: UtcInstant
     availability: Availability
-    run_id: str | None = None
-    configuration_snapshot_id: str
-    configuration_digest: str
+    run_id: RunId | None = None
+    configuration_snapshot_id: ConfigurationSnapshotId
+    configuration_digest: Digest
     code_revision: str
-    environment_digest: str
+    environment_digest: Digest
     quality_state: str = "valid"
     attributes: dict[str, object] | None = None
+
+    @field_validator("code_revision")
+    @classmethod
+    def _check_code_revision(cls, value: str) -> str:
+        return validate_code_revision(value)
 
 
 class TransformationInputRef(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     role: str
-    artifact_id: str
+    artifact_id: ArtifactId
 
 
 class TransformationRequest(BaseModel):
     """Caller-owned request to execute a derived-artifact transformation.
     ``parameters`` are hashed (JCS/SHA-256) into ``parameters_digest``
-    internally; the idempotency digest never depends on output bytes."""
+    internally; the idempotency digest never depends on output bytes.
+
+    ID/digest fields use the typed ``common.identifiers`` types directly
+    (Codex review t_f569c45c finding 3), matching
+    ``SourceRegistrationRequest`` above.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -153,12 +173,17 @@ class TransformationRequest(BaseModel):
     output_artifact_schema_version: str
     output_media_type: str
     parameters: dict[str, object] = {}
-    configuration_snapshot_id: str
-    configuration_digest: str
+    configuration_snapshot_id: ConfigurationSnapshotId
+    configuration_digest: Digest
     code_revision: str
-    environment_digest: str
-    run_id: str | None = None
+    environment_digest: Digest
+    run_id: RunId | None = None
     quality_state: str = "valid"
+
+    @field_validator("code_revision")
+    @classmethod
+    def _check_code_revision(cls, value: str) -> str:
+        return validate_code_revision(value)
 
 
 class TransformationResult(BaseModel):
@@ -309,7 +334,67 @@ class ArtifactService:
         *,
         input_loader: Callable[[bytes], Any],
         output_validator: Callable[[Any], None],
-        input_validator: Callable[[Any], None] | None = None,
+        input_validator: Callable[[Any], None],
+    ) -> TransformationResult:
+        """Canonical transformation API for scientific (xarray.Dataset)
+        payloads. ``input_validator`` is a REQUIRED keyword argument (no
+        default) -- Codex review t_f569c45c finding 1 found the previous
+        signature made ``input_validator`` optional and silently skipped
+        contract validation whenever a caller omitted it, letting
+        malformed units/semantics/vertical definitions/dimensions reach
+        ``transform`` unnoticed. There is no way to call this method
+        without supplying a validator; callers that genuinely transform
+        non-dataset payloads (raw bytes/strings, never a scientific
+        dataset) must use ``execute_raw_transformation`` instead, whose
+        distinct name makes it impossible to confuse with this canonical
+        dataset-validating path.
+        """
+        return self._execute_transformation(
+            request,
+            transform,
+            serializer,
+            input_loader=input_loader,
+            output_validator=output_validator,
+            input_validator=input_validator,
+        )
+
+    def execute_raw_transformation(
+        self,
+        request: TransformationRequest,
+        transform: Callable[..., Any],
+        serializer: Any,
+        *,
+        input_loader: Callable[[bytes], Any],
+        output_validator: Callable[[Any], None],
+    ) -> TransformationResult:
+        """Non-dataset transformation API: no scientific/contract
+        validation is performed on deserialized inputs (there is no
+        ``input_validator`` parameter at all -- this is the "clearly
+        non-dataset API that cannot be confused with" the canonical
+        dataset-validating ``execute_transformation`` per Codex review
+        t_f569c45c finding 1). Use only for payloads that are not
+        canonical xarray.Dataset guidance (e.g. the in-memory
+        unit-test doubles in tests/unit/application/test_artifact_service.py,
+        which transform raw bytes/strings).
+        """
+        return self._execute_transformation(
+            request,
+            transform,
+            serializer,
+            input_loader=input_loader,
+            output_validator=output_validator,
+            input_validator=None,
+        )
+
+    def _execute_transformation(
+        self,
+        request: TransformationRequest,
+        transform: Callable[..., Any],
+        serializer: Any,
+        *,
+        input_loader: Callable[[bytes], Any],
+        output_validator: Callable[[Any], None],
+        input_validator: Callable[[Any], None] | None,
     ) -> TransformationResult:
         """
         Exact order per plan Section 5:
@@ -326,13 +411,14 @@ class ArtifactService:
         10. on failure, mark activity failed, remove unregistered objects;
         11. retrieval always verifies; finally releases the lock.
 
-        ``input_validator``, when supplied, is called once per deserialized
-        input dataset (step 4) before ``transform`` runs -- closing Codex
-        review finding 1 (t_9bb13e2b), which found inputs were deserialized
-        but never contract-validated. Callers that transform non-dataset
-        payloads (e.g. the in-memory unit-test doubles in
-        tests/unit/application/test_artifact_service.py, which transform
-        raw bytes/strings rather than xarray.Dataset objects) may omit it.
+        ``input_validator``, when not ``None``, is called once per
+        deserialized input dataset (step 4) before ``transform`` runs --
+        closing Codex review finding 1 (t_9bb13e2b). Only
+        ``execute_raw_transformation`` ever calls this private method
+        with ``input_validator=None``; the public canonical
+        ``execute_transformation`` always supplies one (Codex review
+        t_f569c45c finding 1: the public method itself must not make
+        validation optional).
 
         Cycle prevention (Codex review t_9bb13e2b finding 8): this service
         never attaches a pre-existing artifact as an activity's output --
@@ -490,22 +576,30 @@ class ArtifactService:
     def create_run(
         self,
         *,
-        run_id: str,
+        run_id: str | RunId,
         forecast_issue_time: datetime,
         information_cutoff: datetime,
-        configuration_snapshot_id: str,
-        configuration_digest: str,
+        configuration_snapshot_id: str | ConfigurationSnapshotId,
+        configuration_digest: str | Digest,
         code_revision: str,
-        environment_digest: str,
-        lockfile_digest: str,
+        environment_digest: str | Digest,
+        lockfile_digest: str | Digest,
         random_seed: int,
-        selected_input_artifact_ids: tuple[str, ...],
+        selected_input_artifact_ids: tuple[str | ArtifactId, ...],
         require_source_inputs: bool = True,
     ) -> RunManifest:
         """
         Exact order (fail-closed at every step; no run row is created
         unless all checks pass):
 
+        0. every ID/digest parameter is validated against its typed
+           ``common.identifiers`` type immediately -- a malformed
+           ``run_id``/``configuration_snapshot_id``/``configuration_digest``/
+           ``environment_digest``/``lockfile_digest``/element of
+           ``selected_input_artifact_ids`` raises ``InvalidIdentifier``
+           before any repository call (Codex review t_f569c45c finding
+           3: ``create_run`` is a public service boundary and must not
+           accept unrestricted ``str`` for these fields);
         1. load the configuration snapshot from the repository and
            verify the caller-supplied ``configuration_digest`` matches
            it -- a tampered/inconsistent snapshot+digest pair is
@@ -526,6 +620,14 @@ class ArtifactService:
         5. insert the run row and its ordered ``run_selected_inputs``
            relational rows in the same transaction, then commit.
         """
+        run_id = RunId(run_id)
+        configuration_snapshot_id = ConfigurationSnapshotId(configuration_snapshot_id)
+        configuration_digest = Digest(configuration_digest)
+        validate_code_revision(code_revision)
+        environment_digest = Digest(environment_digest)
+        lockfile_digest = Digest(lockfile_digest)
+        selected_input_artifact_ids = tuple(ArtifactId(a) for a in selected_input_artifact_ids)
+
         with self._unit_of_work_factory() as uow:
             snapshot = uow.configurations.get(configuration_snapshot_id)
             if snapshot.configuration_digest != configuration_digest:

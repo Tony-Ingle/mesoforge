@@ -78,6 +78,23 @@ def test_stored_objects_and_configuration_snapshots_have_no_payload_columns(
     engine.dispose()
 
 
+def test_runs_table_has_no_legacy_selected_inputs_json_column(
+    clean_postgres_dsn: str,
+) -> None:
+    """Codex review t_f569c45c finding 5: migration
+    0003_drop_legacy_selection_json must remove the unconstrained
+    legacy runs.selected_inputs JSONB column -- run_selected_inputs is
+    the only place selected-input references may live."""
+    config = _alembic_config(clean_postgres_dsn)
+    command.upgrade(config, "head")
+
+    engine = sa.create_engine(clean_postgres_dsn, future=True)
+    inspector = sa.inspect(engine)
+    column_names = {column["name"] for column in inspector.get_columns("runs")}
+    assert "selected_inputs" not in column_names
+    engine.dispose()
+
+
 def test_check_constraints_are_enforced(clean_postgres_dsn: str) -> None:
     config = _alembic_config(clean_postgres_dsn)
     command.upgrade(config, "head")

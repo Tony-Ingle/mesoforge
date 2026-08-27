@@ -149,7 +149,7 @@ def test_full_register_transform_trace_round_trip(
         environment_digest="sha256:" + "b" * 64,
     )
 
-    result = service.execute_transformation(
+    result = service.execute_raw_transformation(
         request,
         transform=lambda data: str(float(data) + 273.15).encode(),
         serializer=_Serializer(),

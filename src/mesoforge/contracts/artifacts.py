@@ -11,7 +11,13 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from mesoforge.common.identifiers import ArtifactId, ConfigurationSnapshotId, Digest, RunId
+from mesoforge.common.identifiers import (
+    ArtifactId,
+    ConfigurationSnapshotId,
+    Digest,
+    RunId,
+    validate_code_revision,
+)
 from mesoforge.common.time import UtcInstant
 
 _MAX_ATTRIBUTES_BYTES = 32 * 1024
@@ -103,4 +109,9 @@ class ArtifactManifest(BaseModel):
                     f"attributes exceed the {_MAX_ATTRIBUTES_BYTES}-byte limit after canonical "
                     f"serialization ({len(encoded)} bytes)"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _check_code_revision(self) -> ArtifactManifest:
+        validate_code_revision(self.code_revision)
         return self

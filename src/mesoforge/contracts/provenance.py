@@ -17,6 +17,7 @@ from mesoforge.common.identifiers import (
     ConfigurationSnapshotId,
     Digest,
     RunId,
+    validate_code_revision,
 )
 from mesoforge.common.time import UtcInstant
 
@@ -100,4 +101,9 @@ class ActivityManifest(BaseModel):
     def _check_unique_roles_per_direction(self) -> ActivityManifest:
         _check_unique_roles(self.inputs, "input")
         _check_unique_roles(self.outputs, "output")
+        return self
+
+    @model_validator(mode="after")
+    def _check_code_revision(self) -> ActivityManifest:
+        validate_code_revision(self.code_revision)
         return self

@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from mesoforge.common.identifiers import ArtifactId, ConfigurationSnapshotId, Digest, RunId
+from mesoforge.common.identifiers import (
+    ArtifactId,
+    ConfigurationSnapshotId,
+    Digest,
+    RunId,
+    validate_code_revision,
+)
 from mesoforge.common.time import UtcInstant
-
-_CODE_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 class RunManifest(BaseModel):
@@ -32,8 +35,4 @@ class RunManifest(BaseModel):
     @field_validator("code_revision")
     @classmethod
     def _check_code_revision(cls, value: str) -> str:
-        if not _CODE_REVISION_RE.match(value):
-            raise ValueError(
-                f"code_revision must be a 40-character lowercase hex Git SHA, got {value!r}"
-            )
-        return value
+        return validate_code_revision(value)

@@ -18,6 +18,22 @@ from mesoforge.common.errors import InvalidIdentifier
 _CANONICAL_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _DIGEST_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 _KEBAB_DOT_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
+_CODE_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def validate_code_revision(value: str) -> str:
+    """Validate a ``code_revision`` string is a 40-character lowercase hex
+    Git SHA. Shared by every public/repository boundary that accepts a
+    ``code_revision`` (plan Section 4.1; Codex review t_f569c45c finding
+    3: public request boundaries must not accept an unrestricted
+    ``str``). Raises ``InvalidIdentifier`` (also a ``ValueError``) on a
+    malformed revision.
+    """
+    if not isinstance(value, str) or not _CODE_REVISION_RE.match(value):
+        raise InvalidIdentifier(
+            f"code_revision must be a 40-character lowercase hex Git SHA, got {value!r}"
+        )
+    return value
 
 
 class _PrefixedUuidId(str):

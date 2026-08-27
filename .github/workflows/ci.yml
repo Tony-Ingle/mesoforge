@@ -74,18 +74,6 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
-      minio:
-        image: minio/minio:RELEASE.2025-09-07T16-13-09Z
-        env:
-          MINIO_ROOT_USER: mesoforge_test
-          MINIO_ROOT_PASSWORD: mesoforge_test_password
-        ports:
-          - 9000:9000
-        options: >-
-          --health-cmd "curl -f http://localhost:9000/minio/health/live || exit 1"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     env:
       # Both env var names point at the same real postgres:16 service
       # container declared above. MESOFORGE_TEST_DATABASE_DSN is read by
@@ -113,6 +101,34 @@ jobs:
         run: uv python install
       - name: Sync dependencies
         run: uv sync --locked --all-groups
+      - name: Start MinIO
+        # MinIO is launched with `docker run` rather than as a GitHub
+        # Actions `services:` container: the `services:` block has no
+        # way to supply a container command/args
+        # (github.com/orgs/community/discussions/26688), and the
+        # minio/minio image requires an explicit `server /data` command
+        # -- run without one it just prints its CLI help and exits,
+        # which is exactly what left this job's MinIO container
+        # unhealthy. Running it as a plain `docker run -d` step gives
+        # full command control while pinning the identical image tag
+        # already used in deploy/local/compose.yaml for local dev.
+        run: |
+          docker run -d --name mesoforge-minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=mesoforge_test \
+            -e MINIO_ROOT_PASSWORD=mesoforge_test_password \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:9000/minio/health/live >/dev/null; then
+              echo "MinIO is healthy"
+              exit 0
+            fi
+            echo "Waiting for MinIO to become healthy ($i/30)..."
+            sleep 2
+          done
+          echo "MinIO did not become healthy in time" >&2
+          docker logs mesoforge-minio >&2
+          exit 1
       - name: Migration upgrade / downgrade / upgrade
         run: |
           uv run alembic upgrade head

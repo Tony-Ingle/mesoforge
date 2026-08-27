@@ -172,6 +172,27 @@ class TestPhase0ArtifactLineageAcceptance:
         assert source_artifact.source_identity.revision == "v1"
 
         # ---------------------------------------------------------
+        # Step 2b: create a valid run selecting the registered source
+        # input, and attach the transformation activity/output to it
+        # (Codex review t_f569c45c finding 6: the acceptance proof must
+        # actually create/attach a run, not omit run_id entirely).
+        # ---------------------------------------------------------
+        lockfile_digest = "sha256:" + "c" * 64
+        created_run = service.create_run(
+            run_id=f"run_{uuid.uuid4()}",
+            forecast_issue_time=datetime(2026, 1, 1, tzinfo=UTC),
+            information_cutoff=datetime(2026, 1, 1, 1, tzinfo=UTC),
+            configuration_snapshot_id=snapshot.configuration_snapshot_id,
+            configuration_digest=snapshot.configuration_digest,
+            code_revision=code_revision,
+            environment_digest=environment_digest,
+            lockfile_digest=lockfile_digest,
+            random_seed=42,
+            selected_input_artifact_ids=(source_artifact.artifact_id,),
+        )
+        assert created_run.selected_input_artifact_ids == (source_artifact.artifact_id,)
+
+        # ---------------------------------------------------------
         # Steps 3-4: execute the pure degC->K transformation; register
         # the canonical output and successful activity atomically
         # ---------------------------------------------------------
@@ -207,6 +228,7 @@ class TestPhase0ArtifactLineageAcceptance:
             configuration_digest=snapshot.configuration_digest,
             code_revision=code_revision,
             environment_digest=environment_digest,
+            run_id=created_run.run_id,
         )
 
         result = service.execute_transformation(
@@ -255,7 +277,12 @@ class TestPhase0ArtifactLineageAcceptance:
         np.testing.assert_array_equal(retrieved_dataset["valid_time"].values, expected_valid_times)
 
         # ---------------------------------------------------------
-        # Step 7: trace backward to source and forward to output
+        # Step 7: trace backward to source and forward to output;
+        # recover run identity and assert full persisted state (Codex
+        # review t_f569c45c finding 6: this step must actually assert
+        # persisted run, config snapshot+digest, authoritative
+        # availability, roles, versions, code/environment, and storage
+        # URIs -- not merely activity/artifact edges).
         # ---------------------------------------------------------
         with PostgresUnitOfWork(migrated_dsn) as uow:
             producer = uow.activities.producer_of(output_artifact.artifact_id)
@@ -269,6 +296,8 @@ class TestPhase0ArtifactLineageAcceptance:
             assert producer.inputs[0].role == "primary"
             assert producer.outputs[0].artifact_id == output_artifact.artifact_id
             assert producer.outputs[0].role == "primary"
+            # the activity is linked to the run created in step 2b
+            assert producer.run_id == created_run.run_id
 
             consumers = uow.activities.consumers_of(source_artifact.artifact_id)
             assert any(c.activity_id == result.activity.activity_id for c in consumers)
@@ -277,6 +306,43 @@ class TestPhase0ArtifactLineageAcceptance:
             refetched_output = uow.artifacts.get(output_artifact.artifact_id)
             assert refetched_source.storage_uri == source_artifact.storage_uri
             assert refetched_output.storage_uri == output_artifact.storage_uri
+
+            # ---- recover run identity and assert full persisted state ----
+            refetched_run = uow.runs.get(created_run.run_id)
+            assert refetched_run.run_id == created_run.run_id
+            assert refetched_run.selected_input_artifact_ids == (source_artifact.artifact_id,)
+            assert refetched_run.configuration_snapshot_id == snapshot.configuration_snapshot_id
+            assert refetched_run.configuration_digest == snapshot.configuration_digest
+            assert refetched_run.code_revision == code_revision
+            assert refetched_run.environment_digest == environment_digest
+            assert refetched_run.lockfile_digest == lockfile_digest
+            assert refetched_run.random_seed == 42
+
+            # ---- authoritative availability, roles, versions,
+            # code/environment, and storage URIs from persisted
+            # records (source and derived) ----
+            assert refetched_source.availability.available_at == source_availability.available_at
+            assert refetched_source.availability.authority == source_availability.authority
+            assert refetched_source.availability.method == source_availability.method
+            assert refetched_source.configuration_snapshot_id == snapshot.configuration_snapshot_id
+            assert refetched_source.configuration_digest == snapshot.configuration_digest
+            assert refetched_source.code_revision == code_revision
+            assert refetched_source.environment_digest == environment_digest
+            assert refetched_source.storage_uri.startswith("s3://")
+
+            assert refetched_output.availability.available_at >= source_availability.available_at
+            assert refetched_output.configuration_snapshot_id == snapshot.configuration_snapshot_id
+            assert refetched_output.configuration_digest == snapshot.configuration_digest
+            assert refetched_output.code_revision == code_revision
+            assert refetched_output.environment_digest == environment_digest
+            assert refetched_output.storage_uri.startswith("s3://")
+            assert refetched_output.source_registration_digest is None
+            # the output artifact was produced as part of the created
+            # run (transformation_request.run_id); the source artifact
+            # itself was registered independently and only later
+            # selected into the run via selected_input_artifact_ids.
+            assert refetched_output.run_id == created_run.run_id
+            assert refetched_source.run_id is None
 
         # ---------------------------------------------------------
         # Step 8: export deterministic lineage JSON, reconstruct the

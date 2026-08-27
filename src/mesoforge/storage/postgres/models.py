@@ -77,7 +77,6 @@ class RunRow(Base):
     environment_digest: Mapped[str] = mapped_column(nullable=False)
     lockfile_digest: Mapped[str] = mapped_column(nullable=False)
     random_seed: Mapped[int] = mapped_column(nullable=False)
-    selected_inputs: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         nullable=False, server_default=func.transaction_timestamp()
     )
