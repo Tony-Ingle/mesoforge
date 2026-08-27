@@ -22,6 +22,7 @@ from mesoforge.storage.postgres.models import (  # noqa: F401 - registers tables
     ConfigurationSnapshotRow,
     GridRow,
     RunRow,
+    RunSelectedInputRow,
     StoredObjectRow,
 )
 

@@ -49,7 +49,7 @@ class ProbabilityEvent(BaseModel):
 class VariableDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: str = "variable-definition.v1"
+    schema_version: Literal["variable-definition.v1"] = "variable-definition.v1"
     variable_id: str
     standard_name: str
     canonical_unit_id: str

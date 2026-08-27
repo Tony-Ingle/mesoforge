@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import jcs
 import yaml
@@ -54,7 +54,7 @@ class SourceReference(BaseModel):
 class MesoForgeConfiguration(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: str = "mesoforge-config.v1"
+    schema_version: Literal["mesoforge-config.v1"] = "mesoforge-config.v1"
     grids: tuple[GridDefinition, ...] = ()
     vertical_definitions: tuple[VerticalDefinition, ...] = ()
     variables: tuple[VariableDefinition, ...] = ()

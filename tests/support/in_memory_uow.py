@@ -124,10 +124,60 @@ class _InMemoryStoredObjectRepository:
 
 
 class _InMemoryArtifactRepository:
-    def __init__(self, store: dict[str, ArtifactManifest]) -> None:
+    def __init__(
+        self, store: dict[str, ArtifactManifest], stored_objects: dict[str, object]
+    ) -> None:
         self._store = store
+        self._stored_objects = stored_objects
 
     def add(self, manifest: ArtifactManifest) -> ArtifactManifest:
+        self._store[manifest.artifact_id] = manifest
+        return manifest
+
+    def add_derived(self, **kwargs: object) -> ArtifactManifest:
+        """In-memory stand-in for PostgresArtifactRepository.add_derived
+        (finding 3, Codex review t_9bb13e2b). There is no real database
+        transaction here, so this double approximates
+        ``transaction_timestamp()`` with one shared ``datetime.now(UTC)``
+        call used consistently for both registered_at and the derived
+        available_at -- sufficient for the unit-level ordering/error-branch
+        tests in tests/unit/application/test_artifact_service.py. The
+        actual "one PostgreSQL transaction_timestamp()" invariant is
+        proven only against real PostgreSQL, in
+        tests/integration/application/test_artifact_registration.py."""
+        from datetime import UTC, datetime
+
+        from mesoforge.contracts.artifacts import Availability
+
+        now = datetime.now(UTC)
+        parent_available_ats = kwargs["parent_available_ats"]
+        activity_completed_at = kwargs["activity_completed_at"]
+        available_at = max([*parent_available_ats, activity_completed_at, now])  # type: ignore[list-item]
+        content_digest = kwargs["content_digest"]
+        stored_object = self._stored_objects[content_digest]  # type: ignore[index]
+        manifest = ArtifactManifest(
+            artifact_id=kwargs["artifact_id"],  # type: ignore[arg-type]
+            artifact_type=kwargs["artifact_type"],  # type: ignore[arg-type]
+            artifact_schema_version=kwargs["artifact_schema_version"],  # type: ignore[arg-type]
+            media_type=stored_object.media_type,  # type: ignore[attr-defined]
+            byte_size=stored_object.byte_size,  # type: ignore[attr-defined]
+            content_digest=content_digest,  # type: ignore[arg-type]
+            storage_uri=stored_object.storage_uri,  # type: ignore[attr-defined]
+            created_at=kwargs["created_at"],  # type: ignore[arg-type]
+            registered_at=now,
+            availability=Availability(
+                available_at=available_at,
+                authority=kwargs["availability_authority"],  # type: ignore[arg-type]
+                method=kwargs["availability_method"],  # type: ignore[arg-type]
+            ),
+            run_id=kwargs["run_id"],  # type: ignore[arg-type]
+            configuration_snapshot_id=kwargs["configuration_snapshot_id"],  # type: ignore[arg-type]
+            configuration_digest=kwargs["configuration_digest"],  # type: ignore[arg-type]
+            code_revision=kwargs["code_revision"],  # type: ignore[arg-type]
+            environment_digest=kwargs["environment_digest"],  # type: ignore[arg-type]
+            quality_state=kwargs["quality_state"],  # type: ignore[arg-type]
+            attributes=kwargs["attributes"],  # type: ignore[arg-type]
+        )
         self._store[manifest.artifact_id] = manifest
         return manifest
 
@@ -144,6 +194,46 @@ class _InMemoryArtifactRepository:
             if manifest.source_registration_digest == digest:
                 return manifest
         return None
+
+
+class _InMemoryConfigurationSnapshot:
+    def __init__(self, configuration_snapshot_id: str, configuration_digest: str) -> None:
+        self.configuration_snapshot_id = configuration_snapshot_id
+        self.configuration_digest = configuration_digest
+
+
+class _InMemoryConfigurationRepository:
+    def __init__(self, store: dict[str, _InMemoryConfigurationSnapshot]) -> None:
+        self._store = store
+
+    def add_if_absent(self, snapshot: object) -> object:
+        digest = snapshot.configuration_digest  # type: ignore[attr-defined]
+        if digest not in self._store:
+            self._store[digest] = _InMemoryConfigurationSnapshot(
+                snapshot.configuration_snapshot_id,  # type: ignore[attr-defined]
+                digest,
+            )
+        return self._store[digest]
+
+    def get(self, snapshot_id: str) -> _InMemoryConfigurationSnapshot:
+        for snapshot in self._store.values():
+            if snapshot.configuration_snapshot_id == snapshot_id:
+                return snapshot
+        raise NotFound(f"configuration snapshot {snapshot_id!r} not found")
+
+
+class _InMemoryRunRepository:
+    def __init__(self, store: dict[str, object]) -> None:
+        self._store = store
+
+    def add(self, manifest: object) -> object:
+        self._store[manifest.run_id] = manifest  # type: ignore[attr-defined]
+        return manifest
+
+    def get(self, run_id: str) -> object:
+        if run_id not in self._store:
+            raise NotFound(f"run {run_id!r} not found")
+        return self._store[run_id]
 
 
 class _InMemoryActivityRepository:
@@ -194,8 +284,10 @@ class InMemoryUnitOfWork:
         self._factory = factory
         self.grids = _InMemoryGridRepository(factory.grids)
         self.stored_objects = _InMemoryStoredObjectRepository(factory.stored_objects)
-        self.artifacts = _InMemoryArtifactRepository(factory.artifacts)
+        self.artifacts = _InMemoryArtifactRepository(factory.artifacts, factory.stored_objects)
         self.activities = _InMemoryActivityRepository(factory.activities)
+        self.configurations = _InMemoryConfigurationRepository(factory.configurations)
+        self.runs = _InMemoryRunRepository(factory.runs)
 
     def __enter__(self) -> InMemoryUnitOfWork:
         return self
@@ -219,6 +311,8 @@ class InMemoryUnitOfWorkFactory:
         self.stored_objects: dict[str, object] = {}
         self.artifacts: dict[str, ArtifactManifest] = {}
         self.activities: dict[str, ActivityManifest] = {}
+        self.configurations: dict[str, _InMemoryConfigurationSnapshot] = {}
+        self.runs: dict[str, object] = {}
         self._guard = threading.Lock()
 
     def __call__(self) -> InMemoryUnitOfWork:

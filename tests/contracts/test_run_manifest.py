@@ -67,3 +67,28 @@ class TestRunManifest:
         assert manifest.forecast_issue_time == issue
         assert manifest.information_cutoff == cutoff
         assert manifest.forecast_issue_time != manifest.information_cutoff
+
+
+class TestRunManifestFailClosedBoundaries:
+    """Finding 6 (Codex review t_9bb13e2b): schema versions and typed
+    identifiers/digests must fail closed at the public contract boundary."""
+
+    def test_unsupported_schema_version_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            RunManifest(**_base_kwargs(schema_version="run-manifest.v99"))
+
+    def test_malformed_run_id_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            RunManifest(**_base_kwargs(run_id="not-prefixed"))
+
+    def test_malformed_configuration_snapshot_id_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            RunManifest(**_base_kwargs(configuration_snapshot_id="not-a-snapshot-id"))
+
+    def test_malformed_configuration_digest_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            RunManifest(**_base_kwargs(configuration_digest="md5:" + "a" * 32))
+
+    def test_malformed_selected_input_artifact_id_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            RunManifest(**_base_kwargs(selected_input_artifact_ids=("not-prefixed",)))

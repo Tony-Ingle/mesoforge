@@ -89,7 +89,7 @@ class VerticalDefinition(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: str = "vertical-definition.v1"
+    schema_version: Literal["vertical-definition.v1"] = "vertical-definition.v1"
     vertical_definition_id: str
     coordinate_type: CoordinateType
     value: float | None = None

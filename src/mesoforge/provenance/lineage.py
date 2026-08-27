@@ -38,7 +38,7 @@ class LineageEdgeView(BaseModel):
 class LineageGraph(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: str = "lineage-graph.v1"
+    schema_version: Literal["lineage-graph.v1"] = "lineage-graph.v1"
     root_artifact_id: str
     artifact_nodes: tuple[str, ...]
     activity_nodes: tuple[str, ...]

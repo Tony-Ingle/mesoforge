@@ -18,7 +18,7 @@ from tests.fixtures.synthetic import (
 )
 
 _grid = build_synthetic_grid()
-_variable = build_synthetic_variable_definition()
+_variable = build_synthetic_variable_definition(canonical_unit_id="degC")
 
 
 @given(offset_ns=st.integers(min_value=1, max_value=10**9))

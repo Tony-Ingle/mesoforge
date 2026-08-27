@@ -16,7 +16,7 @@ import jcs
 import pyproj
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from mesoforge.common.identifiers import Digest
+from mesoforge.common.identifiers import Digest, GridId
 
 CoordinateReference = Literal["cell_center", "cell_bounds"]
 LongitudeConvention = Literal["minus_180_to_180", "zero_to_360"]
@@ -57,8 +57,8 @@ def _is_finite_strictly_monotonic(values: tuple[float, ...]) -> bool:
 class GridDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: str = "grid-definition.v1"
-    grid_id: str
+    schema_version: Literal["grid-definition.v1"] = "grid-definition.v1"
+    grid_id: GridId
     crs_wkt2: str
     shape_y: int
     shape_x: int

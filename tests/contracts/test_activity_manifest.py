@@ -148,3 +148,24 @@ class TestActivityArtifactRefRoles:
         manifest = ActivityManifest(**_base_kwargs())
         with pytest.raises(ValidationError):
             manifest.status = "succeeded"  # type: ignore[misc]
+
+
+class TestActivityManifestFailClosedBoundaries:
+    """Finding 6 (Codex review t_9bb13e2b): schema versions and typed
+    identifiers/digests must fail closed at the public contract boundary."""
+
+    def test_unsupported_schema_version_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ActivityManifest(**_base_kwargs(schema_version="activity-manifest.v99"))
+
+    def test_malformed_activity_id_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ActivityManifest(**_base_kwargs(activity_id="not-prefixed"))
+
+    def test_malformed_idempotency_digest_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ActivityManifest(**_base_kwargs(idempotency_digest="md5:" + "a" * 32))
+
+    def test_malformed_input_ref_artifact_id_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            _ref("primary", "not-prefixed")

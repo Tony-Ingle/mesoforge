@@ -57,15 +57,36 @@ def _source_request(**overrides: object) -> SourceRegistrationRequest:
     return SourceRegistrationRequest(**kwargs)
 
 
+_STANDARD_SNAPSHOT_ID = "cfg_sha256_" + "a" * 64
+_STANDARD_CONFIG_DIGEST = "sha256:" + "a" * 64
+
+
 @pytest.fixture()
 def service_and_uow():
     object_store = InMemoryObjectStore()
     uow_factory = InMemoryUnitOfWorkFactory()
     lock = InMemoryIdempotencyLock()
+    # Pre-register the standard configuration snapshot most tests
+    # reference (configuration_snapshot_id="cfg_sha256_"+"a"*64), so
+    # register_source/execute_transformation's configuration
+    # snapshot/digest consistency check (Codex review t_9bb13e2b
+    # finding 8) passes for the common case; tests that specifically
+    # exercise a tampered/unregistered snapshot register their own.
+    with uow_factory() as uow:
+        uow.configurations.add_if_absent(
+            _FakeSnapshot(_STANDARD_SNAPSHOT_ID, _STANDARD_CONFIG_DIGEST)
+        )
+        uow.commit()
     service = ArtifactService(
         unit_of_work_factory=uow_factory, object_store=object_store, idempotency_lock=lock
     )
     return service, uow_factory, object_store
+
+
+class _FakeSnapshot:
+    def __init__(self, snapshot_id: str, digest: str) -> None:
+        self.configuration_snapshot_id = snapshot_id
+        self.configuration_digest = digest
 
 
 class TestRegisterSource:
@@ -112,6 +133,22 @@ class TestRegisterSource:
         object_store.fail_next_put = True
         request = _source_request(source_locator="loc-fail")
         with pytest.raises(RuntimeError):
+            service.register_source(request, b"payload-bytes")
+        assert len(uow_factory.artifacts) == 0
+
+    def test_tampered_configuration_digest_rejected(self, service_and_uow) -> None:
+        """Finding 8 (Codex review t_9bb13e2b): register_source must
+        validate referenced configuration snapshot/digest consistency."""
+        service, uow_factory, _ = service_and_uow
+        request = _source_request(configuration_digest="sha256:" + "f" * 64)
+        with pytest.raises(ValueError, match="does not match"):
+            service.register_source(request, b"payload-bytes")
+        assert len(uow_factory.artifacts) == 0
+
+    def test_unregistered_configuration_snapshot_raises_not_found(self, service_and_uow) -> None:
+        service, uow_factory, _ = service_and_uow
+        request = _source_request(configuration_snapshot_id="cfg_sha256_" + "9" * 64)
+        with pytest.raises(NotFound):
             service.register_source(request, b"payload-bytes")
         assert len(uow_factory.artifacts) == 0
 
@@ -264,6 +301,31 @@ class TestExecuteTransformation:
         failed = [a for a in uow_factory.activities.values() if a.status == "failed"]
         assert len(failed) == 1
 
+    def test_tampered_configuration_digest_rejected(self, service_and_uow) -> None:
+        """Finding 8 (Codex review t_9bb13e2b): execute_transformation
+        must validate referenced configuration snapshot/digest
+        consistency."""
+        service, uow_factory, _ = service_and_uow
+        source = service.register_source(_source_request(), b"10.0")
+        request = self._transformation_request(
+            inputs=(TransformationInputRef(role="primary", artifact_id=source.artifact_id),),
+            configuration_digest="sha256:" + "f" * 64,
+        )
+
+        class _Serializer:
+            def serialize(self, value: bytes) -> bytes:
+                return value
+
+        with pytest.raises(ValueError, match="does not match"):
+            service.execute_transformation(
+                request,
+                transform=lambda data: data,
+                serializer=_Serializer(),
+                input_loader=lambda payload: payload,
+                output_validator=lambda _output: None,
+            )
+        assert all(a.status != "succeeded" for a in uow_factory.activities.values())
+
     def test_dangling_input_raises_not_found(self, service_and_uow) -> None:
         service, uow_factory, _ = service_and_uow
         request = self._transformation_request(
@@ -349,3 +411,135 @@ class TestExecuteTransformation:
         assert len(output_ids) == 1
         succeeded = [a for a in uow_factory.activities.values() if a.status == "succeeded"]
         assert len(succeeded) == 1
+
+
+class TestCreateRun:
+    """Finding 5 (Codex review t_9bb13e2b): run creation must load
+    selected artifacts transactionally from the repository, reject
+    nonexistent/derived inputs where source inputs are required, validate
+    authoritative availability against cutoff, and validate configuration
+    snapshot/digest consistency."""
+
+    def _register_config(self, uow_factory, *, snapshot_id: str, digest: str) -> None:
+        with uow_factory() as uow:
+            uow.configurations.add_if_absent(_FakeSnapshot(snapshot_id, digest))
+            uow.commit()
+
+    def _run_kwargs(self, **overrides: object) -> dict[str, object]:
+        kwargs: dict[str, object] = dict(
+            run_id="run_00000000-0000-0000-0000-000000000001",
+            forecast_issue_time=datetime(2026, 1, 1, tzinfo=UTC),
+            information_cutoff=datetime(2026, 1, 1, 6, tzinfo=UTC),
+            configuration_snapshot_id="cfg_sha256_" + "a" * 64,
+            configuration_digest="sha256:" + "a" * 64,
+            code_revision="a" * 40,
+            environment_digest="sha256:" + "b" * 64,
+            lockfile_digest="sha256:" + "d" * 64,
+            random_seed=1,
+            selected_input_artifact_ids=(),
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    def test_nonexistent_input_id_raises_not_found_and_creates_no_run(
+        self, service_and_uow
+    ) -> None:
+        service, uow_factory, _ = service_and_uow
+        self._register_config(
+            uow_factory,
+            snapshot_id="cfg_sha256_" + "a" * 64,
+            digest="sha256:" + "a" * 64,
+        )
+        with pytest.raises(NotFound):
+            service.create_run(
+                **self._run_kwargs(
+                    selected_input_artifact_ids=("art_00000000-0000-0000-0000-000000000099",)
+                )
+            )
+        assert len(uow_factory.runs) == 0
+
+    def test_derived_input_rejected_when_source_inputs_required(self, service_and_uow) -> None:
+        service, uow_factory, _ = service_and_uow
+        self._register_config(
+            uow_factory,
+            snapshot_id="cfg_sha256_" + "a" * 64,
+            digest="sha256:" + "a" * 64,
+        )
+        # Build a derived (non-source) artifact directly via the
+        # transformation path so source_registration_digest is None.
+        source = service.register_source(_source_request(), b"10.0")
+        request = TestExecuteTransformation()._transformation_request(
+            inputs=(TransformationInputRef(role="primary", artifact_id=source.artifact_id),)
+        )
+
+        class _Serializer:
+            def serialize(self, value: bytes) -> bytes:
+                return value
+
+        derived_result = service.execute_transformation(
+            request,
+            transform=lambda data: data,
+            serializer=_Serializer(),
+            input_loader=lambda payload: payload,
+            output_validator=lambda _output: None,
+        )
+
+        with pytest.raises(ValueError, match="not a source/root artifact"):
+            service.create_run(
+                **self._run_kwargs(selected_input_artifact_ids=(derived_result.output.artifact_id,))
+            )
+        assert len(uow_factory.runs) == 0
+
+    def test_cutoff_violation_rejected_and_creates_no_run(self, service_and_uow) -> None:
+        service, uow_factory, _ = service_and_uow
+        self._register_config(
+            uow_factory,
+            snapshot_id="cfg_sha256_" + "a" * 64,
+            digest="sha256:" + "a" * 64,
+        )
+        far_future = datetime(2030, 1, 1, tzinfo=UTC)
+        source = service.register_source(
+            _source_request(availability=_availability(available_at=far_future)), b"10.0"
+        )
+
+        with pytest.raises(ValueError, match="fails closed"):
+            service.create_run(
+                **self._run_kwargs(
+                    information_cutoff=datetime(2026, 1, 1, tzinfo=UTC),
+                    selected_input_artifact_ids=(source.artifact_id,),
+                )
+            )
+        assert len(uow_factory.runs) == 0
+
+    def test_tampered_configuration_digest_rejected(self, service_and_uow) -> None:
+        service, uow_factory, _ = service_and_uow
+        self._register_config(
+            uow_factory,
+            snapshot_id="cfg_sha256_" + "a" * 64,
+            digest="sha256:" + "a" * 64,
+        )
+
+        with pytest.raises(ValueError, match="does not match"):
+            service.create_run(**self._run_kwargs(configuration_digest="sha256:" + "f" * 64))
+        assert len(uow_factory.runs) == 0
+
+    def test_valid_run_creation_persists_ordered_selection(self, service_and_uow) -> None:
+        service, uow_factory, _ = service_and_uow
+        self._register_config(
+            uow_factory,
+            snapshot_id="cfg_sha256_" + "a" * 64,
+            digest="sha256:" + "a" * 64,
+        )
+        source_a = service.register_source(_source_request(source_locator="loc-a"), b"a-bytes")
+        source_b = service.register_source(_source_request(source_locator="loc-b"), b"b-bytes")
+
+        created = service.create_run(
+            **self._run_kwargs(
+                selected_input_artifact_ids=(source_a.artifact_id, source_b.artifact_id)
+            )
+        )
+        assert created.selected_input_artifact_ids == (
+            source_a.artifact_id,
+            source_b.artifact_id,
+        )
+        assert len(uow_factory.runs) == 1

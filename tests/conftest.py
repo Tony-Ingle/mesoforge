@@ -1,34 +1,51 @@
 """Shared pytest fixtures and markers for MesoForge tests.
 
-Includes real, ephemeral PostgreSQL fixtures (backed by the ``pgserver``
-pip package -- a self-contained, non-root, no-Docker PostgreSQL binary
-distribution) used by both ``tests/integration/`` and
-``tests/acceptance/``. This is a genuine PostgreSQL 16+ instance, not
-SQLite and not a mock, satisfying the plan's requirement that
-integration/acceptance tests run against real PostgreSQL, while
-remaining runnable in environments without Docker access (this
-development sandbox has no docker group membership).
+Includes real PostgreSQL fixtures used by both ``tests/integration/``
+and ``tests/acceptance/``. Two backends are supported:
 
-CI (``.github/workflows/ci.yml``) instead uses a real ``postgres:16``
-service container; either path exercises the identical Alembic
-migrations and SQLAlchemy models against a real PostgreSQL server.
+- CI (``.github/workflows/ci.yml``) declares a real ``postgres:16``
+  service container and exports ``MESOFORGE_TEST_DATABASE_DSN``; when
+  that environment variable is set, ``postgres_dsn`` connects to it
+  directly rather than spawning anything (Codex review t_9bb13e2b
+  finding 4: tests must use the declared service in CI, not
+  unconditionally spawn pgserver).
+- Locally (or in any environment without ``MESOFORGE_TEST_DATABASE_DSN``
+  set, e.g. this development sandbox with no docker group membership),
+  ``postgres_dsn`` falls back to the ``pgserver`` pip package -- a
+  self-contained, non-root, no-Docker PostgreSQL binary distribution.
+  This is a genuine PostgreSQL 16+ instance, not SQLite and not a mock.
+
+Either path exercises the identical Alembic migrations and SQLAlchemy
+models against a real PostgreSQL server.
 """
 
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 
-import pgserver
 import pytest
 
 
 @pytest.fixture(scope="session")
 def postgres_dsn() -> Iterator[str]:
-    """Start a session-scoped ephemeral PostgreSQL instance and yield a
-    psycopg3 DSN. Torn down at the end of the test session."""
+    """Yield a psycopg3 DSN for a real PostgreSQL instance.
+
+    Uses the CI-declared ``postgres:16`` service (via
+    ``MESOFORGE_TEST_DATABASE_DSN``) when set; otherwise starts a
+    session-scoped ephemeral ``pgserver`` instance and tears it down at
+    the end of the test session.
+    """
+    env_dsn = os.environ.get("MESOFORGE_TEST_DATABASE_DSN")
+    if env_dsn:
+        yield env_dsn
+        return
+
+    import pgserver
+
     data_dir = Path(tempfile.mkdtemp(prefix="mesoforge-pgserver-"))
     server = pgserver.get_server(data_dir, cleanup_mode="stop")
     try:
@@ -57,6 +74,7 @@ def clean_postgres_dsn(postgres_dsn: str) -> Iterator[str]:
         ConfigurationSnapshotRow,
         GridRow,
         RunRow,
+        RunSelectedInputRow,
         StoredObjectRow,
     )
 

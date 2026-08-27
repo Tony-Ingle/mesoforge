@@ -17,8 +17,18 @@ class MesoForgeError(Exception):
     """Base class for all MesoForge domain and storage errors."""
 
 
-class InvalidIdentifier(MesoForgeError):
-    """Raised when a typed identifier string fails validation."""
+class InvalidIdentifier(MesoForgeError, ValueError):
+    """Raised when a typed identifier string fails validation.
+
+    Also a ``ValueError`` so Pydantic's validator machinery
+    (``no_info_after_validator_function``) wraps it into a
+    ``pydantic.ValidationError`` when raised from inside a model field
+    validator, matching the plan's "fails validation" contract-boundary
+    requirement (Section 4/Task 7's fail-closed schema-version and typed
+    ID/digest rule) while still being independently catchable as
+    ``InvalidIdentifier`` wherever code calls the identifier types
+    directly (outside Pydantic).
+    """
 
 
 class NotFound(MesoForgeError):

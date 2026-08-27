@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import re
 import uuid
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Self
 
 from mesoforge.common.errors import InvalidIdentifier
 
@@ -25,7 +25,7 @@ class _PrefixedUuidId(str):
 
     prefix: ClassVar[str]
 
-    def __new__(cls, value: str) -> _PrefixedUuidId:
+    def __new__(cls, value: str) -> Self:
         if not isinstance(value, str):
             raise InvalidIdentifier(f"{cls.__name__} must be a string, got {type(value)!r}")
         if not value.startswith(cls.prefix):
@@ -39,7 +39,7 @@ class _PrefixedUuidId(str):
         return super().__new__(cls, value)
 
     @classmethod
-    def generate(cls) -> _PrefixedUuidId:
+    def generate(cls) -> Self:
         return cls(f"{cls.prefix}{uuid.uuid4()}")
 
     @classmethod
@@ -155,3 +155,15 @@ class VariableId(_KebabDotId):
 
 class VerticalDefinitionId(_KebabDotId):
     """Identifier for a vertical coordinate definition."""
+
+
+def strip_prefix(value: str, prefix: str) -> str:
+    """Strictly remove ``prefix`` from ``value``, raising ``InvalidIdentifier``
+    if the prefix is absent. Unlike ``str.removeprefix``, this never
+    silently no-ops on a malformed/missing-prefix identifier -- repository
+    parsing must fail closed rather than pass an un-prefixed value through
+    to ``uuid.UUID(...)`` (which could coincidentally parse garbage).
+    """
+    if not isinstance(value, str) or not value.startswith(prefix):
+        raise InvalidIdentifier(f"expected an identifier prefixed with {prefix!r}, got {value!r}")
+    return value[len(prefix) :]

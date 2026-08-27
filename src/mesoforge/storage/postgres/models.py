@@ -82,6 +82,10 @@ class RunRow(Base):
         nullable=False, server_default=func.transaction_timestamp()
     )
 
+    selected_input_rows: Mapped[list[RunSelectedInputRow]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
+    )
+
 
 class ArtifactRow(Base):
     __tablename__ = "artifacts"
@@ -213,3 +217,24 @@ class ActivityOutputRow(Base):
     )
 
     activity: Mapped[ActivityRow] = relationship(back_populates="outputs")
+
+
+class RunSelectedInputRow(Base):
+    """Selected-input references for a run, with real foreign-key
+    relational integrity and preserved ordinal order (plan Section 4.8;
+    Codex review t_9bb13e2b finding 5: run creation must persist
+    selected input references with relational integrity, not
+    unconstrained JSON)."""
+
+    __tablename__ = "run_selected_inputs"
+    __table_args__ = (UniqueConstraint("run_id", "artifact_id"),)
+
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("runs.id"), primary_key=True
+    )
+    ordinal: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
+    artifact_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("artifacts.id"), nullable=False
+    )
+
+    run: Mapped[RunRow] = relationship(back_populates="selected_input_rows")

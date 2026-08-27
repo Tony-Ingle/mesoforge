@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, model_validator
 
@@ -71,7 +71,7 @@ class TimeAxisDefinition(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: str = "time-axis.v1"
+    schema_version: Literal["time-axis.v1"] = "time-axis.v1"
     forecast_reference_time: UtcInstant
     lead_times: tuple[timedelta, ...]
 

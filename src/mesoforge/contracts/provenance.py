@@ -7,8 +7,17 @@ activity edges lives in ``provenance/lineage.py``.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from mesoforge.common.identifiers import (
+    ActivityId,
+    ArtifactId,
+    ConfigurationSnapshotId,
+    Digest,
+    RunId,
+)
 from mesoforge.common.time import UtcInstant
 
 
@@ -16,14 +25,14 @@ class ActivityArtifactRef(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     role: str
-    artifact_id: str
+    artifact_id: ArtifactId
 
 
 class ActivityError(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     error_type: str
-    message_digest: str
+    message_digest: Digest
     retryable: bool
 
 
@@ -38,20 +47,20 @@ def _check_unique_roles(refs: tuple[ActivityArtifactRef, ...], label: str) -> No
 class ActivityManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: str = "activity-manifest.v1"
-    activity_id: str
+    schema_version: Literal["activity-manifest.v1"] = "activity-manifest.v1"
+    activity_id: ActivityId
     activity_type: str
     activity_version: str
     status: str
     started_at: UtcInstant
     completed_at: UtcInstant | None = None
-    idempotency_digest: str
-    parameters_digest: str
-    configuration_snapshot_id: str
-    configuration_digest: str
+    idempotency_digest: Digest
+    parameters_digest: Digest
+    configuration_snapshot_id: ConfigurationSnapshotId
+    configuration_digest: Digest
     code_revision: str
-    environment_digest: str
-    run_id: str | None = None
+    environment_digest: Digest
+    run_id: RunId | None = None
     inputs: tuple[ActivityArtifactRef, ...] = ()
     outputs: tuple[ActivityArtifactRef, ...] = ()
     error: ActivityError | None = None

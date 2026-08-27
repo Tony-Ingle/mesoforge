@@ -118,3 +118,40 @@ class TestArtifactManifest:
         manifest = ArtifactManifest(**_base_kwargs())
         with pytest.raises(ValidationError):
             manifest.quality_state = "invalid"  # type: ignore[misc]
+
+
+class TestArtifactManifestFailClosedBoundaries:
+    """Finding 6 (Codex review t_9bb13e2b): schema versions and typed
+    identifiers/digests must fail closed at the public contract boundary."""
+
+    def test_unsupported_schema_version_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ArtifactManifest(**_base_kwargs(schema_version="artifact-manifest.v99"))
+
+    def test_malformed_artifact_id_missing_prefix_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ArtifactManifest(**_base_kwargs(artifact_id="not-prefixed"))
+
+    def test_malformed_artifact_id_wrong_prefix_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ArtifactManifest(**_base_kwargs(artifact_id="run_00000000-0000-0000-0000-000000000001"))
+
+    def test_malformed_content_digest_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ArtifactManifest(**_base_kwargs(content_digest="md5:" + "a" * 32))
+
+    def test_malformed_configuration_snapshot_id_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ArtifactManifest(**_base_kwargs(configuration_snapshot_id="not-a-snapshot-id"))
+
+    def test_malformed_run_id_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ArtifactManifest(**_base_kwargs(run_id="not-prefixed"))
+
+    def test_valid_typed_ids_round_trip(self) -> None:
+        manifest = ArtifactManifest(
+            **_base_kwargs(run_id="run_00000000-0000-0000-0000-000000000001")
+        )
+        assert manifest.artifact_id == _ART_ID
+        assert manifest.run_id == "run_00000000-0000-0000-0000-000000000001"
+        assert manifest.content_digest == _DIGEST

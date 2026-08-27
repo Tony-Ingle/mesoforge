@@ -14,7 +14,13 @@ import jcs
 from pydantic import BaseModel, ConfigDict
 
 from mesoforge.common.errors import IntegrityError
-from mesoforge.common.identifiers import ArtifactId, Digest
+from mesoforge.common.identifiers import (
+    ActivityId,
+    ArtifactId,
+    ConfigurationSnapshotId,
+    Digest,
+    RunId,
+)
 from mesoforge.common.time import UtcInstant
 from mesoforge.contracts.artifacts import ArtifactManifest, Availability, SourceIdentity
 from mesoforge.contracts.provenance import ActivityArtifactRef, ActivityError, ActivityManifest
@@ -49,7 +55,9 @@ class _StoredObjectRepositoryLike(Protocol):
 class _ArtifactRepositoryLike(Protocol):
     def add(self, manifest: ArtifactManifest) -> ArtifactManifest: ...
     def get(self, artifact_id: str) -> ArtifactManifest: ...
+    def get_many(self, ids: tuple[str, ...]) -> tuple[ArtifactManifest, ...]: ...
     def find_by_source_registration_digest(self, digest: str) -> ArtifactManifest | None: ...
+    def add_derived(self, **kwargs: Any) -> ArtifactManifest: ...
 
 
 class _ActivityRepositoryLike(Protocol):
@@ -63,10 +71,25 @@ class _ActivityRepositoryLike(Protocol):
     def find_succeeded_by_idempotency(self, digest: str) -> ActivityManifest | None: ...
 
 
+class _ConfigurationSnapshotLike(Protocol):
+    configuration_snapshot_id: str
+    configuration_digest: str
+
+
+class _ConfigurationRepositoryLike(Protocol):
+    def get(self, snapshot_id: str) -> _ConfigurationSnapshotLike: ...
+
+
+class _RunRepositoryLike(Protocol):
+    def add(self, manifest: RunManifest) -> RunManifest: ...
+
+
 class _UnitOfWorkLike(Protocol):
     stored_objects: _StoredObjectRepositoryLike
     artifacts: _ArtifactRepositoryLike
     activities: _ActivityRepositoryLike
+    configurations: _ConfigurationRepositoryLike
+    runs: _RunRepositoryLike
 
     def __enter__(self) -> _UnitOfWorkLike: ...
     def __exit__(self, exc_type: object, exc: object, tb: object) -> object | None: ...
@@ -178,6 +201,26 @@ class ArtifactService:
         self._object_store = object_store
         self._idempotency_lock = idempotency_lock
 
+    def _verify_configuration_consistency(
+        self, uow: _UnitOfWorkLike, *, configuration_snapshot_id: str, configuration_digest: str
+    ) -> None:
+        """Load the referenced configuration snapshot from the repository
+        and verify the caller-supplied ``configuration_digest`` matches
+        the registered digest for that snapshot ID. Raises ``NotFound``
+        for an unregistered snapshot ID, or ``ValueError`` for a
+        tampered/inconsistent snapshot-ID+digest pair. Shared by
+        ``register_source`` and ``execute_transformation`` (Codex review
+        t_9bb13e2b finding 8: referenced configuration snapshot/digest
+        consistency must be validated in both, not only in
+        ``create_run``)."""
+        snapshot = uow.configurations.get(configuration_snapshot_id)
+        if snapshot.configuration_digest != configuration_digest:
+            raise ValueError(
+                f"configuration_digest {configuration_digest!r} does not match the "
+                f"registered digest {snapshot.configuration_digest!r} for snapshot "
+                f"{configuration_snapshot_id!r}; registration fails closed"
+            )
+
     # ------------------------------------------------------------------
     # Source registration (plan Section 5, first bullet)
     # ------------------------------------------------------------------
@@ -204,6 +247,11 @@ class ArtifactService:
 
         with self._idempotency_lock.acquire(str(source_registration_digest)):
             with self._unit_of_work_factory() as uow:
+                self._verify_configuration_consistency(
+                    uow,
+                    configuration_snapshot_id=request.configuration_snapshot_id,
+                    configuration_digest=request.configuration_digest,
+                )
                 existing = uow.artifacts.find_by_source_registration_digest(
                     str(source_registration_digest)
                 )
@@ -216,23 +264,25 @@ class ArtifactService:
 
             registered_at = datetime.now(UTC)
             manifest = ArtifactManifest(
-                artifact_id=str(ArtifactId.generate()),
+                artifact_id=ArtifactId.generate(),
                 artifact_type=request.artifact_type,
                 artifact_schema_version=request.artifact_schema_version,
                 media_type=stored_object.media_type,
                 byte_size=stored_object.byte_size,
-                content_digest=str(content_digest),
+                content_digest=content_digest,
                 storage_uri=stored_object.storage_uri,
                 created_at=request.created_at,
                 registered_at=registered_at,
                 availability=request.availability,
-                run_id=request.run_id,
-                configuration_snapshot_id=request.configuration_snapshot_id,
-                configuration_digest=request.configuration_digest,
+                run_id=(RunId(request.run_id) if request.run_id is not None else None),
+                configuration_snapshot_id=ConfigurationSnapshotId(
+                    request.configuration_snapshot_id
+                ),
+                configuration_digest=Digest(request.configuration_digest),
                 code_revision=request.code_revision,
-                environment_digest=request.environment_digest,
+                environment_digest=Digest(request.environment_digest),
                 quality_state=request.quality_state,
-                source_registration_digest=str(source_registration_digest),
+                source_registration_digest=source_registration_digest,
                 source_identity=SourceIdentity(
                     authority=request.source_authority,
                     locator=request.source_locator,
@@ -259,6 +309,7 @@ class ArtifactService:
         *,
         input_loader: Callable[[bytes], Any],
         output_validator: Callable[[Any], None],
+        input_validator: Callable[[Any], None] | None = None,
     ) -> TransformationResult:
         """
         Exact order per plan Section 5:
@@ -274,6 +325,29 @@ class ArtifactService:
         9. advisory lock makes in-process concurrent winner impossible;
         10. on failure, mark activity failed, remove unregistered objects;
         11. retrieval always verifies; finally releases the lock.
+
+        ``input_validator``, when supplied, is called once per deserialized
+        input dataset (step 4) before ``transform`` runs -- closing Codex
+        review finding 1 (t_9bb13e2b), which found inputs were deserialized
+        but never contract-validated. Callers that transform non-dataset
+        payloads (e.g. the in-memory unit-test doubles in
+        tests/unit/application/test_artifact_service.py, which transform
+        raw bytes/strings rather than xarray.Dataset objects) may omit it.
+
+        Cycle prevention (Codex review t_9bb13e2b finding 8): this service
+        never attaches a pre-existing artifact as an activity's output --
+        every successful transformation always generates a brand-new
+        ``ArtifactId`` via ``add_derived`` (or returns the pre-existing
+        winner's own manifest on an idempotent repeat, never a
+        newly-composed edge). A lineage cycle would require an activity
+        whose output already exists as one of its own ancestors, which is
+        structurally impossible here because outputs are never selected
+        from existing records. ``provenance.lineage.detect_cycle`` (used
+        directly in ``tests/unit/provenance/test_lineage.py``) remains the
+        primitive for any future service that *does* attach pre-existing
+        outputs (e.g. a batch/merge activity); it is exercised there
+        rather than through this service, matching the plan's
+        "if the service can attach pre-existing outputs" qualifier.
         """
         ordered_inputs = tuple((ref.role, ref.artifact_id) for ref in request.inputs)
         parameters_digest = _parameters_digest(request.parameters)
@@ -290,6 +364,11 @@ class ArtifactService:
 
         with self._idempotency_lock.acquire(str(idempotency_digest)):
             with self._unit_of_work_factory() as uow:
+                self._verify_configuration_consistency(
+                    uow,
+                    configuration_snapshot_id=request.configuration_snapshot_id,
+                    configuration_digest=request.configuration_digest,
+                )
                 existing_activity = uow.activities.find_succeeded_by_idempotency(
                     str(idempotency_digest)
                 )
@@ -307,24 +386,29 @@ class ArtifactService:
                 for m in input_manifests
             ]
             input_datasets = [input_loader(payload) for payload in verified_payloads]
+            if input_validator is not None:
+                for dataset in input_datasets:
+                    input_validator(dataset)
 
             activity_id = str(uuid.uuid4())
-            activity_id_typed = f"act_{activity_id}"
+            activity_id_typed = ActivityId(f"act_{activity_id}")
             started_manifest = ActivityManifest(
                 activity_id=activity_id_typed,
                 activity_type=request.activity_type,
                 activity_version=request.activity_version,
                 status="started",
                 started_at=datetime.now(UTC),
-                idempotency_digest=str(idempotency_digest),
-                parameters_digest=str(parameters_digest),
-                configuration_snapshot_id=request.configuration_snapshot_id,
-                configuration_digest=request.configuration_digest,
+                idempotency_digest=idempotency_digest,
+                parameters_digest=parameters_digest,
+                configuration_snapshot_id=ConfigurationSnapshotId(
+                    request.configuration_snapshot_id
+                ),
+                configuration_digest=Digest(request.configuration_digest),
                 code_revision=request.code_revision,
-                environment_digest=request.environment_digest,
-                run_id=request.run_id,
+                environment_digest=Digest(request.environment_digest),
+                run_id=(RunId(request.run_id) if request.run_id is not None else None),
                 inputs=tuple(
-                    ActivityArtifactRef(role=ref.role, artifact_id=ref.artifact_id)
+                    ActivityArtifactRef(role=ref.role, artifact_id=ArtifactId(ref.artifact_id))
                     for ref in request.inputs
                 ),
             )
@@ -342,37 +426,37 @@ class ArtifactService:
                     str(content_digest), serialized, request.output_media_type
                 )
 
-                parent_available_ats = [m.availability.available_at for m in input_manifests]
+                # completed_at is real wall-clock time for the activity's
+                # own record (it is not itself the authoritative
+                # registration/availability instant). registered_at and
+                # available_at are computed inside one PostgreSQL
+                # transaction_timestamp() by add_derived below (plan
+                # Section 5 step 8; Codex review t_9bb13e2b finding 3) --
+                # never with datetime.now() here.
                 completed_at = datetime.now(UTC)
-                registration_time = datetime.now(UTC)
-                available_at = max([*parent_available_ats, completed_at, registration_time])
-
-                output_manifest = ArtifactManifest(
-                    artifact_id=str(ArtifactId.generate()),
-                    artifact_type=request.output_artifact_type,
-                    artifact_schema_version=request.output_artifact_schema_version,
-                    media_type=stored_object.media_type,
-                    byte_size=stored_object.byte_size,
-                    content_digest=str(content_digest),
-                    storage_uri=stored_object.storage_uri,
-                    created_at=completed_at,
-                    registered_at=registration_time,
-                    availability=Availability(
-                        available_at=available_at,
-                        authority="mesoforge.derived",
-                        method=f"{request.activity_type}.{request.activity_version}",
-                    ),
-                    run_id=request.run_id,
-                    configuration_snapshot_id=request.configuration_snapshot_id,
-                    configuration_digest=request.configuration_digest,
-                    code_revision=request.code_revision,
-                    environment_digest=request.environment_digest,
-                    quality_state=request.quality_state,
-                )
+                parent_available_ats = tuple(m.availability.available_at for m in input_manifests)
+                output_artifact_id = str(ArtifactId.generate())
 
                 with self._unit_of_work_factory() as uow:
                     uow.stored_objects.add_if_absent(stored_object)
-                    created_output = uow.artifacts.add(output_manifest)
+                    created_output = uow.artifacts.add_derived(
+                        artifact_id=output_artifact_id,
+                        artifact_type=request.output_artifact_type,
+                        artifact_schema_version=request.output_artifact_schema_version,
+                        content_digest=str(content_digest),
+                        created_at=completed_at,
+                        availability_authority="mesoforge.derived",
+                        availability_method=f"{request.activity_type}.{request.activity_version}",
+                        parent_available_ats=parent_available_ats,
+                        activity_completed_at=completed_at,
+                        run_id=request.run_id,
+                        configuration_snapshot_id=request.configuration_snapshot_id,
+                        configuration_digest=request.configuration_digest,
+                        code_revision=request.code_revision,
+                        environment_digest=request.environment_digest,
+                        quality_state=request.quality_state,
+                        attributes=None,
+                    )
                     output_ref = ActivityArtifactRef(
                         role=request.output_role, artifact_id=created_output.artifact_id
                     )
@@ -387,7 +471,7 @@ class ArtifactService:
                 failure_time = datetime.now(UTC)
                 error = ActivityError(
                     error_type=type(exc).__name__,
-                    message_digest=str(Digest.of_bytes(str(exc).encode("utf-8"))),
+                    message_digest=Digest.of_bytes(str(exc).encode("utf-8")),
                     retryable=not isinstance(exc, IntegrityError),
                 )
                 with self._unit_of_work_factory() as uow:
@@ -396,9 +480,11 @@ class ArtifactService:
                 raise
 
     # ------------------------------------------------------------------
-    # Run creation eligibility (plan Section 4.8 invariant: "each
-    # selected source input has authoritative available_at <=
-    # information_cutoff"; fails closed, creates no run row.)
+    # Run creation (plan Section 4.8: selected inputs are loaded
+    # transactionally from the repository, not trusted from the caller;
+    # invariant "each selected source input has authoritative
+    # available_at <= information_cutoff" fails closed and creates no
+    # run row. Codex review t_9bb13e2b finding 5.)
     # ------------------------------------------------------------------
 
     def create_run(
@@ -413,30 +499,76 @@ class ArtifactService:
         environment_digest: str,
         lockfile_digest: str,
         random_seed: int,
-        selected_inputs: tuple[ArtifactManifest, ...],
-    ) -> Any:
-        for artifact in selected_inputs:
-            if artifact.availability.available_at > information_cutoff:
+        selected_input_artifact_ids: tuple[str, ...],
+        require_source_inputs: bool = True,
+    ) -> RunManifest:
+        """
+        Exact order (fail-closed at every step; no run row is created
+        unless all checks pass):
+
+        1. load the configuration snapshot from the repository and
+           verify the caller-supplied ``configuration_digest`` matches
+           it -- a tampered/inconsistent snapshot+digest pair is
+           rejected before any artifact lookup;
+        2. load every selected artifact transactionally from the
+           repository by ID, inside the same unit of work as the
+           eventual run insert -- never trust a caller-supplied
+           manifest for authoritative fields (availability, source
+           identity). A nonexistent artifact ID raises ``NotFound``;
+        3. when ``require_source_inputs`` is true (the default -- runs
+           select *source* inputs, matching the plan's reviewed run
+           manifest semantics), reject any selected artifact that is
+           itself derived (``source_registration_digest is None``);
+        4. validate authoritative availability against the cutoff:
+           every selected input's repository-loaded
+           ``availability.available_at`` must be ``<=
+           information_cutoff``;
+        5. insert the run row and its ordered ``run_selected_inputs``
+           relational rows in the same transaction, then commit.
+        """
+        with self._unit_of_work_factory() as uow:
+            snapshot = uow.configurations.get(configuration_snapshot_id)
+            if snapshot.configuration_digest != configuration_digest:
                 raise ValueError(
-                    f"selected input {artifact.artifact_id!r} has available_at "
-                    f"{artifact.availability.available_at!r} after information_cutoff "
-                    f"{information_cutoff!r}; run creation fails closed"
+                    f"configuration_digest {configuration_digest!r} does not match the "
+                    f"registered digest {snapshot.configuration_digest!r} for snapshot "
+                    f"{configuration_snapshot_id!r}; run creation fails closed"
                 )
 
-        manifest = RunManifest(
-            run_id=run_id,
-            forecast_issue_time=forecast_issue_time,
-            information_cutoff=information_cutoff,
-            configuration_snapshot_id=configuration_snapshot_id,
-            configuration_digest=configuration_digest,
-            code_revision=code_revision,
-            environment_digest=environment_digest,
-            lockfile_digest=lockfile_digest,
-            random_seed=random_seed,
-            selected_input_artifact_ids=tuple(a.artifact_id for a in selected_inputs),
-            created_at=datetime.now(UTC),
-        )
-        with self._unit_of_work_factory() as uow:
-            created = uow.runs.add(manifest)  # type: ignore[attr-defined]
+            selected_inputs = uow.artifacts.get_many(selected_input_artifact_ids)
+
+            if require_source_inputs:
+                for artifact in selected_inputs:
+                    if artifact.source_registration_digest is None:
+                        raise ValueError(
+                            f"selected input {artifact.artifact_id!r} is a derived artifact, "
+                            "not a source/root artifact; run creation requires source inputs "
+                            "and fails closed"
+                        )
+
+            for artifact in selected_inputs:
+                if artifact.availability.available_at > information_cutoff:
+                    raise ValueError(
+                        f"selected input {artifact.artifact_id!r} has available_at "
+                        f"{artifact.availability.available_at!r} after information_cutoff "
+                        f"{information_cutoff!r}; run creation fails closed"
+                    )
+
+            manifest = RunManifest(
+                run_id=RunId(run_id),
+                forecast_issue_time=forecast_issue_time,
+                information_cutoff=information_cutoff,
+                configuration_snapshot_id=ConfigurationSnapshotId(configuration_snapshot_id),
+                configuration_digest=Digest(configuration_digest),
+                code_revision=code_revision,
+                environment_digest=Digest(environment_digest),
+                lockfile_digest=Digest(lockfile_digest),
+                random_seed=random_seed,
+                selected_input_artifact_ids=tuple(
+                    ArtifactId(a.artifact_id) for a in selected_inputs
+                ),
+                created_at=datetime.now(UTC),
+            )
+            created = uow.runs.add(manifest)
             uow.commit()
             return created

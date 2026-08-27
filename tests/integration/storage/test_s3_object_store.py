@@ -125,3 +125,97 @@ class TestS3ArtifactObjectStore:
 
         store.delete_unregistered(stored.storage_uri)
         assert store.exists_verified(stored.storage_uri, str(digest)) is False
+
+
+class TestS3ArtifactObjectStoreFailClosedConcurrency:
+    """Finding 2 (Codex review t_9bb13e2b): put_if_absent must hash
+    incoming bytes itself (never trust a claimed digest), never overwrite
+    an existing content-addressed key under concurrent writers, and
+    verify an existing object before reporting it as a successful put."""
+
+    def test_rejects_claimed_digest_that_does_not_match_bytes(self) -> None:
+        store = _make_store()
+        payload_a = _unique_bytes()
+        payload_b = _unique_bytes()
+        digest_of_a = Digest.of_bytes(payload_a)
+
+        # Caller claims digest_of_a's key but actually supplies payload_b's
+        # bytes -- this must be rejected, not silently stored under the
+        # wrong content-addressed key.
+        with pytest.raises(IntegrityError):
+            store.put_if_absent(str(digest_of_a), payload_b, "application/octet-stream")
+
+    def test_same_key_different_bytes_second_writer_does_not_overwrite(self) -> None:
+        store = _make_store()
+        payload_a = _unique_bytes()
+        digest = Digest.of_bytes(payload_a)
+
+        first = store.put_if_absent(str(digest), payload_a, "application/octet-stream")
+
+        # A second writer racing with a *different* payload but claiming
+        # the *same* digest (a corrupt/malicious caller) must never be
+        # able to overwrite the first writer's bytes at that key. Since
+        # put_if_absent now hashes its own input, a genuinely different
+        # payload can only be submitted under its own (different) digest
+        # -- claiming the first digest with different bytes is rejected
+        # by the digest-match check before any write is attempted.
+        payload_b = _unique_bytes()
+        with pytest.raises(IntegrityError):
+            store.put_if_absent(str(digest), payload_b, "application/octet-stream")
+
+        # The original bytes at the key are untouched.
+        fetched = store.get_verified(first.storage_uri, str(digest))
+        assert fetched == payload_a
+
+    def test_concurrent_writers_different_payloads_each_land_under_own_digest(self) -> None:
+        store = _make_store()
+        payloads = [_unique_bytes() for _ in range(6)]
+        digests = [Digest.of_bytes(p) for p in payloads]
+
+        def _put(index: int) -> str:
+            stored = store.put_if_absent(
+                str(digests[index]), payloads[index], "application/octet-stream"
+            )
+            return stored.storage_uri
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+            uris = list(executor.map(_put, range(len(payloads))))
+
+        # Distinct payloads land at distinct content-addressed keys, and
+        # each round-trips to exactly its own bytes -- no cross-writer
+        # corruption under concurrency.
+        assert len(set(uris)) == len(payloads)
+        for uri, digest, payload in zip(uris, digests, payloads, strict=True):
+            assert store.get_verified(uri, str(digest)) == payload
+
+    def test_concurrent_writers_same_content_race_to_create_without_error(self) -> None:
+        store = _make_store()
+        payload = _unique_bytes()
+        digest = Digest.of_bytes(payload)
+
+        def _put() -> str:
+            stored = store.put_if_absent(str(digest), payload, "application/octet-stream")
+            return stored.storage_uri
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+            uris = list(executor.map(lambda _: _put(), range(16)))
+
+        # All 16 concurrent writers agree on one final key/content, and
+        # every one of them (winner and losers alike) observes bytes
+        # that verify against the shared digest -- the conditional
+        # If-None-Match create makes this race-free.
+        assert len(set(uris)) == 1
+        assert store.get_verified(uris[0], str(digest)) == payload
+
+    def test_existing_object_is_hash_verified_before_reporting_success(self) -> None:
+        store = _make_store()
+        payload = _unique_bytes()
+        digest = Digest.of_bytes(payload)
+        first = store.put_if_absent(str(digest), payload, "application/octet-stream")
+
+        # Calling put_if_absent again with the identical (correct) bytes
+        # must succeed and re-verify, not just trust that a same-named
+        # key already exists.
+        second = store.put_if_absent(str(digest), payload, "application/octet-stream")
+        assert second.storage_uri == first.storage_uri
+        assert second.byte_size == len(payload)

@@ -4,7 +4,8 @@ Against real PostgreSQL and MinIO, this test:
  1. resolves and registers the immutable configuration snapshot;
  2. registers a synthetic source artifact with exact checksum,
     authoritative availability, code/environment/config identity;
- 3. executes the pure degC->K transformation;
+ 3. executes the pure degC->K transformation (source contract validated
+    via ``input_validator`` before the transform runs);
  4. registers the canonical output and successful activity atomically;
  5. retrieves and checksum-verifies the output;
  6. asserts exact coordinates, Kelvin values, dtype, units, grid,
@@ -13,12 +14,17 @@ Against real PostgreSQL and MinIO, this test:
     input/output roles, activity version, config snapshot, digests,
     run, availability, and storage URIs;
  8. exports deterministic lineage JSON, reconstructs the graph from
-    persisted records only, and compares;
- 9. repeats the identical request and asserts one succeeded activity
-    and the same output artifact;
-10. changes one semantic configuration value and asserts a new
-    snapshot, idempotency key, activity, and output record while the
-    original remains unchanged;
+    PERSISTED REPOSITORY STATE ONLY (producer_of()'s persisted
+    input/output edges, not manually built in-memory edges), and
+    compares;
+ 9. repeats the identical request and asserts exactly one succeeded
+    activity row and exactly one output edge exist by counting all
+    persisted rows for the idempotency digest/output artifact;
+10. changes ONLY the transformation's configuration identity while
+    retaining the exact same selected source input artifact (isolating
+    configuration identity as the sole idempotency-key variable) and
+    asserts a new snapshot, idempotency key, activity, and output
+    record while the original activity/output remain unchanged;
 11. requests an input with available_at > information_cutoff and
     asserts run creation fails closed;
 12. attempts retrieval with a wrong digest and asserts IntegrityError.
@@ -38,6 +44,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import sqlalchemy as sa
 import xarray as xr
 from alembic import command
 from alembic.config import Config
@@ -100,8 +107,10 @@ def service(migrated_dsn: str, object_store: S3ArtifactObjectStore) -> ArtifactS
 
 
 def _degc_to_kelvin_transform(dataset: xr.Dataset) -> xr.Dataset:
-    """Pure test transformation: validate the source contract, convert
-    air_temperature_2m from degC to K, and stamp canonical attributes."""
+    """Pure test transformation: convert air_temperature_2m from degC to
+    K and stamp canonical attributes. Source-contract validation happens
+    separately via ``input_validator`` (finding 1, Codex review
+    t_9bb13e2b) before this transform ever runs."""
     converted = dataset.copy(deep=True)
     values_k = convert(dataset["air_temperature_2m"].values.astype("float64"), "degC", "K")
     converted["air_temperature_2m"].values[...] = values_k.astype("float32")
@@ -167,7 +176,15 @@ class TestPhase0ArtifactLineageAcceptance:
         # the canonical output and successful activity atomically
         # ---------------------------------------------------------
         grid = build_synthetic_grid()
+        source_variable = build_synthetic_variable_definition(canonical_unit_id="degC")
         variable = build_synthetic_variable_definition(canonical_unit_id="K")
+
+        def _validate_input(dataset: xr.Dataset) -> None:
+            validate_canonical_dataset(
+                dataset,
+                grids={grid.grid_id: grid},
+                variables={source_variable.variable_id: source_variable},
+            )
 
         def _validate_output(dataset: xr.Dataset) -> None:
             validate_canonical_dataset(
@@ -198,6 +215,7 @@ class TestPhase0ArtifactLineageAcceptance:
             serializer=serializer,
             input_loader=serializer.deserialize,
             output_validator=_validate_output,
+            input_validator=_validate_input,
         )
         assert result.activity.status == "succeeded"
         output_artifact = result.output
@@ -262,25 +280,35 @@ class TestPhase0ArtifactLineageAcceptance:
 
         # ---------------------------------------------------------
         # Step 8: export deterministic lineage JSON, reconstruct the
-        # graph from persisted records only, and compare
+        # graph from PERSISTED REPOSITORY STATE ONLY (not manually
+        # built edges from in-memory values -- Codex review t_9bb13e2b
+        # finding 7) and compare
         # ---------------------------------------------------------
-        edges = (
+        with PostgresUnitOfWork(migrated_dsn) as uow:
+            persisted_producer = uow.activities.producer_of(output_artifact.artifact_id)
+        assert persisted_producer is not None
+        persisted_edges = tuple(
             ActivityEdge(
-                activity_id=result.activity.activity_id,
-                artifact_id=source_artifact.artifact_id,
-                role="primary",
+                activity_id=persisted_producer.activity_id,
+                artifact_id=ref.artifact_id,
+                role=ref.role,
                 direction="input",
-            ),
+            )
+            for ref in persisted_producer.inputs
+        ) + tuple(
             ActivityEdge(
-                activity_id=result.activity.activity_id,
-                artifact_id=output_artifact.artifact_id,
-                role="primary",
+                activity_id=persisted_producer.activity_id,
+                artifact_id=ref.artifact_id,
+                role=ref.role,
                 direction="output",
-            ),
+            )
+            for ref in persisted_producer.outputs
         )
-        graph_a = build_lineage_graph(root_artifact_id=output_artifact.artifact_id, edges=edges)
+        graph_a = build_lineage_graph(
+            root_artifact_id=output_artifact.artifact_id, edges=persisted_edges
+        )
         graph_b = build_lineage_graph(
-            root_artifact_id=output_artifact.artifact_id, edges=tuple(reversed(edges))
+            root_artifact_id=output_artifact.artifact_id, edges=tuple(reversed(persisted_edges))
         )
         assert graph_a.model_dump_json() == graph_b.model_dump_json()
         assert source_artifact.artifact_id in graph_a.artifact_nodes
@@ -288,8 +316,10 @@ class TestPhase0ArtifactLineageAcceptance:
         assert result.activity.activity_id in graph_a.activity_nodes
 
         # ---------------------------------------------------------
-        # Step 9: repeat the identical request; one succeeded activity,
-        # same output artifact
+        # Step 9: repeat the identical request; assert exactly one
+        # succeeded activity AND exactly one output edge exist by
+        # counting ALL persisted rows (not merely that a succeeded
+        # match can be found -- Codex review t_9bb13e2b finding 7)
         # ---------------------------------------------------------
         repeat_result = service.execute_transformation(
             transformation_request,
@@ -297,6 +327,7 @@ class TestPhase0ArtifactLineageAcceptance:
             serializer=serializer,
             input_loader=serializer.deserialize,
             output_validator=_validate_output,
+            input_validator=_validate_input,
         )
         assert repeat_result.output.artifact_id == output_artifact.artifact_id
         with PostgresUnitOfWork(migrated_dsn) as uow:
@@ -306,17 +337,42 @@ class TestPhase0ArtifactLineageAcceptance:
             assert succeeded is not None
             assert succeeded.activity_id == result.activity.activity_id
 
+            engine = sa.create_engine(migrated_dsn, future=True)
+            with engine.connect() as connection:
+                activity_count = connection.execute(
+                    sa.text("SELECT COUNT(*) FROM activities WHERE idempotency_digest = :d"),
+                    {"d": result.activity.idempotency_digest},
+                ).scalar_one()
+                output_edge_count = connection.execute(
+                    sa.text("SELECT COUNT(*) FROM activity_outputs WHERE artifact_id = :a"),
+                    {"a": str(output_artifact.artifact_id).removeprefix("art_")},
+                ).scalar_one()
+            engine.dispose()
+        assert activity_count == 1, (
+            "repeat request must not create a second (e.g. lingering 'started') "
+            "activity row for the same idempotency digest"
+        )
+        assert output_edge_count == 1, (
+            "repeat request must not create a second output edge for the same artifact"
+        )
+
         # ---------------------------------------------------------
-        # Step 10: change one semantic configuration value; new
-        # snapshot/idempotency key/activity/output; original unchanged
+        # Step 10: change ONLY the transformation's configuration
+        # identity while retaining the EXACT SAME selected source
+        # input artifact -- isolating configuration identity as the
+        # sole idempotency-key variable (Codex review t_9bb13e2b
+        # finding 7: the prior version also changed the source
+        # artifact/bytes, which did not isolate configuration
+        # identity). Assert a new snapshot, idempotency key, activity,
+        # and output record while the original activity/output remain
+        # byte-for-byte unchanged.
         #
         # Per plan Section 4.4, a changed grid definition requires a new
         # grid_id (an existing grid_id with different coordinates is a
         # rejected Conflict, exercised separately in Task 6/8's tests);
-        # so here the "one semantic value" change is a *new*, additional
-        # grid definition (a distinct grid_id) added to the
-        # configuration -- still a real, digest-changing configuration
-        # edit, without violating the existing grid's immutability.
+        # so the "one semantic value" change is a *new*, additional grid
+        # definition (a distinct grid_id) added to the configuration --
+        # still a real, digest-changing configuration edit.
         # ---------------------------------------------------------
         extra_grid = configuration.grids[0].model_copy(
             update={"grid_id": "synthetic-grid.v2", "y_coordinates": (40.0, 41.0)}
@@ -327,35 +383,14 @@ class TestPhase0ArtifactLineageAcceptance:
         changed_snapshot = config_service.register(changed_configuration)
         assert changed_snapshot.configuration_snapshot_id != snapshot.configuration_snapshot_id
 
-        changed_source_dataset = build_synthetic_dataset(
-            configuration_snapshot_id=changed_snapshot.configuration_snapshot_id
-        )
-        changed_source_bytes = serializer.serialize(changed_source_dataset)
-        changed_source_request = SourceRegistrationRequest(
-            source_authority="mesoforge.synthetic",
-            source_locator="synthetic://phase0-acceptance/source-changed",
-            source_revision="v1",
-            artifact_type="canonical-guidance-source",
-            artifact_schema_version="canonical-guidance.v1",
-            media_type="application/x-netcdf",
-            created_at=datetime(2026, 1, 1, tzinfo=UTC),
-            availability=source_availability,
-            configuration_snapshot_id=changed_snapshot.configuration_snapshot_id,
-            configuration_digest=changed_snapshot.configuration_digest,
-            code_revision=code_revision,
-            environment_digest=environment_digest,
-        )
-        changed_source_artifact = service.register_source(
-            changed_source_request, changed_source_bytes
-        )
-
         changed_transformation_request = TransformationRequest(
             activity_type="unit-conversion.degc-to-kelvin",
             activity_version="1.0.0",
             inputs=(
-                TransformationInputRef(
-                    role="primary", artifact_id=changed_source_artifact.artifact_id
-                ),
+                # exact same selected input as the original request --
+                # only the transformation's own configuration identity
+                # changes below.
+                TransformationInputRef(role="primary", artifact_id=source_artifact.artifact_id),
             ),
             output_role="primary",
             output_artifact_type="canonical-guidance",
@@ -372,6 +407,7 @@ class TestPhase0ArtifactLineageAcceptance:
             serializer=serializer,
             input_loader=serializer.deserialize,
             output_validator=_validate_output,
+            input_validator=_validate_input,
         )
         assert changed_result.activity.idempotency_digest != result.activity.idempotency_digest
         assert changed_result.activity.activity_id != result.activity.activity_id
@@ -396,7 +432,7 @@ class TestPhase0ArtifactLineageAcceptance:
                 environment_digest=environment_digest,
                 lockfile_digest="sha256:" + "d" * 64,
                 random_seed=1,
-                selected_inputs=(source_artifact,),
+                selected_input_artifact_ids=(source_artifact.artifact_id,),
             )
 
         # ---------------------------------------------------------

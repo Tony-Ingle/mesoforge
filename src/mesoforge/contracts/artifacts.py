@@ -7,9 +7,11 @@ first-class activity edges (``contracts/provenance.py``).
 from __future__ import annotations
 
 import json
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from mesoforge.common.identifiers import ArtifactId, ConfigurationSnapshotId, Digest, RunId
 from mesoforge.common.time import UtcInstant
 
 _MAX_ATTRIBUTES_BYTES = 32 * 1024
@@ -18,7 +20,7 @@ _MAX_ATTRIBUTES_BYTES = 32 * 1024
 class Availability(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: str = "availability.v1"
+    schema_version: Literal["availability.v1"] = "availability.v1"
     available_at: UtcInstant
     authority: str
     method: str
@@ -37,24 +39,24 @@ class SourceIdentity(BaseModel):
 class ArtifactManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: str = "artifact-manifest.v1"
-    artifact_id: str
+    schema_version: Literal["artifact-manifest.v1"] = "artifact-manifest.v1"
+    artifact_id: ArtifactId
     artifact_type: str
     artifact_schema_version: str
     media_type: str
     byte_size: int
-    content_digest: str
+    content_digest: Digest
     storage_uri: str
     created_at: UtcInstant
     registered_at: UtcInstant
     availability: Availability
-    run_id: str | None = None
-    configuration_snapshot_id: str
-    configuration_digest: str
+    run_id: RunId | None = None
+    configuration_snapshot_id: ConfigurationSnapshotId
+    configuration_digest: Digest
     code_revision: str
-    environment_digest: str
+    environment_digest: Digest
     quality_state: str
-    source_registration_digest: str | None = None
+    source_registration_digest: Digest | None = None
     source_identity: SourceIdentity | None = None
     attributes: dict[str, object] | None = None
 

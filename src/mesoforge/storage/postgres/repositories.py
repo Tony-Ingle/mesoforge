@@ -16,6 +16,14 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from mesoforge.common.errors import Conflict, NotFound
+from mesoforge.common.identifiers import (
+    ActivityId,
+    ArtifactId,
+    ConfigurationSnapshotId,
+    Digest,
+    RunId,
+    strip_prefix,
+)
 from mesoforge.contracts.artifacts import ArtifactManifest, Availability, SourceIdentity
 from mesoforge.contracts.provenance import ActivityArtifactRef, ActivityError, ActivityManifest
 from mesoforge.contracts.runs import RunManifest
@@ -28,6 +36,7 @@ from mesoforge.storage.postgres.models import (
     ConfigurationSnapshotRow,
     GridRow,
     RunRow,
+    RunSelectedInputRow,
     StoredObjectRow,
 )
 
@@ -194,12 +203,12 @@ def _artifact_row_to_manifest(row: ArtifactRow) -> ArtifactManifest:
             revision=row.source_revision,  # type: ignore[arg-type]
         )
     return ArtifactManifest(
-        artifact_id=f"art_{row.id}",
+        artifact_id=ArtifactId(f"art_{row.id}"),
         artifact_type=row.artifact_type,
         artifact_schema_version=row.artifact_schema_version,
         media_type=row.stored_object.media_type,
         byte_size=row.stored_object.byte_size,
-        content_digest=row.content_digest,
+        content_digest=Digest(row.content_digest),
         storage_uri=row.stored_object.storage_uri,
         created_at=row.created_at,
         registered_at=row.registered_at,
@@ -209,13 +218,17 @@ def _artifact_row_to_manifest(row: ArtifactRow) -> ArtifactManifest:
             method=row.availability_method,
             ingested_at=row.ingested_at,
         ),
-        run_id=(f"run_{row.run_id}" if row.run_id is not None else None),
-        configuration_snapshot_id=row.configuration_snapshot_id,
-        configuration_digest=row.configuration_digest,
+        run_id=(RunId(f"run_{row.run_id}") if row.run_id is not None else None),
+        configuration_snapshot_id=ConfigurationSnapshotId(row.configuration_snapshot_id),
+        configuration_digest=Digest(row.configuration_digest),
         code_revision=row.code_revision,
-        environment_digest=row.environment_digest,
+        environment_digest=Digest(row.environment_digest),
         quality_state=row.quality_state,
-        source_registration_digest=row.source_registration_digest,
+        source_registration_digest=(
+            Digest(row.source_registration_digest)
+            if row.source_registration_digest is not None
+            else None
+        ),
         source_identity=source_identity,
         attributes=row.attributes,
     )
@@ -226,9 +239,11 @@ class PostgresArtifactRepository:
         self._session = session
 
     def add(self, manifest: ArtifactManifest) -> ArtifactManifest:
-        artifact_uuid = uuid.UUID(manifest.artifact_id.removeprefix("art_"))
+        artifact_uuid = uuid.UUID(strip_prefix(manifest.artifact_id, "art_"))
         run_uuid = (
-            uuid.UUID(manifest.run_id.removeprefix("run_")) if manifest.run_id is not None else None
+            uuid.UUID(strip_prefix(manifest.run_id, "run_"))
+            if manifest.run_id is not None
+            else None
         )
         row = ArtifactRow(
             id=artifact_uuid,
@@ -262,8 +277,83 @@ class PostgresArtifactRepository:
         self._session.refresh(row)
         return _artifact_row_to_manifest(row)
 
+    def add_derived(
+        self,
+        *,
+        artifact_id: str,
+        artifact_type: str,
+        artifact_schema_version: str,
+        content_digest: str,
+        created_at: datetime,
+        availability_authority: str,
+        availability_method: str,
+        parent_available_ats: tuple[datetime, ...],
+        activity_completed_at: datetime,
+        run_id: str | None,
+        configuration_snapshot_id: str,
+        configuration_digest: str,
+        code_revision: str,
+        environment_digest: str,
+        quality_state: str,
+        attributes: dict[str, object] | None,
+    ) -> ArtifactManifest:
+        """Insert a derived artifact whose ``registered_at`` and
+        ``available_at`` are BOTH computed by PostgreSQL from a single
+        ``transaction_timestamp()`` call within this insert statement
+        (plan Section 5, step 8; Codex review t_9bb13e2b finding 3).
+
+        ``transaction_timestamp()`` is constant for the duration of a
+        PostgreSQL transaction, so referencing it twice in the same
+        statement -- once directly for ``registered_at`` and once inside
+        ``GREATEST(...)`` for ``available_at`` -- guarantees both derive
+        from the exact same instant, and that ``available_at >=
+        registered_at`` always holds by construction (the
+        ``transaction_timestamp()`` term inside GREATEST can never be
+        less than ``registered_at``, which equals it exactly). The
+        application layer never computes or supplies either timestamp
+        with ``datetime.now()``.
+        """
+        artifact_uuid = uuid.UUID(strip_prefix(artifact_id, "art_"))
+        run_uuid = uuid.UUID(strip_prefix(run_id, "run_")) if run_id is not None else None
+
+        available_at_expr = sa.func.greatest(
+            activity_completed_at, sa.func.transaction_timestamp(), *parent_available_ats
+        )
+        stmt = (
+            sa.insert(ArtifactRow)
+            .values(
+                id=artifact_uuid,
+                schema_version="artifact-manifest.v1",
+                artifact_type=artifact_type,
+                artifact_schema_version=artifact_schema_version,
+                content_digest=content_digest,
+                source_registration_digest=None,
+                source_authority=None,
+                source_locator=None,
+                source_revision=None,
+                created_at=created_at,
+                registered_at=sa.func.transaction_timestamp(),
+                available_at=available_at_expr,
+                availability_authority=availability_authority,
+                availability_method=availability_method,
+                ingested_at=None,
+                run_id=run_uuid,
+                configuration_snapshot_id=configuration_snapshot_id,
+                configuration_digest=configuration_digest,
+                code_revision=code_revision,
+                environment_digest=environment_digest,
+                quality_state=quality_state,
+                attributes=attributes,
+            )
+            .returning(ArtifactRow)
+        )
+        row = self._session.execute(stmt).scalars().one()
+        self._session.flush()
+        self._session.refresh(row)
+        return _artifact_row_to_manifest(row)
+
     def get(self, artifact_id: str) -> ArtifactManifest:
-        row = self._session.get(ArtifactRow, uuid.UUID(artifact_id.removeprefix("art_")))
+        row = self._session.get(ArtifactRow, uuid.UUID(strip_prefix(artifact_id, "art_")))
         if row is None:
             raise NotFound(f"artifact {artifact_id!r} not found")
         return _artifact_row_to_manifest(row)
@@ -280,27 +370,27 @@ class PostgresArtifactRepository:
 
 def _activity_row_to_manifest(row: ActivityRow) -> ActivityManifest:
     inputs = tuple(
-        ActivityArtifactRef(role=i.role, artifact_id=f"art_{i.artifact_id}")
+        ActivityArtifactRef(role=i.role, artifact_id=ArtifactId(f"art_{i.artifact_id}"))
         for i in sorted(row.inputs, key=lambda i: i.ordinal)
     )
     outputs = tuple(
-        ActivityArtifactRef(role=o.role, artifact_id=f"art_{o.artifact_id}")
+        ActivityArtifactRef(role=o.role, artifact_id=ArtifactId(f"art_{o.artifact_id}"))
         for o in sorted(row.outputs, key=lambda o: o.ordinal)
     )
     return ActivityManifest(
-        activity_id=f"act_{row.id}",
+        activity_id=ActivityId(f"act_{row.id}"),
         activity_type=row.activity_type,
         activity_version=row.activity_version,
         status=row.status,
         started_at=row.started_at,
         completed_at=row.completed_at,
-        idempotency_digest=row.idempotency_digest,
-        parameters_digest=row.parameters_digest,
-        configuration_snapshot_id=row.configuration_snapshot_id,
-        configuration_digest=row.configuration_digest,
+        idempotency_digest=Digest(row.idempotency_digest),
+        parameters_digest=Digest(row.parameters_digest),
+        configuration_snapshot_id=ConfigurationSnapshotId(row.configuration_snapshot_id),
+        configuration_digest=Digest(row.configuration_digest),
         code_revision=row.code_revision,
-        environment_digest=row.environment_digest,
-        run_id=(f"run_{row.run_id}" if row.run_id is not None else None),
+        environment_digest=Digest(row.environment_digest),
+        run_id=(RunId(f"run_{row.run_id}") if row.run_id is not None else None),
         inputs=inputs,
         outputs=outputs,
         error=(ActivityError(**row.error) if row.error is not None else None),
@@ -312,9 +402,11 @@ class PostgresActivityRepository:
         self._session = session
 
     def add_started(self, manifest: ActivityManifest) -> ActivityManifest:
-        activity_uuid = uuid.UUID(manifest.activity_id.removeprefix("act_"))
+        activity_uuid = uuid.UUID(strip_prefix(manifest.activity_id, "act_"))
         run_uuid = (
-            uuid.UUID(manifest.run_id.removeprefix("run_")) if manifest.run_id is not None else None
+            uuid.UUID(strip_prefix(manifest.run_id, "run_"))
+            if manifest.run_id is not None
+            else None
         )
         row = ActivityRow(
             id=activity_uuid,
@@ -336,7 +428,7 @@ class PostgresActivityRepository:
                 ActivityInputRow(
                     ordinal=ordinal,
                     role=ref.role,
-                    artifact_id=uuid.UUID(ref.artifact_id.removeprefix("art_")),
+                    artifact_id=uuid.UUID(strip_prefix(ref.artifact_id, "art_")),
                 )
             )
         self._session.add(row)
@@ -350,7 +442,7 @@ class PostgresActivityRepository:
         outputs: tuple[ActivityArtifactRef, ...],
         completed_at: datetime,
     ) -> ActivityManifest:
-        row = self._session.get(ActivityRow, uuid.UUID(activity_id.removeprefix("act_")))
+        row = self._session.get(ActivityRow, uuid.UUID(strip_prefix(activity_id, "act_")))
         if row is None:
             raise NotFound(f"activity {activity_id!r} not found")
         row.status = "succeeded"
@@ -360,7 +452,7 @@ class PostgresActivityRepository:
                 ActivityOutputRow(
                     ordinal=ordinal,
                     role=ref.role,
-                    artifact_id=uuid.UUID(ref.artifact_id.removeprefix("art_")),
+                    artifact_id=uuid.UUID(strip_prefix(ref.artifact_id, "art_")),
                 )
             )
         self._session.flush()
@@ -370,7 +462,7 @@ class PostgresActivityRepository:
     def finish_failed(
         self, activity_id: str, error: ActivityError, completed_at: datetime
     ) -> ActivityManifest:
-        row = self._session.get(ActivityRow, uuid.UUID(activity_id.removeprefix("act_")))
+        row = self._session.get(ActivityRow, uuid.UUID(strip_prefix(activity_id, "act_")))
         if row is None:
             raise NotFound(f"activity {activity_id!r} not found")
         row.status = "failed"
@@ -389,7 +481,7 @@ class PostgresActivityRepository:
         return _activity_row_to_manifest(row) if row is not None else None
 
     def producer_of(self, artifact_id: str) -> ActivityManifest | None:
-        artifact_uuid = uuid.UUID(artifact_id.removeprefix("art_"))
+        artifact_uuid = uuid.UUID(strip_prefix(artifact_id, "art_"))
         output_row = self._session.execute(
             sa.select(ActivityOutputRow).where(ActivityOutputRow.artifact_id == artifact_uuid)
         ).scalar_one_or_none()
@@ -399,7 +491,7 @@ class PostgresActivityRepository:
         return _activity_row_to_manifest(row) if row is not None else None
 
     def consumers_of(self, artifact_id: str) -> tuple[ActivityManifest, ...]:
-        artifact_uuid = uuid.UUID(artifact_id.removeprefix("art_"))
+        artifact_uuid = uuid.UUID(strip_prefix(artifact_id, "art_"))
         input_rows = self._session.execute(
             sa.select(ActivityInputRow).where(ActivityInputRow.artifact_id == artifact_uuid)
         ).scalars()
@@ -409,17 +501,28 @@ class PostgresActivityRepository:
 
 
 def _run_row_to_manifest(row: RunRow) -> RunManifest:
+    # Prefer the relational run_selected_inputs join table (ordinal order
+    # preserved via ORDER BY ordinal) over the legacy selected_inputs
+    # JSONB column, which is retained only for backward read
+    # compatibility (Codex review t_9bb13e2b finding 5).
+    if row.selected_input_rows:
+        ordered_ids = tuple(
+            ArtifactId(f"art_{r.artifact_id}")
+            for r in sorted(row.selected_input_rows, key=lambda r: r.ordinal)
+        )
+    else:
+        ordered_ids = tuple(ArtifactId(a) for a in row.selected_inputs.get("artifact_ids", []))
     return RunManifest(
-        run_id=f"run_{row.id}",
+        run_id=RunId(f"run_{row.id}"),
         forecast_issue_time=row.forecast_issue_time,
         information_cutoff=row.information_cutoff,
-        configuration_snapshot_id=row.configuration_snapshot_id,
-        configuration_digest=row.configuration_digest,
+        configuration_snapshot_id=ConfigurationSnapshotId(row.configuration_snapshot_id),
+        configuration_digest=Digest(row.configuration_digest),
         code_revision=row.code_revision,
-        environment_digest=row.environment_digest,
-        lockfile_digest=row.lockfile_digest,
+        environment_digest=Digest(row.environment_digest),
+        lockfile_digest=Digest(row.lockfile_digest),
         random_seed=row.random_seed,
-        selected_input_artifact_ids=tuple(row.selected_inputs.get("artifact_ids", [])),
+        selected_input_artifact_ids=ordered_ids,
         created_at=row.created_at,
     )
 
@@ -429,8 +532,9 @@ class PostgresRunRepository:
         self._session = session
 
     def add(self, manifest: RunManifest) -> RunManifest:
+        run_uuid = uuid.UUID(strip_prefix(manifest.run_id, "run_"))
         row = RunRow(
-            id=uuid.UUID(manifest.run_id.removeprefix("run_")),
+            id=run_uuid,
             schema_version=manifest.schema_version,
             forecast_issue_time=manifest.forecast_issue_time,
             information_cutoff=manifest.information_cutoff,
@@ -440,15 +544,25 @@ class PostgresRunRepository:
             environment_digest=manifest.environment_digest,
             lockfile_digest=manifest.lockfile_digest,
             random_seed=manifest.random_seed,
+            # Retained for backward read compatibility only; the
+            # authoritative, relationally-integral selection lives in
+            # run_selected_inputs below (finding 5).
             selected_inputs={"artifact_ids": list(manifest.selected_input_artifact_ids)},
         )
+        for ordinal, artifact_id in enumerate(manifest.selected_input_artifact_ids):
+            row.selected_input_rows.append(
+                RunSelectedInputRow(
+                    ordinal=ordinal,
+                    artifact_id=uuid.UUID(strip_prefix(artifact_id, "art_")),
+                )
+            )
         self._session.add(row)
         self._session.flush()
         self._session.refresh(row)
         return _run_row_to_manifest(row)
 
     def get(self, run_id: str) -> RunManifest:
-        row = self._session.get(RunRow, uuid.UUID(run_id.removeprefix("run_")))
+        row = self._session.get(RunRow, uuid.UUID(strip_prefix(run_id, "run_")))
         if row is None:
             raise NotFound(f"run {run_id!r} not found")
         return _run_row_to_manifest(row)

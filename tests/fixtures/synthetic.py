@@ -136,7 +136,7 @@ def build_synthetic_dataset(
         attrs={
             "schema_version": "canonical-guidance.v1",
             "time_encoding": "UTC",
-            "grid_id": grid.grid_id,
+            "grid_id": str(grid.grid_id),
             "configuration_snapshot_id": configuration_snapshot_id,
             "variable_lineage_manifest_id": variable_lineage_manifest_id,
         },
