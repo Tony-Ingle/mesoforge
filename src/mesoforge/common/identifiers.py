@@ -86,7 +86,7 @@ class RunId(_PrefixedUuidId):
 class Digest(str):
     """A content digest, exactly ``sha256:<64 lowercase hex>``."""
 
-    def __new__(cls, value: str) -> Digest:
+    def __new__(cls, value: str) -> Self:
         if not isinstance(value, str):
             raise InvalidIdentifier(f"Digest must be a string, got {type(value)!r}")
         algorithm, _, hex_part = value.partition(":")
@@ -110,7 +110,7 @@ class Digest(str):
 class ConfigurationSnapshotId(str):
     """Exactly the configuration digest rendered as ``cfg_sha256_<64 hex>``."""
 
-    def __new__(cls, value: str) -> ConfigurationSnapshotId:
+    def __new__(cls, value: str) -> Self:
         if not isinstance(value, str):
             raise InvalidIdentifier(
                 f"ConfigurationSnapshotId must be a string, got {type(value)!r}"
@@ -145,7 +145,7 @@ class ConfigurationSnapshotId(str):
 class _KebabDotId(str):
     """Base for lowercase kebab/dot catalog identifiers."""
 
-    def __new__(cls, value: str) -> _KebabDotId:
+    def __new__(cls, value: str) -> Self:
         if not isinstance(value, str):
             raise InvalidIdentifier(f"{cls.__name__} must be a string, got {type(value)!r}")
         if not _KEBAB_DOT_RE.match(value):

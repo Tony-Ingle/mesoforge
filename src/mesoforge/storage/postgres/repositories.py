@@ -3,6 +3,16 @@
 
 SQLAlchemy ORM objects never escape this module: every method returns
 plain dataclass/contract value objects.
+
+Every public repository method's ID/digest parameters and return-object
+fields use the typed ``common.identifiers`` classes (``Digest``,
+``ArtifactId``, ``ActivityId``, ``ConfigurationSnapshotId``, ``GridId``,
+``RunId``), not an unrestricted ``str`` (Codex review t_f569c45c finding
+3; final re-review HIGH finding 6/t_1ecb8414: concrete adapter entry
+points must construct/validate typed values themselves -- a caller that
+bypasses static typing at runtime must still fail closed with
+``InvalidIdentifier`` before a malformed ID/digest reaches SQL, rather
+than silently becoming a query miss).
 """
 
 from __future__ import annotations
@@ -21,6 +31,7 @@ from mesoforge.common.identifiers import (
     ArtifactId,
     ConfigurationSnapshotId,
     Digest,
+    GridId,
     RunId,
     strip_prefix,
 )
@@ -42,14 +53,14 @@ from mesoforge.storage.postgres.models import (
 
 
 class _ConfigurationSnapshotInput(Protocol):
-    configuration_snapshot_id: str
-    configuration_digest: str
+    configuration_snapshot_id: ConfigurationSnapshotId
+    configuration_digest: Digest
     canonical_json: dict[str, object]
     source_references: tuple[dict[str, object], ...]
 
 
 class _StoredObjectInput(Protocol):
-    content_digest: str
+    content_digest: Digest
     storage_uri: str
     media_type: str
     byte_size: int
@@ -57,15 +68,15 @@ class _StoredObjectInput(Protocol):
 
 @dataclass(frozen=True)
 class GridRecord:
-    grid_id: str
-    definition_digest: str
+    grid_id: GridId
+    definition_digest: Digest
     canonical_json: dict[str, object]
 
 
 @dataclass(frozen=True)
 class ConfigurationSnapshotRecord:
-    configuration_snapshot_id: str
-    configuration_digest: str
+    configuration_snapshot_id: ConfigurationSnapshotId
+    configuration_digest: Digest
     canonical_json: dict[str, object]
     source_references: tuple[dict[str, object], ...]
     created_at: datetime
@@ -73,7 +84,7 @@ class ConfigurationSnapshotRecord:
 
 @dataclass(frozen=True)
 class StoredObjectRecord:
-    content_digest: str
+    content_digest: Digest
     storage_uri: str
     media_type: str
     byte_size: int
@@ -84,28 +95,35 @@ class PostgresGridRepository:
         self._session = session
 
     def add_if_absent(
-        self, grid_id: str, definition_digest: str, canonical_json: dict[str, object]
+        self, grid_id: GridId, definition_digest: Digest, canonical_json: dict[str, object]
     ) -> GridRecord:
-        existing = self._session.get(GridRow, grid_id)
+        grid_id = GridId(grid_id)
+        definition_digest = Digest(definition_digest)
+        existing = self._session.get(GridRow, str(grid_id))
         if existing is not None:
             if existing.definition_digest != definition_digest:
                 raise Conflict(
                     f"grid_id {grid_id!r} is already registered with a different definition_digest"
                 )
-            return GridRecord(existing.id, existing.definition_digest, existing.canonical_json)
+            return GridRecord(
+                GridId(existing.id), Digest(existing.definition_digest), existing.canonical_json
+            )
 
         row = GridRow(
-            id=grid_id, definition_digest=definition_digest, canonical_json=canonical_json
+            id=str(grid_id),
+            definition_digest=str(definition_digest),
+            canonical_json=canonical_json,
         )
         self._session.add(row)
         self._session.flush()
-        return GridRecord(row.id, row.definition_digest, row.canonical_json)
+        return GridRecord(GridId(row.id), Digest(row.definition_digest), row.canonical_json)
 
-    def get(self, grid_id: str) -> GridRecord:
-        row = self._session.get(GridRow, grid_id)
+    def get(self, grid_id: GridId) -> GridRecord:
+        grid_id = GridId(grid_id)
+        row = self._session.get(GridRow, str(grid_id))
         if row is None:
             raise NotFound(f"grid_id {grid_id!r} not found")
-        return GridRecord(row.id, row.definition_digest, row.canonical_json)
+        return GridRecord(GridId(row.id), Digest(row.definition_digest), row.canonical_json)
 
 
 class PostgresConfigurationRepository:
@@ -113,20 +131,20 @@ class PostgresConfigurationRepository:
         self._session = session
 
     def add_if_absent(self, snapshot: _ConfigurationSnapshotInput) -> ConfigurationSnapshotRecord:
-        digest = snapshot.configuration_digest
+        digest = str(Digest(snapshot.configuration_digest))
         existing = self._session.execute(
             sa.select(ConfigurationSnapshotRow).where(ConfigurationSnapshotRow.digest == digest)
         ).scalar_one_or_none()
         if existing is not None:
             return ConfigurationSnapshotRecord(
-                configuration_snapshot_id=existing.id,
-                configuration_digest=existing.digest,
+                configuration_snapshot_id=ConfigurationSnapshotId(existing.id),
+                configuration_digest=Digest(existing.digest),
                 canonical_json=existing.canonical_json,
                 source_references=tuple(existing.source_references or []),
                 created_at=existing.created_at,
             )
 
-        snapshot_id = snapshot.configuration_snapshot_id
+        snapshot_id = str(ConfigurationSnapshotId(snapshot.configuration_snapshot_id))
         canonical_json = snapshot.canonical_json
         source_references = getattr(snapshot, "source_references", ()) or ()
         row = ConfigurationSnapshotRow(
@@ -139,20 +157,21 @@ class PostgresConfigurationRepository:
         self._session.add(row)
         self._session.flush()
         return ConfigurationSnapshotRecord(
-            configuration_snapshot_id=row.id,
-            configuration_digest=row.digest,
+            configuration_snapshot_id=ConfigurationSnapshotId(row.id),
+            configuration_digest=Digest(row.digest),
             canonical_json=row.canonical_json,
             source_references=tuple(row.source_references or []),
             created_at=row.created_at,
         )
 
-    def get(self, snapshot_id: str) -> ConfigurationSnapshotRecord:
-        row = self._session.get(ConfigurationSnapshotRow, snapshot_id)
+    def get(self, snapshot_id: ConfigurationSnapshotId) -> ConfigurationSnapshotRecord:
+        snapshot_id = ConfigurationSnapshotId(snapshot_id)
+        row = self._session.get(ConfigurationSnapshotRow, str(snapshot_id))
         if row is None:
             raise NotFound(f"configuration snapshot {snapshot_id!r} not found")
         return ConfigurationSnapshotRecord(
-            configuration_snapshot_id=row.id,
-            configuration_digest=row.digest,
+            configuration_snapshot_id=ConfigurationSnapshotId(row.id),
+            configuration_digest=Digest(row.digest),
             canonical_json=row.canonical_json,
             source_references=tuple(row.source_references or []),
             created_at=row.created_at,
@@ -164,11 +183,11 @@ class PostgresStoredObjectRepository:
         self._session = session
 
     def add_if_absent(self, stored_object: _StoredObjectInput) -> StoredObjectRecord:
-        digest = stored_object.content_digest
+        digest = str(Digest(stored_object.content_digest))
         existing = self._session.get(StoredObjectRow, digest)
         if existing is not None:
             return StoredObjectRecord(
-                existing.content_digest,
+                Digest(existing.content_digest),
                 existing.storage_uri,
                 existing.media_type,
                 existing.byte_size,
@@ -182,15 +201,16 @@ class PostgresStoredObjectRepository:
         self._session.add(row)
         self._session.flush()
         return StoredObjectRecord(
-            row.content_digest, row.storage_uri, row.media_type, row.byte_size
+            Digest(row.content_digest), row.storage_uri, row.media_type, row.byte_size
         )
 
-    def get(self, content_digest: str) -> StoredObjectRecord:
-        row = self._session.get(StoredObjectRow, content_digest)
+    def get(self, content_digest: Digest) -> StoredObjectRecord:
+        content_digest = Digest(content_digest)
+        row = self._session.get(StoredObjectRow, str(content_digest))
         if row is None:
             raise NotFound(f"stored object {content_digest!r} not found")
         return StoredObjectRecord(
-            row.content_digest, row.storage_uri, row.media_type, row.byte_size
+            Digest(row.content_digest), row.storage_uri, row.media_type, row.byte_size
         )
 
 
@@ -280,20 +300,20 @@ class PostgresArtifactRepository:
     def add_derived(
         self,
         *,
-        artifact_id: str,
+        artifact_id: ArtifactId,
         artifact_type: str,
         artifact_schema_version: str,
-        content_digest: str,
+        content_digest: Digest,
         created_at: datetime,
         availability_authority: str,
         availability_method: str,
         parent_available_ats: tuple[datetime, ...],
         activity_completed_at: datetime,
-        run_id: str | None,
-        configuration_snapshot_id: str,
-        configuration_digest: str,
+        run_id: RunId | None,
+        configuration_snapshot_id: ConfigurationSnapshotId,
+        configuration_digest: Digest,
         code_revision: str,
-        environment_digest: str,
+        environment_digest: Digest,
         quality_state: str,
         attributes: dict[str, object] | None,
     ) -> ArtifactManifest:
@@ -312,7 +332,20 @@ class PostgresArtifactRepository:
         less than ``registered_at``, which equals it exactly). The
         application layer never computes or supplies either timestamp
         with ``datetime.now()``.
+
+        Every ID/digest parameter is re-constructed against its typed
+        ``common.identifiers`` class immediately (final re-review HIGH
+        finding 6/t_1ecb8414): a caller that bypasses static typing at
+        runtime with a malformed value fails closed with
+        ``InvalidIdentifier`` here, before any SQL is issued.
         """
+        artifact_id = ArtifactId(artifact_id)
+        content_digest = Digest(content_digest)
+        run_id = RunId(run_id) if run_id is not None else None
+        configuration_snapshot_id = ConfigurationSnapshotId(configuration_snapshot_id)
+        configuration_digest = Digest(configuration_digest)
+        environment_digest = Digest(environment_digest)
+
         artifact_uuid = uuid.UUID(strip_prefix(artifact_id, "art_"))
         run_uuid = uuid.UUID(strip_prefix(run_id, "run_")) if run_id is not None else None
 
@@ -326,7 +359,7 @@ class PostgresArtifactRepository:
                 schema_version="artifact-manifest.v1",
                 artifact_type=artifact_type,
                 artifact_schema_version=artifact_schema_version,
-                content_digest=content_digest,
+                content_digest=str(content_digest),
                 source_registration_digest=None,
                 source_authority=None,
                 source_locator=None,
@@ -338,10 +371,10 @@ class PostgresArtifactRepository:
                 availability_method=availability_method,
                 ingested_at=None,
                 run_id=run_uuid,
-                configuration_snapshot_id=configuration_snapshot_id,
-                configuration_digest=configuration_digest,
+                configuration_snapshot_id=str(configuration_snapshot_id),
+                configuration_digest=str(configuration_digest),
                 code_revision=code_revision,
-                environment_digest=environment_digest,
+                environment_digest=str(environment_digest),
                 quality_state=quality_state,
                 attributes=attributes,
             )
@@ -352,18 +385,20 @@ class PostgresArtifactRepository:
         self._session.refresh(row)
         return _artifact_row_to_manifest(row)
 
-    def get(self, artifact_id: str) -> ArtifactManifest:
+    def get(self, artifact_id: ArtifactId) -> ArtifactManifest:
+        artifact_id = ArtifactId(artifact_id)
         row = self._session.get(ArtifactRow, uuid.UUID(strip_prefix(artifact_id, "art_")))
         if row is None:
             raise NotFound(f"artifact {artifact_id!r} not found")
         return _artifact_row_to_manifest(row)
 
-    def get_many(self, ids: tuple[str, ...]) -> tuple[ArtifactManifest, ...]:
+    def get_many(self, ids: tuple[ArtifactId, ...]) -> tuple[ArtifactManifest, ...]:
         return tuple(self.get(artifact_id) for artifact_id in ids)
 
-    def find_by_source_registration_digest(self, digest: str) -> ArtifactManifest | None:
+    def find_by_source_registration_digest(self, digest: Digest) -> ArtifactManifest | None:
+        digest = Digest(digest)
         row = self._session.execute(
-            sa.select(ArtifactRow).where(ArtifactRow.source_registration_digest == digest)
+            sa.select(ArtifactRow).where(ArtifactRow.source_registration_digest == str(digest))
         ).scalar_one_or_none()
         return _artifact_row_to_manifest(row) if row is not None else None
 
@@ -438,10 +473,11 @@ class PostgresActivityRepository:
 
     def finish_succeeded(
         self,
-        activity_id: str,
+        activity_id: ActivityId,
         outputs: tuple[ActivityArtifactRef, ...],
         completed_at: datetime,
     ) -> ActivityManifest:
+        activity_id = ActivityId(activity_id)
         row = self._session.get(ActivityRow, uuid.UUID(strip_prefix(activity_id, "act_")))
         if row is None:
             raise NotFound(f"activity {activity_id!r} not found")
@@ -460,8 +496,9 @@ class PostgresActivityRepository:
         return _activity_row_to_manifest(row)
 
     def finish_failed(
-        self, activity_id: str, error: ActivityError, completed_at: datetime
+        self, activity_id: ActivityId, error: ActivityError, completed_at: datetime
     ) -> ActivityManifest:
+        activity_id = ActivityId(activity_id)
         row = self._session.get(ActivityRow, uuid.UUID(strip_prefix(activity_id, "act_")))
         if row is None:
             raise NotFound(f"activity {activity_id!r} not found")
@@ -472,15 +509,17 @@ class PostgresActivityRepository:
         self._session.refresh(row)
         return _activity_row_to_manifest(row)
 
-    def find_succeeded_by_idempotency(self, digest: str) -> ActivityManifest | None:
+    def find_succeeded_by_idempotency(self, digest: Digest) -> ActivityManifest | None:
+        digest = Digest(digest)
         row = self._session.execute(
             sa.select(ActivityRow).where(
-                ActivityRow.idempotency_digest == digest, ActivityRow.status == "succeeded"
+                ActivityRow.idempotency_digest == str(digest), ActivityRow.status == "succeeded"
             )
         ).scalar_one_or_none()
         return _activity_row_to_manifest(row) if row is not None else None
 
-    def producer_of(self, artifact_id: str) -> ActivityManifest | None:
+    def producer_of(self, artifact_id: ArtifactId) -> ActivityManifest | None:
+        artifact_id = ArtifactId(artifact_id)
         artifact_uuid = uuid.UUID(strip_prefix(artifact_id, "art_"))
         output_row = self._session.execute(
             sa.select(ActivityOutputRow).where(ActivityOutputRow.artifact_id == artifact_uuid)
@@ -490,7 +529,8 @@ class PostgresActivityRepository:
         row = self._session.get(ActivityRow, output_row.activity_id)
         return _activity_row_to_manifest(row) if row is not None else None
 
-    def consumers_of(self, artifact_id: str) -> tuple[ActivityManifest, ...]:
+    def consumers_of(self, artifact_id: ArtifactId) -> tuple[ActivityManifest, ...]:
+        artifact_id = ArtifactId(artifact_id)
         artifact_uuid = uuid.UUID(strip_prefix(artifact_id, "art_"))
         input_rows = self._session.execute(
             sa.select(ActivityInputRow).where(ActivityInputRow.artifact_id == artifact_uuid)
@@ -558,7 +598,8 @@ class PostgresRunRepository:
         self._session.refresh(row)
         return _run_row_to_manifest(row)
 
-    def get(self, run_id: str) -> RunManifest:
+    def get(self, run_id: RunId) -> RunManifest:
+        run_id = RunId(run_id)
         row = self._session.get(RunRow, uuid.UUID(strip_prefix(run_id, "run_")))
         if row is None:
             raise NotFound(f"run {run_id!r} not found")

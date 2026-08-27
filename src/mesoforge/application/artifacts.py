@@ -36,7 +36,7 @@ from mesoforge.provenance.services import compute_idempotency_digest
 
 
 class _StoredObjectLike(Protocol):
-    content_digest: str
+    content_digest: Digest
     storage_uri: str
     media_type: str
     byte_size: int
@@ -44,9 +44,9 @@ class _StoredObjectLike(Protocol):
 
 class _ObjectStoreLike(Protocol):
     def put_if_absent(
-        self, content_digest: str, data: bytes, media_type: str
+        self, content_digest: Digest, data: bytes, media_type: str
     ) -> _StoredObjectLike: ...
-    def get_verified(self, storage_uri: str, expected_digest: str) -> bytes: ...
+    def get_verified(self, storage_uri: str, expected_digest: Digest) -> bytes: ...
 
 
 class _StoredObjectRepositoryLike(Protocol):
@@ -55,30 +55,52 @@ class _StoredObjectRepositoryLike(Protocol):
 
 class _ArtifactRepositoryLike(Protocol):
     def add(self, manifest: ArtifactManifest) -> ArtifactManifest: ...
-    def get(self, artifact_id: str) -> ArtifactManifest: ...
-    def get_many(self, ids: tuple[str, ...]) -> tuple[ArtifactManifest, ...]: ...
-    def find_by_source_registration_digest(self, digest: str) -> ArtifactManifest | None: ...
-    def add_derived(self, **kwargs: Any) -> ArtifactManifest: ...
+    def get(self, artifact_id: ArtifactId) -> ArtifactManifest: ...
+    def get_many(self, ids: tuple[ArtifactId, ...]) -> tuple[ArtifactManifest, ...]: ...
+    def find_by_source_registration_digest(self, digest: Digest) -> ArtifactManifest | None: ...
+    def add_derived(
+        self,
+        *,
+        artifact_id: ArtifactId,
+        artifact_type: str,
+        artifact_schema_version: str,
+        content_digest: Digest,
+        created_at: datetime,
+        availability_authority: str,
+        availability_method: str,
+        parent_available_ats: tuple[datetime, ...],
+        activity_completed_at: datetime,
+        run_id: RunId | None,
+        configuration_snapshot_id: ConfigurationSnapshotId,
+        configuration_digest: Digest,
+        code_revision: str,
+        environment_digest: Digest,
+        quality_state: str,
+        attributes: dict[str, object] | None,
+    ) -> ArtifactManifest: ...
 
 
 class _ActivityRepositoryLike(Protocol):
     def add_started(self, manifest: ActivityManifest) -> ActivityManifest: ...
     def finish_succeeded(
-        self, activity_id: str, outputs: tuple[ActivityArtifactRef, ...], completed_at: datetime
+        self,
+        activity_id: ActivityId,
+        outputs: tuple[ActivityArtifactRef, ...],
+        completed_at: datetime,
     ) -> ActivityManifest: ...
     def finish_failed(
-        self, activity_id: str, error: ActivityError, completed_at: datetime
+        self, activity_id: ActivityId, error: ActivityError, completed_at: datetime
     ) -> ActivityManifest: ...
-    def find_succeeded_by_idempotency(self, digest: str) -> ActivityManifest | None: ...
+    def find_succeeded_by_idempotency(self, digest: Digest) -> ActivityManifest | None: ...
 
 
 class _ConfigurationSnapshotLike(Protocol):
-    configuration_snapshot_id: str
-    configuration_digest: str
+    configuration_snapshot_id: ConfigurationSnapshotId
+    configuration_digest: Digest
 
 
 class _ConfigurationRepositoryLike(Protocol):
-    def get(self, snapshot_id: str) -> _ConfigurationSnapshotLike: ...
+    def get(self, snapshot_id: ConfigurationSnapshotId) -> _ConfigurationSnapshotLike: ...
 
 
 class _RunRepositoryLike(Protocol):
@@ -99,7 +121,7 @@ class _UnitOfWorkLike(Protocol):
 
 
 class _IdempotencyLockLike(Protocol):
-    def acquire(self, digest: str) -> Any: ...  # context manager
+    def acquire(self, digest: Digest) -> Any: ...  # context manager
 
 
 # --------------------------------------------------------------------------
@@ -227,7 +249,11 @@ class ArtifactService:
         self._idempotency_lock = idempotency_lock
 
     def _verify_configuration_consistency(
-        self, uow: _UnitOfWorkLike, *, configuration_snapshot_id: str, configuration_digest: str
+        self,
+        uow: _UnitOfWorkLike,
+        *,
+        configuration_snapshot_id: ConfigurationSnapshotId,
+        configuration_digest: Digest,
     ) -> None:
         """Load the referenced configuration snapshot from the repository
         and verify the caller-supplied ``configuration_digest`` matches
@@ -270,7 +296,7 @@ class ArtifactService:
 
         source_registration_digest = _source_registration_digest(request, content_digest)
 
-        with self._idempotency_lock.acquire(str(source_registration_digest)):
+        with self._idempotency_lock.acquire(source_registration_digest):
             with self._unit_of_work_factory() as uow:
                 self._verify_configuration_consistency(
                     uow,
@@ -278,13 +304,13 @@ class ArtifactService:
                     configuration_digest=request.configuration_digest,
                 )
                 existing = uow.artifacts.find_by_source_registration_digest(
-                    str(source_registration_digest)
+                    source_registration_digest
                 )
                 if existing is not None:
                     return existing
 
             stored_object = self._object_store.put_if_absent(
-                str(content_digest), payload, request.media_type
+                content_digest, payload, request.media_type
             )
 
             registered_at = datetime.now(UTC)
@@ -448,16 +474,14 @@ class ArtifactService:
             output_schema=request.output_artifact_schema_version,
         )
 
-        with self._idempotency_lock.acquire(str(idempotency_digest)):
+        with self._idempotency_lock.acquire(idempotency_digest):
             with self._unit_of_work_factory() as uow:
                 self._verify_configuration_consistency(
                     uow,
                     configuration_snapshot_id=request.configuration_snapshot_id,
                     configuration_digest=request.configuration_digest,
                 )
-                existing_activity = uow.activities.find_succeeded_by_idempotency(
-                    str(idempotency_digest)
-                )
+                existing_activity = uow.activities.find_succeeded_by_idempotency(idempotency_digest)
                 if existing_activity is not None:
                     output_ref = existing_activity.outputs[0]
                     existing_output = uow.artifacts.get(output_ref.artifact_id)
@@ -509,7 +533,7 @@ class ArtifactService:
                 serialized = serializer.serialize(output_dataset)
                 content_digest = Digest.of_bytes(serialized)
                 stored_object = self._object_store.put_if_absent(
-                    str(content_digest), serialized, request.output_media_type
+                    content_digest, serialized, request.output_media_type
                 )
 
                 # completed_at is real wall-clock time for the activity's
@@ -521,7 +545,7 @@ class ArtifactService:
                 # never with datetime.now() here.
                 completed_at = datetime.now(UTC)
                 parent_available_ats = tuple(m.availability.available_at for m in input_manifests)
-                output_artifact_id = str(ArtifactId.generate())
+                output_artifact_id = ArtifactId.generate()
 
                 with self._unit_of_work_factory() as uow:
                     uow.stored_objects.add_if_absent(stored_object)
@@ -529,7 +553,7 @@ class ArtifactService:
                         artifact_id=output_artifact_id,
                         artifact_type=request.output_artifact_type,
                         artifact_schema_version=request.output_artifact_schema_version,
-                        content_digest=str(content_digest),
+                        content_digest=content_digest,
                         created_at=completed_at,
                         availability_authority="mesoforge.derived",
                         availability_method=f"{request.activity_type}.{request.activity_version}",
@@ -576,30 +600,32 @@ class ArtifactService:
     def create_run(
         self,
         *,
-        run_id: str | RunId,
+        run_id: RunId,
         forecast_issue_time: datetime,
         information_cutoff: datetime,
-        configuration_snapshot_id: str | ConfigurationSnapshotId,
-        configuration_digest: str | Digest,
+        configuration_snapshot_id: ConfigurationSnapshotId,
+        configuration_digest: Digest,
         code_revision: str,
-        environment_digest: str | Digest,
-        lockfile_digest: str | Digest,
+        environment_digest: Digest,
+        lockfile_digest: Digest,
         random_seed: int,
-        selected_input_artifact_ids: tuple[str | ArtifactId, ...],
+        selected_input_artifact_ids: tuple[ArtifactId, ...],
         require_source_inputs: bool = True,
     ) -> RunManifest:
         """
         Exact order (fail-closed at every step; no run row is created
         unless all checks pass):
 
-        0. every ID/digest parameter is validated against its typed
-           ``common.identifiers`` type immediately -- a malformed
-           ``run_id``/``configuration_snapshot_id``/``configuration_digest``/
-           ``environment_digest``/``lockfile_digest``/element of
-           ``selected_input_artifact_ids`` raises ``InvalidIdentifier``
-           before any repository call (Codex review t_f569c45c finding
-           3: ``create_run`` is a public service boundary and must not
-           accept unrestricted ``str`` for these fields);
+        0. every ID/digest parameter is re-validated against its typed
+           ``common.identifiers`` type immediately -- the public
+           signature itself only accepts the typed ``RunId`` /
+           ``ConfigurationSnapshotId`` / ``Digest`` /
+           ``tuple[ArtifactId, ...]`` types (final re-review HIGH
+           finding 6/t_1ecb8414: a ``str | Typed`` union boundary is
+           not a typed boundary), and re-constructing each typed value
+           here also rejects a caller that bypasses static typing (e.g.
+           an untyped/dynamic caller) at runtime, before any
+           repository call (Codex review t_f569c45c finding 3);
         1. load the configuration snapshot from the repository and
            verify the caller-supplied ``configuration_digest`` matches
            it -- a tampered/inconsistent snapshot+digest pair is

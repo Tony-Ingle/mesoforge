@@ -5,6 +5,13 @@ The concrete unit-of-work / repository protocols this depends on live in
 ``storage.interfaces`` (implemented in Task 8/9); this module depends
 only on structural typing (Protocol), matching the plan's dependency
 direction: application -> catalog, contracts, storage.interfaces, common.
+
+Injected protocol ID/digest parameters use the typed
+``common.identifiers`` classes (``GridId``, ``Digest``,
+``ConfigurationSnapshotId``), not an unrestricted ``str`` (Codex review
+t_f569c45c finding 3; final re-review HIGH finding 6/t_1ecb8414: every
+application-layer injected protocol must conform to the typed storage
+boundary it composes, not just ``application/artifacts.py``'s).
 """
 
 from __future__ import annotations
@@ -18,11 +25,12 @@ from mesoforge.catalog.configuration import (
     compute_configuration_digest,
     compute_configuration_snapshot_id,
 )
+from mesoforge.common.identifiers import ConfigurationSnapshotId, Digest, GridId
 
 
 class _GridRepositoryLike(Protocol):
     def add_if_absent(
-        self, grid_id: str, definition_digest: str, canonical_json: dict[str, Any]
+        self, grid_id: GridId, definition_digest: Digest, canonical_json: dict[str, Any]
     ) -> Any: ...
 
 
@@ -50,8 +58,8 @@ class _ConfigurationSnapshotRecord:
     def __init__(
         self,
         *,
-        configuration_snapshot_id: str,
-        configuration_digest: str,
+        configuration_snapshot_id: ConfigurationSnapshotId,
+        configuration_digest: Digest,
         canonical_json: dict[str, Any],
         created_at: datetime,
     ) -> None:
@@ -80,13 +88,13 @@ class ConfigurationService:
             for grid in configuration.grids:
                 unit_of_work.grids.add_if_absent(
                     grid.grid_id,
-                    str(grid.definition_digest),
+                    grid.definition_digest,
                     grid.model_dump(mode="json"),
                 )
 
             record = _ConfigurationSnapshotRecord(
-                configuration_snapshot_id=str(snapshot_id),
-                configuration_digest=str(digest),
+                configuration_snapshot_id=snapshot_id,
+                configuration_digest=digest,
                 canonical_json=canonical_json,
                 created_at=datetime.now(UTC),
             )

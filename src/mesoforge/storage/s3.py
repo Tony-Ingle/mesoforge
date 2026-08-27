@@ -29,6 +29,13 @@ before returning them as if they matched. All three are fixed below:
   the existing bytes are hash-verified against the expected digest
   before being reported as a successful ``put_if_absent``, rather than
   trusting the previously stored ``ContentLength``/metadata alone.
+
+Every public method's digest parameters use the typed ``Digest`` class,
+not an unrestricted ``str`` (Codex review t_f569c45c finding 3; final
+re-review HIGH finding 6/t_1ecb8414: public object-store digest
+boundaries must be typed). A caller-supplied digest is re-constructed
+against ``Digest`` immediately, so a malformed value fails closed with
+``InvalidIdentifier`` before any S3 call is issued.
 """
 
 from __future__ import annotations
@@ -40,9 +47,11 @@ import boto3
 from botocore.exceptions import ClientError
 
 from mesoforge.common.errors import IntegrityError, NotFound
+from mesoforge.common.identifiers import Digest
 
 
-def content_addressed_key(content_digest: str) -> str:
+def content_addressed_key(content_digest: Digest) -> str:
+    content_digest = Digest(content_digest)
     algorithm, _, hex_part = content_digest.partition(":")
     if algorithm != "sha256" or len(hex_part) != 64:
         raise ValueError(f"expected a sha256:<64 hex> digest, got {content_digest!r}")
@@ -51,7 +60,7 @@ def content_addressed_key(content_digest: str) -> str:
 
 @dataclass(frozen=True)
 class S3StoredObject:
-    content_digest: str
+    content_digest: Digest
     storage_uri: str
     media_type: str
     byte_size: int
@@ -89,13 +98,18 @@ class S3ArtifactObjectStore:
     def _storage_uri(self, key: str) -> str:
         return f"s3://{self._bucket}/{key}"
 
-    def put_if_absent(self, content_digest: str, data: bytes, media_type: str) -> S3StoredObject:
+    def put_if_absent(self, content_digest: Digest, data: bytes, media_type: str) -> S3StoredObject:
+        # Public boundary: construct the typed Digest immediately so a
+        # caller that bypasses static typing at runtime with a malformed
+        # value fails closed here, before any S3 call is issued.
+        content_digest = Digest(content_digest)
+
         # Never trust a claimed digest: hash the actual bytes ourselves.
         # A caller-supplied content_digest that disagrees with the real
         # hash of `data` is a programming error upstream (callers are
         # expected to pass Digest.of_bytes(data)); fail closed rather
         # than storing corrupt/mislabeled content under the wrong key.
-        actual_digest = f"sha256:{hashlib.sha256(data).hexdigest()}"
+        actual_digest = Digest(f"sha256:{hashlib.sha256(data).hexdigest()}")
         if actual_digest != content_digest:
             raise IntegrityError(
                 f"put_if_absent called with content_digest {content_digest!r} but the "
@@ -159,7 +173,8 @@ class S3ArtifactObjectStore:
                 byte_size=len(winner_bytes),
             )
 
-    def get_verified(self, storage_uri: str, expected_digest: str) -> bytes:
+    def get_verified(self, storage_uri: str, expected_digest: Digest) -> bytes:
+        expected_digest = Digest(expected_digest)
         key = self._key_from_uri(storage_uri)
         try:
             response = self._client.get_object(Bucket=self._bucket, Key=key)
@@ -168,7 +183,7 @@ class S3ArtifactObjectStore:
                 raise NotFound(f"no object at {storage_uri!r}") from exc
             raise
         data = response["Body"].read()
-        actual_digest = f"sha256:{hashlib.sha256(data).hexdigest()}"
+        actual_digest = Digest(f"sha256:{hashlib.sha256(data).hexdigest()}")
         if actual_digest != expected_digest:
             raise IntegrityError(
                 f"checksum mismatch retrieving {storage_uri!r}: expected "
@@ -176,7 +191,7 @@ class S3ArtifactObjectStore:
             )
         return data
 
-    def exists_verified(self, storage_uri: str, expected_digest: str) -> bool:
+    def exists_verified(self, storage_uri: str, expected_digest: Digest) -> bool:
         try:
             self.get_verified(storage_uri, expected_digest)
         except (NotFound, IntegrityError):
