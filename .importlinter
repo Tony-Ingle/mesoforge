@@ -13,8 +13,8 @@ layers =
     mesoforge.contracts
     mesoforge.common
 
-[importlinter:contract:common-stdlib-only]
-name = common depends on the standard library only
+[importlinter:contract:common-no-internal-deps]
+name = common depends on no other mesoforge package (foundational layer)
 type = forbidden
 source_modules =
     mesoforge.common
@@ -24,12 +24,21 @@ forbidden_modules =
     mesoforge.provenance
     mesoforge.storage
     mesoforge.application
-    pydantic
+
+[importlinter:contract:common-no-heavy-infra]
+name = common never imports storage/array infrastructure libraries
+type = forbidden
+source_modules =
+    mesoforge.common
+forbidden_modules =
     sqlalchemy
     psycopg
+    alembic
     boto3
     xarray
     numpy
+    h5netcdf
+    pyproj
 
 [importlinter:contract:domain-no-infrastructure]
 name = contracts/catalog/provenance never import infrastructure libraries

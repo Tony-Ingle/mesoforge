@@ -68,3 +68,18 @@ resolution across machines and CI.
 - Workflow orchestration engine (Prefect vs. Dagster) — no Phase 0
   interface depends on this choice.
 - Public API layer (FastAPI or otherwise) and UI.
+
+## Implementation clarification (Phase 0 build)
+
+The Phase 0 plan states `common -> Python standard library only`. In
+practice, `common/time.py` (plan Section 4.2) is required to define
+Pydantic models (`IntervalDefinition`, `TimeAxisDefinition`) with strict
+`ConfigDict` validation, so a literal stdlib-only reading is
+unsatisfiable. The enforced `import-linter` contract instead encodes the
+intent behind that rule: `mesoforge.common` may depend on general-purpose
+validation libraries (Pydantic) but must import zero other `mesoforge.*`
+package and zero heavy storage/array infrastructure library (SQLAlchemy,
+psycopg, Alembic, boto3, NumPy, xarray, h5netcdf, pyproj). This keeps
+`common` foundational and dependency-free with respect to the rest of the
+codebase while remaining implementable. Flagged for Codex review rather
+than silently narrowing scope.

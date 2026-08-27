@@ -25,6 +25,7 @@ MAX_FIXTURE_BYTES = 1024 * 1024  # 1 MiB
 
 FORBIDDEN_SUFFIXES = (".grib", ".grib2", ".idx")
 FORBIDDEN_NAME_PATTERNS = (re.compile(r"^\.env(\..+)?$"),)
+ALLOWED_ENV_FILENAMES = {".env.example"}
 FORBIDDEN_DIR_NAMES = {
     "__pycache__",
     ".venv",
@@ -71,7 +72,7 @@ def check_forbidden_names(root: Path) -> list[str]:
             continue
 
         for pattern in FORBIDDEN_NAME_PATTERNS:
-            if pattern.match(name):
+            if pattern.match(name) and name not in ALLOWED_ENV_FILENAMES:
                 errors.append(f"{rel}: forbidden .env credential file must not be committed")
                 break
     return errors
