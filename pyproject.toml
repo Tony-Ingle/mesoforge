@@ -32,6 +32,7 @@ dev = [
     "pre-commit>=4,<5",
     "pgserver>=0.1.4,<1",
     "boto3-stubs[s3]>=1.35,<2",
+    "types-PyYAML>=6,<7",
 ]
 
 [build-system]

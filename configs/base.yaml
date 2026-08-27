@@ -1,0 +1,54 @@
+grids:
+  - grid_id: synthetic-grid.v1
+    crs_wkt2: |
+      GEOGCRS["WGS 84",DATUM["World Geodetic System 1984",
+      ELLIPSOID["WGS 84",6378137,298.257223563]],
+      PRIMEM["Greenwich",0],
+      CS[ellipsoidal,2],AXIS["geodetic latitude",north],
+      AXIS["geodetic longitude",east],ANGLEUNIT["degree",0.0174532925199433],
+      ID["EPSG",4326]]
+    shape_y: 2
+    shape_x: 2
+    x_coordinates: [-100.0, -99.0]
+    y_coordinates: [39.0, 40.0]
+    coordinate_reference: cell_center
+    longitude_convention: minus_180_to_180
+    orientation: x_east_y_north
+    spatial_support: cell_mean
+
+vertical_definitions:
+  - vertical_definition_id: height-agl-2m
+    coordinate_type: height_above_ground
+    value: 2.0
+    unit_id: m
+
+variables:
+  - variable_id: air_temperature_2m
+    standard_name: air_temperature
+    canonical_unit_id: K
+    dtype: float32
+    temporal_semantics: instantaneous
+    spatial_support: cell_mean
+    vertical_definition_id: height-agl-2m
+    allowed_dimension_variants:
+      - [lead_time, y, x]
+    missing_value_policy: nan_with_quality_mask
+    interval_required: false
+  - variable_id: air_temperature_2m_source_degc
+    standard_name: air_temperature
+    canonical_unit_id: degC
+    dtype: float32
+    temporal_semantics: instantaneous
+    spatial_support: cell_mean
+    vertical_definition_id: height-agl-2m
+    allowed_dimension_variants:
+      - [lead_time, y, x]
+    missing_value_policy: nan_with_quality_mask
+    interval_required: false
+
+artifact_store:
+  endpoint_reference: MESOFORGE_S3_ENDPOINT
+  bucket: mesoforge-phase0
+
+metadata_store:
+  dsn_environment_variable: MESOFORGE_DATABASE_DSN
