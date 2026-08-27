@@ -18,6 +18,7 @@ from mesoforge.common.identifiers import ArtifactId, Digest
 from mesoforge.common.time import UtcInstant
 from mesoforge.contracts.artifacts import ArtifactManifest, Availability, SourceIdentity
 from mesoforge.contracts.provenance import ActivityArtifactRef, ActivityError, ActivityManifest
+from mesoforge.contracts.runs import RunManifest
 from mesoforge.provenance.services import compute_idempotency_digest
 
 # --------------------------------------------------------------------------
@@ -393,3 +394,49 @@ class ArtifactService:
                     uow.activities.finish_failed(activity_id_typed, error, failure_time)
                     uow.commit()
                 raise
+
+    # ------------------------------------------------------------------
+    # Run creation eligibility (plan Section 4.8 invariant: "each
+    # selected source input has authoritative available_at <=
+    # information_cutoff"; fails closed, creates no run row.)
+    # ------------------------------------------------------------------
+
+    def create_run(
+        self,
+        *,
+        run_id: str,
+        forecast_issue_time: datetime,
+        information_cutoff: datetime,
+        configuration_snapshot_id: str,
+        configuration_digest: str,
+        code_revision: str,
+        environment_digest: str,
+        lockfile_digest: str,
+        random_seed: int,
+        selected_inputs: tuple[ArtifactManifest, ...],
+    ) -> Any:
+        for artifact in selected_inputs:
+            if artifact.availability.available_at > information_cutoff:
+                raise ValueError(
+                    f"selected input {artifact.artifact_id!r} has available_at "
+                    f"{artifact.availability.available_at!r} after information_cutoff "
+                    f"{information_cutoff!r}; run creation fails closed"
+                )
+
+        manifest = RunManifest(
+            run_id=run_id,
+            forecast_issue_time=forecast_issue_time,
+            information_cutoff=information_cutoff,
+            configuration_snapshot_id=configuration_snapshot_id,
+            configuration_digest=configuration_digest,
+            code_revision=code_revision,
+            environment_digest=environment_digest,
+            lockfile_digest=lockfile_digest,
+            random_seed=random_seed,
+            selected_input_artifact_ids=tuple(a.artifact_id for a in selected_inputs),
+            created_at=datetime.now(UTC),
+        )
+        with self._unit_of_work_factory() as uow:
+            created = uow.runs.add(manifest)  # type: ignore[attr-defined]
+            uow.commit()
+            return created

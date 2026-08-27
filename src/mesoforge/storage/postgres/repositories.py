@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from mesoforge.common.errors import Conflict, NotFound
 from mesoforge.contracts.artifacts import ArtifactManifest, Availability, SourceIdentity
 from mesoforge.contracts.provenance import ActivityArtifactRef, ActivityError, ActivityManifest
+from mesoforge.contracts.runs import RunManifest
 from mesoforge.storage.postgres.database import create_database_engine, create_session_factory
 from mesoforge.storage.postgres.models import (
     ActivityInputRow,
@@ -26,6 +27,7 @@ from mesoforge.storage.postgres.models import (
     ArtifactRow,
     ConfigurationSnapshotRow,
     GridRow,
+    RunRow,
     StoredObjectRow,
 )
 
@@ -406,6 +408,52 @@ class PostgresActivityRepository:
         return tuple(_activity_row_to_manifest(row) for row in rows if row is not None)
 
 
+def _run_row_to_manifest(row: RunRow) -> RunManifest:
+    return RunManifest(
+        run_id=f"run_{row.id}",
+        forecast_issue_time=row.forecast_issue_time,
+        information_cutoff=row.information_cutoff,
+        configuration_snapshot_id=row.configuration_snapshot_id,
+        configuration_digest=row.configuration_digest,
+        code_revision=row.code_revision,
+        environment_digest=row.environment_digest,
+        lockfile_digest=row.lockfile_digest,
+        random_seed=row.random_seed,
+        selected_input_artifact_ids=tuple(row.selected_inputs.get("artifact_ids", [])),
+        created_at=row.created_at,
+    )
+
+
+class PostgresRunRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, manifest: RunManifest) -> RunManifest:
+        row = RunRow(
+            id=uuid.UUID(manifest.run_id.removeprefix("run_")),
+            schema_version=manifest.schema_version,
+            forecast_issue_time=manifest.forecast_issue_time,
+            information_cutoff=manifest.information_cutoff,
+            configuration_snapshot_id=manifest.configuration_snapshot_id,
+            configuration_digest=manifest.configuration_digest,
+            code_revision=manifest.code_revision,
+            environment_digest=manifest.environment_digest,
+            lockfile_digest=manifest.lockfile_digest,
+            random_seed=manifest.random_seed,
+            selected_inputs={"artifact_ids": list(manifest.selected_input_artifact_ids)},
+        )
+        self._session.add(row)
+        self._session.flush()
+        self._session.refresh(row)
+        return _run_row_to_manifest(row)
+
+    def get(self, run_id: str) -> RunManifest:
+        row = self._session.get(RunRow, uuid.UUID(run_id.removeprefix("run_")))
+        if row is None:
+            raise NotFound(f"run {run_id!r} not found")
+        return _run_row_to_manifest(row)
+
+
 class PostgresUnitOfWork:
     """Concrete storage.interfaces.UnitOfWork over one SQLAlchemy Session."""
 
@@ -421,6 +469,7 @@ class PostgresUnitOfWork:
         self.stored_objects = PostgresStoredObjectRepository(self._session)
         self.artifacts = PostgresArtifactRepository(self._session)
         self.activities = PostgresActivityRepository(self._session)
+        self.runs = PostgresRunRepository(self._session)
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:

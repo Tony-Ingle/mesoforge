@@ -27,19 +27,23 @@ class TestPostgresIdempotencyLock:
         lock = PostgresIdempotencyLock(postgres_dsn)
         digest = "sha256:" + "b" * 64
         order: list[str] = []
-        barrier = threading.Barrier(2)
+        first_started = threading.Event()
 
         def _worker(name: str, hold_seconds: float) -> None:
-            barrier.wait()
             with lock.acquire(digest):
                 order.append(f"{name}-start")
+                if name == "first":
+                    first_started.set()
                 time.sleep(hold_seconds)
                 order.append(f"{name}-end")
 
         t1 = threading.Thread(target=_worker, args=("first", 0.3))
-        t2 = threading.Thread(target=_worker, args=("second", 0.0))
         t1.start()
-        time.sleep(0.05)
+        # Deterministically wait for the first thread to actually hold the
+        # lock before starting the second, so this test proves ordering
+        # rather than racing two threads against the lock simultaneously.
+        assert first_started.wait(timeout=5)
+        t2 = threading.Thread(target=_worker, args=("second", 0.0))
         t2.start()
         t1.join(timeout=5)
         t2.join(timeout=5)
