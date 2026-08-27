@@ -1,0 +1,29 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.10
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: uv run mypy src scripts
+        language: system
+        pass_filenames: false
+      - id: import-linter
+        name: import-linter
+        entry: uv run lint-imports
+        language: system
+        pass_filenames: false
+      - id: validate-docs
+        name: validate-docs
+        entry: uv run python scripts/validate_docs.py
+        language: system
+        pass_filenames: false
+      - id: repository-hygiene
+        name: repository-hygiene
+        entry: uv run python scripts/check_repository_hygiene.py
+        language: system
+        pass_filenames: false

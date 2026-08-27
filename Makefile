@@ -1,0 +1,67 @@
+.PHONY: sync lock-check fmt fmt-check lint typecheck import-lint docs-check \
+        hygiene-check unit contract property integration acceptance \
+        test test-all coverage services-up services-down migrate quality ci
+
+sync:
+	uv sync --all-groups
+
+lock-check:
+	uv lock --check
+
+fmt:
+	uv run ruff format .
+
+fmt-check:
+	uv run ruff format --check .
+
+lint:
+	uv run ruff check .
+
+typecheck:
+	uv run mypy src scripts
+
+import-lint:
+	uv run lint-imports
+
+docs-check:
+	uv run python scripts/validate_docs.py
+
+hygiene-check:
+	uv run python scripts/check_repository_hygiene.py
+
+quality: lock-check fmt-check lint typecheck import-lint docs-check hygiene-check
+
+unit:
+	uv run pytest tests/unit -q
+
+contract:
+	uv run pytest tests/contracts -q
+
+property:
+	uv run pytest tests/property -q
+
+integration:
+	uv run pytest -m integration -q
+
+acceptance:
+	uv run pytest tests/acceptance -q
+
+test:
+	uv run pytest tests/unit tests/contracts tests/property -q
+
+test-all:
+	uv run pytest -q
+
+coverage:
+	uv run pytest --cov=mesoforge --cov-report=term-missing --cov-fail-under=90 -q
+
+services-up:
+	docker compose -f deploy/local/compose.yaml up -d --wait
+
+services-down:
+	docker compose -f deploy/local/compose.yaml down -v
+
+migrate:
+	uv run alembic upgrade head
+
+ci: sync quality test

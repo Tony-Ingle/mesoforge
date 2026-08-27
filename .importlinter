@@ -1,0 +1,45 @@
+[importlinter]
+root_packages =
+    mesoforge
+include_external_packages = True
+
+[importlinter:contract:core-layers]
+name = MesoForge Phase 0 core layering (application above provenance/catalog/contracts/common)
+type = layers
+layers =
+    mesoforge.application
+    mesoforge.provenance
+    mesoforge.catalog
+    mesoforge.contracts
+    mesoforge.common
+
+[importlinter:contract:common-stdlib-only]
+name = common depends on the standard library only
+type = forbidden
+source_modules =
+    mesoforge.common
+forbidden_modules =
+    mesoforge.contracts
+    mesoforge.catalog
+    mesoforge.provenance
+    mesoforge.storage
+    mesoforge.application
+    pydantic
+    sqlalchemy
+    psycopg
+    boto3
+    xarray
+    numpy
+
+[importlinter:contract:domain-no-infrastructure]
+name = contracts/catalog/provenance never import infrastructure libraries
+type = forbidden
+source_modules =
+    mesoforge.contracts
+    mesoforge.catalog
+    mesoforge.provenance
+forbidden_modules =
+    boto3
+    sqlalchemy
+    psycopg
+    alembic
