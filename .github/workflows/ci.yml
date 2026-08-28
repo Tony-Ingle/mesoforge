@@ -54,7 +54,7 @@ jobs:
       - name: Sync dependencies
         run: uv sync --locked --all-groups
       - name: Unit, contract, property tests
-        run: uv run pytest tests/unit tests/contracts tests/property --cov=mesoforge --cov-report=term-missing -q
+        run: uv run pytest tests/unit tests/contracts tests/property -q
       - name: Scientific tests (offline, deterministic)
         run: uv run pytest -m scientific -q
       - name: Full offline coverage threshold
