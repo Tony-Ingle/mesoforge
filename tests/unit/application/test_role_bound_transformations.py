@@ -103,7 +103,15 @@ def _raw_bytes_loader(payload: bytes) -> bytes:
     return payload
 
 
+def _validate_any(_value: object) -> None:
+    return None
+
+
 class TestExecuteRoleBoundTransformation:
+    def test_binding_cannot_omit_validation(self) -> None:
+        with pytest.raises(TypeError, match="requires callable"):
+            InputBinding(parse_canonical_json, None)  # type: ignore[arg-type]
+
     def test_merges_json_and_raw_inputs_by_role(self, service_and_uow) -> None:
         service, _uow_factory, _object_store = service_and_uow
         json_artifact = service.register_source(
@@ -131,8 +139,8 @@ class TestExecuteRoleBoundTransformation:
             transform,
             CanonicalJsonSerializer(),
             input_bindings={
-                "inventory": InputBinding(parse_canonical_json, None),
-                "grib": InputBinding(_raw_bytes_loader, None),
+                "inventory": InputBinding(parse_canonical_json, _validate_any),
+                "grib": InputBinding(_raw_bytes_loader, _validate_any),
             },
             output_validator=lambda output: None,
         )
@@ -206,8 +214,8 @@ class TestExecuteRoleBoundTransformation:
                 lambda inputs: {},
                 CanonicalJsonSerializer(),
                 input_bindings={
-                    "inventory": InputBinding(parse_canonical_json, None),
-                    "unexpected": InputBinding(parse_canonical_json, None),
+                    "inventory": InputBinding(parse_canonical_json, _validate_any),
+                    "unexpected": InputBinding(parse_canonical_json, _validate_any),
                 },
                 output_validator=lambda output: None,
             )
@@ -225,7 +233,7 @@ class TestExecuteRoleBoundTransformation:
         def transform(inputs: object) -> dict[str, object]:
             return {"station": inputs["inventory"]["station"]}  # type: ignore[index]
 
-        bindings = {"inventory": InputBinding(parse_canonical_json, None)}
+        bindings = {"inventory": InputBinding(parse_canonical_json, _validate_any)}
         first = service.execute_role_bound_transformation(
             request,
             transform,
@@ -256,7 +264,7 @@ class TestExecuteRoleBoundTransformation:
         request = _transformation_request(
             (TransformationInputRef(role="inventory", artifact_id=json_artifact.artifact_id),),
         )
-        bindings = {"inventory": InputBinding(parse_canonical_json, None)}
+        bindings = {"inventory": InputBinding(parse_canonical_json, _validate_any)}
 
         def transform(inputs: object) -> dict[str, object]:
             return {"station": inputs["inventory"]["station"]}  # type: ignore[index]

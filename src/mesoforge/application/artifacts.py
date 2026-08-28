@@ -14,7 +14,7 @@ from typing import Any, Protocol
 import jcs
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from mesoforge.common.errors import IntegrityError
+from mesoforge.common.errors import Conflict, IntegrityError, NotFound
 from mesoforge.common.identifiers import (
     ActivityId,
     ArtifactId,
@@ -106,6 +106,7 @@ class _ConfigurationRepositoryLike(Protocol):
 
 class _RunRepositoryLike(Protocol):
     def add(self, manifest: RunManifest) -> RunManifest: ...
+    def get(self, run_id: RunId) -> RunManifest: ...
 
 
 class _UnitOfWorkLike(Protocol):
@@ -220,15 +221,9 @@ class InputBinding:
     """A role-scoped ``(loader, validator)`` pair for
     ``execute_role_bound_transformation`` (plan Section 4.4).
 
-    ``validator`` may be ``None`` for a role whose deserialized payload
-    is not a canonical xarray.Dataset (e.g. a raw-bytes or Parquet-table
-    input using an explicit raw contract validator supplied as the
-    loader's own responsibility) -- but every role must still supply a
-    loader; there is no way to omit validation *silently* the way the
-    pre-Phase-1 ``execute_transformation`` mistake did, because the
-    caller must explicitly construct an ``InputBinding(loader, None)``
-    for that role, a visible, auditable per-role decision rather than a
-    single implicit flag governing every input.
+    Both callables are mandatory. Raw inputs use an explicit raw-byte
+    contract validator; validation may not be hidden in a loader or
+    silently disabled with ``None``.
     """
 
     __slots__ = ("loader", "validator")
@@ -236,8 +231,10 @@ class InputBinding:
     def __init__(
         self,
         loader: Callable[[bytes], Any],
-        validator: Callable[[Any], None] | None,
+        validator: Callable[[Any], None],
     ) -> None:
+        if not callable(loader) or not callable(validator):
+            raise TypeError("InputBinding requires callable loader and validator")
         self.loader = loader
         self.validator = validator
 
@@ -583,8 +580,7 @@ class ArtifactService:
                 ):
                     binding = role_bindings[role]
                     value = binding.loader(payload)
-                    if binding.validator is not None:
-                        binding.validator(value)
+                    binding.validator(value)
                     input_datasets.append(value)
                     role_to_value[role] = value
                 transform_input: Any = MappingProxyType(role_to_value)
@@ -780,6 +776,39 @@ class ArtifactService:
                         f"{artifact.availability.available_at!r} after information_cutoff "
                         f"{information_cutoff!r}; run creation fails closed"
                     )
+
+            try:
+                existing = uow.runs.get(run_id)
+            except NotFound:
+                existing = None
+            if existing is not None:
+                requested_identity = (
+                    forecast_issue_time,
+                    information_cutoff,
+                    configuration_snapshot_id,
+                    configuration_digest,
+                    code_revision,
+                    environment_digest,
+                    lockfile_digest,
+                    random_seed,
+                    tuple(a.artifact_id for a in selected_inputs),
+                )
+                existing_identity = (
+                    existing.forecast_issue_time,
+                    existing.information_cutoff,
+                    existing.configuration_snapshot_id,
+                    existing.configuration_digest,
+                    existing.code_revision,
+                    existing.environment_digest,
+                    existing.lockfile_digest,
+                    existing.random_seed,
+                    existing.selected_input_artifact_ids,
+                )
+                if existing_identity != requested_identity:
+                    raise Conflict(
+                        f"run_id {run_id!r} already exists with a different immutable identity"
+                    )
+                return existing
 
             manifest = RunManifest(
                 run_id=RunId(run_id),

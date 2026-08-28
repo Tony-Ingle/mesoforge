@@ -124,4 +124,7 @@ source_modules =
 forbidden_modules =
     mesoforge.guidance.sources.hrrr
     mesoforge.observations.sources.aviationweather
+ignore_imports =
+    mesoforge.guidance.acquisition -> mesoforge.guidance.sources.hrrr
+    mesoforge.observations.acquisition -> mesoforge.observations.sources.aviationweather
 
