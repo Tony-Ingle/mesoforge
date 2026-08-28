@@ -112,6 +112,14 @@ _ALLOWED_PLAIN_STR_SITES: dict[str, str] = {
     "mesoforge.contracts.datasets.VariableLike.vertical_definition_id": (
         "catalog vertical-definition label; no typed value class exists in Phase 0"
     ),
+    "mesoforge.contracts.observations.RawMetarRecord.icao_id": (
+        "external AviationWeather.gov provider ICAO identifier, not a MesoForge "
+        "StationId -- station-catalog resolution maps this to StationId separately"
+    ),
+    "mesoforge.contracts.observations.NormalizedObservation.provider_station_id": (
+        "external AviationWeather.gov provider ICAO identifier retained as lineage, "
+        "not a MesoForge StationId (see station_id on the same model)"
+    ),
 }
 
 # Name patterns that flag a parameter/attribute as identifier/digest-like
