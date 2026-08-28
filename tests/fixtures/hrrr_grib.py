@@ -16,12 +16,12 @@ LOV_DEGREES = 262.5
 LAD_DEGREES = 38.5
 LATIN1_DEGREES = 38.5
 LATIN2_DEGREES = 38.5
-FIRST_LAT_DEGREES = 44.5
-FIRST_LON_DEGREES = 267.5  # -92.5, east of Grasston so the domain sits mid-grid
+FIRST_LAT_DEGREES = 44.9
+FIRST_LON_DEGREES = 265.7  # -94.3; covers the configured Grasston bbox plus halo
 DX_M = 3000.0
 DY_M = 3000.0
-NX = 6
-NY = 6
+NX = 80
+NY = 70
 
 
 def _base_message(*, forecast_hour: int) -> int:
