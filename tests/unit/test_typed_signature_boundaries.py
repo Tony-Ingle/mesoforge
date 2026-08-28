@@ -67,7 +67,12 @@ from mesoforge.common.identifiers import (
     ConfigurationSnapshotId,
     Digest,
     GridId,
+    MatchingPolicyId,
+    MetricSetId,
     RunId,
+    StationId,
+    VariableId,
+    VerticalDefinitionId,
 )
 
 _TYPED_IDENTIFIER_CLASSES = (
@@ -77,6 +82,11 @@ _TYPED_IDENTIFIER_CLASSES = (
     Digest,
     GridId,
     RunId,
+    VariableId,
+    VerticalDefinitionId,
+    StationId,
+    MatchingPolicyId,
+    MetricSetId,
 )
 
 # Parameter/attribute names that look like an identifier/digest but are
