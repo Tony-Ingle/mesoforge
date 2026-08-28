@@ -72,3 +72,24 @@ class TestValidateBaselineForecast:
         dataset["air_temperature_2m"].values[0, 0] = np.nan
         with pytest.raises(BaselineForecastValidationError, match="non-finite"):
             validate_baseline_forecast(dataset)
+
+    def test_rejects_valid_time_anchored_to_issue_time_instead_of_source_time(self) -> None:
+        """Codex review t_09a43c6c finding 3: a baseline whose valid_time
+        was (incorrectly) computed from forecast_issue_time rather than
+        hrrr_source_reference_time must fail validation."""
+        issue_time = np.datetime64("2026-08-28T18:30:00", "ns")
+        source_reference_time = np.datetime64("2026-08-28T18:00:00", "ns")
+        dataset = assemble_baseline_forecast(
+            station_values=_complete_station_values(),
+            lead_hours=tuple(range(7)),
+            forecast_issue_time=issue_time,
+            hrrr_source_reference_time=source_reference_time,
+            contributor_artifact_id="art_" + "0" * 8 + "-0000-0000-0000-000000000000",
+            extraction_report_artifact_id="art_" + "1" * 8 + "-0000-0000-0000-000000000000",
+        )
+        # Mutate valid_time to the (wrong) issue-time-anchored values,
+        # simulating the pre-fix behavior.
+        wrong_valid_time = issue_time + dataset["lead_time"].values
+        dataset = dataset.assign_coords(valid_time=("lead_time", wrong_valid_time))
+        with pytest.raises(BaselineForecastValidationError, match="valid_time must equal"):
+            validate_baseline_forecast(dataset)

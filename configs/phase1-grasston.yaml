@@ -94,6 +94,13 @@ phase1:
       - LoVInDegrees
       - Latin1InDegrees
       - Latin2InDegrees
+      - LaDInDegrees
+      - units
+      - step
+      - dataDate
+      - dataTime
+      - validityDate
+      - validityTime
     retry_policy:
       connect_timeout_seconds: 10.0
       read_timeout_seconds: 60.0

@@ -24,6 +24,17 @@ from mesoforge.observations.sources.aviationweather import (
 _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 504})
 _TERMINAL_STATUS_CODES = frozenset({400, 403, 404})
 
+# Section 2.4/Codex review t_09a43c6c finding 6: AviationWeather.gov
+# documents a 204 as "no data" for the query window -- the exact raw
+# body a 204 carries is not contractually specified (some responses are
+# empty bytes, others may include an incidental whitespace body), so a
+# 204 is always canonicalized to the empty JSON array. This keeps the
+# retained source artifact deterministic/content-addressed regardless
+# of provider-side incidental byte variance, and lets downstream
+# parsing (``parse_raw_metar_response``) treat 200-with-``[]`` and
+# canonicalized-204 identically.
+_CANONICAL_EMPTY_RESPONSE = b"[]"
+
 
 class AviationWeatherAcquisitionError(MesoForgeError):
     """Terminal AviationWeather.gov acquisition failure: a
@@ -37,6 +48,31 @@ class FetchedResponse:
     payload: bytes
     headers: dict[str, str]
     completed_at: datetime
+
+
+class RequestRateLimiter:
+    """Enforces at least ``min_interval_seconds`` between successive
+    requests sharing this limiter instance (plan Section 2.4/Codex
+    review t_09a43c6c finding 6: ``min_request_interval_seconds`` is
+    validated configuration but must actually be enforced -- at
+    minimum -- across the stationinfo and METAR calls of one process,
+    using the injected ``Clock``/``Sleeper`` so unit tests remain
+    deterministic (no real wall-clock sleep)."""
+
+    def __init__(self, min_interval_seconds: float) -> None:
+        if min_interval_seconds <= 0:
+            raise ValueError("min_interval_seconds must be positive")
+        self._min_interval_seconds = min_interval_seconds
+        self._last_request_at: datetime | None = None
+
+    def wait(self, *, clock: Clock, sleeper: Sleeper) -> None:
+        now = clock.now()
+        if self._last_request_at is not None:
+            elapsed_seconds = (now - self._last_request_at).total_seconds()
+            remaining = self._min_interval_seconds - elapsed_seconds
+            if remaining > 0:
+                sleeper.sleep(remaining)
+        self._last_request_at = clock.now()
 
 
 def _header(headers: dict[str, str], name: str) -> str | None:
@@ -93,10 +129,15 @@ def _fetch_with_retry(
             continue
 
         if response.status_code in (200, 204):
+            payload = (
+                _CANONICAL_EMPTY_RESPONSE
+                if response.status_code == 204
+                else bytes(response.content)
+            )
             return FetchedResponse(
                 url=url,
                 status_code=response.status_code,
-                payload=bytes(response.content),
+                payload=payload,
                 headers=dict(response.headers),
                 completed_at=clock.now(),
             )
@@ -134,7 +175,10 @@ def acquire_stationinfo(
     clock: Clock,
     sleeper: Sleeper,
     station_ids: tuple[str, ...],
+    rate_limiter: RequestRateLimiter | None = None,
 ) -> FetchedResponse:
+    if rate_limiter is not None:
+        rate_limiter.wait(clock=clock, sleeper=sleeper)
     url = build_stationinfo_url(settings, station_ids=station_ids)
     return _fetch_with_retry(
         transport,
@@ -154,7 +198,10 @@ def acquire_metar_batch(
     sleeper: Sleeper,
     station_ids: tuple[str, ...],
     query_date: datetime,
+    rate_limiter: RequestRateLimiter | None = None,
 ) -> FetchedResponse:
+    if rate_limiter is not None:
+        rate_limiter.wait(clock=clock, sleeper=sleeper)
     url = build_metar_url(settings, station_ids=station_ids, query_date=query_date)
     return _fetch_with_retry(
         transport,

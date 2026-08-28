@@ -11,6 +11,7 @@ import pytest
 from mesoforge.catalog.sources import AviationWeatherSettings, RetryPolicy
 from mesoforge.observations.acquisition import (
     AviationWeatherAcquisitionError,
+    RequestRateLimiter,
     acquire_metar_batch,
     acquire_stationinfo,
 )
@@ -149,7 +150,23 @@ class TestAcquireStationinfo:
             _SETTINGS, transport=transport, clock=clock, sleeper=sleeper, station_ids=("KCBG",)
         )
         assert result.status_code == 204
-        assert result.payload == b""
+        assert result.payload == b"[]"
+
+    def test_204_canonicalizes_incidental_body_bytes(self) -> None:
+        """Review finding 6: 204 responses must be canonicalized
+        regardless of any incidental raw body bytes the provider
+        actually sends, so the retained source artifact is
+        deterministic across provider-side variance."""
+        transport = _FakeTransport()
+        transport.get_queue = [_FakeResponse(status_code=204, content=b"   ")]
+        clock = _FakeClock(datetime(2026, 8, 28, 12, 0, tzinfo=UTC))
+        sleeper = _FakeSleeper(clock)
+
+        result = acquire_stationinfo(
+            _SETTINGS, transport=transport, clock=clock, sleeper=sleeper, station_ids=("KCBG",)
+        )
+        assert result.status_code == 204
+        assert result.payload == b"[]"
 
     def test_all_retries_exhausted_raises(self) -> None:
         transport = _FakeTransport()
@@ -206,3 +223,110 @@ class TestAcquireMetarBatch:
         )
         assert result.status_code == 200
         assert "ids=KCBG,KJMR,KROS" in transport.calls[0]
+
+
+class TestRequestRateLimiter:
+    """MEDIUM review finding 6: max_requests_per_minute/
+    min_request_interval_seconds are validated config but must
+    actually be enforced across stationinfo/METAR calls, using the
+    injected Clock/Sleeper (never real wall-clock sleep) so tests stay
+    deterministic."""
+
+    def test_back_to_back_stationinfo_calls_sleep_the_configured_interval(self) -> None:
+        transport = _FakeTransport()
+        transport.get_queue = [
+            _FakeResponse(status_code=200, content=b"[]"),
+            _FakeResponse(status_code=200, content=b"[]"),
+        ]
+        clock = _FakeClock(datetime(2026, 8, 28, 12, 0, 0, tzinfo=UTC))
+        sleeper = _FakeSleeper(clock)
+        limiter = RequestRateLimiter(min_interval_seconds=1.0)
+
+        acquire_stationinfo(
+            _SETTINGS,
+            transport=transport,
+            clock=clock,
+            sleeper=sleeper,
+            station_ids=("KCBG",),
+            rate_limiter=limiter,
+        )
+        acquire_stationinfo(
+            _SETTINGS,
+            transport=transport,
+            clock=clock,
+            sleeper=sleeper,
+            station_ids=("KCBG",),
+            rate_limiter=limiter,
+        )
+        # First call: no prior request, no sleep. Second call arrives
+        # immediately after (clock unchanged by the first call besides
+        # its own bookkeeping), so it must sleep the full configured
+        # interval before issuing its GET.
+        assert sleeper.sleeps == [1.0]
+        assert len(transport.calls) == 2
+
+    def test_no_sleep_when_interval_already_elapsed(self) -> None:
+        transport = _FakeTransport()
+        transport.get_queue = [
+            _FakeResponse(status_code=200, content=b"[]"),
+            _FakeResponse(status_code=200, content=b"[]"),
+        ]
+        clock = _FakeClock(datetime(2026, 8, 28, 12, 0, 0, tzinfo=UTC))
+        sleeper = _FakeSleeper()
+        limiter = RequestRateLimiter(min_interval_seconds=1.0)
+
+        acquire_stationinfo(
+            _SETTINGS,
+            transport=transport,
+            clock=clock,
+            sleeper=sleeper,
+            station_ids=("KCBG",),
+            rate_limiter=limiter,
+        )
+        clock.advance(2.0)  # well past the configured interval
+        acquire_stationinfo(
+            _SETTINGS,
+            transport=transport,
+            clock=clock,
+            sleeper=sleeper,
+            station_ids=("KCBG",),
+            rate_limiter=limiter,
+        )
+        assert sleeper.sleeps == []
+
+    def test_shared_limiter_enforced_across_stationinfo_and_metar_calls(self) -> None:
+        """The limiter must be enforced across *both* stationinfo and
+        METAR calls when the caller shares one instance across the
+        whole process, per review finding 6 ('across stationinfo/METAR
+        calls')."""
+        transport = _FakeTransport()
+        transport.get_queue = [
+            _FakeResponse(status_code=200, content=b"[]"),
+            _FakeResponse(status_code=200, content=b"[]"),
+        ]
+        clock = _FakeClock(datetime(2026, 8, 28, 12, 0, 0, tzinfo=UTC))
+        sleeper = _FakeSleeper(clock)
+        limiter = RequestRateLimiter(min_interval_seconds=1.0)
+
+        acquire_stationinfo(
+            _SETTINGS,
+            transport=transport,
+            clock=clock,
+            sleeper=sleeper,
+            station_ids=("KCBG",),
+            rate_limiter=limiter,
+        )
+        acquire_metar_batch(
+            _SETTINGS,
+            transport=transport,
+            clock=clock,
+            sleeper=sleeper,
+            station_ids=("KCBG",),
+            query_date=datetime(2026, 8, 28, 18, 15, tzinfo=UTC),
+            rate_limiter=limiter,
+        )
+        assert sleeper.sleeps == [1.0]
+
+    def test_rejects_nonpositive_interval(self) -> None:
+        with pytest.raises(ValueError, match="positive"):
+            RequestRateLimiter(min_interval_seconds=0.0)

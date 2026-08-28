@@ -24,7 +24,7 @@ NX = 80
 NY = 70
 
 
-def _base_message(*, forecast_hour: int) -> int:
+def _base_message(*, forecast_hour: int, cycle_date: str = "20260828", cycle_hour: int = 18) -> int:
     import eccodes
 
     gid = eccodes.codes_grib_new_from_samples("regular_ll_sfc_grib2")
@@ -41,14 +41,22 @@ def _base_message(*, forecast_hour: int) -> int:
     eccodes.codes_set(gid, "LaDInDegrees", LAD_DEGREES)
     eccodes.codes_set(gid, "discipline", 0)
     eccodes.codes_set(gid, "stepType", "instant")
+    eccodes.codes_set(gid, "dataDate", int(cycle_date))
+    eccodes.codes_set(gid, "dataTime", cycle_hour * 100)
     eccodes.codes_set(gid, "step", forecast_hour)
     return gid
 
 
-def make_temperature_message(*, forecast_hour: int, values_k: np.ndarray) -> bytes:
+def make_temperature_message(
+    *,
+    forecast_hour: int,
+    values_k: np.ndarray,
+    cycle_date: str = "20260828",
+    cycle_hour: int = 18,
+) -> bytes:
     import eccodes
 
-    gid = _base_message(forecast_hour=forecast_hour)
+    gid = _base_message(forecast_hour=forecast_hour, cycle_date=cycle_date, cycle_hour=cycle_hour)
     try:
         eccodes.codes_set(gid, "typeOfLevel", "heightAboveGround")
         eccodes.codes_set(gid, "level", 2)
@@ -66,11 +74,13 @@ def make_wind_message(
     component: str,
     values_m_s: np.ndarray,
     grid_relative: bool,
+    cycle_date: str = "20260828",
+    cycle_hour: int = 18,
 ) -> bytes:
     import eccodes
 
     parameter_number = 2 if component == "u" else 3
-    gid = _base_message(forecast_hour=forecast_hour)
+    gid = _base_message(forecast_hour=forecast_hour, cycle_date=cycle_date, cycle_hour=cycle_hour)
     try:
         eccodes.codes_set(gid, "typeOfLevel", "heightAboveGround")
         eccodes.codes_set(gid, "level", 10)
@@ -90,21 +100,32 @@ def make_lead_grib_bytes(
     eastward_wind_m_s: np.ndarray,
     northward_wind_m_s: np.ndarray,
     grid_relative_wind: bool = True,
+    cycle_date: str = "20260828",
+    cycle_hour: int = 18,
 ) -> bytes:
     """Concatenate T/U/V messages in that order, matching Phase 1's
     field_assertions order (temperature, U, V)."""
     return (
-        make_temperature_message(forecast_hour=forecast_hour, values_k=temperature_k)
+        make_temperature_message(
+            forecast_hour=forecast_hour,
+            values_k=temperature_k,
+            cycle_date=cycle_date,
+            cycle_hour=cycle_hour,
+        )
         + make_wind_message(
             forecast_hour=forecast_hour,
             component="u",
             values_m_s=eastward_wind_m_s,
             grid_relative=grid_relative_wind,
+            cycle_date=cycle_date,
+            cycle_hour=cycle_hour,
         )
         + make_wind_message(
             forecast_hour=forecast_hour,
             component="v",
             values_m_s=northward_wind_m_s,
             grid_relative=grid_relative_wind,
+            cycle_date=cycle_date,
+            cycle_hour=cycle_hour,
         )
     )

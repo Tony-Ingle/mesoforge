@@ -81,7 +81,17 @@ _FULL_GRIB_LENGTH = 300
 
 
 def _grib_bytes() -> bytes:
-    return (b"T" * 100) + (b"U" * 100) + (b"V" * 100)
+    # Each 100-byte segment carries the real GRIB2 message framing
+    # (``GRIB`` indicator .. ``7777`` end section) so the acquisition
+    # boundary check (plan Section 2.2/2.3, review finding 5) accepts
+    # these synthetic byte-range fixtures the same way it accepts a
+    # real provider payload; only the interior payload bytes vary per
+    # simulated field.
+    return (
+        (b"GRIB" + b"T" * 92 + b"7777")
+        + (b"GRIB" + b"U" * 92 + b"7777")
+        + (b"GRIB" + b"V" * 92 + b"7777")
+    )
 
 
 @dataclass
@@ -99,6 +109,7 @@ class _FakeTransport:
         self.get_queue: dict[str, list[_FakeResponse | Exception]] = {}
         self.head_queue: dict[str, list[_FakeResponse | Exception]] = {}
         self.calls: list[tuple[str, str]] = []
+        self.get_headers: list[dict[str, str] | None] = []
 
     def _pop(self, queue: dict[str, list], key: str) -> _FakeResponse:
         entries = queue.get(key)
@@ -111,6 +122,7 @@ class _FakeTransport:
 
     def get(self, url, *, headers=None, timeout=None):
         self.calls.append(("get", url))
+        self.get_headers.append(dict(headers) if headers is not None else None)
         for key in self.get_queue:
             if key in url:
                 return self._pop(self.get_queue, key)
@@ -454,6 +466,238 @@ class TestAcquireHrrrLead:
         )
         assert "20260828" in result.resolved_grib_url
         assert "t18z" in result.resolved_grib_url
+
+
+class TestRangeHeaderTransport:
+    """CRITICAL review finding 1: acquisition must actually transmit the
+    computed ``Range`` header on every selected-message GET, not merely
+    compute it. A transport spy asserts the exact header value on every
+    ranged GET call."""
+
+    def test_every_selected_message_get_carries_exact_range_header(self) -> None:
+        transport = _FakeTransport()
+        transport.get_queue["aws"] = [
+            _FakeResponse(status_code=200, content=_INDEX_TEXT.encode()),
+            _range_response(0, 100),
+            _range_response(100, 200),
+            _range_response(200, 300),
+        ]
+        transport.head_queue["aws"] = [
+            _FakeResponse(status_code=200, headers={"Content-Length": str(_FULL_GRIB_LENGTH)})
+        ]
+        clock = _FakeClock(datetime(2026, 8, 28, 18, 5, tzinfo=UTC))
+        sleeper = _FakeSleeper()
+
+        acquire_hrrr_lead(
+            _SETTINGS,
+            transport=transport,
+            clock=clock,
+            sleeper=sleeper,
+            cycle_date=date(2026, 8, 28),
+            cycle_hour=18,
+            forecast_hour=0,
+            cycle_deadline=datetime(2026, 8, 28, 19, 30, tzinfo=UTC),
+        )
+
+        # First GET is the .idx index fetch (no Range); the next three
+        # are the ranged GRIB GETs and must each carry the exact
+        # computed Range header.
+        expected_ranges = ["bytes=0-99", "bytes=100-199", "bytes=200-299"]
+        range_get_headers = transport.get_headers[1:]
+        assert len(range_get_headers) == 3
+        for headers, expected in zip(range_get_headers, expected_ranges, strict=True):
+            assert headers is not None
+            assert headers.get("Range") == expected
+
+    def test_index_get_carries_no_range_header(self) -> None:
+        transport = _FakeTransport()
+        transport.get_queue["aws"] = [
+            _FakeResponse(status_code=200, content=_INDEX_TEXT.encode()),
+            _range_response(0, 100),
+            _range_response(100, 200),
+            _range_response(200, 300),
+        ]
+        transport.head_queue["aws"] = [
+            _FakeResponse(status_code=200, headers={"Content-Length": str(_FULL_GRIB_LENGTH)})
+        ]
+        clock = _FakeClock(datetime(2026, 8, 28, 18, 5, tzinfo=UTC))
+        sleeper = _FakeSleeper()
+
+        acquire_hrrr_lead(
+            _SETTINGS,
+            transport=transport,
+            clock=clock,
+            sleeper=sleeper,
+            cycle_date=date(2026, 8, 28),
+            cycle_hour=18,
+            forecast_hour=0,
+            cycle_deadline=datetime(2026, 8, 28, 19, 30, tzinfo=UTC),
+        )
+        assert transport.get_headers[0] is None or "Range" not in transport.get_headers[0]
+
+
+class TestRangeIntegrityMutations:
+    """MEDIUM review finding 5: acquisition must reject a
+    Content-Range whose start/end/total do not exactly match the
+    request and the full object length -- mere header presence is not
+    sufficient. Also validates GRIB2 message header/trailer boundaries."""
+
+    def test_rejects_wrong_start_end_content_range(self) -> None:
+        transport = _FakeTransport()
+        transport.get_queue["aws"] = [
+            _FakeResponse(status_code=200, content=_INDEX_TEXT.encode()),
+            _FakeResponse(
+                status_code=206,
+                headers={"Content-Range": "bytes 999-1098/300"},
+                content=_grib_bytes()[0:100],
+            ),
+            _FakeResponse(
+                status_code=206,
+                headers={"Content-Range": "bytes 999-1098/300"},
+                content=_grib_bytes()[0:100],
+            ),
+        ]
+        transport.head_queue["aws"] = [
+            _FakeResponse(status_code=200, headers={"Content-Length": str(_FULL_GRIB_LENGTH)})
+        ]
+        clock = _FakeClock(datetime(2026, 8, 28, 18, 5, tzinfo=UTC))
+        sleeper = _FakeSleeper(clock)
+
+        with pytest.raises(HrrrAcquisitionError, match="range integrity mismatch"):
+            acquire_hrrr_lead(
+                _SETTINGS,
+                transport=transport,
+                clock=clock,
+                sleeper=sleeper,
+                cycle_date=date(2026, 8, 28),
+                cycle_hour=18,
+                forecast_hour=0,
+                cycle_deadline=datetime(2026, 8, 28, 19, 30, tzinfo=UTC),
+            )
+
+    def test_rejects_garbage_content_range(self) -> None:
+        transport = _FakeTransport()
+        transport.get_queue["aws"] = [
+            _FakeResponse(status_code=200, content=_INDEX_TEXT.encode()),
+            _FakeResponse(
+                status_code=206,
+                headers={"Content-Range": "garbage"},
+                content=_grib_bytes()[0:100],
+            ),
+            _FakeResponse(
+                status_code=206,
+                headers={"Content-Range": "garbage"},
+                content=_grib_bytes()[0:100],
+            ),
+        ]
+        transport.head_queue["aws"] = [
+            _FakeResponse(status_code=200, headers={"Content-Length": str(_FULL_GRIB_LENGTH)})
+        ]
+        clock = _FakeClock(datetime(2026, 8, 28, 18, 5, tzinfo=UTC))
+        sleeper = _FakeSleeper(clock)
+
+        with pytest.raises(HrrrAcquisitionError, match="range integrity mismatch"):
+            acquire_hrrr_lead(
+                _SETTINGS,
+                transport=transport,
+                clock=clock,
+                sleeper=sleeper,
+                cycle_date=date(2026, 8, 28),
+                cycle_hour=18,
+                forecast_hour=0,
+                cycle_deadline=datetime(2026, 8, 28, 19, 30, tzinfo=UTC),
+            )
+
+    def test_rejects_content_range_with_wrong_total(self) -> None:
+        transport = _FakeTransport()
+        transport.get_queue["aws"] = [
+            _FakeResponse(status_code=200, content=_INDEX_TEXT.encode()),
+            _FakeResponse(
+                status_code=206,
+                headers={"Content-Range": "bytes 0-99/1"},
+                content=_grib_bytes()[0:100],
+            ),
+            _FakeResponse(
+                status_code=206,
+                headers={"Content-Range": "bytes 0-99/1"},
+                content=_grib_bytes()[0:100],
+            ),
+        ]
+        transport.head_queue["aws"] = [
+            _FakeResponse(status_code=200, headers={"Content-Length": str(_FULL_GRIB_LENGTH)})
+        ]
+        clock = _FakeClock(datetime(2026, 8, 28, 18, 5, tzinfo=UTC))
+        sleeper = _FakeSleeper(clock)
+
+        with pytest.raises(HrrrAcquisitionError, match="range integrity mismatch"):
+            acquire_hrrr_lead(
+                _SETTINGS,
+                transport=transport,
+                clock=clock,
+                sleeper=sleeper,
+                cycle_date=date(2026, 8, 28),
+                cycle_hour=18,
+                forecast_hour=0,
+                cycle_deadline=datetime(2026, 8, 28, 19, 30, tzinfo=UTC),
+            )
+
+    def test_rejects_message_missing_grib_header(self) -> None:
+        transport = _FakeTransport()
+        bad_payload = b"X" * 96 + b"7777"  # right length, no GRIB magic
+        transport.get_queue["aws"] = [
+            _FakeResponse(status_code=200, content=_INDEX_TEXT.encode()),
+            _FakeResponse(
+                status_code=206,
+                headers={"Content-Range": "bytes 0-99/300"},
+                content=bad_payload,
+            ),
+        ]
+        transport.head_queue["aws"] = [
+            _FakeResponse(status_code=200, headers={"Content-Length": str(_FULL_GRIB_LENGTH)})
+        ]
+        clock = _FakeClock(datetime(2026, 8, 28, 18, 5, tzinfo=UTC))
+        sleeper = _FakeSleeper(clock)
+
+        with pytest.raises(HrrrAcquisitionError, match="GRIB2.*indicator section"):
+            acquire_hrrr_lead(
+                _SETTINGS,
+                transport=transport,
+                clock=clock,
+                sleeper=sleeper,
+                cycle_date=date(2026, 8, 28),
+                cycle_hour=18,
+                forecast_hour=0,
+                cycle_deadline=datetime(2026, 8, 28, 19, 30, tzinfo=UTC),
+            )
+
+    def test_rejects_message_missing_grib_trailer(self) -> None:
+        transport = _FakeTransport()
+        bad_payload = b"GRIB" + b"X" * 96  # right length, no 7777 trailer
+        transport.get_queue["aws"] = [
+            _FakeResponse(status_code=200, content=_INDEX_TEXT.encode()),
+            _FakeResponse(
+                status_code=206,
+                headers={"Content-Range": "bytes 0-99/300"},
+                content=bad_payload,
+            ),
+        ]
+        transport.head_queue["aws"] = [
+            _FakeResponse(status_code=200, headers={"Content-Length": str(_FULL_GRIB_LENGTH)})
+        ]
+        clock = _FakeClock(datetime(2026, 8, 28, 18, 5, tzinfo=UTC))
+        sleeper = _FakeSleeper(clock)
+
+        with pytest.raises(HrrrAcquisitionError, match="GRIB2.*end section"):
+            acquire_hrrr_lead(
+                _SETTINGS,
+                transport=transport,
+                clock=clock,
+                sleeper=sleeper,
+                cycle_date=date(2026, 8, 28),
+                cycle_hour=18,
+                forecast_hour=0,
+                cycle_deadline=datetime(2026, 8, 28, 19, 30, tzinfo=UTC),
+            )
 
 
 class TestBuildAcquisitionManifestPayload:

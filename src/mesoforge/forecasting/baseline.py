@@ -93,7 +93,14 @@ def assemble_baseline_forecast(
     direction_quality_mask = np.where(speed == 0, _DIRECTION_UNDEFINED_BIT, np.uint8(0))
 
     lead_time = np.array([np.timedelta64(h, "h") for h in lead_hours], dtype="timedelta64[ns]")
-    valid_time = forecast_issue_time + lead_time
+    # Section 3.6/Codex review t_09a43c6c finding 3: valid times must
+    # remain anchored to the HRRR source reference time (the cycle the
+    # guidance was actually decoded from) plus lead -- never to
+    # ``forecast_issue_time``, which is only the forecast's issuance
+    # identity and may legitimately differ from the HRRR cycle time
+    # (e.g. a run issued minutes after the cycle it consumes). METAR
+    # verification matching must target the true source valid time.
+    valid_time = hrrr_source_reference_time + lead_time
 
     dataset = xr.Dataset(
         data_vars={

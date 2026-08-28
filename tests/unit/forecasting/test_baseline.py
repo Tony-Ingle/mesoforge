@@ -146,17 +146,54 @@ class TestAssembleBaselineForecast:
                 extraction_report_artifact_id="art_" + "1" * 8 + "-0000-0000-0000-000000000000",
             )
 
-    def test_valid_time_equals_issue_time_plus_lead(self) -> None:
+    def test_valid_time_equals_hrrr_source_reference_time_plus_lead(self) -> None:
+        """Codex review t_09a43c6c finding 3 regression: valid times
+        must track hrrr_source_reference_time, not forecast_issue_time,
+        even when the two diverge."""
+        issue_time = np.datetime64("2026-08-28T18:30:00", "ns")
+        source_reference_time = np.datetime64("2026-08-28T18:00:00", "ns")
         dataset = assemble_baseline_forecast(
             station_values=_complete_station_values(),
             lead_hours=tuple(range(7)),
-            forecast_issue_time=_issue_time(),
-            hrrr_source_reference_time=_issue_time(),
+            forecast_issue_time=issue_time,
+            hrrr_source_reference_time=source_reference_time,
             contributor_artifact_id="art_" + "0" * 8 + "-0000-0000-0000-000000000000",
             extraction_report_artifact_id="art_" + "1" * 8 + "-0000-0000-0000-000000000000",
         )
-        expected = _issue_time() + np.array([np.timedelta64(h, "h") for h in range(7)])
+        expected = source_reference_time + np.array([np.timedelta64(h, "h") for h in range(7)])
         np.testing.assert_array_equal(dataset["valid_time"].values, expected)
+        # Explicitly not equal to the issue-time-anchored computation --
+        # proves valid times are not silently shifting with issue time.
+        wrong = issue_time + np.array([np.timedelta64(h, "h") for h in range(7)])
+        assert not np.array_equal(dataset["valid_time"].values, wrong)
+
+    def test_valid_time_unaffected_by_issue_time_when_source_time_fixed(self) -> None:
+        """A later issue_time (e.g. run issued after the HRRR cycle it
+        consumes) must not shift any lead's valid time -- METAR matching
+        targets the HRRR source valid time, not issuance identity."""
+        source_reference_time = np.datetime64("2026-08-28T12:00:00", "ns")
+        early_issue = source_reference_time
+        late_issue = source_reference_time + np.timedelta64(45, "m")
+
+        early_dataset = assemble_baseline_forecast(
+            station_values=_complete_station_values(),
+            lead_hours=tuple(range(7)),
+            forecast_issue_time=early_issue,
+            hrrr_source_reference_time=source_reference_time,
+            contributor_artifact_id="art_" + "0" * 8 + "-0000-0000-0000-000000000000",
+            extraction_report_artifact_id="art_" + "1" * 8 + "-0000-0000-0000-000000000000",
+        )
+        late_dataset = assemble_baseline_forecast(
+            station_values=_complete_station_values(),
+            lead_hours=tuple(range(7)),
+            forecast_issue_time=late_issue,
+            hrrr_source_reference_time=source_reference_time,
+            contributor_artifact_id="art_" + "0" * 8 + "-0000-0000-0000-000000000000",
+            extraction_report_artifact_id="art_" + "1" * 8 + "-0000-0000-0000-000000000000",
+        )
+        np.testing.assert_array_equal(
+            early_dataset["valid_time"].values, late_dataset["valid_time"].values
+        )
 
     def test_calm_station_has_undefined_direction(self) -> None:
         values = _complete_station_values()

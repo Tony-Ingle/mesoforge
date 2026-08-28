@@ -11,6 +11,7 @@ source artifacts.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -94,9 +95,10 @@ def _attempt_request(
     url: str,
     endpoint: str,
     timeout: tuple[float, float],
+    request_headers: dict[str, str] | None = None,
 ) -> tuple[HttpResponse | None, RequestAttempt]:
     try:
-        response = getattr(transport, method)(url, timeout=timeout)
+        response = getattr(transport, method)(url, headers=request_headers, timeout=timeout)
     except Exception as exc:  # noqa: BLE001 -- transport errors are all retryable here
         return None, RequestAttempt(
             endpoint=endpoint, url=url, status_code=None, error=str(exc), headers={}
@@ -313,9 +315,12 @@ def acquire_hrrr_lead(
             endpoint=index_fetch.endpoint,
             url=grib_url,
             range_header=range_header,
+            byte_start=byte_start,
+            byte_end=byte_end,
             retry_policy=settings.retry_policy,
             cycle_deadline=cycle_deadline,
             expected_length=byte_end - byte_start,
+            full_object_length=full_object_content_length,
         )
         all_grib_attempts.extend(range_fetch.attempts)
         latest_grib_completed_at = range_fetch.completed_at
@@ -356,6 +361,46 @@ def acquire_hrrr_lead(
     )
 
 
+def _parse_content_range(value: str | None) -> tuple[int, int, int] | None:
+    """Strictly parse a ``Content-Range: bytes start-end/total`` header
+    value into ``(start, end, total)`` (end inclusive). Returns ``None``
+    for a missing or malformed value -- never partially trusts a
+    garbage/ambiguous header (plan Section 2.3/review finding 5: mere
+    header *presence* is insufficient; the exact start/end/total must
+    be validated)."""
+    if value is None:
+        return None
+    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", value.strip())
+    if match is None:
+        return None
+    start, end, total = (int(group) for group in match.groups())
+    if end < start or total <= end:
+        return None
+    return start, end, total
+
+
+_GRIB_MAGIC = b"GRIB"
+_GRIB_TRAILER = b"7777"
+
+
+def _validate_grib_message_boundaries(payload: bytes, *, url: str, range_header: str) -> None:
+    """Section 2.1/2.3 GRIB2 message framing: every selected message is
+    exactly one complete GRIB2 message, so its bytes must begin with the
+    ``GRIB`` indicator section and end with the ``7777`` end section
+    (plan Section 2.2/review finding 5: acquisition must validate GRIB
+    message header/trailer boundaries, not merely byte counts)."""
+    if not payload.startswith(_GRIB_MAGIC):
+        raise HrrrAcquisitionError(
+            f"selected GRIB message for {url!r} (range {range_header!r}) does not begin "
+            f"with the GRIB2 {_GRIB_MAGIC!r} indicator section; boundary integrity failed"
+        )
+    if not payload.endswith(_GRIB_TRAILER):
+        raise HrrrAcquisitionError(
+            f"selected GRIB message for {url!r} (range {range_header!r}) does not end "
+            f"with the GRIB2 {_GRIB_TRAILER!r} end section; boundary integrity failed"
+        )
+
+
 def _fetch_with_range(
     transport: HttpTransport,
     clock: Clock,
@@ -364,13 +409,19 @@ def _fetch_with_range(
     endpoint: str,
     url: str,
     range_header: str,
+    byte_start: int,
+    byte_end: int,
     retry_policy: RetryPolicy,
     cycle_deadline: datetime,
     expected_length: int,
+    full_object_length: int | None,
 ) -> FetchedObject:
     """Ranged GET with one extra integrity-mismatch retry (plan Section
     2.3: 'Retry an integrity/range mismatch once from a fresh connection;
-    then fail closed')."""
+    then fail closed'). Sends the exact ``Range`` header computed by the
+    caller (review finding 1: a computed range_header must actually be
+    transmitted) and validates the response's ``Content-Range`` and GRIB
+    message framing exactly (review finding 5)."""
     integrity_retries_remaining = 1
     while True:
         all_attempts: list[RequestAttempt] = []
@@ -382,6 +433,7 @@ def _fetch_with_range(
                 url=url,
                 endpoint=endpoint,
                 timeout=(retry_policy.connect_timeout_seconds, retry_policy.read_timeout_seconds),
+                request_headers={"Range": range_header},
             )
             all_attempts.append(attempt)
             if resp is not None and resp.status_code in (200, 206):
@@ -415,16 +467,28 @@ def _fetch_with_range(
             )
 
         content_range = _header(dict(response.headers), "Content-Range")
+        parsed_range = _parse_content_range(content_range)
         payload = bytes(response.content)
-        if len(payload) != expected_length or content_range is None:
+
+        integrity_ok = (
+            len(payload) == expected_length
+            and parsed_range is not None
+            and parsed_range[0] == byte_start
+            and parsed_range[1] == byte_end - 1
+            and (full_object_length is None or parsed_range[2] == full_object_length)
+        )
+        if not integrity_ok:
             if integrity_retries_remaining > 0:
                 integrity_retries_remaining -= 1
                 continue
             raise HrrrAcquisitionError(
                 f"range integrity mismatch for {url!r} (range {range_header!r}): "
-                f"expected {expected_length} bytes, got {len(payload)}, "
+                f"expected {expected_length} bytes at [{byte_start}, {byte_end}) "
+                f"(full_object_length={full_object_length!r}), got {len(payload)} bytes, "
                 f"Content-Range={content_range!r}"
             )
+
+        _validate_grib_message_boundaries(payload, url=url, range_header=range_header)
 
         return FetchedObject(
             endpoint=endpoint,

@@ -67,6 +67,33 @@ def validate_baseline_forecast(dataset: xr.Dataset) -> None:
                 f"lead_time must be exactly {_EXPECTED_LEAD_HOURS!r} hours, got {lead_hours!r}"
             )
 
+    # Section 3.6/Codex review t_09a43c6c finding 3: valid_time must be
+    # exactly hrrr_source_reference_time + lead -- never anchored to
+    # forecast_issue_time (which is only the forecast's issuance
+    # identity and may differ from the HRRR source cycle time).
+    if "valid_time" not in dataset.coords:
+        errors.append("missing 'valid_time' coordinate")
+    elif "lead_time" in dataset.dims and "hrrr_source_reference_time" in dataset.attrs:
+        try:
+            source_reference_time = np.datetime64(dataset.attrs["hrrr_source_reference_time"])
+        except ValueError:
+            errors.append(
+                "hrrr_source_reference_time attribute is not a valid datetime: "
+                f"{dataset.attrs['hrrr_source_reference_time']!r}"
+            )
+        else:
+            expected_valid_time = source_reference_time + dataset["lead_time"].values
+            actual_valid_time = dataset["valid_time"].values
+            if not np.array_equal(
+                actual_valid_time.astype("datetime64[ns]"),
+                expected_valid_time.astype("datetime64[ns]"),
+            ):
+                errors.append(
+                    "valid_time must equal hrrr_source_reference_time + lead_time exactly "
+                    f"(never forecast_issue_time + lead_time); expected "
+                    f"{expected_valid_time!r}, got {actual_valid_time!r}"
+                )
+
     for variable_id in ("air_temperature_2m", "eastward_wind_10m", "northward_wind_10m"):
         if variable_id not in dataset.data_vars:
             errors.append(f"missing required data variable {variable_id!r}")
