@@ -1,0 +1,66 @@
+[importlinter]
+root_packages =
+    mesoforge
+include_external_packages = True
+
+[importlinter:contract:core-layers]
+name = MesoForge Phase 0 core layering (application above provenance/catalog/contracts/common)
+type = layers
+layers =
+    mesoforge.application
+    mesoforge.provenance
+    mesoforge.catalog
+    mesoforge.contracts
+    mesoforge.common
+
+[importlinter:contract:common-no-internal-deps]
+name = common depends on no other mesoforge package (foundational layer)
+type = forbidden
+source_modules =
+    mesoforge.common
+forbidden_modules =
+    mesoforge.contracts
+    mesoforge.catalog
+    mesoforge.provenance
+    mesoforge.storage
+    mesoforge.application
+
+[importlinter:contract:common-no-heavy-infra]
+name = common never imports storage/array infrastructure libraries
+type = forbidden
+source_modules =
+    mesoforge.common
+forbidden_modules =
+    sqlalchemy
+    psycopg
+    alembic
+    boto3
+    xarray
+    numpy
+    h5netcdf
+    pyproj
+
+[importlinter:contract:domain-no-infrastructure]
+name = contracts/catalog/provenance never import infrastructure libraries
+type = forbidden
+source_modules =
+    mesoforge.contracts
+    mesoforge.catalog
+    mesoforge.provenance
+forbidden_modules =
+    boto3
+    sqlalchemy
+    psycopg
+    alembic
+
+[importlinter:contract:storage-interfaces-thin]
+name = storage.interfaces contains protocols/contract types only, no infra imports
+type = forbidden
+source_modules =
+    mesoforge.storage.interfaces
+forbidden_modules =
+    boto3
+    sqlalchemy
+    psycopg
+    alembic
+    h5netcdf

@@ -1,0 +1,138 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  UV_VERSION: "0.5.11"
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install uv
+        uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3.2.4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - name: Install Python
+        run: uv python install
+      - name: Sync dependencies
+        run: uv sync --locked --all-groups
+      - name: Lock check
+        run: uv lock --check
+      - name: Ruff format check
+        run: uv run ruff format --check .
+      - name: Ruff lint
+        run: uv run ruff check .
+      - name: Mypy
+        run: uv run mypy src scripts
+      - name: Import boundaries
+        run: uv run lint-imports
+      - name: Docs validation
+        run: uv run python scripts/validate_docs.py
+      - name: Repository hygiene
+        run: uv run python scripts/check_repository_hygiene.py
+
+  unit:
+    name: unit
+    runs-on: ubuntu-latest
+    needs: quality
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install uv
+        uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3.2.4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - name: Install Python
+        run: uv python install
+      - name: Sync dependencies
+        run: uv sync --locked --all-groups
+      - name: Unit, contract, property tests
+        run: uv run pytest tests/unit tests/contracts tests/property --cov=mesoforge --cov-report=term-missing -q
+
+  integration:
+    name: integration
+    runs-on: ubuntu-latest
+    needs: quality
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: mesoforge
+          POSTGRES_PASSWORD: mesoforge_test
+          POSTGRES_DB: mesoforge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mesoforge"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Both env var names point at the same real postgres:16 service
+      # container declared above. MESOFORGE_TEST_DATABASE_DSN is read by
+      # tests/conftest.py's postgres_dsn fixture (so tests use this
+      # declared service rather than unconditionally spawning pgserver);
+      # MESOFORGE_ALEMBIC_DSN is the exact variable name
+      # migrations/env.py's _get_url() recognizes (it accepts
+      # MESOFORGE_ALEMBIC_DSN or MESOFORGE_DATABASE_DSN -- MESOFORGE_ALEMBIC_DSN
+      # is set explicitly here so `uv run alembic upgrade/downgrade` at
+      # the shell level works without a test fixture setting it first).
+      MESOFORGE_TEST_DATABASE_DSN: "postgresql+psycopg://mesoforge:mesoforge_test@localhost:5432/mesoforge"
+      MESOFORGE_ALEMBIC_DSN: "postgresql+psycopg://mesoforge:mesoforge_test@localhost:5432/mesoforge"
+      MESOFORGE_TEST_S3_ENDPOINT: "http://localhost:9000"
+      MESOFORGE_TEST_S3_ACCESS_KEY: "mesoforge_test"
+      MESOFORGE_TEST_S3_SECRET_KEY: "mesoforge_test_password"
+      MESOFORGE_TEST_S3_BUCKET: "mesoforge-test"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install uv
+        uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3.2.4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - name: Install Python
+        run: uv python install
+      - name: Sync dependencies
+        run: uv sync --locked --all-groups
+      - name: Start MinIO
+        # MinIO is launched with `docker run` rather than as a GitHub
+        # Actions `services:` container: the `services:` block has no
+        # way to supply a container command/args
+        # (github.com/orgs/community/discussions/26688), and the
+        # minio/minio image requires an explicit `server /data` command
+        # -- run without one it just prints its CLI help and exits,
+        # which is exactly what left this job's MinIO container
+        # unhealthy. Running it as a plain `docker run -d` step gives
+        # full command control while pinning the identical image tag
+        # already used in deploy/local/compose.yaml for local dev.
+        run: |
+          docker run -d --name mesoforge-minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=mesoforge_test \
+            -e MINIO_ROOT_PASSWORD=mesoforge_test_password \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:9000/minio/health/live >/dev/null; then
+              echo "MinIO is healthy"
+              exit 0
+            fi
+            echo "Waiting for MinIO to become healthy ($i/30)..."
+            sleep 2
+          done
+          echo "MinIO did not become healthy in time" >&2
+          docker logs mesoforge-minio >&2
+          exit 1
+      - name: Migration upgrade / downgrade / upgrade
+        run: |
+          uv run alembic upgrade head
+          uv run alembic downgrade base
+          uv run alembic upgrade head
+      - name: Integration and acceptance tests
+        run: uv run pytest -m integration tests/integration tests/acceptance -q

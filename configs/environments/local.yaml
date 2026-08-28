@@ -1,0 +1,6 @@
+artifact_store:
+  endpoint_reference: MESOFORGE_LOCAL_S3_ENDPOINT
+  bucket: mesoforge-phase0-local
+
+metadata_store:
+  dsn_environment_variable: MESOFORGE_DATABASE_DSN

@@ -3,9 +3,31 @@ __pycache__/
 .venv/
 .env
 .env.*
+!.env.example
 data/
 cache/
 *.grib
 *.grib2
 *.idx
 .DS_Store
+
+# Python packaging / tooling
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+htmlcov/
+
+# Local runtime state (never committed)
+var/
+deploy/local/.pgdata/
+deploy/local/.miniodata/
+
+# Scientific runtime artifacts (only explicit committed fixtures are permitted)
+*.nc
+*.nc4
+*.zarr/
