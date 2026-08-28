@@ -1,0 +1,159 @@
+phase1:
+  domain:
+    domain_id: grasston-minnesota.v1
+    center_latitude: 45.80265
+    center_longitude: -93.07956
+    bbox:
+      south: 45.05265
+      north: 46.55265
+      west: -94.07956
+      east: -92.07956
+    station_ids:
+      - station.kcbg
+      - station.kjmr
+      - station.kros
+
+  stations:
+    - station_id: station.kcbg
+      provider_icao_id: KCBG
+      expected_latitude: 45.55700
+      expected_longitude: -93.26400
+      expected_elevation_m: 285.0
+      site_name: Cambridge Muni
+      provider_site_types: [METAR]
+      provider_priority: 1
+    - station_id: station.kjmr
+      provider_icao_id: KJMR
+      expected_latitude: 45.88854
+      expected_longitude: -93.26900
+      expected_elevation_m: 301.0
+      site_name: Mora Muni
+      provider_site_types: [METAR]
+      provider_priority: 1
+    - station_id: station.kros
+      provider_icao_id: KROS
+      expected_latitude: 45.69624
+      expected_longitude: -92.95427
+      expected_elevation_m: 282.0
+      site_name: Rush City Rgnl
+      provider_site_types: [METAR]
+      provider_priority: 1
+
+  hrrr:
+    model: hrrr
+    product: sfc
+    sector: conus
+    cycle_frequency: hourly
+    forecast_hours: [0, 1, 2, 3, 4, 5, 6]
+    file_template: "hrrr.t{HH:02d}z.wrfsfcf{FF:02d}.grib2"
+    index_suffix: ".idx"
+    endpoint_order: [aws, nomads]
+    endpoint_url_templates:
+      aws: "https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.{YYYYMMDD}/conus/{FILE}"
+      nomads: "https://nomads.ncep.noaa.gov/pub/data/nccf/com/hrrr/prod/hrrr.{YYYYMMDD}/conus/{FILE}"
+    field_assertions:
+      - canonical_variable_id: air_temperature_2m
+        inventory_selector: ":TMP:2 m above ground:(anl|[0-9]+ hour fcst):"
+        discipline: 0
+        parameter_category: 0
+        parameter_number: 0
+        type_of_level: heightAboveGround
+        level: 2.0
+        expected_unit_id: K
+      - canonical_variable_id: eastward_wind_10m
+        inventory_selector: ":UGRD:10 m above ground:(anl|[0-9]+ hour fcst):"
+        discipline: 0
+        parameter_category: 2
+        parameter_number: 2
+        type_of_level: heightAboveGround
+        level: 10.0
+        expected_unit_id: "m/s"
+      - canonical_variable_id: northward_wind_10m
+        inventory_selector: ":VGRD:10 m above ground:(anl|[0-9]+ hour fcst):"
+        discipline: 0
+        parameter_category: 2
+        parameter_number: 3
+        type_of_level: heightAboveGround
+        level: 10.0
+        expected_unit_id: "m/s"
+    read_keys:
+      - discipline
+      - parameterCategory
+      - parameterNumber
+      - typeOfLevel
+      - level
+      - stepType
+      - uvRelativeToGrid
+      - gridType
+      - Nx
+      - Ny
+      - DxInMetres
+      - DyInMetres
+      - latitudeOfFirstGridPointInDegrees
+      - longitudeOfFirstGridPointInDegrees
+      - LoVInDegrees
+      - Latin1InDegrees
+      - Latin2InDegrees
+    retry_policy:
+      connect_timeout_seconds: 10.0
+      read_timeout_seconds: 60.0
+      attempts_per_endpoint: 4
+      backoff_seconds: [1.0, 2.0, 4.0, 8.0]
+      retry_after_cap_seconds: 60.0
+    cycle_availability_deadline_minutes: 90.0
+
+  aviationweather:
+    base_url: "https://aviationweather.gov"
+    stationinfo_path: "/api/data/stationinfo"
+    metar_path: "/api/data/metar"
+    query_parameter_order: [ids, format, date, hours]
+    user_agent: "MesoForge/0.1 (+https://github.com/mesoforge; phase1-grasston)"
+    max_requests_per_minute: 60
+    min_request_interval_seconds: 1.0
+    metar_window_hours: 6.5
+    metar_completion_offset_minutes: 15.0
+    retry_policy:
+      connect_timeout_seconds: 10.0
+      read_timeout_seconds: 60.0
+      attempts_per_endpoint: 4
+      backoff_seconds: [1.0, 2.0, 4.0, 8.0]
+      retry_after_cap_seconds: 60.0
+
+  point_extraction_policy:
+    policy_id: bilinear-native-grid.v1
+    allow_extrapolation: false
+    require_four_corners_finite: true
+    halo_cells: 1
+    weight_sum_tolerance: 1.0e-12
+
+  observation_normalization_policy:
+    policy_id: metar-normalization.v1
+    temperature_valid_min_k: 180.0
+    temperature_valid_max_k: 340.0
+    wind_speed_valid_min_m_s: 0.0
+    wind_speed_valid_max_m_s: 100.0
+    max_receipt_before_event_minutes: 5.0
+    station_coordinate_tolerance_degrees: 0.02
+    station_elevation_tolerance_m: 30.0
+
+  matching_policy:
+    matching_policy_id: metar-nearest-15m.v1
+    tolerance_minutes: 15.0
+    calm_threshold_m_s: 1.5
+
+  metric_set:
+    metric_set_id: phase1-temperature-wind.v1
+    metric_names:
+      - temperature_bias
+      - temperature_mae
+      - temperature_rmse
+      - eastward_wind_bias
+      - eastward_wind_mae
+      - eastward_wind_rmse
+      - northward_wind_bias
+      - northward_wind_mae
+      - northward_wind_rmse
+      - wind_speed_bias
+      - wind_speed_mae
+      - wind_speed_rmse
+      - wind_direction_mean_absolute_error

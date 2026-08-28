@@ -27,6 +27,7 @@ _CONTROLLED_UNITS: dict[str, str] = {
     "dimensionless": "dimensionless",
     "m": "meter",
     "Pa": "pascal",
+    "degree": "degree",
 }
 
 

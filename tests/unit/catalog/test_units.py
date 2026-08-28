@@ -15,7 +15,8 @@ from mesoforge.common.errors import InvalidIdentifier
 
 class TestParseRegisteredUnit:
     @pytest.mark.parametrize(
-        "unit_id", ["K", "degC", "m/s", "kg/m^2", "percent", "dimensionless", "m", "Pa"]
+        "unit_id",
+        ["K", "degC", "m/s", "kg/m^2", "percent", "dimensionless", "m", "Pa", "degree"],
     )
     def test_accepts_controlled_unit_ids(self, unit_id: str) -> None:
         parse_registered_unit(unit_id)

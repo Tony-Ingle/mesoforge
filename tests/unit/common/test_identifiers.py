@@ -16,7 +16,10 @@ from mesoforge.common.identifiers import (
     ConfigurationSnapshotId,
     Digest,
     GridId,
+    MatchingPolicyId,
+    MetricSetId,
     RunId,
+    StationId,
     VariableId,
     VerticalDefinitionId,
 )
@@ -120,32 +123,55 @@ class TestDigest:
 
 
 class TestKebabDotIdentifiers:
-    @pytest.mark.parametrize("cls", [GridId, VariableId, VerticalDefinitionId])
+    @pytest.mark.parametrize(
+        "cls", [GridId, VariableId, VerticalDefinitionId, StationId, MatchingPolicyId, MetricSetId]
+    )
     def test_accepts_valid_ids(self, cls: type) -> None:
         for value in ("synthetic-grid.v1", "air-temperature-2m", "height-agl-2m", "a"):
             assert cls(value) == value
 
-    @pytest.mark.parametrize("cls", [GridId, VariableId, VerticalDefinitionId])
+    @pytest.mark.parametrize(
+        "cls", [GridId, VariableId, VerticalDefinitionId, StationId, MatchingPolicyId, MetricSetId]
+    )
     def test_rejects_uppercase(self, cls: type) -> None:
         with pytest.raises(InvalidIdentifier):
             cls("Synthetic-Grid.v1")
 
-    @pytest.mark.parametrize("cls", [GridId, VariableId, VerticalDefinitionId])
+    @pytest.mark.parametrize(
+        "cls", [GridId, VariableId, VerticalDefinitionId, StationId, MatchingPolicyId, MetricSetId]
+    )
     def test_rejects_leading_digit(self, cls: type) -> None:
         with pytest.raises(InvalidIdentifier):
             cls("1grid")
 
-    @pytest.mark.parametrize("cls", [GridId, VariableId, VerticalDefinitionId])
+    @pytest.mark.parametrize(
+        "cls", [GridId, VariableId, VerticalDefinitionId, StationId, MatchingPolicyId, MetricSetId]
+    )
     def test_rejects_double_separators(self, cls: type) -> None:
         with pytest.raises(InvalidIdentifier):
             cls("grid--v1")
 
-    @pytest.mark.parametrize("cls", [GridId, VariableId, VerticalDefinitionId])
+    @pytest.mark.parametrize(
+        "cls", [GridId, VariableId, VerticalDefinitionId, StationId, MatchingPolicyId, MetricSetId]
+    )
     def test_rejects_trailing_separator(self, cls: type) -> None:
         with pytest.raises(InvalidIdentifier):
             cls("grid-")
 
-    @pytest.mark.parametrize("cls", [GridId, VariableId, VerticalDefinitionId])
+    @pytest.mark.parametrize(
+        "cls", [GridId, VariableId, VerticalDefinitionId, StationId, MatchingPolicyId, MetricSetId]
+    )
     def test_rejects_empty_string(self, cls: type) -> None:
         with pytest.raises(InvalidIdentifier):
             cls("")
+
+
+class TestPhase1KebabDotIdentifiers:
+    def test_station_id_accepts_canonical_station_form(self) -> None:
+        assert StationId("station.kcbg") == "station.kcbg"
+
+    def test_matching_policy_id_accepts_versioned_form(self) -> None:
+        assert MatchingPolicyId("metar-nearest-15m.v1") == "metar-nearest-15m.v1"
+
+    def test_metric_set_id_accepts_versioned_form(self) -> None:
+        assert MetricSetId("phase1-temperature-wind.v1") == "phase1-temperature-wind.v1"
