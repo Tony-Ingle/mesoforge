@@ -1,35 +1,66 @@
 """Static signature/type-hint tests: every public request, service,
-application protocol, storage protocol, and concrete repository/
-object-store/lock boundary must use the typed ``common.identifiers``
-classes (``Digest``, ``ArtifactId``, ``ActivityId``,
+application protocol, storage protocol, concrete repository/object-store/
+lock boundary, and provenance model/function must use the typed
+``common.identifiers`` classes (``Digest``, ``ArtifactId``, ``ActivityId``,
 ``ConfigurationSnapshotId``, ``GridId``, ``RunId``) for ID/digest
 parameters and return-object fields, never an unrestricted ``str``
 (Codex review t_f569c45c finding 3; final re-review HIGH finding
 6/t_1ecb8414: request/protocol/repository signature conformance must be
 directly asserted, not only inferred from runtime rejection tests).
 
-This module inspects live ``typing.get_type_hints`` for every public
-method across the storage protocols, the concrete PostgreSQL
-repositories, the S3 object store, the PostgreSQL idempotency lock, and
-``ArtifactService.create_run``/its injected protocols, and asserts that
-every parameter/attribute whose name denotes an identifier or digest
-(``*_id``, ``*_digest``, ``digest``) is annotated with (or a
-``| None``/``tuple[...]`` composition of) one of the typed identifier
-classes -- never bare ``str``. Plain ``str`` fields that are genuinely
-not identifiers (``storage_uri``, ``media_type``, ``canonical_json``,
-``role``, ``code_revision`` -- which has its own dedicated
-``validate_code_revision`` runtime check, not a class) are excluded by
-an explicit allowlist so this test does not become a blunt "no str
+Exhaustive-inventory remediation (t_4a21981a): the earlier version of
+this module enumerated the classes/functions/methods/fields to inspect
+by hand (an explicit ``protocol_classes = [...]`` list, an explicit
+``repository_classes = [...]`` list, an explicit S3 method tuple, an
+explicit application-protocol list, and explicit provenance
+function/model/field lists). A newly added public boundary -- e.g.
+``mesoforge.provenance.services.newly_added_public_boundary(artifact_id:
+str)`` -- was never discovered by any of those lists, so the suite
+stayed green even though the new boundary was unrestricted ``str``.
+
+This module now performs *automatic discovery* instead: it walks every
+module in the Phase 0 public service/value boundary scope
+(``mesoforge.application``, ``mesoforge.storage``, ``mesoforge.provenance``,
+``mesoforge.contracts``) via ``pkgutil.walk_packages``, inspects every
+class and every public function actually defined in each discovered
+module (not a hand-picked subset), and for each one inspects every
+method/``__init__``/annotated field via live ``typing.get_type_hints``.
+Adding a new public boundary anywhere in that scope is picked up on the
+next test run with zero changes to this file. Internal SQLAlchemy mapped
+rows are excluded by boundary kind (``__table__``), not module/class
+inventory. The only plain-string exemptions are three exact, documented
+catalog labels for which Phase 0 defines no typed value class.
+``TestDiscoveryDetectsInjectedMalformedBoundaries``
+below proves the discovery mechanism itself is exhaustive: each test
+injects a temporary malformed boundary directly onto a real in-scope
+module/class (never editing any list in this file) and asserts the scan
+reports it.
+
+Plain ``str`` remains legitimate for genuinely non-identifier fields
+(``storage_uri``, ``media_type``, ``canonical_json``, ``role``, and
+``code_revision``, which has its own dedicated ``validate_code_revision``
+runtime check rather than a typed class) via a narrow, documented
+allowlist/pattern -- this module does not become a blunt "no str
 anywhere" rule that would also reject those legitimate fields.
 """
 
 from __future__ import annotations
 
+import ast
+import importlib
 import inspect
+import pkgutil
+import sys
+import textwrap
+import types
 import typing
 
-from mesoforge.application import artifacts as artifacts_module
-from mesoforge.application import configuration as configuration_module
+import pytest
+
+import mesoforge.application as _application_pkg
+import mesoforge.contracts as _contracts_pkg
+import mesoforge.provenance as _provenance_pkg
+import mesoforge.storage as _storage_pkg
 from mesoforge.common.identifiers import (
     ActivityId,
     ArtifactId,
@@ -38,12 +69,6 @@ from mesoforge.common.identifiers import (
     GridId,
     RunId,
 )
-from mesoforge.provenance import lineage as lineage_module
-from mesoforge.provenance import services as provenance_services_module
-from mesoforge.storage import interfaces as interfaces_module
-from mesoforge.storage import s3 as s3_module
-from mesoforge.storage.postgres import idempotency_lock as lock_module
-from mesoforge.storage.postgres import repositories as repositories_module
 
 _TYPED_IDENTIFIER_CLASSES = (
     ActivityId,
@@ -53,46 +78,108 @@ _TYPED_IDENTIFIER_CLASSES = (
     GridId,
     RunId,
 )
-_TYPED_IDENTIFIER_NAMES = {cls.__name__ for cls in _TYPED_IDENTIFIER_CLASSES}
 
 # Parameter/attribute names that look like an identifier/digest but are
-# legitimately plain str -- either because they are validated by a
-# dedicated function rather than a class (code_revision), or because
-# they genuinely are not an identifier at all despite the name pattern.
-_ALLOWED_PLAIN_STR_NAMES = frozenset(
-    {
-        "code_revision",  # validated by validate_code_revision(), not a typed class
-    }
+# legitimately plain str -- validated by a dedicated function rather than
+# a typed class (code_revision has no typed class; see
+# TestCodeRevisionBoundariesUseSharedRuntimeValidator below, which proves
+# every discovered code_revision boundary routes through
+# validate_code_revision instead).
+_ALLOWED_PLAIN_STR_NAMES = frozenset({"code_revision"})
+
+# Exact catalog labels deliberately represented as strings by
+# VariableDefinition. These are not artifact/activity/run identity or
+# digest boundaries, and Phase 0 defines no corresponding typed value
+# classes. Qualifying each site prevents a similarly named field in any
+# other model or module from escaping the audit.
+_ALLOWED_PLAIN_STR_SITES: dict[str, str] = {
+    "mesoforge.contracts.datasets.VariableLike.variable_id": (
+        "catalog variable label; no VariableId value class exists in Phase 0"
+    ),
+    "mesoforge.contracts.datasets.VariableLike.canonical_unit_id": (
+        "catalog unit label; no UnitId value class exists in Phase 0"
+    ),
+    "mesoforge.contracts.datasets.VariableLike.vertical_definition_id": (
+        "catalog vertical-definition label; no typed value class exists in Phase 0"
+    ),
+}
+
+# Name patterns that flag a parameter/attribute as identifier/digest-like
+# (final re-review HIGH finding: the original suffix-only heuristic
+# missed "ids"/"artifact_nodes"/"activity_nodes", which is exactly how
+# the unrestricted-str regression in provenance.lineage escaped the
+# original static audit). "*_ids" (plural aggregate, e.g.
+# selected_input_artifact_ids) is included alongside "*_id" per the
+# exhaustive-inventory requirement.
+_IDENTIFIER_NAME_SUFFIXES = ("_id", "_ids", "_digest", "_digests")
+_IDENTIFIER_EXACT_NAMES = frozenset({"digest", "ids"})
+_AGGREGATE_EXACT_NAMES = frozenset({"artifact_nodes", "activity_nodes"})
+
+# The Phase 0 public service/value boundary scope this suite audits.
+# pkgutil.walk_packages recurses into every submodule of each package
+# automatically, so a newly added module under any of these four
+# packages is discovered without editing this file.
+_SCOPE_ROOT_PACKAGES: tuple[types.ModuleType, ...] = (
+    _application_pkg,
+    _storage_pkg,
+    _provenance_pkg,
+    _contracts_pkg,
 )
 
-_IDENTIFIER_NAME_SUFFIXES = ("_id", "_digest")
-_IDENTIFIER_EXACT_NAMES = frozenset({"digest"})
 
-# Aggregate parameter/field names that hold a bare tuple of identifiers
-# (not identifier-suffixed themselves) -- final re-review HIGH finding:
-# the suffix heuristic alone misses ``ids``/``artifact_nodes``/
-# ``activity_nodes``, which is exactly how the unrestricted-str
-# regression in ``provenance.lineage`` escaped the original static
-# audit. Their annotations must resolve to a typed identifier (or a
-# tuple/union composition of one), exactly like a normal identifier
-# parameter.
-_AGGREGATE_IDENTIFIER_NAMES = frozenset({"ids", "artifact_nodes", "activity_nodes"})
+def _discover_scope_modules() -> dict[str, types.ModuleType]:
+    """Every module under the four scoped packages.
 
-# Parameter/field names that hold an ordered tuple of ``(role, artifact_id)``
-# pairs -- the ``role`` element legitimately stays a bare ``str``, but the
-# second element of every pair must be a typed identifier. Handled by a
-# dedicated shape check (``_annotation_is_typed_role_id_pairs``) rather
-# than the generic all-typed-args heuristic, which would otherwise also
-# demand ``role`` be typed and produce a false failure.
-_ROLE_IDENTIFIER_PAIR_NAMES = frozenset({"ordered_inputs"})
+    Adding a new module under ``application``, ``storage``, ``provenance``,
+    or ``contracts`` makes it appear automatically on the next test run.
+    """
+    modules: dict[str, types.ModuleType] = {}
+    for root in _SCOPE_ROOT_PACKAGES:
+        modules[root.__name__] = root
+        discovered = pkgutil.walk_packages(root.__path__, prefix=root.__name__ + ".")
+        for info in sorted(discovered, key=lambda item: item.name):
+            modules[info.name] = importlib.import_module(info.name)
+    return dict(sorted(modules.items()))
+
+
+def _classes_defined_in(module: types.ModuleType) -> list[type]:
+    """Every class whose __module__ is this module -- public or
+    underscore-prefixed. Underscore-prefixed structural Protocol classes
+    (``_StoredObjectLike``, ``_ArtifactRepositoryLike``, etc.) are the
+    application layer's injected-boundary shapes and must be inspected
+    exactly like a public class; Python's leading-underscore convention
+    marks them module-private, not exempt from this boundary audit."""
+    classes = [
+        member
+        for member in vars(module).values()
+        if inspect.isclass(member)
+        and member.__module__ == module.__name__
+        and not hasattr(member, "__table__")
+    ]
+    return sorted(classes, key=lambda cls: cls.__qualname__)
+
+
+def _public_functions_defined_in(module: types.ModuleType) -> list[types.FunctionType]:
+    """Every public (non-underscore) top-level function defined directly
+    in this module. Private module-level helpers (``_edge_sort_key``,
+    ``_parameters_digest``, etc.) are internal wiring, not a public
+    boundary, and are intentionally excluded -- matching every function
+    this suite has ever required typed (``compute_idempotency_digest``,
+    ``build_lineage_graph``, ``detect_cycle``) being public."""
+    functions = [
+        member
+        for name, member in vars(module).items()
+        if inspect.isfunction(member)
+        and member.__module__ == module.__name__
+        and not name.startswith("_")
+    ]
+    return sorted(functions, key=lambda func: func.__qualname__)
 
 
 def _looks_like_identifier(name: str) -> bool:
     if name in _ALLOWED_PLAIN_STR_NAMES:
         return False
-    if name in _IDENTIFIER_EXACT_NAMES:
-        return True
-    if name in _AGGREGATE_IDENTIFIER_NAMES or name in _ROLE_IDENTIFIER_PAIR_NAMES:
+    if name in _IDENTIFIER_EXACT_NAMES or name in _AGGREGATE_EXACT_NAMES:
         return True
     return any(name.endswith(suffix) for suffix in _IDENTIFIER_NAME_SUFFIXES)
 
@@ -105,9 +192,6 @@ def _annotation_uses_typed_identifier(annotation: object) -> bool:
     if origin is None:
         return annotation in _TYPED_IDENTIFIER_CLASSES
     args = typing.get_args(annotation)
-    # str | None, ConfigurationSnapshotId | None, tuple[ArtifactId, ...],
-    # tuple[ArtifactId | None, ...], etc: every non-None/non-Ellipsis
-    # member must itself resolve to a typed identifier (recursively).
     substantive_args = [a for a in args if a is not type(None) and a is not Ellipsis]
     if not substantive_args:
         return False
@@ -123,405 +207,577 @@ def _annotation_contains_bare_str(annotation: object) -> bool:
     return any(_annotation_contains_bare_str(a) for a in typing.get_args(annotation))
 
 
-def _annotation_is_typed_role_id_pairs(annotation: object) -> bool:
-    """True if ``annotation`` is ``tuple[tuple[str, <TypedId>], ...]``
-    (or a ``tuple[tuple[str, <TypedId>], ...] | None``): an ordered
-    sequence of ``(role, artifact_id)`` pairs where ``role`` stays a
-    bare ``str`` by design but the second element must be one of the
-    typed identifier classes with no bare ``str`` fallback."""
+_NOT_PAIR_SHAPE = object()
+
+
+def _pair_second_element_type(annotation: object) -> object:
+    """If ``annotation`` is ``tuple[tuple[str, X], ...]`` (optionally
+    wrapped in ``| None``) -- an ordered sequence of ``(role, X)`` pairs,
+    the shape ``ordered_inputs`` uses -- return ``X``. Otherwise return
+    the ``_NOT_PAIR_SHAPE`` sentinel.
+
+    This is a purely structural check, independent of the field/parameter
+    name: it catches a new ``(role, artifact_id)``-shaped aggregate under
+    *any* name, not only a name matching ``_ROLE_IDENTIFIER_PAIR_NAMES``
+    the way the pre-remediation version required (exhaustive-inventory
+    requirement 2). ``tuple[str, ...]`` (a homogeneous variadic tuple of
+    plain strings, e.g. ``allowed_dimension_variants``'s inner tuples) is
+    correctly NOT a pair shape: its second "element" is the literal
+    ``Ellipsis`` variadic marker, not a second, distinct field type.
+    """
     origin = typing.get_origin(annotation)
-    if origin is None:
-        return False
+    if origin in {typing.Union, types.UnionType}:
+        substantive = [arg for arg in typing.get_args(annotation) if arg is not type(None)]
+        if len(substantive) == 1:
+            return _pair_second_element_type(substantive[0])
+        return _NOT_PAIR_SHAPE
+    if origin is not tuple:
+        return _NOT_PAIR_SHAPE
     args = [a for a in typing.get_args(annotation) if a is not type(None)]
-    # tuple[tuple[str, ArtifactId], ...] -> args = (tuple[str, ArtifactId], Ellipsis)
     pair_types = [a for a in args if a is not Ellipsis]
     if len(pair_types) != 1:
-        return False
+        return _NOT_PAIR_SHAPE
     pair_type = pair_types[0]
     if typing.get_origin(pair_type) is not tuple:
-        return False
+        return _NOT_PAIR_SHAPE
     pair_args = typing.get_args(pair_type)
     if len(pair_args) != 2:
-        return False
-    role_type, id_type = pair_args
-    return role_type is str and id_type in _TYPED_IDENTIFIER_CLASSES
+        return _NOT_PAIR_SHAPE
+    role_type, second_type = pair_args
+    if role_type is not str or second_type is Ellipsis:
+        return _NOT_PAIR_SHAPE
+    return second_type
 
 
-def _assert_identifier_params_typed(
-    func: object, *, label: str, owner_globalns: dict[str, object] | None = None
-) -> list[str]:
-    """Return a list of failure descriptions (empty means fully typed)."""
-    failures: list[str] = []
+def _scan_named_annotation(name: str, annotation: object, label: str, failures: list[str]) -> None:
+    """Check one named parameter/attribute's annotation, appending a
+    failure description to ``failures`` if it violates the typed
+    identifier/digest boundary. Handles the ``(role, id)`` pair shape
+    structurally first (independent of ``name``), then falls back to the
+    name-pattern-based identifier/digest/aggregate check."""
+    if annotation is None:
+        return
+    if f"{label}.{name}" in _ALLOWED_PLAIN_STR_SITES:
+        return
+
+    pair_second = _pair_second_element_type(annotation)
+    if pair_second is not _NOT_PAIR_SHAPE:
+        if (
+            pair_second is str
+            or _annotation_contains_bare_str(pair_second)
+            or not _annotation_uses_typed_identifier(pair_second)
+        ):
+            failures.append(
+                f"{label}: {name!r} annotation {annotation!r} is a (role, id)-shaped "
+                f"tuple whose second element {pair_second!r} is not a typed identifier "
+                "class (role, the first element, legitimately stays bare str)"
+            )
+        return
+
+    if not _looks_like_identifier(name):
+        return
+    if _annotation_contains_bare_str(annotation) or not _annotation_uses_typed_identifier(
+        annotation
+    ):
+        failures.append(
+            f"{label}: {name!r} annotation {annotation!r} is not a typed identifier/digest class"
+        )
+
+
+def _scan_callable(func: object, label: str, failures: list[str]) -> None:
+    module = sys.modules.get(getattr(func, "__module__", None))
+    globalns = vars(module) if module is not None else None
     try:
-        hints = typing.get_type_hints(func, include_extras=True, globalns=owner_globalns)
+        hints = typing.get_type_hints(func, include_extras=True, globalns=globalns)
     except Exception as exc:  # pragma: no cover - diagnostic aid only
         failures.append(f"{label}: could not resolve type hints ({exc})")
-        return failures
+        return
+    try:
+        signature = inspect.signature(func)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:  # pragma: no cover - diagnostic aid only
+        failures.append(f"{label}: could not resolve signature ({exc})")
+        return
 
-    signature = inspect.signature(func)  # type: ignore[arg-type]
     for param_name in signature.parameters:
         if param_name in {"self", "cls"}:
             continue
-        if not _looks_like_identifier(param_name):
+        if param_name not in hints:
+            if _looks_like_identifier(param_name):
+                failures.append(f"{label}: parameter {param_name!r} has no resolvable annotation")
             continue
-        annotation = hints.get(param_name)
-        if annotation is None:
-            failures.append(f"{label}: parameter {param_name!r} has no resolvable annotation")
-            continue
-        if param_name in _ROLE_IDENTIFIER_PAIR_NAMES:
-            if not _annotation_is_typed_role_id_pairs(annotation):
-                failures.append(
-                    f"{label}: parameter {param_name!r} annotation {annotation!r} is not "
-                    "tuple[tuple[str, <TypedId>], ...]"
-                )
-            continue
-        if _annotation_contains_bare_str(annotation) or not _annotation_uses_typed_identifier(
-            annotation
+        _scan_named_annotation(param_name, hints[param_name], label, failures)
+
+    # Return-type checking is limited to the structural (role, id) pair
+    # shape: unlike parameters/fields, a bare return annotation has no
+    # name to pattern-match against, and plenty of legitimate functions
+    # return a bare non-identifier str (e.g. content_addressed_key's S3
+    # key) or a manifest/record class whose own fields are independently
+    # discovered and scanned as a class in their own right.
+    if "return" in hints:
+        return_annotation = hints["return"]
+        pair_second = _pair_second_element_type(return_annotation)
+        if pair_second is not _NOT_PAIR_SHAPE and (
+            pair_second is str
+            or _annotation_contains_bare_str(pair_second)
+            or not _annotation_uses_typed_identifier(pair_second)
         ):
             failures.append(
-                f"{label}: parameter {param_name!r} annotation {annotation!r} is not a "
-                "typed identifier/digest class"
+                f"{label}: return annotation {return_annotation!r} is a (role, id)-shaped "
+                f"tuple whose second element {pair_second!r} is not a typed identifier class"
             )
-    return failures
 
 
-def _protocol_methods(protocol_cls: type) -> list[str]:
-    return [
-        name
-        for name, member in vars(protocol_cls).items()
-        if callable(member) and not name.startswith("_") and name not in {"__init__"}
-    ]
+def _scan_class(cls: type, failures: list[str]) -> None:
+    module = sys.modules.get(cls.__module__)
+    globalns = vars(module) if module is not None else None
+    try:
+        hints = typing.get_type_hints(cls, include_extras=True, globalns=globalns)
+    except Exception as exc:  # pragma: no cover - diagnostic aid only
+        failures.append(f"{cls.__qualname__}: could not resolve class type hints ({exc})")
+        hints = {}
+    for attr_name, annotation in hints.items():
+        _scan_named_annotation(
+            attr_name, annotation, f"{cls.__module__}.{cls.__qualname__}", failures
+        )
+
+    own_members = vars(cls)
+    init = own_members.get("__init__")
+    if init is not None and init is not object.__init__:
+        _scan_callable(init, f"{cls.__module__}.{cls.__qualname__}.__init__", failures)
+
+    for name, member in own_members.items():
+        if name == "__init__" or (name.startswith("__") and name.endswith("__")):
+            continue
+        if isinstance(member, (classmethod, staticmethod)):
+            member = member.__func__
+        if inspect.isfunction(member):
+            _scan_callable(member, f"{cls.__module__}.{cls.__qualname__}.{name}", failures)
 
 
-class TestStorageInterfacesProtocolsUseTypedIdentifiers:
-    """``storage.interfaces``: every protocol method's ID/digest
-    parameters must be typed (final re-review HIGH finding
-    6/t_1ecb8414 -- the earlier remediation left this file's
-    StoredObject/ConfigurationSnapshotLike/GridDefinitionLike/
-    ArtifactObjectStore/StoredObjectRepository/IdempotencyLock
-    string-typed)."""
+def collect_boundary_failures(
+    modules: dict[str, types.ModuleType] | None = None,
+) -> list[str]:
+    """Run the full automatic discovery + scan over ``modules`` (defaults
+    to the live Phase 0 scope) and return every violation description.
+    Exposed as a module-level function (not buried in a test method) so
+    ``TestDiscoveryDetectsInjectedMalformedBoundaries`` can call it after
+    injecting a temporary malformed boundary onto a real module."""
+    if modules is None:
+        modules = _discover_scope_modules()
+    failures: list[str] = []
+    for module_name in sorted(modules):
+        module = modules[module_name]
+        for cls in _classes_defined_in(module):
+            _scan_class(cls, failures)
+        for func in _public_functions_defined_in(module):
+            _scan_callable(func, f"{module.__name__}.{func.__name__}", failures)
+    return sorted(failures)
 
-    def test_all_protocol_methods_use_typed_identifiers(self) -> None:
-        protocol_classes = [
-            interfaces_module.ArtifactObjectStore,
-            interfaces_module.StoredObjectRepository,
-            interfaces_module.ArtifactRepository,
-            interfaces_module.ActivityRepository,
-            interfaces_module.ConfigurationRepository,
-            interfaces_module.GridRepository,
-            interfaces_module.RunRepository,
-            interfaces_module.LineageReader,
-            interfaces_module.IdempotencyLock,
+
+def _discover_code_revision_sites() -> list[tuple[str, object]]:
+    """Every discovered class field / function-or-method parameter named
+    exactly ``code_revision`` across the scope, as ``(label, object)``
+    pairs. Automatic, name-based discovery -- not an enumerated list of
+    "the functions that happen to take code_revision today"."""
+    sites: list[tuple[str, object]] = []
+    modules = _discover_scope_modules()
+    for module_name in sorted(modules):
+        module = modules[module_name]
+        for cls in _classes_defined_in(module):
+            globalns = vars(module)
+            try:
+                hints = typing.get_type_hints(cls, include_extras=True, globalns=globalns)
+            except Exception:  # pragma: no cover - diagnostic aid only
+                hints = {}
+            # Protocol methods only declare the static contract and cannot
+            # execute validation. Their concrete implementations are
+            # discovered independently and must validate at runtime.
+            if getattr(cls, "_is_protocol", False):
+                continue
+            if "code_revision" in hints:
+                sites.append((f"{cls.__qualname__}.code_revision (field)", cls))
+            for name, member in vars(cls).items():
+                if name.startswith("__") and name != "__init__":
+                    continue
+                if isinstance(member, (classmethod, staticmethod)):
+                    member = member.__func__
+                if not inspect.isfunction(member):
+                    continue
+                try:
+                    params = inspect.signature(member).parameters
+                except (TypeError, ValueError):  # pragma: no cover - diagnostic aid only
+                    continue
+                if "code_revision" in params:
+                    sites.append((f"{cls.__qualname__}.{name}", member))
+        for func in _public_functions_defined_in(module):
+            try:
+                params = inspect.signature(func).parameters
+            except (TypeError, ValueError):  # pragma: no cover - diagnostic aid only
+                continue
+            if "code_revision" in params:
+                sites.append((f"{module.__name__}.{func.__name__}", func))
+    return sorted(sites, key=lambda site: site[0])
+
+
+def _code_revision_boundary_has_runtime_validator(obj: object) -> bool:
+    """True if ``obj`` (a class carrying a ``code_revision`` field, or a
+    function/method taking a ``code_revision`` parameter) routes that
+    value through ``validate_code_revision`` -- via a Pydantic
+    field/model validator for a class, or a direct call for a plain
+    callable. Uses source inspection as a generic, automatable proxy for
+    "calls the shared validator" that works for a boundary added after
+    this file was last edited, not just the ones enumerated today."""
+    if inspect.isclass(obj):
+        decorators = getattr(obj, "__pydantic_decorators__", None)
+        if decorators is not None:
+            for validator in decorators.field_validators.values():
+                if "code_revision" in validator.info.fields:
+                    try:
+                        source = inspect.getsource(validator.func)
+                    except (OSError, TypeError):  # pragma: no cover - diagnostic aid only
+                        source = ""
+                    if _source_calls_code_revision_validator(source):
+                        return True
+            for validator in decorators.model_validators.values():
+                try:
+                    source = inspect.getsource(validator.func)
+                except (OSError, TypeError):  # pragma: no cover - diagnostic aid only
+                    source = ""
+                if _source_calls_code_revision_validator(source):
+                    return True
+        init = vars(obj).get("__init__")
+        if init is not None:
+            try:
+                source = inspect.getsource(init)
+            except (OSError, TypeError):  # pragma: no cover - diagnostic aid only
+                source = ""
+            if _source_calls_code_revision_validator(source):
+                return True
+        return False
+
+    try:
+        source = inspect.getsource(obj)  # type: ignore[arg-type]
+    except (OSError, TypeError):  # pragma: no cover - diagnostic aid only
+        return False
+    return _source_calls_code_revision_validator(source)
+
+
+def _source_calls_code_revision_validator(source: str) -> bool:
+    """Return whether executable source contains a direct call to the
+    shared validator; comments, docstrings, and mere references do not
+    count as runtime validation."""
+    if not source:
+        return False
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except SyntaxError:  # pragma: no cover - diagnostic aid only
+        return False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        is_validator = (
+            isinstance(node.func, ast.Name) and node.func.id == "validate_code_revision"
+        ) or (isinstance(node.func, ast.Attribute) and node.func.attr == "validate_code_revision")
+        argument = node.args[0]
+        uses_boundary_value = (
+            isinstance(argument, ast.Name) and argument.id in {"code_revision", "value"}
+        ) or (isinstance(argument, ast.Attribute) and argument.attr == "code_revision")
+        if is_validator and uses_boundary_value:
+            return True
+    return False
+
+
+class TestExhaustivePublicBoundaryInventory:
+    """The core exhaustive scan: every class/function automatically
+    discovered under the Phase 0 public service/value boundary scope
+    must use typed identifiers/digests for every ID/digest-shaped
+    parameter, attribute, and (role, id) pair aggregate."""
+
+    def test_no_bare_str_identifier_digest_boundaries(self) -> None:
+        failures = collect_boundary_failures()
+        assert not failures, "\n".join(failures)
+
+    def test_discovery_covers_every_scoped_module(self) -> None:
+        """Discovery cannot silently omit a newly added scoped module."""
+        all_modules: set[str] = set()
+        for root in _SCOPE_ROOT_PACKAGES:
+            all_modules.add(root.__name__)
+            for info in pkgutil.walk_packages(root.__path__, prefix=root.__name__ + "."):
+                all_modules.add(info.name)
+
+        discovered = set(_discover_scope_modules())
+        assert discovered == all_modules
+
+    def test_plain_string_site_allowlist_is_exact_and_live(self) -> None:
+        """Every qualified exception must still resolve to a bare-string
+        field; stale, misspelled, or module-wide exemptions are forbidden."""
+        discovered_sites: set[str] = set()
+        for module in _discover_scope_modules().values():
+            for cls in _classes_defined_in(module):
+                hints = typing.get_type_hints(cls, include_extras=True, globalns=vars(module))
+                for field_name, annotation in hints.items():
+                    site = f"{cls.__module__}.{cls.__qualname__}.{field_name}"
+                    if site in _ALLOWED_PLAIN_STR_SITES and _annotation_contains_bare_str(
+                        annotation
+                    ):
+                        discovered_sites.add(site)
+
+        assert discovered_sites == set(_ALLOWED_PLAIN_STR_SITES)
+
+
+class TestCodeRevisionBoundariesUseSharedRuntimeValidator:
+    """Revision-bearing public boundaries: ``code_revision`` has no typed
+    class (it is validated by ``validate_code_revision`` instead), so it
+    is excepted from the bare-str check above -- but every discovered
+    ``code_revision`` field/parameter must be proven to actually route
+    through that shared validator, automatically, not by trusting the
+    exception list alone.
+
+    ``source_revision`` (``SourceIdentity``/``SourceRegistrationRequest``)
+    is a deliberately distinct, free-form external-source revision label
+    (e.g. ``"v1"``), not a 40-hex-character Git SHA, so it is intentionally
+    not part of this ``validate_code_revision``-governed family and is not
+    inventoried here.
+    """
+
+    def test_every_discovered_code_revision_boundary_is_validated(self) -> None:
+        sites = _discover_code_revision_sites()
+        # If this ever comes back empty, the discovery mechanism itself
+        # broke silently -- code_revision is a real, load-bearing field
+        # in this codebase today.
+        assert sites, "expected at least one discovered code_revision boundary"
+        failures = [
+            label for label, obj in sites if not _code_revision_boundary_has_runtime_validator(obj)
         ]
-        all_failures: list[str] = []
-        for protocol_cls in protocol_classes:
-            for method_name in _protocol_methods(protocol_cls):
-                func = vars(protocol_cls)[method_name]
-                label = f"{protocol_cls.__name__}.{method_name}"
-                all_failures.extend(
-                    _assert_identifier_params_typed(
-                        func, label=label, owner_globalns=vars(interfaces_module)
-                    )
-                )
-        assert not all_failures, "\n".join(all_failures)
-
-    def test_value_object_protocols_use_typed_identifier_fields(self) -> None:
-        """``StoredObject``, ``ConfigurationSnapshotLike``, and
-        ``GridDefinitionLike`` are attribute-only protocols (no
-        methods to inspect via signatures); check their annotated
-        class-body attributes directly."""
-        all_failures: list[str] = []
-        for protocol_cls in (
-            interfaces_module.StoredObject,
-            interfaces_module.ConfigurationSnapshotLike,
-            interfaces_module.GridDefinitionLike,
-        ):
-            hints = typing.get_type_hints(protocol_cls, globalns=vars(interfaces_module))
-            for attr_name, annotation in hints.items():
-                if not _looks_like_identifier(attr_name):
-                    continue
-                if _annotation_contains_bare_str(
-                    annotation
-                ) or not _annotation_uses_typed_identifier(annotation):
-                    all_failures.append(
-                        f"{protocol_cls.__name__}.{attr_name}: annotation {annotation!r} "
-                        "is not a typed identifier/digest class"
-                    )
-        assert not all_failures, "\n".join(all_failures)
-
-
-class TestConcretePostgresRepositoriesUseTypedIdentifiers:
-    """``storage.postgres.repositories``: every concrete repository's
-    public method must declare typed ID/digest parameters (final
-    re-review HIGH finding 6/t_1ecb8414 -- grid/config/stored-object
-    access, add_derived, artifact lookups, activity methods/lookups,
-    and run lookup were all left string-typed)."""
-
-    def test_all_public_repository_methods_use_typed_identifiers(self) -> None:
-        repository_classes = [
-            repositories_module.PostgresGridRepository,
-            repositories_module.PostgresConfigurationRepository,
-            repositories_module.PostgresStoredObjectRepository,
-            repositories_module.PostgresArtifactRepository,
-            repositories_module.PostgresActivityRepository,
-            repositories_module.PostgresRunRepository,
-        ]
-        all_failures: list[str] = []
-        for repo_cls in repository_classes:
-            for method_name, member in vars(repo_cls).items():
-                if method_name.startswith("_") or not callable(member):
-                    continue
-                label = f"{repo_cls.__name__}.{method_name}"
-                all_failures.extend(
-                    _assert_identifier_params_typed(
-                        member, label=label, owner_globalns=vars(repositories_module)
-                    )
-                )
-        assert not all_failures, "\n".join(all_failures)
-
-    def test_record_dataclasses_use_typed_identifier_fields(self) -> None:
-        all_failures: list[str] = []
-        for record_cls in (
-            repositories_module.GridRecord,
-            repositories_module.ConfigurationSnapshotRecord,
-            repositories_module.StoredObjectRecord,
-        ):
-            hints = typing.get_type_hints(record_cls, globalns=vars(repositories_module))
-            for attr_name, annotation in hints.items():
-                if not _looks_like_identifier(attr_name):
-                    continue
-                if _annotation_contains_bare_str(
-                    annotation
-                ) or not _annotation_uses_typed_identifier(annotation):
-                    all_failures.append(
-                        f"{record_cls.__name__}.{attr_name}: annotation {annotation!r} "
-                        "is not a typed identifier/digest class"
-                    )
-        assert not all_failures, "\n".join(all_failures)
-
-
-class TestS3ObjectStoreUsesTypedIdentifiers:
-    """``storage.s3``: public object-store digest boundaries must be
-    typed (final re-review HIGH finding 6/t_1ecb8414)."""
-
-    def test_public_methods_use_typed_digest(self) -> None:
-        all_failures: list[str] = []
-        for method_name in ("put_if_absent", "get_verified", "exists_verified"):
-            func = vars(s3_module.S3ArtifactObjectStore)[method_name]
-            all_failures.extend(
-                _assert_identifier_params_typed(
-                    func,
-                    label=f"S3ArtifactObjectStore.{method_name}",
-                    owner_globalns=vars(s3_module),
-                )
-            )
-        all_failures.extend(
-            _assert_identifier_params_typed(
-                s3_module.content_addressed_key,
-                label="content_addressed_key",
-                owner_globalns=vars(s3_module),
-            )
-        )
-        assert not all_failures, "\n".join(all_failures)
-
-    def test_s3_stored_object_uses_typed_digest_field(self) -> None:
-        hints = typing.get_type_hints(s3_module.S3StoredObject, globalns=vars(s3_module))
-        annotation = hints["content_digest"]
-        assert _annotation_uses_typed_identifier(annotation)
-        assert not _annotation_contains_bare_str(annotation)
-
-
-class TestPostgresIdempotencyLockUsesTypedIdentifiers:
-    """``storage.postgres.idempotency_lock``: the public digest boundary
-    must be typed (final re-review HIGH finding 6/t_1ecb8414)."""
-
-    def test_acquire_uses_typed_digest(self) -> None:
-        failures = _assert_identifier_params_typed(
-            lock_module.PostgresIdempotencyLock.acquire,
-            label="PostgresIdempotencyLock.acquire",
-            owner_globalns=vars(lock_module),
-        )
         assert not failures, "\n".join(failures)
 
 
-class TestArtifactServicePublicBoundaryUsesTypedIdentifiers:
-    """``application.artifacts``: ``create_run`` and every injected
-    application-side protocol must be typed, not ``str | Typed`` unions
-    (final re-review HIGH finding 6/t_1ecb8414: a ``str | Typed`` union
-    boundary is not a typed boundary, and the earlier remediation left
-    the injected protocols string-typed even though the request models
-    were already typed)."""
+class TestDiscoveryDetectsInjectedMalformedBoundaries:
+    """Regression proving discovery itself is exhaustive, not another
+    enumerated list (exhaustive-inventory requirement 3): each test
+    injects a temporary malformed public boundary directly onto a real
+    in-scope module/class -- never editing any list in this file -- and
+    asserts the automatic scan reports it. If ``collect_boundary_failures``
+    were ever reverted to a hand-picked inventory, every test below would
+    fail, because the injected boundary is never in any such list.
+    """
 
-    def test_create_run_signature_has_no_bare_str_identifier_union(self) -> None:
-        hints = typing.get_type_hints(
-            artifacts_module.ArtifactService.create_run, globalns=vars(artifacts_module)
+    def test_injected_malformed_public_function_is_discovered(self) -> None:
+        import mesoforge.provenance.services as services_module
+
+        def newly_added_public_boundary(artifact_id: str) -> str:  # pragma: no cover
+            return artifact_id
+
+        newly_added_public_boundary.__module__ = services_module.__name__
+        services_module.newly_added_public_boundary = newly_added_public_boundary
+        try:
+            failures = collect_boundary_failures()
+        finally:
+            del services_module.newly_added_public_boundary
+
+        assert any(
+            "newly_added_public_boundary" in failure and "artifact_id" in failure
+            for failure in failures
+        ), "\n".join(failures)
+
+    def test_injected_malformed_protocol_method_is_discovered(self) -> None:
+        from mesoforge.storage import interfaces as interfaces_module
+
+        def rogue_lookup(self: object, artifact_id: str) -> None:  # pragma: no cover
+            raise NotImplementedError
+
+        rogue_lookup.__module__ = interfaces_module.__name__
+        interfaces_module.ArtifactRepository.rogue_lookup = rogue_lookup
+        try:
+            failures = collect_boundary_failures()
+        finally:
+            del interfaces_module.ArtifactRepository.rogue_lookup
+
+        assert any(
+            "ArtifactRepository.rogue_lookup" in failure and "artifact_id" in failure
+            for failure in failures
+        ), "\n".join(failures)
+
+    def test_injected_malformed_classmethod_is_discovered(self) -> None:
+        """Descriptor-wrapped methods are boundaries too; discovery must
+        not be limited to members for which ``inspect.isfunction`` is true."""
+        from mesoforge.storage import interfaces as interfaces_module
+
+        def rogue_lookup(cls: type, artifact_id: str) -> None:  # pragma: no cover
+            raise NotImplementedError
+
+        rogue_lookup.__module__ = interfaces_module.__name__
+        interfaces_module.ArtifactRepository.rogue_class_lookup = classmethod(rogue_lookup)
+        try:
+            failures = collect_boundary_failures()
+        finally:
+            delattr(interfaces_module.ArtifactRepository, "rogue_class_lookup")
+
+        assert any(
+            "ArtifactRepository.rogue_class_lookup" in failure and "artifact_id" in failure
+            for failure in failures
+        ), "\n".join(failures)
+
+    def test_injected_malformed_staticmethod_is_discovered(self) -> None:
+        from mesoforge.storage import interfaces as interfaces_module
+
+        def rogue_lookup(artifact_id: str) -> None:  # pragma: no cover
+            raise NotImplementedError
+
+        rogue_lookup.__module__ = interfaces_module.__name__
+        interfaces_module.ArtifactRepository.rogue_static_lookup = staticmethod(rogue_lookup)
+        try:
+            failures = collect_boundary_failures()
+        finally:
+            delattr(interfaces_module.ArtifactRepository, "rogue_static_lookup")
+
+        assert any(
+            "ArtifactRepository.rogue_static_lookup" in failure and "artifact_id" in failure
+            for failure in failures
+        ), "\n".join(failures)
+
+    def test_injected_malformed_model_field_is_discovered(self) -> None:
+        from pydantic import BaseModel, ConfigDict
+
+        from mesoforge.contracts import artifacts as artifacts_module
+
+        class _RogueManifest(BaseModel):
+            model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+            artifact_id: str
+
+        _RogueManifest.__module__ = artifacts_module.__name__
+        artifacts_module._RogueManifest = _RogueManifest
+        try:
+            failures = collect_boundary_failures()
+        finally:
+            del artifacts_module._RogueManifest
+
+        assert any(
+            "_RogueManifest" in failure and "artifact_id" in failure for failure in failures
+        ), "\n".join(failures)
+
+    def test_injected_malformed_aggregate_ids_collection_is_discovered(self) -> None:
+        import mesoforge.provenance.lineage as lineage_module
+
+        def rogue_bulk_lookup(*, ids: tuple[str, ...]) -> None:  # pragma: no cover
+            raise NotImplementedError
+
+        rogue_bulk_lookup.__module__ = lineage_module.__name__
+        lineage_module.rogue_bulk_lookup = rogue_bulk_lookup
+        try:
+            failures = collect_boundary_failures()
+        finally:
+            del lineage_module.rogue_bulk_lookup
+
+        assert any("rogue_bulk_lookup" in failure and "'ids'" in failure for failure in failures), (
+            "\n".join(failures)
         )
-        identifier_params = {
-            "run_id": RunId,
-            "configuration_snapshot_id": ConfigurationSnapshotId,
-            "configuration_digest": Digest,
-            "environment_digest": Digest,
-            "lockfile_digest": Digest,
-        }
-        failures: list[str] = []
-        for param_name, expected_cls in identifier_params.items():
-            annotation = hints[param_name]
-            if _annotation_contains_bare_str(annotation):
-                failures.append(
-                    f"create_run parameter {param_name!r} annotation {annotation!r} "
-                    f"still permits bare str (expected exactly {expected_cls.__name__})"
-                )
-            if annotation is not expected_cls:
-                failures.append(
-                    f"create_run parameter {param_name!r} annotation is {annotation!r}, "
-                    f"expected exactly {expected_cls.__name__} (no str union)"
-                )
-        selected_annotation = hints["selected_input_artifact_ids"]
-        if _annotation_contains_bare_str(selected_annotation):
-            failures.append(
-                f"create_run parameter 'selected_input_artifact_ids' annotation "
-                f"{selected_annotation!r} still permits bare str elements"
+
+    @pytest.mark.parametrize(
+        "field_name",
+        ("selected_artifact_ids", "artifact_nodes", "activity_nodes"),
+    )
+    def test_injected_malformed_aggregate_model_field_is_discovered(self, field_name: str) -> None:
+        from pydantic import ConfigDict, create_model
+
+        from mesoforge.contracts import provenance as provenance_module
+
+        rogue_model = create_model(
+            "_RogueAggregate",
+            __config__=ConfigDict(extra="forbid", frozen=True, strict=True),
+            __module__=provenance_module.__name__,
+            **{field_name: (tuple[str, ...], ...)},
+        )
+        provenance_module._RogueAggregate = rogue_model
+        try:
+            failures = collect_boundary_failures()
+        finally:
+            delattr(provenance_module, "_RogueAggregate")
+
+        assert any(
+            "_RogueAggregate" in failure and field_name in failure for failure in failures
+        ), "\n".join(failures)
+
+    def test_injected_malformed_role_id_pair_is_discovered(self) -> None:
+        """Structural (role, id) pair detection: a new aggregate whose
+        second tuple element is a bare str must be caught even under a
+        field name (``entries``) that matches no identifier heuristic at
+        all -- proving the pair-shape check is independent of naming."""
+        import mesoforge.provenance.services as services_module
+
+        def rogue_pair_consumer(
+            *, entries: tuple[tuple[str, str], ...]
+        ) -> None:  # pragma: no cover
+            raise NotImplementedError
+
+        rogue_pair_consumer.__module__ = services_module.__name__
+        services_module.rogue_pair_consumer = rogue_pair_consumer
+        try:
+            failures = collect_boundary_failures()
+        finally:
+            del services_module.rogue_pair_consumer
+
+        assert any(
+            "rogue_pair_consumer" in failure and "entries" in failure for failure in failures
+        ), "\n".join(failures)
+
+    def test_injected_optional_malformed_role_id_pair_is_discovered(self) -> None:
+        import mesoforge.provenance.services as services_module
+
+        def rogue_optional_pair_consumer(
+            *, entries: tuple[tuple[str, str], ...] | None
+        ) -> None:  # pragma: no cover
+            raise NotImplementedError
+
+        rogue_optional_pair_consumer.__module__ = services_module.__name__
+        services_module.rogue_optional_pair_consumer = rogue_optional_pair_consumer
+        try:
+            failures = collect_boundary_failures()
+        finally:
+            del services_module.rogue_optional_pair_consumer
+
+        assert any(
+            "rogue_optional_pair_consumer" in failure and "entries" in failure
+            for failure in failures
+        ), "\n".join(failures)
+
+    def test_injected_code_revision_boundary_without_validator_is_discovered(self) -> None:
+        import mesoforge.provenance.services as services_module
+
+        def rogue_revision_consumer(*, code_revision: str) -> str:  # pragma: no cover
+            return code_revision
+
+        rogue_revision_consumer.__module__ = services_module.__name__
+        services_module.rogue_revision_consumer = rogue_revision_consumer
+        try:
+            sites = _discover_code_revision_sites()
+            matching = [label for label, obj in sites if "rogue_revision_consumer" in label]
+            assert matching, "expected the injected code_revision boundary to be discovered"
+            assert not _code_revision_boundary_has_runtime_validator(
+                services_module.rogue_revision_consumer
             )
-        assert not failures, "\n".join(failures)
+        finally:
+            del services_module.rogue_revision_consumer
 
-    def test_injected_protocols_use_typed_identifiers(self) -> None:
-        protocol_classes = [
-            artifacts_module._StoredObjectLike,
-            artifacts_module._ObjectStoreLike,
-            artifacts_module._ArtifactRepositoryLike,
-            artifacts_module._ActivityRepositoryLike,
-            artifacts_module._ConfigurationSnapshotLike,
-            artifacts_module._ConfigurationRepositoryLike,
-            artifacts_module._IdempotencyLockLike,
-        ]
-        all_failures: list[str] = []
-        for protocol_cls in protocol_classes:
-            hints = typing.get_type_hints(protocol_cls, globalns=vars(artifacts_module))
-            for attr_name, annotation in hints.items():
-                if not _looks_like_identifier(attr_name):
-                    continue
-                if _annotation_contains_bare_str(
-                    annotation
-                ) or not _annotation_uses_typed_identifier(annotation):
-                    all_failures.append(
-                        f"{protocol_cls.__name__}.{attr_name}: annotation {annotation!r} "
-                        "is not a typed identifier/digest class"
-                    )
-            for method_name, member in vars(protocol_cls).items():
-                if method_name.startswith("_") or not callable(member):
-                    continue
-                label = f"{protocol_cls.__name__}.{method_name}"
-                all_failures.extend(
-                    _assert_identifier_params_typed(
-                        member, label=label, owner_globalns=vars(artifacts_module)
-                    )
-                )
-        assert not all_failures, "\n".join(all_failures)
+    def test_injected_code_revision_model_without_validator_is_discovered(self) -> None:
+        from pydantic import BaseModel, ConfigDict
 
+        from mesoforge.contracts import provenance as provenance_module
 
-class TestConfigurationServiceInjectedProtocolUsesTypedIdentifiers:
-    """``application.configuration``: the injected ``_GridRepositoryLike``
-    protocol must be typed too (final re-review HIGH finding
-    6/t_1ecb8414: every application-layer injected protocol must
-    conform, not just ``application/artifacts.py``'s)."""
+        class _RogueRevisionModel(BaseModel):
+            model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    def test_grid_repository_like_uses_typed_identifiers(self) -> None:
-        failures = _assert_identifier_params_typed(
-            configuration_module._GridRepositoryLike.add_if_absent,
-            label="_GridRepositoryLike.add_if_absent",
-            owner_globalns=vars(configuration_module),
-        )
-        assert not failures, "\n".join(failures)
+            code_revision: str
 
-
-class TestProvenanceServicesPublicBoundaryUsesTypedIdentifiers:
-    """``provenance.services``: the public, non-Pydantic-mediated
-    ``compute_idempotency_digest`` function boundary must be typed (HIGH
-    finding: the earlier remediation left ``ordered_inputs``,
-    ``configuration_digest``, ``parameters_digest``, ``code_revision``,
-    and ``environment_digest`` as unrestricted ``str``/``tuple[str, str]``
-    with no boundary reconstruction, so a direct runtime call with
-    malformed values succeeded)."""
-
-    def test_compute_idempotency_digest_uses_typed_identifiers(self) -> None:
-        failures = _assert_identifier_params_typed(
-            provenance_services_module.compute_idempotency_digest,
-            label="compute_idempotency_digest",
-            owner_globalns=vars(provenance_services_module),
-        )
-        assert not failures, "\n".join(failures)
-
-
-class TestProvenanceLineagePublicBoundaryUsesTypedIdentifiers:
-    """``provenance.lineage``: every public model/function boundary must
-    use typed ``ArtifactId``/``ActivityId``, including aggregate field
-    names (``root_artifact_id``, ``artifact_nodes``, ``activity_nodes``)
-    that the original suffix-only heuristic could not detect (HIGH
-    finding: ``ActivityEdge``, ``LineageEdgeView``, ``LineageGraph``,
-    ``build_lineage_graph``, and ``detect_cycle`` were all left
-    string-typed)."""
-
-    def test_activity_edge_and_lineage_edge_view_use_typed_fields(self) -> None:
-        all_failures: list[str] = []
-        for model_cls in (lineage_module.ActivityEdge, lineage_module.LineageEdgeView):
-            hints = typing.get_type_hints(model_cls, globalns=vars(lineage_module))
-            for attr_name, annotation in hints.items():
-                if not _looks_like_identifier(attr_name):
-                    continue
-                if _annotation_contains_bare_str(
-                    annotation
-                ) or not _annotation_uses_typed_identifier(annotation):
-                    all_failures.append(
-                        f"{model_cls.__name__}.{attr_name}: annotation {annotation!r} "
-                        "is not a typed identifier/digest class"
-                    )
-        assert not all_failures, "\n".join(all_failures)
-
-    def test_lineage_graph_uses_typed_fields_including_aggregate_names(self) -> None:
-        hints = typing.get_type_hints(lineage_module.LineageGraph, globalns=vars(lineage_module))
-        all_failures: list[str] = []
-        for attr_name in ("root_artifact_id", "artifact_nodes", "activity_nodes"):
-            annotation = hints[attr_name]
-            if _annotation_contains_bare_str(annotation) or not _annotation_uses_typed_identifier(
-                annotation
-            ):
-                all_failures.append(
-                    f"LineageGraph.{attr_name}: annotation {annotation!r} is not a typed "
-                    "identifier class"
-                )
-        assert not all_failures, "\n".join(all_failures)
-
-    def test_build_lineage_graph_and_detect_cycle_use_typed_identifiers(self) -> None:
-        all_failures: list[str] = []
-        for func, label in (
-            (lineage_module.build_lineage_graph, "build_lineage_graph"),
-            (lineage_module.detect_cycle, "detect_cycle"),
-        ):
-            all_failures.extend(
-                _assert_identifier_params_typed(
-                    func, label=label, owner_globalns=vars(lineage_module)
-                )
+        _RogueRevisionModel.__module__ = provenance_module.__name__
+        provenance_module._RogueRevisionModel = _RogueRevisionModel
+        try:
+            sites = _discover_code_revision_sites()
+            matching = [(label, obj) for label, obj in sites if "_RogueRevisionModel" in label]
+            assert matching, "expected the injected revision model to be discovered"
+            assert all(
+                not _code_revision_boundary_has_runtime_validator(obj) for _, obj in matching
             )
-        assert not all_failures, "\n".join(all_failures)
-
-
-class TestStorageLineageReaderUsesTypedIdentifiers:
-    """``storage.interfaces.LineageReader`` exposes ``LineageGraph``,
-    which must itself be typed (final re-review HIGH finding: this
-    storage-facing value boundary remained string-typed via
-    ``provenance.lineage`` even though the protocol method signature
-    itself already used ``ArtifactId``)."""
-
-    def test_lineage_reader_return_type_is_fully_typed(self) -> None:
-        hints = typing.get_type_hints(interfaces_module.LineageGraph, globalns=vars(lineage_module))
-        all_failures: list[str] = []
-        for attr_name in ("root_artifact_id", "artifact_nodes", "activity_nodes"):
-            annotation = hints[attr_name]
-            if _annotation_contains_bare_str(annotation) or not _annotation_uses_typed_identifier(
-                annotation
-            ):
-                all_failures.append(
-                    f"LineageGraph.{attr_name}: annotation {annotation!r} is not a typed "
-                    "identifier class"
-                )
-        assert not all_failures, "\n".join(all_failures)
+        finally:
+            delattr(provenance_module, "_RogueRevisionModel")

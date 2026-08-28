@@ -138,6 +138,28 @@ class TestPostgresArtifactRepositoryRejectsMalformedValues:
                 attributes=None,
             )
 
+    def test_add_derived_rejects_malformed_code_revision(self, migrated_dsn: str) -> None:
+        completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+        with PostgresUnitOfWork(migrated_dsn) as uow, pytest.raises(InvalidIdentifier):
+            uow.artifacts.add_derived(
+                artifact_id=f"art_{uuid.uuid4()}",
+                artifact_type="x",
+                artifact_schema_version="x.v1",
+                content_digest=_VALID_DIGEST,
+                created_at=completed_at,
+                availability_authority="a",
+                availability_method="m",
+                parent_available_ats=(),
+                activity_completed_at=completed_at,
+                run_id=None,
+                configuration_snapshot_id=_VALID_CONFIG_SNAPSHOT_ID,
+                configuration_digest=_VALID_DIGEST,
+                code_revision="not-a-revision",
+                environment_digest=_VALID_DIGEST,
+                quality_state="valid",
+                attributes=None,
+            )
+
 
 class TestPostgresActivityRepositoryRejectsMalformedValues:
     def test_finish_succeeded_rejects_malformed_activity_id(self, migrated_dsn: str) -> None:

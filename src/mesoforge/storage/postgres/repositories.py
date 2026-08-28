@@ -34,6 +34,7 @@ from mesoforge.common.identifiers import (
     GridId,
     RunId,
     strip_prefix,
+    validate_code_revision,
 )
 from mesoforge.contracts.artifacts import ArtifactManifest, Availability, SourceIdentity
 from mesoforge.contracts.provenance import ActivityArtifactRef, ActivityError, ActivityManifest
@@ -338,12 +339,19 @@ class PostgresArtifactRepository:
         finding 6/t_1ecb8414): a caller that bypasses static typing at
         runtime with a malformed value fails closed with
         ``InvalidIdentifier`` here, before any SQL is issued.
+        ``code_revision`` is a direct (non-Pydantic-mediated) parameter
+        of this boundary -- like ``compute_idempotency_digest`` -- so it
+        must itself call ``validate_code_revision`` rather than trust a
+        caller that bypasses static typing (exhaustive-inventory
+        remediation: this was the one direct ``code_revision`` boundary
+        that had no runtime validation at all).
         """
         artifact_id = ArtifactId(artifact_id)
         content_digest = Digest(content_digest)
         run_id = RunId(run_id) if run_id is not None else None
         configuration_snapshot_id = ConfigurationSnapshotId(configuration_snapshot_id)
         configuration_digest = Digest(configuration_digest)
+        code_revision = validate_code_revision(code_revision)
         environment_digest = Digest(environment_digest)
 
         artifact_uuid = uuid.UUID(strip_prefix(artifact_id, "art_"))

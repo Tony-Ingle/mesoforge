@@ -32,11 +32,12 @@ import numpy as np
 import xarray as xr
 
 from mesoforge.common.errors import MesoForgeError
+from mesoforge.common.identifiers import GridId
 
 
 @runtime_checkable
 class GridLike(Protocol):
-    grid_id: str
+    grid_id: GridId
     shape_y: int
     shape_x: int
     x_coordinates: tuple[float, ...]
@@ -229,7 +230,7 @@ def _validate_interval_bounds(
 def validate_canonical_dataset(
     dataset: xr.Dataset,
     *,
-    grids: dict[str, GridLike],
+    grids: dict[GridId, GridLike],
     variables: dict[str, VariableLike],
 ) -> None:
     """Validate ``dataset`` in place. Raises CanonicalDatasetError with all
