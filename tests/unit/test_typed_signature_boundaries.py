@@ -120,6 +120,10 @@ _ALLOWED_PLAIN_STR_SITES: dict[str, str] = {
         "external AviationWeather.gov provider ICAO identifier retained as lineage, "
         "not a MesoForge StationId (see station_id on the same model)"
     ),
+    "mesoforge.contracts.verification.MetricRow.unit_id": (
+        "catalog unit label; no UnitId value class exists in Phase 0 (matches "
+        "VariableLike.canonical_unit_id above)"
+    ),
 }
 
 # Name patterns that flag a parameter/attribute as identifier/digest-like
