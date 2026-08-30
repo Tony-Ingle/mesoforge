@@ -330,3 +330,87 @@ class TestRequestRateLimiter:
     def test_rejects_nonpositive_interval(self) -> None:
         with pytest.raises(ValueError, match="positive"):
             RequestRateLimiter(min_interval_seconds=0.0)
+
+    def test_retry_after_zero_does_not_bypass_minimum_interval(self) -> None:
+        """Codex review t_30309949: a valid ``Retry-After: 0`` (or any
+        value below ``min_request_interval_seconds``) must never let
+        the retried attempt fire sooner than the configured minimum --
+        the shared limiter, invoked before every actual transport
+        attempt, tops up the gap on top of the provider's Retry-After.
+        """
+        clock = _FakeClock(datetime(2026, 8, 28, 12, 0, 0, tzinfo=UTC))
+        attempt_times: list[datetime] = []
+
+        class _RecordingTransport(_FakeTransport):
+            def get(self, url, *, headers=None, timeout=None):
+                attempt_times.append(clock.now())
+                return super().get(url, headers=headers, timeout=timeout)
+
+        transport = _RecordingTransport()
+        transport.get_queue = [
+            _FakeResponse(status_code=429, headers={"Retry-After": "0"}),
+            _FakeResponse(status_code=200, content=b"[]"),
+        ]
+        sleeper = _FakeSleeper(clock)
+        limiter = RequestRateLimiter(min_interval_seconds=1.0)
+
+        acquire_stationinfo(
+            _SETTINGS,
+            transport=transport,
+            clock=clock,
+            sleeper=sleeper,
+            station_ids=("KCBG",),
+            rate_limiter=limiter,
+        )
+
+        assert len(attempt_times) == 2
+        delta_seconds = (attempt_times[1] - attempt_times[0]).total_seconds()
+        assert delta_seconds >= _SETTINGS.min_request_interval_seconds
+
+    def test_subsequent_call_after_a_retry_still_respects_minimum_interval(self) -> None:
+        """Codex review t_30309949: after a retried acquisition
+        completes, the very next acquisition call sharing the same
+        limiter must still be spaced by at least
+        ``min_request_interval_seconds`` from the last *actual*
+        attempt (the retry), not merely from the call that returned
+        the retryable status.
+        """
+        clock = _FakeClock(datetime(2026, 8, 28, 12, 0, 0, tzinfo=UTC))
+        attempt_times: list[datetime] = []
+
+        class _RecordingTransport(_FakeTransport):
+            def get(self, url, *, headers=None, timeout=None):
+                attempt_times.append(clock.now())
+                return super().get(url, headers=headers, timeout=timeout)
+
+        transport = _RecordingTransport()
+        transport.get_queue = [
+            _FakeResponse(status_code=429, headers={"Retry-After": "0"}),
+            _FakeResponse(status_code=200, content=b"[]"),
+            _FakeResponse(status_code=200, content=b"[]"),
+        ]
+        sleeper = _FakeSleeper(clock)
+        limiter = RequestRateLimiter(min_interval_seconds=1.0)
+
+        acquire_stationinfo(
+            _SETTINGS,
+            transport=transport,
+            clock=clock,
+            sleeper=sleeper,
+            station_ids=("KCBG",),
+            rate_limiter=limiter,
+        )
+        acquire_metar_batch(
+            _SETTINGS,
+            transport=transport,
+            clock=clock,
+            sleeper=sleeper,
+            station_ids=("KCBG",),
+            query_date=datetime(2026, 8, 28, 18, 15, tzinfo=UTC),
+            rate_limiter=limiter,
+        )
+
+        assert len(attempt_times) == 3
+        for earlier, later in zip(attempt_times, attempt_times[1:], strict=False):
+            delta_seconds = (later - earlier).total_seconds()
+            assert delta_seconds >= _SETTINGS.min_request_interval_seconds

@@ -169,14 +169,21 @@ class AviationWeatherSettings(BaseModel):
             )
         if self.min_request_interval_seconds <= 0:
             raise ValueError("min_request_interval_seconds must be positive")
-        # Residual review finding 3: RequestRateLimiter.wait() is only
-        # invoked once per acquire_stationinfo/acquire_metar_batch call
-        # (before that call's retry loop begins); subsequent retry
-        # attempts within the same call are spaced only by
-        # retry_policy.backoff_seconds. For every actual HTTP attempt --
-        # including retries -- to respect the configured process
-        # interval, the retry policy's first (smallest) backoff must be
-        # at least the configured minimum interval; backoff_seconds is
+        # Residual review finding (Codex review t_30309949):
+        # ``RequestRateLimiter.wait()`` is now invoked by
+        # ``observations.acquisition._fetch_with_retry`` immediately
+        # before *every* actual transport attempt -- the first request
+        # and every retry -- so when a rate limiter is supplied the
+        # limiter itself is authoritative and this backoff/interval
+        # relationship is no longer required for correctness. This
+        # check is retained as defense-in-depth for any call site that
+        # invokes ``acquire_stationinfo``/``acquire_metar_batch``
+        # directly without an injected limiter (``rate_limiter=None``),
+        # where ``retry_policy.backoff_seconds`` alone spaces retries:
+        # requiring the first (smallest) backoff to be at least the
+        # configured minimum interval keeps even that unthrottled path
+        # from firing retries closer together than
+        # ``min_request_interval_seconds``. ``backoff_seconds`` is
         # already required to be strictly increasing, so this alone
         # guarantees every later retry gap is >= min_request_interval_seconds
         # too.

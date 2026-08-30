@@ -101,15 +101,31 @@ def _fetch_with_retry(
     url: str,
     headers: dict[str, str],
     settings: AviationWeatherSettings,
+    rate_limiter: RequestRateLimiter | None = None,
 ) -> FetchedResponse:
     """Section 2.4 HTTP handling: 200 retains the exact body even if
     empty; 204 retains a canonical empty-response artifact; 400/403/404
     are terminal; 429/500/502/504 and transport timeouts retry with the
-    shared 1/2/4/8s policy and Retry-After cap."""
+    shared 1/2/4/8s policy and Retry-After cap.
+
+    Residual review finding (Codex review t_30309949): ``rate_limiter``
+    -- when supplied -- is invoked immediately before *every* actual
+    ``transport.get`` attempt, including the first request and every
+    retry, not merely once before this function is entered. This keeps
+    the limiter's last-attempt state accurate across the whole retry
+    loop, so a provider ``Retry-After`` (even ``Retry-After: 0``) or a
+    configured backoff step shorter than ``min_request_interval_seconds``
+    can never let two actual attempts fire closer together than the
+    configured minimum: the limiter tops up any shortfall after the
+    provider-directed sleep, on top of -- never instead of -- honoring
+    Retry-After/backoff.
+    """
     retry_policy = settings.retry_policy
     last_status: int | None = None
 
     for attempt_index in range(retry_policy.attempts_per_endpoint):
+        if rate_limiter is not None:
+            rate_limiter.wait(clock=clock, sleeper=sleeper)
         try:
             response: HttpResponse = transport.get(
                 url,
@@ -177,8 +193,6 @@ def acquire_stationinfo(
     station_ids: tuple[str, ...],
     rate_limiter: RequestRateLimiter | None = None,
 ) -> FetchedResponse:
-    if rate_limiter is not None:
-        rate_limiter.wait(clock=clock, sleeper=sleeper)
     url = build_stationinfo_url(settings, station_ids=station_ids)
     return _fetch_with_retry(
         transport,
@@ -187,6 +201,7 @@ def acquire_stationinfo(
         url=url,
         headers=dict(request_headers(settings)),
         settings=settings,
+        rate_limiter=rate_limiter,
     )
 
 
@@ -200,8 +215,6 @@ def acquire_metar_batch(
     query_date: datetime,
     rate_limiter: RequestRateLimiter | None = None,
 ) -> FetchedResponse:
-    if rate_limiter is not None:
-        rate_limiter.wait(clock=clock, sleeper=sleeper)
     url = build_metar_url(settings, station_ids=station_ids, query_date=query_date)
     return _fetch_with_retry(
         transport,
@@ -210,4 +223,5 @@ def acquire_metar_batch(
         url=url,
         headers=dict(request_headers(settings)),
         settings=settings,
+        rate_limiter=rate_limiter,
     )
