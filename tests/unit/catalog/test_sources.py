@@ -174,3 +174,19 @@ class TestAviationWeatherSettings:
     def test_rejects_nonpositive_window(self) -> None:
         with pytest.raises(ValidationError):
             self._settings(metar_window_hours=0.0)
+
+    def test_rejects_backoff_smaller_than_min_interval(self) -> None:
+        """MEDIUM review finding 3: every actual HTTP attempt, including
+        retries, must respect the configured process interval. The
+        first (smallest) backoff step must be at least
+        min_request_interval_seconds so no retry attempt can fire
+        sooner than the configured throttle."""
+        under_interval_retry = RetryPolicy(
+            connect_timeout_seconds=10.0,
+            read_timeout_seconds=60.0,
+            attempts_per_endpoint=4,
+            backoff_seconds=(0.1, 2.0, 4.0, 8.0),
+            retry_after_cap_seconds=60.0,
+        )
+        with pytest.raises(ValidationError, match="backoff_seconds"):
+            self._settings(min_request_interval_seconds=1.0, retry_policy=under_interval_retry)

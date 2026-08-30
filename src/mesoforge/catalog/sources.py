@@ -169,6 +169,24 @@ class AviationWeatherSettings(BaseModel):
             )
         if self.min_request_interval_seconds <= 0:
             raise ValueError("min_request_interval_seconds must be positive")
+        # Residual review finding 3: RequestRateLimiter.wait() is only
+        # invoked once per acquire_stationinfo/acquire_metar_batch call
+        # (before that call's retry loop begins); subsequent retry
+        # attempts within the same call are spaced only by
+        # retry_policy.backoff_seconds. For every actual HTTP attempt --
+        # including retries -- to respect the configured process
+        # interval, the retry policy's first (smallest) backoff must be
+        # at least the configured minimum interval; backoff_seconds is
+        # already required to be strictly increasing, so this alone
+        # guarantees every later retry gap is >= min_request_interval_seconds
+        # too.
+        if self.retry_policy.backoff_seconds[0] < self.min_request_interval_seconds:
+            raise ValueError(
+                "retry_policy.backoff_seconds[0] "
+                f"({self.retry_policy.backoff_seconds[0]!r}) must be >= "
+                f"min_request_interval_seconds ({self.min_request_interval_seconds!r}) so "
+                "every retry attempt also respects the configured process interval"
+            )
         return self
 
     @model_validator(mode="after")

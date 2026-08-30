@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlencode
 
@@ -43,33 +43,50 @@ _REQUIRED_CAMEL_KEYS: tuple[str, ...] = (
 _OPTIONAL_CAMEL_KEYS: tuple[str, ...] = ("temp", "wdir", "wspd", "qcField")
 
 
-def _parse_provider_instant(value: Any, *, field: str) -> datetime:
-    """The provider encodes ``obsTime`` as Unix epoch seconds (int) and
-    ``reportTime``/``receiptTime`` as ISO 8601 UTC strings ending in
-    ``Z``; both shapes are accepted for any of the three fields
-    defensively, since the live schema is not contractually pinned by
-    an OpenAPI enum (mirrors ``catalog.stations._extract_site_types``'s
-    documented defensive-parsing rationale)."""
-    if isinstance(value, bool):
-        raise AviationWeatherParseError(f"{field} must not be a boolean, got {value!r}")
-    if isinstance(value, int):
-        return datetime.fromtimestamp(value, tz=UTC)
-    if isinstance(value, str):
-        text = value.strip()
-        if text.endswith("Z"):
-            text = text[:-1] + "+00:00"
-        try:
-            parsed = datetime.fromisoformat(text)
-        except ValueError as exc:
-            raise AviationWeatherParseError(
-                f"{field} is not a valid ISO 8601 string: {value!r}"
-            ) from exc
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=UTC)
-        return parsed.astimezone(UTC)
-    raise AviationWeatherParseError(
-        f"{field} must be a Unix epoch integer or an ISO 8601 string, got {value!r}"
-    )
+def _parse_epoch_seconds_instant(value: Any, *, field: str) -> datetime:
+    """The provider encodes ``obsTime`` as exact Unix epoch seconds
+    (int), per the Phase 1 plan ('pinning obsTime to Unix seconds').
+    Residual review finding 4: this is now strict and fail-closed --
+    only an ``int`` (never ``bool``, ``float``, or ``str``, even a
+    numeric-looking one) is accepted."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise AviationWeatherParseError(
+            f"{field} must be a Unix epoch integer (seconds), got {value!r} ({type(value)!r})"
+        )
+    return datetime.fromtimestamp(value, tz=UTC)
+
+
+def _parse_iso8601_utc_instant(value: Any, *, field: str) -> datetime:
+    """``reportTime``/``receiptTime`` must be an explicit-UTC ISO 8601
+    string (per the Phase 1 plan: malformed/non-UTC timestamps are
+    rejected, never silently coerced). Residual review finding 4: a
+    naive (offset-less) string is no longer defaulted to UTC, and a
+    non-``Z``/non-``+00:00`` offset (e.g. ``+01:00``) is rejected
+    rather than converted -- the provider's own field representation
+    must already be explicit UTC."""
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise AviationWeatherParseError(
+            f"{field} must be an explicit-UTC ISO 8601 string, got {value!r} ({type(value)!r})"
+        )
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise AviationWeatherParseError(
+            f"{field} is not a valid ISO 8601 string: {value!r}"
+        ) from exc
+    if parsed.tzinfo is None:
+        raise AviationWeatherParseError(
+            f"{field} must carry an explicit UTC offset ('Z' or '+00:00'), got a "
+            f"naive (offset-less) value: {value!r}"
+        )
+    if parsed.utcoffset() != timedelta(0):
+        raise AviationWeatherParseError(
+            f"{field} must be explicit UTC ('Z' or '+00:00'), got a non-UTC offset: {value!r}"
+        )
+    return parsed.replace(tzinfo=UTC)
 
 
 def parse_raw_metar_record(record: Mapping[str, Any]) -> RawMetarRecord:
@@ -85,9 +102,9 @@ def parse_raw_metar_record(record: Mapping[str, Any]) -> RawMetarRecord:
 
     mapped: dict[str, Any] = {
         "icao_id": record["icaoId"],
-        "obs_time": _parse_provider_instant(record["obsTime"], field="obsTime"),
-        "report_time": _parse_provider_instant(record["reportTime"], field="reportTime"),
-        "receipt_time": _parse_provider_instant(record["receiptTime"], field="receiptTime"),
+        "obs_time": _parse_epoch_seconds_instant(record["obsTime"], field="obsTime"),
+        "report_time": _parse_iso8601_utc_instant(record["reportTime"], field="reportTime"),
+        "receipt_time": _parse_iso8601_utc_instant(record["receiptTime"], field="receiptTime"),
         "metar_type": record["metarType"],
         "raw_ob": record["rawOb"],
         "lat": record["lat"],

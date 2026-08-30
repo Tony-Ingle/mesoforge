@@ -169,6 +169,67 @@ class TestParseRawMetarRecord:
         assert record.icao_id == "KCBG"
 
 
+class TestStrictProviderTimestamps:
+    """MEDIUM residual review finding 4: the Phase 1 plan requires
+    malformed/non-UTC timestamps to be rejected and obsTime pinned to
+    Unix seconds -- provider timestamp fields must be parsed strictly
+    against their exact documented representation, never defensively
+    coerced across shapes or silently assumed/converted to UTC."""
+
+    def test_rejects_string_obs_time(self) -> None:
+        """obsTime must be an int (Unix epoch seconds); a numeric-
+        looking string must not be silently coerced."""
+        with pytest.raises(AviationWeatherParseError, match="obsTime"):
+            parse_raw_metar_record(_live_record(obsTime="1787950380"))
+
+    def test_rejects_float_obs_time(self) -> None:
+        with pytest.raises(AviationWeatherParseError, match="obsTime"):
+            parse_raw_metar_record(_live_record(obsTime=1787950380.5))
+
+    def test_rejects_boolean_obs_time(self) -> None:
+        with pytest.raises(AviationWeatherParseError, match="obsTime"):
+            parse_raw_metar_record(_live_record(obsTime=True))
+
+    def test_rejects_int_report_time(self) -> None:
+        """reportTime/receiptTime must be an ISO 8601 string; a raw
+        epoch integer must not be silently accepted as an alternate
+        shape."""
+        with pytest.raises(AviationWeatherParseError, match="reportTime"):
+            parse_raw_metar_record(_live_record(reportTime=1787950800))
+
+    def test_rejects_int_receipt_time(self) -> None:
+        with pytest.raises(AviationWeatherParseError, match="receiptTime"):
+            parse_raw_metar_record(_live_record(receiptTime=1787950800))
+
+    def test_rejects_naive_report_time(self) -> None:
+        """A naive (offset-less) ISO string must be rejected outright,
+        never defaulted to UTC -- reproduces the runtime probe that
+        previously accepted a naive reportTime."""
+        with pytest.raises(AviationWeatherParseError, match="reportTime"):
+            parse_raw_metar_record(_live_record(reportTime="2026-08-28T21:00:00"))
+
+    def test_rejects_naive_receipt_time(self) -> None:
+        with pytest.raises(AviationWeatherParseError, match="receiptTime"):
+            parse_raw_metar_record(_live_record(receiptTime="2026-08-28T20:56:23.517"))
+
+    def test_rejects_non_utc_offset_report_time(self) -> None:
+        """A non-UTC offset (e.g. +01:00) must be rejected outright,
+        never silently converted to UTC -- reproduces the runtime
+        probe that previously accepted a +01:00 reportTime."""
+        with pytest.raises(AviationWeatherParseError, match="reportTime"):
+            parse_raw_metar_record(_live_record(reportTime="2026-08-28T22:00:00+01:00"))
+
+    def test_rejects_non_utc_offset_receipt_time(self) -> None:
+        with pytest.raises(AviationWeatherParseError, match="receiptTime"):
+            parse_raw_metar_record(_live_record(receiptTime="2026-08-28T21:56:23.517+01:00"))
+
+    def test_accepts_explicit_plus_00_00_offset(self) -> None:
+        """An explicit ``+00:00`` offset (not just the ``Z`` shorthand)
+        is still valid UTC and must be accepted."""
+        record = parse_raw_metar_record(_live_record(reportTime="2026-08-28T21:00:00+00:00"))
+        assert record.report_time == datetime(2026, 8, 28, 21, 0, 0, tzinfo=UTC)
+
+
 class TestParseRawMetarResponse:
     def test_parses_json_array_in_order(self) -> None:
         payload = json.dumps([_live_record(icaoId="KCBG"), _live_record(icaoId="KJMR")]).encode()

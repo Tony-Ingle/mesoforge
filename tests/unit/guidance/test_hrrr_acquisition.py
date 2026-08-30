@@ -80,18 +80,37 @@ _INDEX_TEXT = (
 _FULL_GRIB_LENGTH = 300
 
 
+def _grib2_section0(*, total_length: int) -> bytes:
+    """A spec-shaped GRIB2 Section 0 (Indicator Section, 16 octets):
+    ``GRIB`` magic, 2 reserved octets, 1 discipline octet, edition 2,
+    then the 8-octet big-endian total-message-length field."""
+    return b"GRIB" + b"\x00\x00" + b"\x00" + b"\x02" + total_length.to_bytes(8, "big")
+
+
+_GRIB2_SECTION0_LEN = 16
+_GRIB_TRAILER = b"7777"
+
+
+def _grib2_message(fill: bytes, *, total_length: int = 100) -> bytes:
+    """One synthetic, framing-valid GRIB2 message of exactly
+    ``total_length`` bytes: a real Section 0 (edition 2, correct
+    encoded total length) plus filler interior bytes and the ``7777``
+    end section -- passes both the legacy prefix/suffix check and the
+    residual edition/Section-0-length validation (review finding 2)."""
+    section0 = _grib2_section0(total_length=total_length)
+    interior_length = total_length - len(section0) - len(_GRIB_TRAILER)
+    assert interior_length >= 0
+    return section0 + fill * interior_length + _GRIB_TRAILER
+
+
 def _grib_bytes() -> bytes:
-    # Each 100-byte segment carries the real GRIB2 message framing
-    # (``GRIB`` indicator .. ``7777`` end section) so the acquisition
-    # boundary check (plan Section 2.2/2.3, review finding 5) accepts
-    # these synthetic byte-range fixtures the same way it accepts a
-    # real provider payload; only the interior payload bytes vary per
-    # simulated field.
-    return (
-        (b"GRIB" + b"T" * 92 + b"7777")
-        + (b"GRIB" + b"U" * 92 + b"7777")
-        + (b"GRIB" + b"V" * 92 + b"7777")
-    )
+    # Each 100-byte segment carries real GRIB2 Section 0 framing (magic,
+    # edition 2, exact encoded total-message length) and the ``7777``
+    # end section, so the acquisition boundary check (plan Section
+    # 2.2/2.3, review finding 2/5) accepts these synthetic byte-range
+    # fixtures the same way it accepts a real provider payload; only
+    # the interior payload bytes vary per simulated field.
+    return _grib2_message(b"T") + _grib2_message(b"U") + _grib2_message(b"V")
 
 
 @dataclass
@@ -641,6 +660,86 @@ class TestRangeIntegrityMutations:
                 cycle_deadline=datetime(2026, 8, 28, 19, 30, tzinfo=UTC),
             )
 
+    def test_rejects_wrong_total_when_selected_rows_are_not_the_final_inventory_row(
+        self,
+    ) -> None:
+        """Residual review finding 1: previously, ``full_object_length``
+        was only established (and only enforced) when a *selected* row
+        happened to be the inventory's last message. Here the selected
+        TMP/UGRD/VGRD rows are all followed by an unselected fourth
+        inventory row (a field Phase 1 does not select), so under the
+        old logic ``needs_full_length`` was False, no HEAD ran, and a
+        wrong/inconsistent Content-Range total was silently accepted
+        (runtime probe ``ACCEPTED_WRONG_TOTAL``). The fix must always
+        HEAD first and reject every selected range whose Content-Range
+        total does not match, regardless of selection position."""
+        transport = _FakeTransport()
+        index_with_trailing_unselected_row = (
+            _INDEX_TEXT + "4:300:d=2026082818:HGT:2 m above ground:anl:\n"
+        )
+        transport.get_queue["aws"] = [
+            _FakeResponse(status_code=200, content=index_with_trailing_unselected_row.encode()),
+            _FakeResponse(
+                status_code=206,
+                # Correct start/end and correct byte count, but a
+                # wrong/inconsistent total (999999 != the real
+                # full-object length) -- must still be rejected.
+                headers={"Content-Range": "bytes 0-99/999999"},
+                content=_grib_bytes()[0:100],
+            ),
+            _FakeResponse(
+                status_code=206,
+                headers={"Content-Range": "bytes 0-99/999999"},
+                content=_grib_bytes()[0:100],
+            ),
+        ]
+        transport.head_queue["aws"] = [
+            # The real full-object length, as HEAD would report it.
+            _FakeResponse(status_code=200, headers={"Content-Length": "400"})
+        ]
+        clock = _FakeClock(datetime(2026, 8, 28, 18, 5, tzinfo=UTC))
+        sleeper = _FakeSleeper(clock)
+
+        with pytest.raises(HrrrAcquisitionError, match="range integrity mismatch"):
+            acquire_hrrr_lead(
+                _SETTINGS,
+                transport=transport,
+                clock=clock,
+                sleeper=sleeper,
+                cycle_date=date(2026, 8, 28),
+                cycle_hour=18,
+                forecast_hour=0,
+                cycle_deadline=datetime(2026, 8, 28, 19, 30, tzinfo=UTC),
+            )
+        # A HEAD must always be issued now, regardless of selection
+        # position within the inventory.
+        assert len([c for c in transport.calls if c[0] == "head"]) == 1
+
+    def test_missing_content_length_on_head_is_terminal(self) -> None:
+        """Residual review finding 1: a HEAD response without a valid
+        Content-Length must fail closed, never silently proceed with
+        ``full_object_length=None`` (which previously skipped total
+        validation entirely)."""
+        transport = _FakeTransport()
+        transport.get_queue["aws"] = [
+            _FakeResponse(status_code=200, content=_INDEX_TEXT.encode()),
+        ]
+        transport.head_queue["aws"] = [_FakeResponse(status_code=200, headers={})]
+        clock = _FakeClock(datetime(2026, 8, 28, 18, 5, tzinfo=UTC))
+        sleeper = _FakeSleeper(clock)
+
+        with pytest.raises(HrrrAcquisitionError, match="Content-Length"):
+            acquire_hrrr_lead(
+                _SETTINGS,
+                transport=transport,
+                clock=clock,
+                sleeper=sleeper,
+                cycle_date=date(2026, 8, 28),
+                cycle_hour=18,
+                forecast_hour=0,
+                cycle_deadline=datetime(2026, 8, 28, 19, 30, tzinfo=UTC),
+            )
+
     def test_rejects_message_missing_grib_header(self) -> None:
         transport = _FakeTransport()
         bad_payload = b"X" * 96 + b"7777"  # right length, no GRIB magic
@@ -672,7 +771,10 @@ class TestRangeIntegrityMutations:
 
     def test_rejects_message_missing_grib_trailer(self) -> None:
         transport = _FakeTransport()
-        bad_payload = b"GRIB" + b"X" * 96  # right length, no 7777 trailer
+        # Correct GRIB2 Section 0 (edition 2, exact 100-byte encoded
+        # total length) but no ``7777`` end section -- must still fail
+        # closed on the trailer check.
+        bad_payload = _grib2_section0(total_length=100) + b"X" * (100 - _GRIB2_SECTION0_LEN)
         transport.get_queue["aws"] = [
             _FakeResponse(status_code=200, content=_INDEX_TEXT.encode()),
             _FakeResponse(
@@ -688,6 +790,110 @@ class TestRangeIntegrityMutations:
         sleeper = _FakeSleeper(clock)
 
         with pytest.raises(HrrrAcquisitionError, match="GRIB2.*end section"):
+            acquire_hrrr_lead(
+                _SETTINGS,
+                transport=transport,
+                clock=clock,
+                sleeper=sleeper,
+                cycle_date=date(2026, 8, 28),
+                cycle_hour=18,
+                forecast_hour=0,
+                cycle_deadline=datetime(2026, 8, 28, 19, 30, tzinfo=UTC),
+            )
+
+    def test_rejects_non_edition_2_grib(self) -> None:
+        """MEDIUM review finding 2: a payload with valid GRIB/7777
+        framing but a non-2 edition byte in Section 0 must be rejected
+        -- not merely accepted because the outer prefix/suffix match."""
+        transport = _FakeTransport()
+        section0 = b"GRIB" + b"\x00\x00" + b"\x00" + b"\x01" + (100).to_bytes(8, "big")
+        bad_payload = section0 + b"X" * (100 - len(section0) - 4) + b"7777"
+        transport.get_queue["aws"] = [
+            _FakeResponse(status_code=200, content=_INDEX_TEXT.encode()),
+            _FakeResponse(
+                status_code=206,
+                headers={"Content-Range": "bytes 0-99/300"},
+                content=bad_payload,
+            ),
+        ]
+        transport.head_queue["aws"] = [
+            _FakeResponse(status_code=200, headers={"Content-Length": str(_FULL_GRIB_LENGTH)})
+        ]
+        clock = _FakeClock(datetime(2026, 8, 28, 18, 5, tzinfo=UTC))
+        sleeper = _FakeSleeper(clock)
+
+        with pytest.raises(HrrrAcquisitionError, match="edition"):
+            acquire_hrrr_lead(
+                _SETTINGS,
+                transport=transport,
+                clock=clock,
+                sleeper=sleeper,
+                cycle_date=date(2026, 8, 28),
+                cycle_hour=18,
+                forecast_hour=0,
+                cycle_deadline=datetime(2026, 8, 28, 19, 30, tzinfo=UTC),
+            )
+
+    def test_rejects_wrong_section0_encoded_length(self) -> None:
+        """MEDIUM review finding 2: Section 0's own encoded
+        total-message-length must equal the exact ranged payload; a
+        100-byte payload with a valid GRIB2 edition but a bogus
+        (e.g. way too large) encoded length must be rejected --
+        reproduces the runtime probe
+        ``ACCEPTED_NON_GRIB2_OR_BAD_SECTION0 100``."""
+        transport = _FakeTransport()
+        bad_payload = (
+            _grib2_section0(total_length=999_999) + b"X" * (100 - _GRIB2_SECTION0_LEN - 4) + b"7777"
+        )
+        assert len(bad_payload) == 100
+        transport.get_queue["aws"] = [
+            _FakeResponse(status_code=200, content=_INDEX_TEXT.encode()),
+            _FakeResponse(
+                status_code=206,
+                headers={"Content-Range": "bytes 0-99/300"},
+                content=bad_payload,
+            ),
+        ]
+        transport.head_queue["aws"] = [
+            _FakeResponse(status_code=200, headers={"Content-Length": str(_FULL_GRIB_LENGTH)})
+        ]
+        clock = _FakeClock(datetime(2026, 8, 28, 18, 5, tzinfo=UTC))
+        sleeper = _FakeSleeper(clock)
+
+        with pytest.raises(HrrrAcquisitionError, match="Section 0 total message length"):
+            acquire_hrrr_lead(
+                _SETTINGS,
+                transport=transport,
+                clock=clock,
+                sleeper=sleeper,
+                cycle_date=date(2026, 8, 28),
+                cycle_hour=18,
+                forecast_hour=0,
+                cycle_deadline=datetime(2026, 8, 28, 19, 30, tzinfo=UTC),
+            )
+
+    def test_rejects_payload_too_short_for_section0_and_trailer(self) -> None:
+        transport = _FakeTransport()
+        short_index = (
+            "1:0:d=2026082818:TMP:2 m above ground:anl:\n"
+            "2:10:d=2026082818:UGRD:10 m above ground:anl:\n"
+            "3:20:d=2026082818:VGRD:10 m above ground:anl:\n"
+        )
+        transport.get_queue["aws"] = [
+            _FakeResponse(status_code=200, content=short_index.encode()),
+            _FakeResponse(
+                status_code=206,
+                headers={"Content-Range": "bytes 0-9/30"},
+                content=b"GRIB123456",  # 10 bytes: too short for framing
+            ),
+        ]
+        transport.head_queue["aws"] = [
+            _FakeResponse(status_code=200, headers={"Content-Length": "30"})
+        ]
+        clock = _FakeClock(datetime(2026, 8, 28, 18, 5, tzinfo=UTC))
+        sleeper = _FakeSleeper(clock)
+
+        with pytest.raises(HrrrAcquisitionError, match="too short"):
             acquire_hrrr_lead(
                 _SETTINGS,
                 transport=transport,

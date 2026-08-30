@@ -163,7 +163,23 @@ class Phase1ProductionAdapters:
         self._configuration = configuration
         self._hrrr_transport = hrrr_transport
         self._aviationweather_transport = aviationweather_transport
-        self._aviationweather_rate_limiter = aviationweather_rate_limiter
+        # Residual review finding 3: production composition must never
+        # silently run unthrottled. When the caller does not explicitly
+        # inject a (typically test-scripted) limiter, a real one is
+        # always constructed here from the configured
+        # ``min_request_interval_seconds`` and shared across every
+        # stationinfo/METAR acquisition call this instance makes for
+        # the life of the process -- never a bare ``None`` default that
+        # lets ``acquire_stationinfo``/``acquire_metar_batch`` skip
+        # waiting entirely (runtime probe
+        # ``DEFAULT_LIMITER_SLEEPS [] CALLS 2``).
+        self._aviationweather_rate_limiter = (
+            aviationweather_rate_limiter
+            if aviationweather_rate_limiter is not None
+            else RequestRateLimiter(
+                min_interval_seconds=configuration.aviationweather.min_request_interval_seconds
+            )
+        )
         self._json = CanonicalJsonSerializer()
         self._netcdf = H5NetcdfDatasetSerializer()
         self._parquet = ParquetTableSerializer()

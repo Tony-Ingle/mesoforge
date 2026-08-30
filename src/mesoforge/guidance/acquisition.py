@@ -216,7 +216,7 @@ class HrrrLeadAcquisition:
     grib_completed_at: datetime
     full_object_etag: str | None
     full_object_last_modified: str | None
-    full_object_content_length: int | None
+    full_object_content_length: int
 
 
 def acquire_hrrr_lead(
@@ -276,29 +276,44 @@ def acquire_hrrr_lead(
     )
 
     ordered_selected = sorted(selected_rows, key=lambda item: item[1].byte_offset)
-    needs_full_length = any(
-        row.message_number == max(r.message_number for r in rows) for _cvid, row in ordered_selected
+
+    # Review finding 1 (residual): the full object length must be
+    # established for *every* lead -- via HEAD -- regardless of whether
+    # a selected row happens to be the inventory's final message. It is
+    # required both to compute the last message's byte range (when
+    # applicable) and, critically, to validate the exact Content-Range
+    # ``total`` on *every* selected ranged GET, including rows that are
+    # followed by later (unselected) inventory rows. A missing/invalid
+    # Content-Length is a terminal acquisition failure, never silently
+    # skipped validation.
+    head_fetch = _fetch_with_retry(
+        transport,
+        clock,
+        sleeper,
+        method="head",
+        urls_by_endpoint=[(index_fetch.endpoint, grib_url)],
+        retry_policy=settings.retry_policy,
+        cycle_deadline=cycle_deadline,
     )
-    full_object_content_length: int | None = None
-    full_object_etag: str | None = None
-    full_object_last_modified: str | None = None
-    if needs_full_length:
-        head_fetch = _fetch_with_retry(
-            transport,
-            clock,
-            sleeper,
-            method="head",
-            urls_by_endpoint=[(index_fetch.endpoint, grib_url)],
-            retry_policy=settings.retry_policy,
-            cycle_deadline=cycle_deadline,
+    content_length_header = _header(head_fetch.headers, "Content-Length")
+    if content_length_header is None:
+        raise HrrrAcquisitionError(
+            f"HEAD {grib_url!r} did not return a Content-Length header; the exact "
+            "full object length is required to validate every selected byte range"
         )
-        full_object_content_length = (
-            int(content_length_header)
-            if (content_length_header := _header(head_fetch.headers, "Content-Length")) is not None
-            else None
+    try:
+        full_object_content_length = int(content_length_header)
+    except ValueError as exc:
+        raise HrrrAcquisitionError(
+            f"HEAD {grib_url!r} returned a non-integer Content-Length {content_length_header!r}"
+        ) from exc
+    if full_object_content_length <= 0:
+        raise HrrrAcquisitionError(
+            f"HEAD {grib_url!r} returned a non-positive Content-Length "
+            f"{full_object_content_length!r}"
         )
-        full_object_etag = _header(head_fetch.headers, "ETag")
-        full_object_last_modified = _header(head_fetch.headers, "Last-Modified")
+    full_object_etag: str | None = _header(head_fetch.headers, "ETag")
+    full_object_last_modified: str | None = _header(head_fetch.headers, "Last-Modified")
 
     all_grib_attempts: list[RequestAttempt] = []
     latest_grib_completed_at = index_fetch.completed_at
@@ -381,18 +396,48 @@ def _parse_content_range(value: str | None) -> tuple[int, int, int] | None:
 
 _GRIB_MAGIC = b"GRIB"
 _GRIB_TRAILER = b"7777"
+_GRIB_EDITION_2 = 2
+# GRIB2 Section 0 (Indicator Section) is exactly 16 octets: "GRIB" (4),
+# reserved (2), discipline (1), edition number (1), then an 8-octet
+# big-endian unsigned total-message-length field (WMO Manual on Codes,
+# FM 92-XII GRIB2, Section 0).
+_GRIB2_SECTION0_LENGTH = 16
 
 
 def _validate_grib_message_boundaries(payload: bytes, *, url: str, range_header: str) -> None:
     """Section 2.1/2.3 GRIB2 message framing: every selected message is
-    exactly one complete GRIB2 message, so its bytes must begin with the
-    ``GRIB`` indicator section and end with the ``7777`` end section
-    (plan Section 2.2/review finding 5: acquisition must validate GRIB
-    message header/trailer boundaries, not merely byte counts)."""
+    exactly one complete GRIB2 message. Residual review finding 2: mere
+    ``GRIB``/``7777`` prefix/suffix checks are insufficient (they accept
+    truncated/concatenated/other-edition payloads that merely happen to
+    start and end with those four bytes) -- this validates GRIB edition
+    2 and that Section 0's own encoded total-message-length field
+    equals the exact ranged payload length, i.e. the payload is one
+    single, complete, edition-2 GRIB message."""
+    if len(payload) < _GRIB2_SECTION0_LENGTH + len(_GRIB_TRAILER):
+        raise HrrrAcquisitionError(
+            f"selected GRIB message for {url!r} (range {range_header!r}) is only "
+            f"{len(payload)} bytes, too short to contain a GRIB2 Section 0 "
+            f"({_GRIB2_SECTION0_LENGTH} octets) plus the '7777' end section"
+        )
     if not payload.startswith(_GRIB_MAGIC):
         raise HrrrAcquisitionError(
             f"selected GRIB message for {url!r} (range {range_header!r}) does not begin "
             f"with the GRIB2 {_GRIB_MAGIC!r} indicator section; boundary integrity failed"
+        )
+    edition = payload[7]
+    if edition != _GRIB_EDITION_2:
+        raise HrrrAcquisitionError(
+            f"selected GRIB message for {url!r} (range {range_header!r}) declares "
+            f"GRIB edition {edition!r} in Section 0, expected edition "
+            f"{_GRIB_EDITION_2!r} (GRIB2); boundary integrity failed"
+        )
+    section0_total_length = int.from_bytes(payload[8:16], byteorder="big", signed=False)
+    if section0_total_length != len(payload):
+        raise HrrrAcquisitionError(
+            f"selected GRIB message for {url!r} (range {range_header!r}) declares a "
+            f"Section 0 total message length of {section0_total_length} octets, but the "
+            f"exact ranged payload is {len(payload)} bytes; the range must contain "
+            "exactly one complete GRIB2 message"
         )
     if not payload.endswith(_GRIB_TRAILER):
         raise HrrrAcquisitionError(
@@ -414,14 +459,18 @@ def _fetch_with_range(
     retry_policy: RetryPolicy,
     cycle_deadline: datetime,
     expected_length: int,
-    full_object_length: int | None,
+    full_object_length: int,
 ) -> FetchedObject:
     """Ranged GET with one extra integrity-mismatch retry (plan Section
     2.3: 'Retry an integrity/range mismatch once from a fresh connection;
     then fail closed'). Sends the exact ``Range`` header computed by the
     caller (review finding 1: a computed range_header must actually be
     transmitted) and validates the response's ``Content-Range`` and GRIB
-    message framing exactly (review finding 5)."""
+    message framing exactly (review finding 5). ``full_object_length`` is
+    always a valid, HEAD-established total (residual review finding 1):
+    the response's exact Content-Range ``total`` must equal it on every
+    selected range, not merely when a row happens to be the inventory's
+    final message."""
     integrity_retries_remaining = 1
     while True:
         all_attempts: list[RequestAttempt] = []
@@ -475,7 +524,7 @@ def _fetch_with_range(
             and parsed_range is not None
             and parsed_range[0] == byte_start
             and parsed_range[1] == byte_end - 1
-            and (full_object_length is None or parsed_range[2] == full_object_length)
+            and parsed_range[2] == full_object_length
         )
         if not integrity_ok:
             if integrity_retries_remaining > 0:
