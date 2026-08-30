@@ -173,6 +173,18 @@ class VerticalDefinitionId(_KebabDotId):
     """Identifier for a vertical coordinate definition."""
 
 
+class StationId(_KebabDotId):
+    """Identifier for a Phase 1 observation station (e.g. ``station.kcbg``)."""
+
+
+class MatchingPolicyId(_KebabDotId):
+    """Identifier for a forecast/observation matching policy."""
+
+
+class MetricSetId(_KebabDotId):
+    """Identifier for a named verification metric set."""
+
+
 def strip_prefix(value: str, prefix: str) -> str:
     """Strictly remove ``prefix`` from ``value``, raising ``InvalidIdentifier``
     if the prefix is absent. Unlike ``str.removeprefix``, this never

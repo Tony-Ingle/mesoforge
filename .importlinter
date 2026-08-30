@@ -13,6 +13,17 @@ layers =
     mesoforge.contracts
     mesoforge.common
 
+[importlinter:contract:phase1-domain-layers]
+name = MesoForge Phase 1 domain layering (application composes pure Phase 1 domains)
+type = layers
+layers =
+    mesoforge.application
+    mesoforge.verification
+    mesoforge.forecasting
+    mesoforge.alignment
+    mesoforge.observations
+    mesoforge.guidance
+
 [importlinter:contract:common-no-internal-deps]
 name = common depends on no other mesoforge package (foundational layer)
 type = forbidden
@@ -24,6 +35,11 @@ forbidden_modules =
     mesoforge.provenance
     mesoforge.storage
     mesoforge.application
+    mesoforge.guidance
+    mesoforge.alignment
+    mesoforge.forecasting
+    mesoforge.observations
+    mesoforge.verification
 
 [importlinter:contract:common-no-heavy-infra]
 name = common never imports storage/array infrastructure libraries
@@ -64,3 +80,50 @@ forbidden_modules =
     psycopg
     alembic
     h5netcdf
+
+[importlinter:contract:phase1-pure-domains-no-infrastructure]
+name = Phase 1 pure scientific domains never import storage/PostgreSQL/S3/application infrastructure
+type = forbidden
+source_modules =
+    mesoforge.alignment
+    mesoforge.forecasting
+    mesoforge.verification
+forbidden_modules =
+    boto3
+    sqlalchemy
+    psycopg
+    alembic
+    mesoforge.storage
+    mesoforge.application
+    requests
+
+[importlinter:contract:phase1-guidance-observations-network-isolation]
+name = Only guidance.sources/observations.sources import network libraries; no storage/application leak
+type = forbidden
+source_modules =
+    mesoforge.guidance.acquisition
+    mesoforge.guidance.decoding
+    mesoforge.guidance.normalization
+    mesoforge.guidance.validation
+    mesoforge.observations.normalization
+    mesoforge.observations.quality
+forbidden_modules =
+    requests
+    boto3
+    sqlalchemy
+    psycopg
+    alembic
+    mesoforge.storage
+    mesoforge.application
+
+[importlinter:contract:phase1-application-no-scientific-logic]
+name = application.phase1 depends on domains only through their public modules, never a provider adapter directly
+type = forbidden
+source_modules =
+    mesoforge.application.phase1
+forbidden_modules =
+    mesoforge.guidance.sources.hrrr
+    mesoforge.observations.sources.aviationweather
+ignore_imports =
+    mesoforge.guidance.acquisition -> mesoforge.guidance.sources.hrrr
+    mesoforge.observations.acquisition -> mesoforge.observations.sources.aviationweather

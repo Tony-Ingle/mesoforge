@@ -19,6 +19,10 @@ dependencies = [
     "alembic>=1.14,<2",
     "boto3>=1.35,<2",
     "PyYAML>=6,<7",
+    "eccodes>=2.48.0",
+    "cfgrib>=0.9.15.1",
+    "herbie-data>=2026.3.0",
+    "pyarrow>=25.0.1",
 ]
 
 [dependency-groups]
@@ -61,13 +65,15 @@ warn_unused_configs = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["jcs", "pint_xarray", "pgserver"]
+module = ["jcs", "pint_xarray", "pgserver", "pyarrow", "pyarrow.parquet", "cfgrib", "eccodes"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 markers = [
     "integration: requires real PostgreSQL and/or MinIO services",
     "acceptance: end-to-end acceptance proof spanning multiple subsystems",
+    "scientific: exercises scientific/numerical formulas (offline, deterministic)",
+    "live: requires live network access to an external provider (opt-in only, never run by default CI)",
 ]
 filterwarnings = [
     "error",

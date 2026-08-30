@@ -67,7 +67,12 @@ from mesoforge.common.identifiers import (
     ConfigurationSnapshotId,
     Digest,
     GridId,
+    MatchingPolicyId,
+    MetricSetId,
     RunId,
+    StationId,
+    VariableId,
+    VerticalDefinitionId,
 )
 
 _TYPED_IDENTIFIER_CLASSES = (
@@ -77,6 +82,11 @@ _TYPED_IDENTIFIER_CLASSES = (
     Digest,
     GridId,
     RunId,
+    VariableId,
+    VerticalDefinitionId,
+    StationId,
+    MatchingPolicyId,
+    MetricSetId,
 )
 
 # Parameter/attribute names that look like an identifier/digest but are
@@ -101,6 +111,18 @@ _ALLOWED_PLAIN_STR_SITES: dict[str, str] = {
     ),
     "mesoforge.contracts.datasets.VariableLike.vertical_definition_id": (
         "catalog vertical-definition label; no typed value class exists in Phase 0"
+    ),
+    "mesoforge.contracts.observations.RawMetarRecord.icao_id": (
+        "external AviationWeather.gov provider ICAO identifier, not a MesoForge "
+        "StationId -- station-catalog resolution maps this to StationId separately"
+    ),
+    "mesoforge.contracts.observations.NormalizedObservation.provider_station_id": (
+        "external AviationWeather.gov provider ICAO identifier retained as lineage, "
+        "not a MesoForge StationId (see station_id on the same model)"
+    ),
+    "mesoforge.contracts.verification.MetricRow.unit_id": (
+        "catalog unit label; no UnitId value class exists in Phase 0 (matches "
+        "VariableLike.canonical_unit_id above)"
     ),
 }
 
@@ -140,6 +162,14 @@ def _discover_scope_modules() -> dict[str, types.ModuleType]:
         for info in sorted(discovered, key=lambda item: item.name):
             modules[info.name] = importlib.import_module(info.name)
     return dict(sorted(modules.items()))
+
+
+# Import the audited boundary once during test collection.  Deferring this until a
+# test body runs can load the storage native stack after cfgrib/eccodes has already
+# decoded messages in an earlier test, an order that segfaults during interpreter
+# teardown on Linux.  The inventory remains exhaustive and injected-boundary tests
+# still mutate these same live module objects.
+_SCOPE_MODULES = _discover_scope_modules()
 
 
 def _classes_defined_in(module: types.ModuleType) -> list[type]:
@@ -363,7 +393,7 @@ def collect_boundary_failures(
     ``TestDiscoveryDetectsInjectedMalformedBoundaries`` can call it after
     injecting a temporary malformed boundary onto a real module."""
     if modules is None:
-        modules = _discover_scope_modules()
+        modules = _SCOPE_MODULES
     failures: list[str] = []
     for module_name in sorted(modules):
         module = modules[module_name]
@@ -380,7 +410,7 @@ def _discover_code_revision_sites() -> list[tuple[str, object]]:
     pairs. Automatic, name-based discovery -- not an enumerated list of
     "the functions that happen to take code_revision today"."""
     sites: list[tuple[str, object]] = []
-    modules = _discover_scope_modules()
+    modules = _SCOPE_MODULES
     for module_name in sorted(modules):
         module = modules[module_name]
         for cls in _classes_defined_in(module):
@@ -505,14 +535,14 @@ class TestExhaustivePublicBoundaryInventory:
             for info in pkgutil.walk_packages(root.__path__, prefix=root.__name__ + "."):
                 all_modules.add(info.name)
 
-        discovered = set(_discover_scope_modules())
+        discovered = set(_SCOPE_MODULES)
         assert discovered == all_modules
 
     def test_plain_string_site_allowlist_is_exact_and_live(self) -> None:
         """Every qualified exception must still resolve to a bare-string
         field; stale, misspelled, or module-wide exemptions are forbidden."""
         discovered_sites: set[str] = set()
-        for module in _discover_scope_modules().values():
+        for module in _SCOPE_MODULES.values():
             for cls in _classes_defined_in(module):
                 hints = typing.get_type_hints(cls, include_extras=True, globalns=vars(module))
                 for field_name, annotation in hints.items():

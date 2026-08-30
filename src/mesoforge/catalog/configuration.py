@@ -17,10 +17,18 @@ import jcs
 import yaml
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from mesoforge.catalog.domains import DomainDefinition
 from mesoforge.catalog.grids import GridDefinition
+from mesoforge.catalog.sources import AviationWeatherSettings, HrrrSourceSettings
+from mesoforge.catalog.stations import StationDefinition
 from mesoforge.catalog.units import VerticalDefinition
 from mesoforge.catalog.variables import VariableDefinition
-from mesoforge.common.identifiers import ConfigurationSnapshotId, Digest
+from mesoforge.common.identifiers import (
+    ConfigurationSnapshotId,
+    Digest,
+    MatchingPolicyId,
+    MetricSetId,
+)
 
 _PERMITTED_OVERRIDE_PATHS: frozenset[str] = frozenset(
     {
@@ -51,6 +59,145 @@ class SourceReference(BaseModel):
     content_digest: Digest
 
 
+class PointExtractionPolicy(BaseModel):
+    """Section 3.2: bilinear native-grid station point extraction, no
+    extrapolation, exact four-corner finite requirement, and the
+    interpolation halo width used when subsetting canonical guidance."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal["point-extraction-policy.v1"] = "point-extraction-policy.v1"
+    policy_id: Literal["bilinear-native-grid.v1"] = "bilinear-native-grid.v1"
+    allow_extrapolation: Literal[False] = False
+    require_four_corners_finite: Literal[True] = True
+    halo_cells: int = 1
+    weight_sum_tolerance: float = 1e-12
+
+    @model_validator(mode="after")
+    def _check_halo(self) -> PointExtractionPolicy:
+        if self.halo_cells != 1:
+            raise ValueError("Phase 1 requires exactly a one-cell interpolation halo")
+        if not (0 < self.weight_sum_tolerance < 1e-6):
+            raise ValueError("weight_sum_tolerance must be a small positive value")
+        return self
+
+
+class ObservationNormalizationPolicy(BaseModel):
+    """Section 3.7: unit conversions and range/completeness checks
+    applied when normalizing raw METAR JSON records."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal["observation-normalization-policy.v1"] = (
+        "observation-normalization-policy.v1"
+    )
+    policy_id: str
+    temperature_valid_min_k: float = 180.0
+    temperature_valid_max_k: float = 340.0
+    wind_speed_valid_min_m_s: float = 0.0
+    wind_speed_valid_max_m_s: float = 100.0
+    max_receipt_before_event_minutes: float = 5.0
+    station_coordinate_tolerance_degrees: float = 0.02
+    station_elevation_tolerance_m: float = 30.0
+
+    @model_validator(mode="after")
+    def _check_ranges(self) -> ObservationNormalizationPolicy:
+        if self.temperature_valid_min_k >= self.temperature_valid_max_k:
+            raise ValueError("temperature_valid_min_k must be < temperature_valid_max_k")
+        if self.wind_speed_valid_min_m_s < 0:
+            raise ValueError("wind_speed_valid_min_m_s must be nonnegative")
+        if self.wind_speed_valid_max_m_s <= self.wind_speed_valid_min_m_s:
+            raise ValueError("wind_speed_valid_max_m_s must be > wind_speed_valid_min_m_s")
+        if self.max_receipt_before_event_minutes < 0:
+            raise ValueError("max_receipt_before_event_minutes must be nonnegative")
+        if self.station_coordinate_tolerance_degrees <= 0:
+            raise ValueError("station_coordinate_tolerance_degrees must be positive")
+        if self.station_elevation_tolerance_m <= 0:
+            raise ValueError("station_elevation_tolerance_m must be positive")
+        return self
+
+
+class MatchingPolicy(BaseModel):
+    """Section 3.8: as-of, symmetric-inclusive-tolerance forecast/
+    observation matching, and the calm-wind direction-eligibility
+    threshold shared with verification metrics."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal["matching-policy.v1"] = "matching-policy.v1"
+    matching_policy_id: MatchingPolicyId
+    tolerance_minutes: float = 15.0
+    calm_threshold_m_s: float = 1.5
+
+    @model_validator(mode="after")
+    def _check_thresholds(self) -> MatchingPolicy:
+        if self.tolerance_minutes <= 0:
+            raise ValueError("tolerance_minutes must be positive")
+        if self.calm_threshold_m_s <= 0:
+            raise ValueError("calm_threshold_m_s must be positive")
+        return self
+
+    @property
+    def digest(self) -> Digest:
+        payload = self.model_dump(mode="json")
+        return Digest.of_bytes(jcs.canonicalize(payload))
+
+
+class MetricSet(BaseModel):
+    """Section 3.9: the named formula set reported by Phase 1
+    verification."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal["metric-set.v1"] = "metric-set.v1"
+    metric_set_id: MetricSetId
+    metric_names: tuple[str, ...]
+
+    @model_validator(mode="after")
+    def _check_metric_names(self) -> MetricSet:
+        if len(self.metric_names) == 0:
+            raise ValueError("metric_names must be non-empty")
+        if len(set(self.metric_names)) != len(self.metric_names):
+            raise ValueError("metric_names must not contain duplicates")
+        return self
+
+
+class Phase1Configuration(BaseModel):
+    """Section 3.2: the complete Phase 1 Grasston slice configuration,
+    nested under the top-level ``MesoForgeConfiguration`` as an optional
+    section so Phase 0 configuration remains valid without it."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal["phase1-configuration.v1"] = "phase1-configuration.v1"
+    domain: DomainDefinition
+    stations: tuple[StationDefinition, ...]
+    hrrr: HrrrSourceSettings
+    aviationweather: AviationWeatherSettings
+    point_extraction_policy: PointExtractionPolicy
+    observation_normalization_policy: ObservationNormalizationPolicy
+    matching_policy: MatchingPolicy
+    metric_set: MetricSet
+
+    @model_validator(mode="after")
+    def _check_station_definitions_match_domain(self) -> Phase1Configuration:
+        defined_ids = tuple(s.station_id for s in self.stations)
+        if defined_ids != self.domain.station_ids:
+            raise ValueError(
+                f"Phase 1 'stations' station_ids {defined_ids!r} must exactly match "
+                f"domain.station_ids {self.domain.station_ids!r} in the same order"
+            )
+        for station in self.stations:
+            if not self.domain.bbox.contains(
+                latitude=station.expected_latitude, longitude=station.expected_longitude
+            ):
+                raise ValueError(
+                    f"station {station.station_id!r} expected coordinates lie outside "
+                    "the domain bounding box"
+                )
+        return self
+
+
 class MesoForgeConfiguration(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -60,6 +207,7 @@ class MesoForgeConfiguration(BaseModel):
     variables: tuple[VariableDefinition, ...] = ()
     artifact_store: ArtifactStoreSettings
     metadata_store: MetadataStoreSettings
+    phase1: Phase1Configuration | None = None
 
     @model_validator(mode="after")
     def _check_duplicate_ids(self) -> MesoForgeConfiguration:

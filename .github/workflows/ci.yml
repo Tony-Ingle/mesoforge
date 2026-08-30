@@ -6,7 +6,7 @@ on:
   pull_request:
 
 env:
-  UV_VERSION: "0.5.11"
+  UV_VERSION: "0.12.6"
 
 jobs:
   quality:
@@ -54,7 +54,11 @@ jobs:
       - name: Sync dependencies
         run: uv sync --locked --all-groups
       - name: Unit, contract, property tests
-        run: uv run pytest tests/unit tests/contracts tests/property --cov=mesoforge --cov-report=term-missing -q
+        run: uv run pytest tests/unit tests/contracts tests/property -q
+      - name: Scientific tests (offline, deterministic)
+        run: uv run pytest -m scientific -q
+      - name: Proof that live tests are skipped by default (no MESOFORGE_LIVE_TESTS)
+        run: uv run pytest tests/live -q
 
   integration:
     name: integration
@@ -136,3 +140,5 @@ jobs:
           uv run alembic upgrade head
       - name: Integration and acceptance tests
         run: uv run pytest -m integration tests/integration tests/acceptance -q
+      - name: Full coverage threshold
+        run: uv run pytest --cov=mesoforge --cov-report=term-missing --cov-fail-under=90 -q

@@ -56,3 +56,17 @@ is used there.
 See `Makefile` targets (`make quality`, `make test`, `make coverage`) or
 the exact command sequence in the Phase 0 implementation plan, Section
 "Task 12: Final quality and scope audit".
+
+## Phase 1 offline and live checks
+
+`make phase1-acceptance` runs the PostgreSQL/MinIO-backed offline acceptance proof.
+Provider access is never enabled in normal tests or CI. To validate current provider
+contracts manually, supply a recent explicit cycle and opt in:
+
+```bash
+MESOFORGE_LIVE_TESTS=1 MESOFORGE_LIVE_HRRR_CYCLE=YYYYMMDDTHH make smoke-live
+```
+
+The smoke tests use one HRRR lead and one bounded three-station METAR query, assert
+contract shape rather than weather values, and retain responses only in temporary test
+storage. Avoid repeated invocation and respect provider rate limits.

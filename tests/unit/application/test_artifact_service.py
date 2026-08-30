@@ -19,7 +19,7 @@ from mesoforge.application.artifacts import (
     TransformationInputRef,
     TransformationRequest,
 )
-from mesoforge.common.errors import IntegrityError, NotFound
+from mesoforge.common.errors import Conflict, IntegrityError, NotFound
 from mesoforge.contracts.artifacts import Availability
 from tests.support.in_memory_uow import (
     InMemoryIdempotencyLock,
@@ -546,6 +546,32 @@ class TestCreateRun:
             source_a.artifact_id,
             source_b.artifact_id,
         )
+        assert len(uow_factory.runs) == 1
+
+    def test_identical_run_creation_is_idempotent(self, service_and_uow) -> None:
+        service, uow_factory, _ = service_and_uow
+        self._register_config(
+            uow_factory,
+            snapshot_id="cfg_sha256_" + "a" * 64,
+            digest="sha256:" + "a" * 64,
+        )
+        source = service.register_source(_source_request(), b"source")
+        kwargs = self._run_kwargs(selected_input_artifact_ids=(source.artifact_id,))
+        first = service.create_run(**kwargs)
+        second = service.create_run(**kwargs)
+        assert second == first
+        assert len(uow_factory.runs) == 1
+
+    def test_reused_run_id_with_changed_identity_fails_closed(self, service_and_uow) -> None:
+        service, uow_factory, _ = service_and_uow
+        self._register_config(
+            uow_factory,
+            snapshot_id="cfg_sha256_" + "a" * 64,
+            digest="sha256:" + "a" * 64,
+        )
+        service.create_run(**self._run_kwargs())
+        with pytest.raises(Conflict, match="different immutable identity"):
+            service.create_run(**self._run_kwargs(random_seed=2))
         assert len(uow_factory.runs) == 1
 
 

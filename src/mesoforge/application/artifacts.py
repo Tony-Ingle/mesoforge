@@ -6,14 +6,15 @@ protocols; owns transaction ordering, not meteorological algorithms.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import Any, Protocol
 
 import jcs
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from mesoforge.common.errors import IntegrityError
+from mesoforge.common.errors import Conflict, IntegrityError, NotFound
 from mesoforge.common.identifiers import (
     ActivityId,
     ArtifactId,
@@ -105,6 +106,7 @@ class _ConfigurationRepositoryLike(Protocol):
 
 class _RunRepositoryLike(Protocol):
     def add(self, manifest: RunManifest) -> RunManifest: ...
+    def get(self, run_id: RunId) -> RunManifest: ...
 
 
 class _UnitOfWorkLike(Protocol):
@@ -213,6 +215,28 @@ class TransformationResult(BaseModel):
 
     activity: ActivityManifest
     output: ArtifactManifest
+
+
+class InputBinding:
+    """A role-scoped ``(loader, validator)`` pair for
+    ``execute_role_bound_transformation`` (plan Section 4.4).
+
+    Both callables are mandatory. Raw inputs use an explicit raw-byte
+    contract validator; validation may not be hidden in a loader or
+    silently disabled with ``None``.
+    """
+
+    __slots__ = ("loader", "validator")
+
+    def __init__(
+        self,
+        loader: Callable[[bytes], Any],
+        validator: Callable[[Any], None],
+    ) -> None:
+        if not callable(loader) or not callable(validator):
+            raise TypeError("InputBinding requires callable loader and validator")
+        self.loader = loader
+        self.validator = validator
 
 
 def _parameters_digest(parameters: dict[str, object]) -> Digest:
@@ -412,15 +436,64 @@ class ArtifactService:
             input_validator=None,
         )
 
+    def execute_role_bound_transformation(
+        self,
+        request: TransformationRequest,
+        transform: Callable[[Mapping[str, Any]], Any],
+        serializer: Any,
+        *,
+        input_bindings: Mapping[str, InputBinding],
+        output_validator: Callable[[Any], None],
+    ) -> TransformationResult:
+        """Mixed-codec transformation API (plan Section 4.4): each input
+        role is deserialized and validated with its own
+        ``InputBinding(loader, validator)`` rather than one uniform
+        loader/validator applied to every input. ``transform`` receives
+        a single immutable ``role -> deserialized value`` mapping
+        (``types.MappingProxyType``), built in request role order, so a
+        transform combining NetCDF/Parquet/canonical-JSON inputs can
+        address each by its declared role rather than positional index.
+
+        ``input_bindings`` keys must equal ``request.inputs`` roles
+        exactly (no missing role, no extra role) -- both directions are
+        checked before any I/O so a caller cannot silently skip
+        validating one role of a multi-role request.
+        """
+        request_roles = tuple(ref.role for ref in request.inputs)
+        binding_roles = tuple(input_bindings.keys())
+        missing = set(request_roles) - set(binding_roles)
+        extra = set(binding_roles) - set(request_roles)
+        if missing or extra:
+            raise ValueError(
+                "input_bindings roles must equal request input roles exactly; "
+                f"missing={sorted(missing)!r} extra={sorted(extra)!r}"
+            )
+        if len(set(request_roles)) != len(request_roles):
+            raise ValueError(
+                f"request.inputs roles must be unique for role-bound execution, got "
+                f"{request_roles!r}"
+            )
+
+        return self._execute_transformation(
+            request,
+            transform,
+            serializer,
+            input_loader=None,
+            output_validator=output_validator,
+            input_validator=None,
+            role_bindings=input_bindings,
+        )
+
     def _execute_transformation(
         self,
         request: TransformationRequest,
         transform: Callable[..., Any],
         serializer: Any,
         *,
-        input_loader: Callable[[bytes], Any],
+        input_loader: Callable[[bytes], Any] | None,
         output_validator: Callable[[Any], None],
         input_validator: Callable[[Any], None] | None,
+        role_bindings: Mapping[str, InputBinding] | None = None,
     ) -> TransformationResult:
         """
         Exact order per plan Section 5:
@@ -495,10 +568,29 @@ class ArtifactService:
                 self._object_store.get_verified(m.storage_uri, m.content_digest)
                 for m in input_manifests
             ]
-            input_datasets = [input_loader(payload) for payload in verified_payloads]
-            if input_validator is not None:
-                for dataset in input_datasets:
-                    input_validator(dataset)
+            if role_bindings is not None:
+                # Role-aware path (plan Section 4.4): load/validate in
+                # request role order using each role's own binding; the
+                # transform receives an immutable role->value mapping,
+                # not a positional dataset list.
+                input_datasets = []
+                role_to_value: dict[str, Any] = {}
+                for (role, _artifact_id), payload in zip(
+                    ordered_inputs, verified_payloads, strict=True
+                ):
+                    binding = role_bindings[role]
+                    value = binding.loader(payload)
+                    binding.validator(value)
+                    input_datasets.append(value)
+                    role_to_value[role] = value
+                transform_input: Any = MappingProxyType(role_to_value)
+            else:
+                assert input_loader is not None  # noqa: S101 -- guarded by public API split
+                input_datasets = [input_loader(payload) for payload in verified_payloads]
+                if input_validator is not None:
+                    for dataset in input_datasets:
+                        input_validator(dataset)
+                transform_input = tuple(input_datasets)
 
             activity_id = str(uuid.uuid4())
             activity_id_typed = ActivityId(f"act_{activity_id}")
@@ -527,7 +619,10 @@ class ArtifactService:
                 uow.commit()
 
             try:
-                output_dataset = transform(*input_datasets)
+                if role_bindings is not None:
+                    output_dataset = transform(transform_input)
+                else:
+                    output_dataset = transform(*input_datasets)
                 output_validator(output_dataset)
 
                 serialized = serializer.serialize(output_dataset)
@@ -681,6 +776,39 @@ class ArtifactService:
                         f"{artifact.availability.available_at!r} after information_cutoff "
                         f"{information_cutoff!r}; run creation fails closed"
                     )
+
+            try:
+                existing = uow.runs.get(run_id)
+            except NotFound:
+                existing = None
+            if existing is not None:
+                requested_identity = (
+                    forecast_issue_time,
+                    information_cutoff,
+                    configuration_snapshot_id,
+                    configuration_digest,
+                    code_revision,
+                    environment_digest,
+                    lockfile_digest,
+                    random_seed,
+                    tuple(a.artifact_id for a in selected_inputs),
+                )
+                existing_identity = (
+                    existing.forecast_issue_time,
+                    existing.information_cutoff,
+                    existing.configuration_snapshot_id,
+                    existing.configuration_digest,
+                    existing.code_revision,
+                    existing.environment_digest,
+                    existing.lockfile_digest,
+                    existing.random_seed,
+                    existing.selected_input_artifact_ids,
+                )
+                if existing_identity != requested_identity:
+                    raise Conflict(
+                        f"run_id {run_id!r} already exists with a different immutable identity"
+                    )
+                return existing
 
             manifest = RunManifest(
                 run_id=RunId(run_id),

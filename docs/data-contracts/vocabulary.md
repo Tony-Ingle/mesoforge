@@ -172,3 +172,18 @@ original bytes via `get_verified`. This is a stronger, simpler guarantee
 than logical replay: the bytes returned are byte-identical to what was
 originally stored, forever, because objects are immutable and
 content-addressed.
+
+## Phase 1 terms
+
+- **Station snapshot:** immutable, effective station metadata derived from retained
+  AviationWeather station-response bytes before the forecast information cutoff.
+- **Logical observation:** a station and observation-event-time identity shared by all
+  revisions of one report.
+- **Observation revision:** an append-only provider record identified by logical
+  observation, provider receipt time, and canonical provider content.
+- **Verification cutoff:** the UTC as-of instant limiting both provider availability and
+  local ingestion during revision selection.
+- **Matched pair:** one explicit station/lead coverage row, including field-specific
+  matched or missing status even when no observation value is usable.
+- **Calm threshold:** `1.5 m/s`; wind direction is scored only when forecast and observed
+  speeds both meet or exceed it.

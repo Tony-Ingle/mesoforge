@@ -1,6 +1,7 @@
 .PHONY: sync lock-check fmt fmt-check lint typecheck import-lint docs-check \
         hygiene-check unit contract property integration acceptance \
-        test test-all coverage services-up services-down migrate quality ci
+        test test-all coverage services-up services-down migrate quality ci \
+        scientific phase1-acceptance smoke-live
 
 sync:
 	uv sync --all-groups
@@ -45,6 +46,19 @@ integration:
 
 acceptance:
 	uv run pytest tests/acceptance -q
+
+scientific:
+	uv run pytest -m scientific -q
+
+phase1-acceptance:
+	uv run pytest -m integration tests/acceptance/test_phase1_grasston_hrrr_metar_verification.py -q
+
+smoke-live:
+	@if [ "$$MESOFORGE_LIVE_TESTS" != "1" ]; then \
+		echo "smoke-live requires MESOFORGE_LIVE_TESTS=1 (opt-in only; never run by default CI)"; \
+		exit 1; \
+	fi
+	uv run pytest -m live tests/live -q
 
 test:
 	uv run pytest tests/unit tests/contracts tests/property -q
