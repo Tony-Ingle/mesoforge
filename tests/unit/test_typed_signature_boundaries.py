@@ -134,6 +134,10 @@ _ALLOWED_PLAIN_STR_SITES: dict[str, str] = {
         "catalog unit label; no UnitId value class exists in Phase 0 (matches "
         "VariableLike.canonical_unit_id above)"
     ),
+    "mesoforge.contracts.verification.MetricRowV2.unit_id": (
+        "catalog unit label; no UnitId value class exists (matches the additive "
+        "MetricRow v1 contract above)"
+    ),
 }
 
 # Name patterns that flag a parameter/attribute as identifier/digest-like
