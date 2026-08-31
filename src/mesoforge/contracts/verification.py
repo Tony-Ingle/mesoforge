@@ -10,9 +10,11 @@ combination across overall/by-lead/by-station strata.
 
 from __future__ import annotations
 
+import math
+from datetime import timedelta
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from mesoforge.common.identifiers import (
     ArtifactId,
@@ -210,3 +212,228 @@ class VerificationReport(BaseModel):
 
     schema_version: Literal["verification-report.v1"] = "verification-report.v1"
     rows: tuple[MetricRow, ...]
+
+
+# Additive Phase 2 contracts.  The v1 classes above intentionally remain
+# unchanged and continue to reject the v2 schema versions.
+FieldStatusV2 = Literal[
+    "forecast_missing_or_invalid",
+    "no_report_within_tolerance",
+    "revision_after_cutoff",
+    "station_metadata_conflict",
+    "observation_qc_rejected",
+    "field_missing",
+    "calm_direction_excluded",
+    "precipitation_interval_mismatch",
+    "matched",
+]
+AvailabilityStateV2 = Literal["complete", "fallback", "unavailable", "inconsistent"]
+
+
+class MatchedPairRowV2(BaseModel):
+    """One immutable Phase 2 station/target-horizon row with all named fields."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal["matched-pairs.v2"] = "matched-pairs.v2"
+    station_id: StationId
+    target_horizon_hours: int
+    valid_time: UtcInstant
+    precipitation_interval_start: UtcInstant
+    precipitation_interval_end: UtcInstant
+    baseline_artifact_id: ArtifactId
+    observations_artifact_id: ArtifactId
+    matching_policy_id: MatchingPolicyId
+    matching_policy_digest: Digest
+    verification_cutoff: UtcInstant
+    availability_state: AvailabilityStateV2
+    selected_logical_observation_digest: Digest | None = None
+    selected_revision_digest: Digest | None = None
+    selected_event_time: UtcInstant | None = None
+    selected_provider_available_at: UtcInstant | None = None
+    delta_seconds: float | None = None
+
+    forecast_temperature_k: float | None = None
+    forecast_dew_point_k: float | None = None
+    forecast_eastward_wind_m_s: float | None = None
+    forecast_northward_wind_m_s: float | None = None
+    forecast_wind_speed_m_s: float | None = None
+    forecast_wind_from_direction_degrees: float | None = None
+    forecast_wind_gust_m_s: float | None = None
+    forecast_qpf_kg_m2: float | None = None
+    forecast_pop_probability: float | None = None
+    observed_temperature_k: float | None = None
+    observed_dew_point_k: float | None = None
+    observed_eastward_wind_m_s: float | None = None
+    observed_northward_wind_m_s: float | None = None
+    observed_wind_speed_m_s: float | None = None
+    observed_wind_from_direction_degrees: float | None = None
+    observed_wind_gust_m_s: float | None = None
+    observed_qpf_kg_m2: float | None = None
+
+    row_status: RowStatus
+    temperature_status: FieldStatusV2
+    dew_point_status: FieldStatusV2
+    eastward_component_status: FieldStatusV2
+    northward_component_status: FieldStatusV2
+    wind_speed_status: FieldStatusV2
+    wind_direction_status: FieldStatusV2
+    gust_status: FieldStatusV2
+    qpf_status: FieldStatusV2
+    pop_status: FieldStatusV2
+
+    @model_validator(mode="after")
+    def _validate_v2_row(self) -> MatchedPairRowV2:
+        if not 1 <= self.target_horizon_hours <= 36:
+            raise ValueError("target_horizon_hours must be in 1..36")
+        statuses = tuple(
+            getattr(self, f"{name}_status")
+            for name in (
+                "temperature",
+                "dew_point",
+                "eastward_component",
+                "northward_component",
+                "wind_speed",
+                "wind_direction",
+                "gust",
+                "qpf",
+                "pop",
+            )
+        )
+        expected = "matched_any_field" if "matched" in statuses else "matched_no_fields"
+        if self.row_status != expected:
+            raise ValueError(f"row_status must be {expected!r} for field statuses")
+        pairs = (
+            ("temperature", self.forecast_temperature_k, self.observed_temperature_k),
+            ("dew_point", self.forecast_dew_point_k, self.observed_dew_point_k),
+            (
+                "eastward_component",
+                self.forecast_eastward_wind_m_s,
+                self.observed_eastward_wind_m_s,
+            ),
+            (
+                "northward_component",
+                self.forecast_northward_wind_m_s,
+                self.observed_northward_wind_m_s,
+            ),
+            ("wind_speed", self.forecast_wind_speed_m_s, self.observed_wind_speed_m_s),
+            (
+                "wind_direction",
+                self.forecast_wind_from_direction_degrees,
+                self.observed_wind_from_direction_degrees,
+            ),
+            ("gust", self.forecast_wind_gust_m_s, self.observed_wind_gust_m_s),
+            ("qpf", self.forecast_qpf_kg_m2, self.observed_qpf_kg_m2),
+        )
+        for name, forecast, observed in pairs:
+            if getattr(self, f"{name}_status") == "matched" and (
+                forecast is None or observed is None
+            ):
+                raise ValueError(f"{name} matched status requires forecast and observed values")
+        if self.pop_status == "matched" and (
+            self.forecast_pop_probability is None or self.observed_qpf_kg_m2 is None
+        ):
+            raise ValueError("pop matched status requires probability and observed QPF")
+        for name, value in self.__dict__.items():
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
+        if (
+            self.forecast_pop_probability is not None
+            and not 0 <= self.forecast_pop_probability <= 1
+        ):
+            raise ValueError("forecast_pop_probability must be in [0, 1]")
+        for name in ("forecast_qpf_kg_m2", "observed_qpf_kg_m2"):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must be nonnegative")
+        if self.precipitation_interval_end != self.valid_time:
+            raise ValueError("forecast precipitation interval must end at valid_time")
+        if self.precipitation_interval_end - self.precipitation_interval_start != timedelta(
+            hours=1
+        ):
+            raise ValueError("forecast precipitation interval must be exactly one hour")
+        for name in (
+            "forecast_wind_speed_m_s",
+            "observed_wind_speed_m_s",
+            "forecast_wind_gust_m_s",
+            "observed_wind_gust_m_s",
+        ):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must be nonnegative")
+        for name in (
+            "forecast_wind_from_direction_degrees",
+            "observed_wind_from_direction_degrees",
+        ):
+            value = getattr(self, name)
+            if value is not None and not 0 <= value < 360:
+                raise ValueError(f"{name} must be in [0, 360)")
+        if self.delta_seconds is not None and self.delta_seconds < 0:
+            raise ValueError("delta_seconds must be nonnegative")
+        return self
+
+
+StratumKindV2 = Literal["overall", "by_target_horizon", "by_station", "by_availability_state"]
+
+
+class MetricRowV2(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    metric_name: str
+    unit_id: str
+    stratum_kind: StratumKindV2
+    stratum_value: str | int | None = None
+    value: float | None = None
+    null_reason: str | None = None
+    sample_count: int
+    missing_counts: dict[str, int]
+    label: Literal["conditional_on_reported_gust"] | None = None
+    details: dict[str, object] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_metric(self) -> MetricRowV2:
+        if self.sample_count < 0 or any(value < 0 for value in self.missing_counts.values()):
+            raise ValueError("metric counts must be nonnegative")
+        if self.value is not None and not math.isfinite(self.value):
+            raise ValueError("metric value must be finite")
+        pending = list(self.details.values())
+        while pending:
+            member = pending.pop()
+            if isinstance(member, float) and not math.isfinite(member):
+                raise ValueError("metric details must contain only finite JSON numbers")
+            if isinstance(member, dict):
+                pending.extend(member.values())
+            elif isinstance(member, (list, tuple)):
+                pending.extend(member)
+        if (self.value is None) != (self.null_reason is not None):
+            raise ValueError("null metrics require a reason; valued metrics prohibit one")
+        return self
+
+
+class VerificationReportV2(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    schema_version: Literal["verification-report.v2"] = "verification-report.v2"
+    metric_set_id: MetricSetId
+    baseline_artifact_id: ArtifactId
+    matched_pairs_artifact_id: ArtifactId
+    matching_policy_id: MatchingPolicyId
+    matching_policy_digest: Digest
+    verification_cutoff: UtcInstant
+    rows: tuple[MetricRowV2, ...]
+
+    @model_validator(mode="after")
+    def _check_complete_strata(self) -> VerificationReportV2:
+        if not self.rows:
+            raise ValueError("verification-report.v2 rows must not be empty")
+        kinds = {row.stratum_kind for row in self.rows}
+        required = {"overall", "by_target_horizon", "by_station", "by_availability_state"}
+        if kinds != required:
+            raise ValueError("verification-report.v2 requires all four stratum kinds")
+        horizons = {
+            row.stratum_value for row in self.rows if row.stratum_kind == "by_target_horizon"
+        }
+        stations = {row.stratum_value for row in self.rows if row.stratum_kind == "by_station"}
+        if horizons != set(range(1, 37)):
+            raise ValueError("verification-report.v2 requires target horizons 1..36")
+        if stations != {"station.kcbg", "station.kjmr", "station.kros"}:
+            raise ValueError("verification-report.v2 requires all three canonical stations")
+        return self
