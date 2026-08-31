@@ -120,6 +120,16 @@ _ALLOWED_PLAIN_STR_SITES: dict[str, str] = {
         "external AviationWeather.gov provider ICAO identifier retained as lineage, "
         "not a MesoForge StationId (see station_id on the same model)"
     ),
+    "mesoforge.contracts.observations_v2.RawMetarRecordV2.icao_id": (
+        "external AviationWeather.gov provider ICAO identifier, not a MesoForge "
+        "StationId -- station-catalog resolution maps this to StationId separately "
+        "(Phase 2 metar-observations.v2 mirrors the v1 rationale exactly)"
+    ),
+    "mesoforge.contracts.observations_v2.NormalizedObservationV2.provider_station_id": (
+        "external AviationWeather.gov provider ICAO identifier retained as lineage, "
+        "not a MesoForge StationId (see station_id on the same model; Phase 2 "
+        "metar-observations.v2 mirrors the v1 rationale exactly)"
+    ),
     "mesoforge.contracts.verification.MetricRow.unit_id": (
         "catalog unit label; no UnitId value class exists in Phase 0 (matches "
         "VariableLike.canonical_unit_id above)"
