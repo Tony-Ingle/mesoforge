@@ -40,6 +40,13 @@ def test_rejects_grib_files(tmp_path: Path) -> None:
     assert "grib" in (result.stdout + result.stderr).lower()
 
 
+def test_rejects_cfgrib_index_cache(tmp_path: Path) -> None:
+    (tmp_path / "guidance.grib2.923a8.idx").write_bytes(b"cache")
+    result = run_hygiene(tmp_path)
+    assert result.returncode != 0
+    assert "grib/index" in (result.stdout + result.stderr).lower()
+
+
 def test_rejects_env_files(tmp_path: Path) -> None:
     (tmp_path / ".env").write_text("SECRET=1\n", encoding="utf-8")
     result = run_hygiene(tmp_path)

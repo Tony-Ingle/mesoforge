@@ -1,6 +1,6 @@
 # MesoForge local development environment
 
-MesoForge's Phase 0 tests require two real backing services: PostgreSQL
+MesoForge's integration and acceptance tests require two real backing services: PostgreSQL
 (metadata/provenance) and an S3-compatible object store (MinIO).
 
 ## Option A: Docker Compose (preferred where Docker is available)
@@ -70,3 +70,38 @@ MESOFORGE_LIVE_TESTS=1 MESOFORGE_LIVE_HRRR_CYCLE=YYYYMMDDTHH make smoke-live
 The smoke tests use one HRRR lead and one bounded three-station METAR query, assert
 contract shape rather than weather values, and retain responses only in temporary test
 storage. Avoid repeated invocation and respect provider rate limits.
+
+## Phase 2 checks
+
+The authoritative scope is the [Phase 2 data contract](../data-contracts/phase-2.md).
+The default Phase 2 gate is offline:
+
+```bash
+make phase2-offline
+```
+
+It runs quality checks, unit/contract/property tests, scientific tests, and proves the
+live suite skips without `MESOFORGE_LIVE_TESTS=1`. With PostgreSQL and MinIO configured
+as above, run the full fixture-source workflow with:
+
+```bash
+make phase2-acceptance
+```
+
+For the same migration round trip used by CI, run `uv run alembic upgrade head`,
+`uv run alembic downgrade base`, then `uv run alembic upgrade head` before acceptance.
+CI uses real PostgreSQL 16 and MinIO and follows acceptance with the 90% coverage gate.
+
+Live provider canaries remain manual and non-gating. They require
+`MESOFORGE_LIVE_TESTS=1` and explicit recent cycles:
+
+```bash
+MESOFORGE_LIVE_TESTS=1 \
+MESOFORGE_LIVE_HRRR_CYCLE=YYYYMMDDTHH \
+MESOFORGE_LIVE_NBM_CYCLE=YYYYMMDDTHH \
+MESOFORGE_LIVE_GFS_CYCLE=YYYYMMDDTHH \
+uv run pytest -m live tests/live -q
+```
+
+They prove only narrow response contract shape, not forecast skill, operational
+availability, or publication readiness.

@@ -49,6 +49,8 @@ def test_validator_requires_unique_adr_numbers(tmp_path: Path) -> None:
     data_contracts_dir.mkdir(parents=True)
     (data_contracts_dir / "vocabulary.md").write_text("# Vocabulary\n", encoding="utf-8")
     (data_contracts_dir / "phase-0.md").write_text("# Phase 0\n", encoding="utf-8")
+    (data_contracts_dir / "phase-1.md").write_text("# Phase 1\n", encoding="utf-8")
+    (data_contracts_dir / "phase-2.md").write_text("# Phase 2\n", encoding="utf-8")
 
     result = subprocess.run(
         [sys.executable, str(SCRIPT), "--root", str(tmp_path)],
@@ -72,6 +74,8 @@ def test_validator_requires_accepted_status(tmp_path: Path) -> None:
     data_contracts_dir.mkdir(parents=True)
     (data_contracts_dir / "vocabulary.md").write_text("# Vocabulary\n", encoding="utf-8")
     (data_contracts_dir / "phase-0.md").write_text("# Phase 0\n", encoding="utf-8")
+    (data_contracts_dir / "phase-1.md").write_text("# Phase 1\n", encoding="utf-8")
+    (data_contracts_dir / "phase-2.md").write_text("# Phase 2\n", encoding="utf-8")
 
     result = subprocess.run(
         [sys.executable, str(SCRIPT), "--root", str(tmp_path)],
@@ -94,6 +98,8 @@ def test_validator_requires_required_headings(tmp_path: Path) -> None:
     data_contracts_dir.mkdir(parents=True)
     (data_contracts_dir / "vocabulary.md").write_text("# Vocabulary\n", encoding="utf-8")
     (data_contracts_dir / "phase-0.md").write_text("# Phase 0\n", encoding="utf-8")
+    (data_contracts_dir / "phase-1.md").write_text("# Phase 1\n", encoding="utf-8")
+    (data_contracts_dir / "phase-2.md").write_text("# Phase 2\n", encoding="utf-8")
 
     result = subprocess.run(
         [sys.executable, str(SCRIPT), "--root", str(tmp_path)],
@@ -117,6 +123,8 @@ def test_validator_detects_broken_relative_links(tmp_path: Path) -> None:
     data_contracts_dir.mkdir(parents=True)
     (data_contracts_dir / "vocabulary.md").write_text("# Vocabulary\n", encoding="utf-8")
     (data_contracts_dir / "phase-0.md").write_text("# Phase 0\n", encoding="utf-8")
+    (data_contracts_dir / "phase-1.md").write_text("# Phase 1\n", encoding="utf-8")
+    (data_contracts_dir / "phase-2.md").write_text("# Phase 2\n", encoding="utf-8")
 
     result = subprocess.run(
         [sys.executable, str(SCRIPT), "--root", str(tmp_path)],
