@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from mesoforge.application.phase2 import Phase2Request
+from mesoforge.application.phase2_adapters import Phase2ArtifactOperations
 from mesoforge.common.identifiers import ConfigurationSnapshotId, Digest, RunId
 
 _DIGEST = Digest("sha256:" + "1" * 64)
@@ -57,3 +58,37 @@ def test_request_rejects_invalid_frame(changes: dict[str, object]) -> None:
 def test_request_requires_aware_utc_instants() -> None:
     with pytest.raises(ValidationError):
         request(target_reference_time=datetime(2026, 8, 31, 12))
+
+
+def test_artifact_operations_require_every_named_phase2_operation() -> None:
+    def operation(*args: object, **kwargs: object) -> None:
+        return None
+
+    with pytest.raises(TypeError, match="missing.*calculate"):
+        Phase2ArtifactOperations(
+            normalize=operation,
+            align=operation,
+            evaluate=operation,
+            generate=operation,
+            apply=operation,
+            acquire_and_normalize=operation,
+            match=operation,
+        )
+
+
+def test_artifact_operations_are_immutable() -> None:
+    def operation(*args: object, **kwargs: object) -> None:
+        return None
+
+    operations = Phase2ArtifactOperations(
+        normalize=operation,
+        align=operation,
+        evaluate=operation,
+        generate=operation,
+        apply=operation,
+        acquire_and_normalize=operation,
+        match=operation,
+        calculate=operation,
+    )
+    with pytest.raises((AttributeError, TypeError)):
+        operations.normalize = operation  # type: ignore[misc]

@@ -8,6 +8,8 @@ to the injected artifact-backed operations.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol
 
 from mesoforge.application.artifacts import ArtifactService
@@ -109,6 +111,27 @@ class Phase2ScienceSubport(Protocol):
     ) -> VerificationArtifacts: ...
 
 
+@dataclass(frozen=True, slots=True)
+class Phase2ArtifactOperations:
+    """Named production composition for the artifact-backed science stages.
+
+    The callables have the same contracts as :class:`Phase2ScienceSubport` and
+    receive the production ``ArtifactService`` explicitly.  Keeping the stages
+    named prevents an acceptance harness from replacing the application workflow
+    with a second coordinator while still allowing deterministic provider fixtures
+    to supply bytes at the network boundary.
+    """
+
+    normalize: Callable[..., NormalizedGuidanceArtifacts]
+    align: Callable[..., AlignmentArtifacts]
+    evaluate: Callable[..., AvailabilityArtifacts]
+    generate: Callable[..., AtomicForecastArtifacts]
+    apply: Callable[..., CorrectedForecastArtifacts]
+    acquire_and_normalize: Callable[..., ObservationArtifacts]
+    match: Callable[..., MatchingArtifacts]
+    calculate: Callable[..., VerificationArtifacts]
+
+
 class Phase2ProductionAdapters:
     """Concrete application adapter backed only by approved injected subports."""
 
@@ -117,7 +140,7 @@ class Phase2ProductionAdapters:
         *,
         artifact_service: ArtifactService,
         providers: Phase2ProviderSubport,
-        science: Phase2ScienceSubport,
+        science: Phase2ScienceSubport | Phase2ArtifactOperations,
     ) -> None:
         self._artifacts = artifact_service
         self._providers = providers

@@ -197,6 +197,60 @@ class TestExecuteTransformation:
         assert result.activity.status == "succeeded"
         assert result.output.artifact_type == "synthetic-derived"
 
+    def test_atomic_pair_registers_both_outputs_on_one_activity(self, service_and_uow) -> None:
+        service, _, _ = service_and_uow
+        source = service.register_source(_source_request(), b"input")
+        common = dict(
+            activity_type="atomic-pair",
+            activity_version="1.0.0",
+            inputs=(TransformationInputRef(role="primary", artifact_id=source.artifact_id),),
+            output_media_type="application/octet-stream",
+            configuration_snapshot_id=_STANDARD_SNAPSHOT_ID,
+            configuration_digest=_STANDARD_CONFIG_DIGEST,
+            code_revision="a" * 40,
+            environment_digest="sha256:" + "b" * 64,
+        )
+        left = TransformationRequest(
+            **common,
+            output_role="forecast",
+            output_artifact_type="uncorrected-blend-forecast",
+            output_artifact_schema_version="uncorrected-blend-forecast.v1",
+        )
+        right = TransformationRequest(
+            **common,
+            output_role="contributions",
+            output_artifact_type="blend-contribution-manifest",
+            output_artifact_schema_version="blend-contribution-manifest.v1",
+        )
+
+        class _Serializer:
+            def serialize(self, value: bytes) -> bytes:
+                return value
+
+        first = service.execute_atomic_raw_pair(
+            left,
+            right,
+            transform=lambda value: (value + b"-forecast", value + b"-contributions"),
+            serializers=(_Serializer(), _Serializer()),
+            input_loader=lambda payload: payload,
+            output_validators=(lambda _: None, lambda _: None),
+        )
+        second = service.execute_atomic_raw_pair(
+            left,
+            right,
+            transform=lambda value: (value + b"-forecast", value + b"-contributions"),
+            serializers=(_Serializer(), _Serializer()),
+            input_loader=lambda payload: payload,
+            output_validators=(lambda _: None, lambda _: None),
+        )
+        assert first.activity.outputs == second.activity.outputs
+        assert first.outputs == second.outputs
+        assert {ref.role for ref in first.activity.outputs} == {"forecast", "contributions"}
+        assert tuple(output.artifact_type for output in first.outputs) == (
+            "uncorrected-blend-forecast",
+            "blend-contribution-manifest",
+        )
+
     def test_repeat_identical_request_returns_same_output(self, service_and_uow) -> None:
         service, uow_factory, object_store = service_and_uow
         source = service.register_source(_source_request(), b"10.0")
