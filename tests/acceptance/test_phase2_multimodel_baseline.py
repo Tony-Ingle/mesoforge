@@ -1046,6 +1046,31 @@ def test_complete_source_failure_matrix_uses_only_approved_rows(
         assert np.all(baseline.probability_of_precipitation_1h_state.values == 2)
         # A nonzero deterministic QPF proves PoP was not synthesized from QPF.
         assert np.all(baseline.liquid_equivalent_precipitation_amount_1h.values > 0)
+        pairs = [
+            _model_from_json(MatchedPairRowV2, row)
+            for row in _payload(store, result.matching.matched_pairs)["rows"]
+        ]
+        for pair in pairs:
+            assert pair.temperature_availability_state == "fallback"
+            assert pair.wind_speed_availability_state == "fallback"
+            assert pair.gust_availability_state == "fallback"
+            assert pair.qpf_availability_state == "fallback"
+            assert pair.pop_availability_state == "unavailable"
+        verification = _model_from_json(
+            VerificationReportV2, _payload(store, result.verification.report)
+        )
+        availability_rows = {
+            (row.stratum_value, row.metric_name): row
+            for row in verification.rows
+            if row.stratum_kind == "by_availability_state"
+        }
+        for metric in ("temperature_mae", "wind_speed_mae", "gust_mae", "qpf_mae"):
+            assert availability_rows[("fallback", metric)].sample_count > 0
+            assert availability_rows[("unavailable", metric)].sample_count == 0
+        assert availability_rows[("fallback", "pop_brier_score")].sample_count == 0
+        unavailable_pop = availability_rows[("unavailable", "pop_brier_score")]
+        assert unavailable_pop.sample_count == 0
+        assert unavailable_pop.missing_counts["forecast_missing_or_invalid"] > 0
 
 
 def test_complete_cycle_proves_configuration_lineage_replay_and_concurrency(

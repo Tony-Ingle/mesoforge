@@ -285,6 +285,17 @@ _V2_STATUS_FIELD = {
     "pop": "pop_status",
     "wind_direction": "wind_direction_status",
 }
+_V2_AVAILABILITY_FIELD = {
+    "temperature": "temperature_availability_state",
+    "dew_point": "dew_point_availability_state",
+    "eastward_wind": "eastward_wind_availability_state",
+    "northward_wind": "northward_wind_availability_state",
+    "wind_speed": "wind_speed_availability_state",
+    "wind_direction": "wind_direction_availability_state",
+    "gust": "gust_availability_state",
+    "qpf": "qpf_availability_state",
+    "pop": "pop_availability_state",
+}
 
 
 def _v2_missing(rows: list[MatchedPairRowV2], field: str) -> dict[str, int]:
@@ -330,9 +341,16 @@ def _metrics_for_rows_v2(
     stratum_value: str | int | None,
 ) -> list[MetricRowV2]:
     output: list[MetricRowV2] = []
+
+    def metric_rows(field: str) -> list[MatchedPairRowV2]:
+        if kind != "by_availability_state":
+            return rows
+        return [row for row in rows if getattr(row, _V2_AVAILABILITY_FIELD[field]) == stratum_value]
+
     for field, forecast_attr, observed_attr, unit in _V2_CONTINUOUS_FIELDS:
+        field_rows = metric_rows(field)
         errors: list[float] = []
-        for row in rows:
+        for row in field_rows:
             if getattr(row, _V2_STATUS_FIELD[field]) != "matched":
                 continue
             forecast, observed = getattr(row, forecast_attr), getattr(row, observed_attr)
@@ -344,7 +362,7 @@ def _metrics_for_rows_v2(
                 raise ValueError(f"matched {field} inputs must be finite and non-null")
             errors.append(forecast - observed)
         bias, mae, rmse = _compute_scalar_metrics(errors)
-        missing = _v2_missing(rows, field)
+        missing = _v2_missing(field_rows, field)
         for suffix, value in (("bias", bias), ("mae", mae), ("rmse", rmse)):
             output.append(
                 _metric_row_v2(
@@ -361,7 +379,8 @@ def _metrics_for_rows_v2(
             )
 
     direction_errors: list[float] = []
-    for row in rows:
+    direction_rows = metric_rows("wind_direction")
+    for row in direction_rows:
         if row.wind_direction_status == "matched":
             forecast = row.forecast_wind_from_direction_degrees
             observed = row.observed_wind_from_direction_degrees
@@ -382,13 +401,14 @@ def _metrics_for_rows_v2(
             value=direction,
             null_reason=None if direction is not None else "no_matched_samples",
             sample=len(direction_errors),
-            missing=_v2_missing(rows, "wind_direction"),
+            missing=_v2_missing(direction_rows, "wind_direction"),
         )
     )
 
+    qpf_rows = metric_rows("qpf")
     qpf_pairs = [
         (row.forecast_qpf_kg_m2, row.observed_qpf_kg_m2)
-        for row in rows
+        for row in qpf_rows
         if row.qpf_status == "matched"
     ]
     checked_qpf: list[tuple[float, float]] = []
@@ -411,13 +431,14 @@ def _metrics_for_rows_v2(
                     value=getattr(contingency, name),
                     null_reason=getattr(contingency, f"{name}_null_reason"),
                     sample=len(checked_qpf),
-                    missing=_v2_missing(rows, "qpf"),
+                    missing=_v2_missing(qpf_rows, "qpf"),
                     details=details,
                 )
             )
 
     pop_pairs: list[tuple[float, float]] = []
-    for row in rows:
+    pop_rows = metric_rows("pop")
+    for row in pop_rows:
         if row.pop_status != "matched":
             continue
         if row.forecast_pop_probability is None or row.observed_qpf_kg_m2 is None:
@@ -434,7 +455,7 @@ def _metrics_for_rows_v2(
             value=brier,
             null_reason=None if brier is not None else "no_matched_samples",
             sample=len(pop_pairs),
-            missing=_v2_missing(rows, "pop"),
+            missing=_v2_missing(pop_rows, "pop"),
             details={"bins": [asdict(bin_) for bin_ in bins]},
         )
     )
@@ -450,7 +471,7 @@ def _metrics_for_rows_v2(
                 value=value,
                 null_reason=decomposition.null_reason,
                 sample=len(pop_pairs),
-                missing=_v2_missing(rows, "pop"),
+                missing=_v2_missing(pop_rows, "pop"),
             )
         )
     auc = compute_roc_auc(pop_pairs)
@@ -463,7 +484,7 @@ def _metrics_for_rows_v2(
             value=auc.value,
             null_reason=auc.null_reason,
             sample=len(pop_pairs),
-            missing=_v2_missing(rows, "pop"),
+            missing=_v2_missing(pop_rows, "pop"),
         )
     )
     return output
@@ -496,10 +517,14 @@ def compute_verification_report_v2(
         ("by_station", station, [r for r in rows if str(r.station_id) == station])
         for station in sorted({str(r.station_id) for r in rows})
     )
-    strata.extend(
-        ("by_availability_state", state, [r for r in rows if r.availability_state == state])
-        for state in sorted({r.availability_state for r in rows})
+    availability_states = sorted(
+        {
+            getattr(row, availability_field)
+            for row in rows
+            for availability_field in _V2_AVAILABILITY_FIELD.values()
+        }
     )
+    strata.extend(("by_availability_state", state, rows) for state in availability_states)
     for kind, value, subset in strata:
         report_rows.extend(_metrics_for_rows_v2(subset, kind=kind, stratum_value=value))
     first = rows[0]

@@ -430,13 +430,16 @@ def match_baseline_to_observations_v2(
             valid_time = _datetime_from_numpy(selection.target_valid_time.values)
             forecast: dict[str, float | None] = {}
             states: list[AvailabilityStateV2] = []
+            field_states: dict[str, AvailabilityStateV2] = {}
             for field, variable in variable_map.items():
                 value = float(selection[variable].values)
                 forecast[field] = value if math.isfinite(value) else None
                 code = int(selection[f"{variable}_state"].values)
                 if code not in _STATE_NAMES:
                     raise ValueError(f"invalid availability state code {code} for {variable}")
-                states.append(_STATE_NAMES[code])
+                state = _STATE_NAMES[code]
+                states.append(state)
+                field_states[field] = state
             u, v = forecast["eastward_component"], forecast["northward_component"]
             if u is None or v is None:
                 forecast["wind_speed"] = forecast["wind_direction"] = None
@@ -447,6 +450,10 @@ def match_baseline_to_observations_v2(
                     None if speed == 0 else (math.degrees(math.atan2(-u, -v)) % 360.0)
                 )
             availability = max(states, key=state_rank.__getitem__)
+            wind_availability = max(
+                (field_states["eastward_component"], field_states["northward_component"]),
+                key=state_rank.__getitem__,
+            )
             selected, had_candidate = _select_observation_v2(
                 station_id=StationId(station_id),
                 valid_time=valid_time,
@@ -554,6 +561,15 @@ def match_baseline_to_observations_v2(
                     matching_policy_digest=matching_policy.digest,
                     verification_cutoff=verification_cutoff,
                     availability_state=availability,
+                    temperature_availability_state=field_states["temperature"],
+                    dew_point_availability_state=field_states["dew_point"],
+                    eastward_wind_availability_state=field_states["eastward_component"],
+                    northward_wind_availability_state=field_states["northward_component"],
+                    wind_speed_availability_state=wind_availability,
+                    wind_direction_availability_state=wind_availability,
+                    gust_availability_state=field_states["gust"],
+                    qpf_availability_state=field_states["qpf"],
+                    pop_availability_state=field_states["pop"],
                     selected_logical_observation_digest=(
                         selected.logical_observation_digest if selected else None
                     ),

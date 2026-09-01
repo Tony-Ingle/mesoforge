@@ -41,7 +41,11 @@ def _baseline() -> xr.Dataset:
 
 
 def _observation(
-    *, available: datetime, interval_end: datetime | None = None, revision: str = "b"
+    *,
+    available: datetime,
+    interval_start: datetime | None = None,
+    interval_end: datetime | None = None,
+    revision: str = "b",
 ) -> NormalizedObservationV2:
     event = datetime(2026, 1, 1, 1, tzinfo=UTC)
     end = interval_end or event
@@ -72,7 +76,7 @@ def _observation(
         wind_gust_m_s=8.0,
         precipitation_amount_kg_m2=1.016,
         precipitation_truth_status="reported",
-        precipitation_interval_start=end - timedelta(hours=1),
+        precipitation_interval_start=interval_start or end - timedelta(hours=1),
         precipitation_interval_end=end,
         mesoforge_qc_state="eligible",
     )
@@ -111,6 +115,26 @@ def test_revision_cutoff_and_exact_precipitation_interval_matching() -> None:
         available=cutoff, interval_end=datetime(2026, 1, 1, 1, 16, tzinfo=UTC)
     )
     row = _match([wrong_interval], cutoff=cutoff)[0]
+    assert row.qpf_status == "precipitation_interval_mismatch"
+    assert row.pop_status == "precipitation_interval_mismatch"
+
+
+def test_precipitation_interval_uses_end_time_tolerance_but_requires_one_hour() -> None:
+    cutoff = datetime(2026, 1, 1, 2, tzinfo=UTC)
+    for minute_offset in (-15, 15):
+        interval_end = datetime(2026, 1, 1, 1, tzinfo=UTC) + timedelta(minutes=minute_offset)
+        row = _match([_observation(available=cutoff, interval_end=interval_end)], cutoff=cutoff)[0]
+        assert row.temperature_status == "matched"
+        assert row.wind_speed_status == "matched"
+        assert row.qpf_status == "matched"
+        assert row.pop_status == "matched"
+
+    wrong_duration = _observation(
+        available=cutoff,
+        interval_start=datetime(2026, 1, 1, 0, 1, tzinfo=UTC),
+        interval_end=datetime(2026, 1, 1, 1, tzinfo=UTC),
+    )
+    row = _match([wrong_duration], cutoff=cutoff)[0]
     assert row.qpf_status == "precipitation_interval_mismatch"
     assert row.pop_status == "precipitation_interval_mismatch"
 

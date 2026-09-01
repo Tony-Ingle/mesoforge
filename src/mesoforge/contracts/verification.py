@@ -228,6 +228,12 @@ FieldStatusV2 = Literal[
     "matched",
 ]
 AvailabilityStateV2 = Literal["complete", "fallback", "unavailable", "inconsistent"]
+_AVAILABILITY_STATE_RANK: dict[AvailabilityStateV2, int] = {
+    "complete": 0,
+    "fallback": 1,
+    "unavailable": 2,
+    "inconsistent": 3,
+}
 
 
 class MatchedPairRowV2(BaseModel):
@@ -246,7 +252,18 @@ class MatchedPairRowV2(BaseModel):
     matching_policy_id: MatchingPolicyId
     matching_policy_digest: Digest
     verification_cutoff: UtcInstant
+    # Retained as the worst row state for compatibility. Metric-specific
+    # states below drive availability-stratified verification.
     availability_state: AvailabilityStateV2
+    temperature_availability_state: AvailabilityStateV2
+    dew_point_availability_state: AvailabilityStateV2
+    eastward_wind_availability_state: AvailabilityStateV2
+    northward_wind_availability_state: AvailabilityStateV2
+    wind_speed_availability_state: AvailabilityStateV2
+    wind_direction_availability_state: AvailabilityStateV2
+    gust_availability_state: AvailabilityStateV2
+    qpf_availability_state: AvailabilityStateV2
+    pop_availability_state: AvailabilityStateV2
     selected_logical_observation_digest: Digest | None = None
     selected_revision_digest: Digest | None = None
     selected_event_time: UtcInstant | None = None
@@ -286,6 +303,22 @@ class MatchedPairRowV2(BaseModel):
     def _validate_v2_row(self) -> MatchedPairRowV2:
         if not 1 <= self.target_horizon_hours <= 36:
             raise ValueError("target_horizon_hours must be in 1..36")
+        variable_states = (
+            self.temperature_availability_state,
+            self.dew_point_availability_state,
+            self.eastward_wind_availability_state,
+            self.northward_wind_availability_state,
+            self.wind_speed_availability_state,
+            self.wind_direction_availability_state,
+            self.gust_availability_state,
+            self.qpf_availability_state,
+            self.pop_availability_state,
+        )
+        expected_availability = max(variable_states, key=_AVAILABILITY_STATE_RANK.__getitem__)
+        if self.availability_state != expected_availability:
+            raise ValueError(
+                f"availability_state must be the worst per-variable state {expected_availability!r}"
+            )
         statuses = tuple(
             getattr(self, f"{name}_status")
             for name in (

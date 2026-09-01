@@ -21,6 +21,15 @@ def _row(**updates: object) -> MatchedPairRowV2:
         "matching_policy_digest": "sha256:" + "3" * 64,
         "verification_cutoff": datetime(2026, 1, 2, tzinfo=UTC),
         "availability_state": "complete",
+        "temperature_availability_state": "complete",
+        "dew_point_availability_state": "complete",
+        "eastward_wind_availability_state": "complete",
+        "northward_wind_availability_state": "complete",
+        "wind_speed_availability_state": "complete",
+        "wind_direction_availability_state": "complete",
+        "gust_availability_state": "complete",
+        "qpf_availability_state": "complete",
+        "pop_availability_state": "complete",
         "row_status": "matched_no_fields",
         **{
             f"{name}_status": "no_report_within_tolerance"
@@ -62,6 +71,22 @@ def test_v2_contract_requires_horizons_one_through_36() -> None:
         _row(target_horizon_hours=0)
     with pytest.raises(ValidationError):
         _row(target_horizon_hours=37)
+
+
+def test_v2_contract_validates_each_metric_availability_state_exactly() -> None:
+    with pytest.raises(ValidationError):
+        _row(temperature_availability_state="degraded")
+
+
+@pytest.mark.parametrize("state", ["fallback", "unavailable", "inconsistent"])
+def test_v2_contract_rejects_aggregate_availability_better_than_variable(
+    state: str,
+) -> None:
+    with pytest.raises(ValidationError, match="worst per-variable state"):
+        _row(temperature_availability_state=state)
+
+    row = _row(availability_state=state, temperature_availability_state=state)
+    assert row.availability_state == state
 
 
 def test_metric_contract_rejects_nonfinite_nested_json_details() -> None:
