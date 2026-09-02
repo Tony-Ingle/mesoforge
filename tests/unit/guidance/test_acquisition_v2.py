@@ -115,7 +115,7 @@ class TestAcquireNbmLead:
             "5:400:d=2026083012:GUST:10 m above ground:6 hour fcst:",
             "6:500:d=2026083012:APCP:surface:5-6 hour acc fcst:",
             r"7:600:d=2026083012:APCP:surface:5-6 hour acc fcst:prob >0.254:"
-            r"some probability forecast:",
+            r"prob fcst 255/255",
         ]
         index_text = "\n".join(rows_text_lines) + "\n"
         total_length = len(full)

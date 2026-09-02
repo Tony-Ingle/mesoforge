@@ -79,8 +79,27 @@ class TestBuildFieldSelector:
 
     def test_pop_selector(self) -> None:
         selector = build_field_selector("probability_of_precipitation_1h", forecast_hour=6)
-        assert "prob >0\\.254" in selector
-        assert "probability forecast" in selector
+        assert selector == r":APCP:surface:5-6 hour acc fcst:prob >0\.254:prob fcst \d+/\d+$"
+
+    def test_pop_selector_matches_exactly_one_live_inventory_descriptor(self) -> None:
+        """The operational NBM core inventory spells PoP01's trailing
+        identity ``prob fcst {n}/{m}``. The selector must match exactly
+        that descriptor and nothing else in the same accumulation
+        window -- in particular not the deterministic APCP record, the
+        ensemble std-dev record, or a neighbouring probability threshold.
+        """
+        import re
+
+        selector = build_field_selector("probability_of_precipitation_1h", forecast_hour=6)
+        descriptors = (
+            ":APCP:surface:5-6 hour acc fcst:prob >0.254:prob fcst 255/255",
+            ":APCP:surface:5-6 hour acc fcst:",
+            ":APCP:surface:5-6 hour acc fcst:ens std dev",
+            ":APCP:surface:5-6 hour acc fcst:prob >2.54:prob fcst 255/255",
+            ":APCP:surface:4-5 hour acc fcst:prob >0.254:prob fcst 255/255",
+        )
+        matched = [d for d in descriptors if re.search(selector, d)]
+        assert matched == [":APCP:surface:5-6 hour acc fcst:prob >0.254:prob fcst 255/255"]
 
     def test_rejects_lead_zero(self) -> None:
         with pytest.raises(ValueError, match=">= 1"):
@@ -98,9 +117,7 @@ class TestBuildFieldSelector:
 
         det = build_field_selector("liquid_equivalent_precipitation_amount_1h", forecast_hour=6)
         pop = build_field_selector("probability_of_precipitation_1h", forecast_hour=6)
-        pop_descriptor = (
-            ":APCP:surface:5-6 hour acc fcst:prob >0.254:0-6 hour acc fcst:probability forecast:"
-        )
+        pop_descriptor = ":APCP:surface:5-6 hour acc fcst:prob >0.254:prob fcst 255/255"
         det_descriptor = ":APCP:surface:5-6 hour acc fcst:"
         assert re.search(det, pop_descriptor) is None
         assert re.search(det, det_descriptor) is not None
@@ -128,9 +145,22 @@ class TestConvertSpeedDirectionToComponents:
         with pytest.raises(ValueError, match="nonnegative"):
             convert_speed_direction_to_components(speed_m_s=-1.0, direction_degrees=0.0)
 
-    def test_rejects_out_of_range_direction_at_nonzero_speed(self) -> None:
+    def test_accepts_360_as_due_north_exactly_like_zero(self) -> None:
+        # The operational NBM WDIR field reports due north as 360, not 0.
+        # It is the same physical direction, so it must produce exactly
+        # the same components as 0 -- including an exactly-zero eastward
+        # component, which evaluating math.radians(360.0) would not give.
+        u_360, v_360 = convert_speed_direction_to_components(
+            speed_m_s=10.0, direction_degrees=360.0
+        )
+        u_0, v_0 = convert_speed_direction_to_components(speed_m_s=10.0, direction_degrees=0.0)
+        assert (u_360, v_360) == (u_0, v_0)
+        assert u_360 == 0.0
+        assert v_360 == -10.0
+
+    def test_rejects_direction_above_360_at_nonzero_speed(self) -> None:
         with pytest.raises(ValueError, match="0, 360"):
-            convert_speed_direction_to_components(speed_m_s=1.0, direction_degrees=360.0)
+            convert_speed_direction_to_components(speed_m_s=1.0, direction_degrees=360.1)
 
     def test_rejects_negative_direction(self) -> None:
         with pytest.raises(ValueError, match="0, 360"):

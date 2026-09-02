@@ -79,10 +79,18 @@ _GFS_DESCRIPTORS: dict[str, str] = {
 
 @dataclass(frozen=True, slots=True)
 class InventoryEntry:
-    """One inventory row plus the exact message bytes it points at."""
+    """One inventory row plus the exact message bytes it points at.
+
+    ``trailing_colon`` reproduces a real provider detail: NBM's PoP01
+    probability row is the one inventory line that does *not* end in a
+    colon (``...:prob >0.254:prob fcst 255/255``), whereas every other
+    row does. Production's selector anchors on that exact identity, so
+    the fixture must not paper over the difference.
+    """
 
     descriptor: str
     payload: bytes
+    trailing_colon: bool = True
 
 
 @dataclass
@@ -111,7 +119,8 @@ class LeadObject:
         offset = 0
         date_tag = f"d={self.cycle_date:%Y%m%d}{self.cycle_hour:02d}"
         for number, entry in enumerate(self.entries, start=1):
-            lines.append(f"{number}:{offset}:{date_tag}:{entry.descriptor}:")
+            suffix = ":" if entry.trailing_colon else ""
+            lines.append(f"{number}:{offset}:{date_tag}:{entry.descriptor}{suffix}")
             offset += len(entry.payload)
         return "\n".join(lines) + "\n"
 
@@ -309,16 +318,19 @@ def build_nbm_lead_object(*, cycle: datetime, forecast_hour: int, base_value: fl
             ),
         )
     )
-    # PoP01's inventory row carries the exact probability suffix the
-    # production selector requires, so the deterministic APCP row and the
-    # probability row are distinguishable without ambiguity.
+    # PoP01's inventory row carries the exact probability identity the
+    # production selector requires -- the operational NBM core spelling
+    # ``prob >0.254:prob fcst {n}/{m}`` with no trailing colon -- so the
+    # deterministic APCP row and the probability row are distinguishable
+    # without ambiguity.
     entries.append(
         InventoryEntry(
             f"APCP:surface:{forecast_hour - 1}-{forecast_hour} hour acc fcst:"
-            "prob >0.254:prob fcst 255/255:probability forecast",
+            "prob >0.254:prob fcst 255/255",
             nbm_grib.make_pop01_message(
                 values_percent=np.full(shape, min(99, 20 + forecast_hour)), **args
             ),
+            trailing_colon=False,
         )
     )
     return LeadObject(tuple(entries), cycle.date(), cycle.hour)

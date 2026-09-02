@@ -264,17 +264,25 @@ def _valid_map(value: object) -> None:
 def _late_acquisitions(
     acquisitions: tuple[Phase2LeadAcquisition, ...], information_cutoff: datetime
 ) -> tuple[datetime, ...]:
-    """Every acquisition timestamp in ``acquisitions`` that is strictly
-    after ``information_cutoff`` (Codex re-review finding 4).
+    """Every *authoritative provider availability* timestamp in
+    ``acquisitions`` that is strictly after ``information_cutoff``
+    (Codex re-review finding 4).
 
-    Both the index retrieval and the ranged message retrieval count: a
-    forecast may only use input bytes that actually existed by the
-    cutoff, and an index that only appeared afterwards is just as much
-    a leak of future information as a late message.
+    Both the index and the ranged message object count: a forecast may
+    only use input bytes that actually existed by the cutoff, and an
+    index that only appeared afterwards is just as much a leak of
+    future information as a late message.
+
+    The comparison uses ``*_available_at`` -- the provider's own
+    ``Last-Modified`` publication assertion -- not ``*_completed_at``,
+    which is merely when this process happened to retrieve the bytes.
+    Using retrieval time here would reject an already-published
+    retrospective cycle purely because the run started later, which is
+    not a leak of future information at all.
     """
     late: list[datetime] = []
     for acquisition in acquisitions:
-        for available_at in (acquisition.index_completed_at, acquisition.grib_completed_at):
+        for available_at in (acquisition.index_available_at, acquisition.grib_available_at):
             if available_at > information_cutoff:
                 late.append(available_at)
     return tuple(late)
@@ -557,7 +565,13 @@ class Phase2ProductionProvider:
                     len(late),
                 )
                 continue
-            completed_at = max(a.grib_completed_at for a in acquisitions)
+            # The cycle's completion instant is the provider's own
+            # publication assertion for the last object in the required
+            # set, not this process's retrieval wall time. Comparing
+            # retrieval time to the cycle-completion deadline would
+            # reject every legitimately-published retrospective cycle
+            # merely because it was fetched later.
+            completed_at = max(a.grib_available_at for a in acquisitions)
             selection = select_model_cycle(
                 model=model,  # type: ignore[arg-type]
                 target_reference_time=target,
@@ -626,7 +640,7 @@ class Phase2ProductionProvider:
                     schema=f"{model.lower()}-index.v1",
                     payload=acquisition.index_payload,
                     media_type="text/plain",
-                    available_at=acquisition.index_completed_at,
+                    available_at=acquisition.index_available_at,
                     source_revision=acquisition.endpoint,
                 )
                 roots.append(
@@ -650,7 +664,7 @@ class Phase2ProductionProvider:
                         schema=f"{model.lower()}-message.v1",
                         payload=message.payload,
                         media_type="application/octet-stream",
-                        available_at=acquisition.grib_completed_at,
+                        available_at=acquisition.grib_available_at,
                         source_revision=acquisition.endpoint,
                     )
                     roots.append(
@@ -807,8 +821,16 @@ class Phase2ProductionProvider:
             "endpoint": acquisition.endpoint,
             "resolved_index_url": acquisition.resolved_index_url,
             "resolved_grib_url": acquisition.resolved_grib_url,
+            # Local retrieval provenance of this process.
             "index_completed_at": acquisition.index_completed_at.isoformat(),
             "grib_completed_at": acquisition.grib_completed_at.isoformat(),
+            # Authoritative provider publication instants (the values the
+            # cutoff/deadline policy was actually applied to), plus the
+            # verbatim provider assertions they were derived from.
+            "index_available_at": acquisition.index_available_at.isoformat(),
+            "grib_available_at": acquisition.grib_available_at.isoformat(),
+            "index_last_modified": acquisition.index_last_modified,
+            "grib_last_modified": acquisition.full_object_last_modified,
             "selected_messages": [
                 {
                     "canonical_variable_id": message.canonical_variable_id,

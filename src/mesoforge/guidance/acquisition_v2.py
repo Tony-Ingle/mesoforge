@@ -18,7 +18,8 @@ pure computation over already-acquired bytes.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
+from email.utils import parsedate_to_datetime
 
 from mesoforge.catalog.sources import GfsSourceSettings, HrrrPhase2SourceSettings, NbmSourceSettings
 from mesoforge.guidance.http_fetch import FetchedObject as FetchedObject
@@ -41,6 +42,43 @@ from mesoforge.guidance.sources import nbm as nbm_source
 Phase2AcquisitionError = FetchError
 
 
+def parse_provider_availability(last_modified: str | None) -> datetime | None:
+    """Parse a provider's ``Last-Modified`` HTTP-date into an aware UTC
+    instant, or return ``None`` when it is absent or unparseable.
+
+    This is the *authoritative* moment an object became publicly
+    available, as asserted by the provider itself. It is categorically
+    different from the local wall-clock moment this process happened to
+    retrieve those bytes, and only the former may be compared against a
+    run's information cutoff or a cycle's completion deadline.
+    """
+    if last_modified is None:
+        return None
+    try:
+        parsed = parsedate_to_datetime(last_modified)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def resolve_available_at(last_modified: str | None, *, retrieved_at: datetime) -> datetime:
+    """The authoritative availability instant for one fetched object.
+
+    Prefers the provider's own ``Last-Modified`` assertion. When a
+    provider supplies none, falls back to this process's retrieval time,
+    which is necessarily no earlier than publication -- a conservative
+    direction that can only make an object look *later* than it truly
+    was, so a genuinely late input can never be admitted by the
+    fallback.
+    """
+    published = parse_provider_availability(last_modified)
+    if published is None:
+        return retrieved_at
+    return published
+
+
 @dataclass(frozen=True, slots=True)
 class SelectedMessage:
     canonical_variable_id: str
@@ -58,7 +96,22 @@ class Phase2LeadAcquisition:
     like NBM's deterministic APCP/PoP01 or GFS's duplicate bucket/
     continuous APCP rows decode unambiguously), and enough metadata
     to register both as source artifacts and to reconstruct a
-    manifest."""
+    manifest.
+
+    Two distinct kinds of timestamp are retained, and conflating them
+    is a correctness bug:
+
+    ``index_completed_at``/``grib_completed_at``
+        When *this process* finished retrieving the bytes -- local
+        wall-clock provenance of the acquisition itself.
+    ``index_available_at``/``grib_available_at``
+        When the *provider* published the object, taken from its own
+        ``Last-Modified`` assertion. This is the authoritative
+        information-availability instant, and the only one that may be
+        compared against a run's information cutoff or a cycle's
+        completion deadline. Retrieving an already-published
+        retrospective cycle later must not make that cycle look late.
+    """
 
     model: str
     cycle_date: date
@@ -76,6 +129,9 @@ class Phase2LeadAcquisition:
     full_object_etag: str | None
     full_object_last_modified: str | None
     full_object_content_length: int
+    index_available_at: datetime
+    grib_available_at: datetime
+    index_last_modified: str | None = None
 
     def payloads_by_variable(self) -> dict[str, list[bytes]]:
         """Group this lead's selected messages by canonical variable
@@ -278,6 +334,7 @@ def acquire_nbm_lead(
         full_object_etag=full_object_etag,
         full_object_last_modified=full_object_last_modified,
     )
+    index_last_modified = _header(index_fetch.headers, "Last-Modified")
     return Phase2LeadAcquisition(
         model="nbm",
         cycle_date=cycle_date,
@@ -295,6 +352,13 @@ def acquire_nbm_lead(
         full_object_etag=full_object_etag,
         full_object_last_modified=full_object_last_modified,
         full_object_content_length=full_object_content_length,
+        index_last_modified=index_last_modified,
+        index_available_at=resolve_available_at(
+            index_last_modified, retrieved_at=index_fetch.completed_at
+        ),
+        grib_available_at=resolve_available_at(
+            full_object_last_modified, retrieved_at=grib_completed_at
+        ),
     )
 
 
@@ -381,6 +445,7 @@ def acquire_hrrr_phase2_lead(
         full_object_etag=full_object_etag,
         full_object_last_modified=full_object_last_modified,
     )
+    index_last_modified = _header(index_fetch.headers, "Last-Modified")
     return Phase2LeadAcquisition(
         model="hrrr",
         cycle_date=cycle_date,
@@ -398,6 +463,13 @@ def acquire_hrrr_phase2_lead(
         full_object_etag=full_object_etag,
         full_object_last_modified=full_object_last_modified,
         full_object_content_length=full_object_content_length,
+        index_last_modified=index_last_modified,
+        index_available_at=resolve_available_at(
+            index_last_modified, retrieved_at=index_fetch.completed_at
+        ),
+        grib_available_at=resolve_available_at(
+            full_object_last_modified, retrieved_at=grib_completed_at
+        ),
     )
 
 
@@ -494,6 +566,7 @@ def acquire_gfs_lead(
         full_object_etag=full_object_etag,
         full_object_last_modified=full_object_last_modified,
     )
+    index_last_modified = _header(index_fetch.headers, "Last-Modified")
     return Phase2LeadAcquisition(
         model="gfs",
         cycle_date=cycle_date,
@@ -511,4 +584,11 @@ def acquire_gfs_lead(
         full_object_etag=full_object_etag,
         full_object_last_modified=full_object_last_modified,
         full_object_content_length=full_object_content_length,
+        index_last_modified=index_last_modified,
+        index_available_at=resolve_available_at(
+            index_last_modified, retrieved_at=index_fetch.completed_at
+        ),
+        grib_available_at=resolve_available_at(
+            full_object_last_modified, retrieved_at=grib_completed_at
+        ),
     )
