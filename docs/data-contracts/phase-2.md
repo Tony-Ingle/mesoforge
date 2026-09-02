@@ -252,23 +252,77 @@ NaN or Infinity.
 
 ## Replay and acceptance
 
-Replay receives the recorded `Phase2SelectedInputs`; it does not rediscover a cycle,
-re-query providers, select later revisions, or reconstruct inputs by timestamps. The
-durable inputs are complete enough to make that real. The `phase2-run-spec.v1`
-artifact records both cutoffs, the forecast issue time, the target horizons and random
-seed, the cycle-selection policy actually applied, the per-model required source groups
-(selected cycle reference time, acquired source leads, endpoints, deadlines, allowed
-cycle hours, canonical variable IDs), every request identity digest, and digests of the
-Phase 2 configuration, blend configuration, and matching policy. The
-`station-catalog-snapshot.v1` artifact records each station's exact expected
-coordinates and elevation, provider ICAO identity, site name, site types, priority, and
-exposure/instrument identities, plus the point-extraction policy — every station field
-downstream alignment, METAR normalization, and matching consume. Replay therefore
-reconstructs from persisted bytes rather than from mutable live configuration.
-Verified content digests protect object reads. Activity idempotency includes ordered
-roles, configuration/parameter/code/environment identities, and output schema.
-Identical replay, including concurrent replay, reuses the same activities and
-artifacts and produces byte-identical verification content.
+Replay is reconstructed from the run's own immutable persisted roots and never
+trusts a caller. `Phase2Coordinator.replay` re-reads the `phase2-run-spec.v1` and
+`station-catalog-snapshot.v1` artifacts from the repository by artifact ID,
+verifies their bytes against the registered content digests, and parses them under
+the strict `application.phase2_replay` contracts. Only then is the caller-supplied
+request checked *against* that persisted identity: a differing run ID, target
+frame, cutoff, horizon set, seed, configuration snapshot/digest, code revision,
+environment digest, or lockfile digest fails closed with
+`Phase2ReplayIdentityError` before any stage runs. Pinned source roots must match
+the run spec's recorded acquisitions exactly in both directions and by exact
+artifact identity. The station snapshot and every index/message source are
+registered before the run spec, which binds their `artifact_id` and
+`content_digest`. Replay reloads each authoritative manifest and verified payload
+and reconstructs `Phase2SelectedInputs`; caller manifest fields are never used.
+A missing root, extra root, or same-role artifact substitution is a hard failure,
+and a missing or incomplete persisted
+root raises `Phase2ReplayContractError`. Replay never rediscovers a cycle,
+re-queries providers, selects later revisions, or reconstructs inputs by
+timestamps.
+
+The registered AviationWeather response uses the run-specific locator
+`phase2-metar://<run_id>`. Replay reloads its authoritative manifest and requires
+that locator plus exact configuration/code identity, AviationWeather source and
+availability authority, valid quality, and availability by the verification
+cutoff before any stage executes.
+
+The durable inputs are complete enough to make that real. The
+`phase2-run-spec.v1` artifact records both cutoffs, the forecast issue time, the
+target horizons and random seed, the cycle-selection policy actually applied, the
+per-model required source groups (selected cycle reference time, acquired source
+leads, endpoints, deadlines, allowed cycle hours, canonical variable IDs, source
+grid profile) *and each acquired lead's own evidence* — resolved index and GRIB
+URLs, index/GRIB completion timestamps, and every selected message's canonical
+variable, record identity, message number, byte range, and exact inventory row.
+That per-lead evidence is what lets normalization and `variable-lineage.v2`
+construction run with no process-local acquisition cache: a fresh provider in a
+fresh process rebuilds a byte-identical manifest. The run spec additionally
+embeds the complete `Phase2Configuration` and the digests it must reproduce, so
+the spec is self-verifying and alignment, availability, blending, observation
+normalization, matching, and verification all read persisted policy rather than a
+mutable live object. The `station-catalog-snapshot.v1` artifact records each
+station's exact expected coordinates and elevation, provider ICAO identity, site
+name, site types, priority, and exposure/instrument identities, plus the
+point-extraction policy — every station field downstream alignment, METAR
+normalization, and matching consume.
+
+Replay performs zero network access. Observations are not re-fetched: the
+coordinator passes the run's own recorded `aviationweather-metar-response`
+artifacts, whose repository-authoritative manifests are validated for artifact
+type, schema, source authority, quality state, configuration/code identity, and
+availability by the run's verification cutoff, and whose verified stored bytes are
+re-normalized. Each response is registered under the run-specific
+`phase2-metar://<run-id>` locator with an immutable source identity: a retry with
+different bytes for that locator fails closed, so exactly one authoritative
+observation artifact can belong to the run. `build_phase2_replay_adapters` composes a replay-only coordinator
+that is given no `Phase2Configuration` at all, a `Phase2UnavailableProvider` that
+refuses discovery and acquisition, and an `UnavailableHttpTransport` that raises on
+every request — so a network call is structurally impossible rather than merely
+unused. When a live configuration *is* supplied to `Phase2ProductionScience`, it is
+only ever compared against the persisted configuration digest and never read for
+policy; a conflicting one fails closed.
+
+Verified content digests protect object reads. Activity idempotency includes
+ordered roles, configuration/parameter/code/environment identities, and output
+schema. Identical replay, including concurrent replay, reuses the same activities
+and artifacts and produces byte-identical verification content. The acceptance
+proof demonstrates this independently: it runs the pipeline, deliberately mutates
+the live configuration's stations, matching policy, and metric set, forbids every
+socket, and then replays through a coordinator that shares no provider, science
+instance, or configuration with the original run — asserting both physical
+(artifact/activity identity) and logical (byte-identical payload) equality.
 
 `make phase2-offline` is the no-network quality/unit/contract/property/scientific and
 default-live-skip proof. `make phase2-acceptance` is the fixture-source acceptance

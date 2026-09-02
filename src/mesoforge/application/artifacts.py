@@ -255,11 +255,14 @@ def _parameters_digest(parameters: dict[str, object]) -> Digest:
 def _source_registration_digest(
     request: SourceRegistrationRequest, content_digest: Digest
 ) -> Digest:
+    immutable_source_identity = _uses_immutable_source_identity(request)
     payload = {
         "source_authority": request.source_authority,
         "source_locator": request.source_locator,
         "source_revision": request.source_revision,
-        "content_digest": str(content_digest),
+        "content_digest": (
+            "immutable-source-identity" if immutable_source_identity else str(content_digest)
+        ),
         "artifact_schema_version": request.artifact_schema_version,
         "configuration_digest": request.configuration_digest,
         "code_revision": request.code_revision,
@@ -267,6 +270,22 @@ def _source_registration_digest(
         "quality_state": request.quality_state,
     }
     return Digest.of_bytes(jcs.canonicalize(payload))
+
+
+def _uses_immutable_source_identity(request: SourceRegistrationRequest) -> bool:
+    """Reserve the Phase 2 METAR namespace as once-only per run.
+
+    This is derived from the validated source contract rather than a caller
+    flag, so a second caller cannot bypass byte immutability by omitting an
+    option while reusing the same authoritative observation identity.
+    """
+    return (
+        request.source_authority == "aviationweather.gov"
+        and request.source_locator.startswith("phase2-metar://run_")
+        and request.source_revision == "phase2.v1"
+        and request.artifact_type == "aviationweather-metar-response"
+        and request.artifact_schema_version == "aviationweather-metar-response.v1"
+    )
 
 
 class ArtifactService:
@@ -306,6 +325,28 @@ class ArtifactService:
             )
 
     # ------------------------------------------------------------------
+    # Authoritative artifact retrieval (immutable replay roots)
+    # ------------------------------------------------------------------
+
+    def load_verified_payload(self, artifact_id: ArtifactId) -> tuple[ArtifactManifest, bytes]:
+        """Load an artifact's repository-authoritative manifest and its
+        integrity-verified bytes.
+
+        Callers that must reconstruct a run from persisted state (Phase 2
+        replay) may not trust a caller-supplied manifest for
+        availability, quality state, configuration identity, or storage
+        location: the manifest is re-read from the repository by ID and
+        the payload is retrieved through ``get_verified``, so a tampered
+        object or a forged manifest fails closed before any policy is
+        reconstructed from it.
+        """
+        artifact_id = ArtifactId(artifact_id)
+        with self._unit_of_work_factory() as uow:
+            manifest = uow.artifacts.get(artifact_id)
+        payload = self._object_store.get_verified(manifest.storage_uri, manifest.content_digest)
+        return manifest, payload
+
+    # ------------------------------------------------------------------
     # Source registration (plan Section 5, first bullet)
     # ------------------------------------------------------------------
 
@@ -340,6 +381,13 @@ class ArtifactService:
                     source_registration_digest
                 )
                 if existing is not None:
+                    if (
+                        _uses_immutable_source_identity(request)
+                        and existing.content_digest != content_digest
+                    ):
+                        raise IntegrityError(
+                            "immutable source identity was already registered with different bytes"
+                        )
                     return existing
 
             stored_object = self._object_store.put_if_absent(

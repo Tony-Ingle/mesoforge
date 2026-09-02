@@ -66,9 +66,11 @@ from mesoforge.common.identifiers import (
     ArtifactId,
     ConfigurationSnapshotId,
     Digest,
+    FallbackRowId,
     GridId,
     MatchingPolicyId,
     MetricSetId,
+    ModelCycleSelectionPolicyId,
     RunId,
     StationId,
     VariableId,
@@ -87,6 +89,11 @@ _TYPED_IDENTIFIER_CLASSES = (
     StationId,
     MatchingPolicyId,
     MetricSetId,
+    # Phase 2 catalog identities; both are real validated
+    # ``common.identifiers`` classes, so a boundary typed with either
+    # already satisfies this audit's intent.
+    ModelCycleSelectionPolicyId,
+    FallbackRowId,
 )
 
 # Parameter/attribute names that look like an identifier/digest but are
@@ -137,6 +144,16 @@ _ALLOWED_PLAIN_STR_SITES: dict[str, str] = {
     "mesoforge.contracts.verification.MetricRowV2.unit_id": (
         "catalog unit label; no UnitId value class exists (matches the additive "
         "MetricRow v1 contract above)"
+    ),
+    "mesoforge.application.phase2_replay.Phase2StationSnapshotV1.domain_id": (
+        "persisted mirror of catalog.domains.DomainDefinition.domain_id, which Phase 1 "
+        "defines as a plain string label; no DomainId value class exists, and the "
+        "persisted snapshot must round-trip that field byte-identically"
+    ),
+    "mesoforge.application.phase2_replay.PersistedStation.provider_icao_id": (
+        "external AviationWeather.gov provider ICAO identifier, not a MesoForge "
+        "StationId (see station_id on the same model) -- mirrors the identical "
+        "RawMetarRecordV2.icao_id rationale above"
     ),
 }
 

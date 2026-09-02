@@ -37,6 +37,14 @@ from mesoforge.application.phase2_adapters import Phase2ProductionAdapters
 from mesoforge.application.phase2_production import (
     Phase2ProductionProvider,
     Phase2ProductionScience,
+    Phase2UnavailableProvider,
+    UnavailableHttpTransport,
+    build_phase2_replay_adapters,
+)
+from mesoforge.application.phase2_replay import (
+    Phase2ReplayContractError,
+    Phase2ReplayIdentityError,
+    parse_run_spec,
 )
 from mesoforge.catalog.configuration import Phase2Configuration, load_configuration_source
 from mesoforge.common.identifiers import ArtifactId
@@ -274,7 +282,6 @@ def _build(service, config, available, *, fault_scripts=None):
     ]
     science = Phase2ProductionScience(
         configuration=config,
-        provider=provider,
         aviationweather_transport=aviation,
         clock=clock,
         sleeper=sleeper,
@@ -493,7 +500,13 @@ def test_complete_cycle_proves_configuration_lineage_replay_and_concurrency(
         if root.field_role.startswith("message:")
     )
 
-    physical = coordinator.replay(request, first.selected_inputs)
+    # Replay is proved *independently* below in
+    # ``test_replay_is_reproduced_from_persisted_roots_alone``: a fresh
+    # provider/science/coordinator, mutated live configuration, and
+    # raising transports. Here we only confirm the same-process replay
+    # is idempotent and concurrency-safe.
+    recorded = first.observations.responses
+    physical = coordinator.replay(request, first.selected_inputs, recorded)
     assert physical.verification.report.artifact_id == first.verification.report.artifact_id
     assert (
         physical.atomic_forecast.activity.activity_id == first.atomic_forecast.activity.activity_id
@@ -504,7 +517,9 @@ def test_complete_cycle_proves_configuration_lineage_replay_and_concurrency(
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         concurrent = tuple(
-            pool.map(lambda _: coordinator.replay(request, first.selected_inputs), range(2))
+            pool.map(
+                lambda _: coordinator.replay(request, first.selected_inputs, recorded), range(2)
+            )
         )
     assert {item.verification.report.artifact_id for item in concurrent} == {
         first.verification.report.artifact_id
@@ -512,10 +527,10 @@ def test_complete_cycle_proves_configuration_lineage_replay_and_concurrency(
     assert {item.atomic_forecast.activity.activity_id for item in concurrent} == {
         first.atomic_forecast.activity.activity_id
     }
-    # Replay never touches the network again: no additional provider
-    # request was issued after the first run's acquisition.
+    # Replay never touches the network again: no additional provider or
+    # observation request was issued after the first run's acquisition.
     calls_after = {model: len(transports[model].get_calls) for model in MODELS}
-    coordinator.replay(request, first.selected_inputs)
+    coordinator.replay(request, first.selected_inputs, recorded)
     assert {model: len(transports[model].get_calls) for model in MODELS} == calls_after
 
     forbidden = ("mesoforge.rrfs", "mesoforge.ai", "mesoforge.bias", "mesoforge.publication")
@@ -525,6 +540,291 @@ def test_complete_cycle_proves_configuration_lineage_replay_and_concurrency(
         for prefix in forbidden
     )
     _ = provider
+
+
+def _replay_coordinator(service) -> Phase2Coordinator:
+    """A coordinator that can *only* replay.
+
+    Codex review ``t_652b155e``: this is the independent proof harness.
+    It shares nothing with the run that produced the artifacts -- no
+    provider instance, no acquisition cache, no ``Phase2Configuration``
+    at all -- and its provider/transport wiring raises on every network
+    or discovery attempt. Anything it reproduces therefore came from
+    persisted bytes.
+    """
+    adapters = build_phase2_replay_adapters(
+        artifact_service=service,
+        clock=FixedClock(VERIFY + timedelta(days=365)),
+        sleeper=FrozenSleeper(),
+    )
+    return Phase2Coordinator(
+        artifact_service=service,
+        discovery=adapters,
+        acquisition=adapters,
+        normalization=adapters,
+        alignment=adapters,
+        availability=adapters,
+        forecast=adapters,
+        correction=adapters,
+        observations=adapters,
+        matching=adapters,
+        verification=adapters,
+    )
+
+
+def test_replay_is_reproduced_from_persisted_roots_alone(infrastructure, migrated_dsn, monkeypatch):
+    """Codex review ``t_652b155e``: a replay must be reconstructible
+    from the run's immutable persisted roots by a process that shares
+    nothing with the original run.
+
+    The replay coordinator is built with a brand-new science instance,
+    no configuration object whatsoever, a provider that refuses
+    discovery/acquisition, and a transport that raises on every request.
+    The live configuration used for the original run is then deliberately
+    mutated (different stations, matching tolerance, metric set, blend
+    weights) *before* replay -- and the replay must still be physically
+    and logically identical, because it never reads that object.
+    """
+    service, store = infrastructure
+    config, snapshot = _configuration(migrated_dsn)
+    request = _request(snapshot, run_id=f"run_{uuid.uuid4()}")
+    coordinator, _provider, _transports_by_model = _build(service, config, frozenset(MODELS))
+    first = coordinator.run(request)
+
+    # Every subsequent socket attempt is fatal: replay must be offline.
+    monkeypatch.setattr(
+        socket,
+        "create_connection",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("network forbidden")),
+    )
+
+    # Mutate the live configuration in ways that would visibly change
+    # alignment, availability, blending, matching, and verification if
+    # any stage still read it.
+    mutated = config.model_copy(
+        update={
+            "matching_policy": config.matching_policy.model_copy(
+                update={"tolerance_minutes": 1.0, "calm_threshold_m_s": 99.0}
+            ),
+            "metric_set": config.metric_set.model_copy(
+                update={"metric_names": ("temperature_mae",)}
+            ),
+            "stations": tuple(
+                station.model_copy(
+                    update={
+                        "expected_latitude": station.expected_latitude + 0.75,
+                        "expected_longitude": station.expected_longitude - 0.75,
+                        "expected_elevation_m": station.expected_elevation_m + 500.0,
+                    }
+                )
+                for station in config.stations
+            ),
+        }
+    )
+    assert mutated.stations != config.stations
+
+    replay_coordinator = _replay_coordinator(service)
+    replayed = replay_coordinator.replay(
+        request, first.selected_inputs, first.observations.responses
+    )
+
+    # Physical equality: the same artifact and activity identities.
+    assert replayed.verification.report.artifact_id == first.verification.report.artifact_id
+    assert replayed.matching.matched_pairs.artifact_id == first.matching.matched_pairs.artifact_id
+    assert (
+        replayed.corrected_forecast.baseline.artifact_id
+        == first.corrected_forecast.baseline.artifact_id
+    )
+    assert replayed.alignment.aligned_guidance.artifact_id == (
+        first.alignment.aligned_guidance.artifact_id
+    )
+    assert tuple(a.artifact_id for a in replayed.normalized.artifacts) == tuple(
+        a.artifact_id for a in first.normalized.artifacts
+    )
+    assert (
+        replayed.atomic_forecast.activity.activity_id == first.atomic_forecast.activity.activity_id
+    )
+    # Observations were reused, not re-fetched.
+    assert tuple(r.artifact_id for r in replayed.observations.responses) == tuple(
+        r.artifact_id for r in first.observations.responses
+    )
+
+    # Logical equality: byte-identical payloads at every derived stage.
+    for stage_first, stage_replayed, serializer in (
+        (first.alignment.aligned_guidance, replayed.alignment.aligned_guidance, JSON),
+        (first.availability.report, replayed.availability.report, JSON),
+        (first.corrected_forecast.baseline, replayed.corrected_forecast.baseline, NETCDF),
+        (first.observations.normalized, replayed.observations.normalized, JSON),
+        (first.matching.matched_pairs, replayed.matching.matched_pairs, JSON),
+        (first.verification.report, replayed.verification.report, JSON),
+    ):
+        assert stage_first.content_digest == stage_replayed.content_digest
+        if serializer is JSON:
+            assert _payload(store, stage_first) == _payload(store, stage_replayed)
+
+
+def test_replay_rejects_a_request_that_conflicts_with_the_persisted_run_spec(
+    infrastructure, migrated_dsn
+):
+    """A caller-supplied request is checked against the run spec, never
+    trusted: a different verification cutoff, seed, or lockfile digest
+    fails closed before any stage runs."""
+    service, _store = infrastructure
+    config, snapshot = _configuration(migrated_dsn)
+    request = _request(snapshot, run_id=f"run_{uuid.uuid4()}")
+    coordinator, _provider, _transports_by_model = _build(service, config, frozenset(MODELS))
+    first = coordinator.run(request)
+    replay_coordinator = _replay_coordinator(service)
+    recorded = first.observations.responses
+
+    for changes, expected in (
+        ({"verification_cutoff": VERIFY + timedelta(hours=1)}, "verification_cutoff"),
+        ({"random_seed": 7}, "random_seed"),
+        ({"lockfile_digest": "sha256:" + "5" * 64}, "lockfile_digest"),
+        ({"forecast_issue_time": ISSUE + timedelta(minutes=5)}, "forecast_issue_time"),
+    ):
+        conflicting = Phase2Request.model_validate({**request.model_dump(), **changes}, strict=True)
+        with pytest.raises(Phase2ReplayIdentityError, match=expected):
+            replay_coordinator.replay(conflicting, first.selected_inputs, recorded)
+
+
+def test_replay_rejects_pinned_roots_and_observations_that_the_run_never_consumed(
+    infrastructure, migrated_dsn
+):
+    """Pinned source roots and recorded observations must match the
+    persisted run spec exactly; dropping or substituting either fails
+    closed."""
+    service, _store = infrastructure
+    config, snapshot = _configuration(migrated_dsn)
+    request = _request(snapshot, run_id=f"run_{uuid.uuid4()}")
+    coordinator, _provider, _transports_by_model = _build(service, config, frozenset(MODELS))
+    first = coordinator.run(request)
+    replay_coordinator = _replay_coordinator(service)
+    recorded = first.observations.responses
+
+    dropped = first.selected_inputs.model_copy(
+        update={"source_roots": first.selected_inputs.source_roots[1:]}
+    )
+    with pytest.raises(Phase2ReplayIdentityError, match="do not match the persisted run spec"):
+        replay_coordinator.replay(request, dropped, recorded)
+
+    # Substituting the station snapshot for the run spec (a valid
+    # artifact of this very run, but in the wrong role) is rejected by
+    # the artifact-role contract before anything is parsed.
+    swapped = first.selected_inputs.model_copy(
+        update={"run_spec": first.selected_inputs.station_snapshot}
+    )
+    with pytest.raises(Phase2ReplayContractError):
+        replay_coordinator.replay(request, swapped, recorded)
+
+    with pytest.raises(Phase2ReplayIdentityError, match="at least one recorded observation"):
+        replay_coordinator.replay(request, first.selected_inputs, ())
+
+    # A genuine artifact of this run that is not an observation response.
+    with pytest.raises(Phase2ReplayIdentityError, match="artifact type"):
+        replay_coordinator.replay(
+            request, first.selected_inputs, (first.selected_inputs.station_snapshot,)
+        )
+
+
+def test_replay_rejects_a_conflicting_live_configuration(infrastructure, migrated_dsn):
+    """When a live configuration *is* wired in, it must agree with the
+    run's persisted configuration identity or replay fails closed --
+    a silently-different policy can never be applied to a replay."""
+    service, _store = infrastructure
+    config, snapshot = _configuration(migrated_dsn)
+    request = _request(snapshot, run_id=f"run_{uuid.uuid4()}")
+    coordinator, _provider, _transports_by_model = _build(service, config, frozenset(MODELS))
+    first = coordinator.run(request)
+
+    conflicting = config.model_copy(
+        update={
+            "matching_policy": config.matching_policy.model_copy(update={"tolerance_minutes": 1.0})
+        }
+    )
+    science = Phase2ProductionScience(
+        configuration=conflicting,
+        aviationweather_transport=UnavailableHttpTransport(),
+        clock=FixedClock(CUTOFF),
+        sleeper=FrozenSleeper(),
+    )
+    adapters = Phase2ProductionAdapters(
+        artifact_service=service,
+        providers=Phase2UnavailableProvider(),
+        science=science.operations(),
+    )
+    replay_coordinator = Phase2Coordinator(
+        artifact_service=service,
+        discovery=adapters,
+        acquisition=adapters,
+        normalization=adapters,
+        alignment=adapters,
+        availability=adapters,
+        forecast=adapters,
+        correction=adapters,
+        observations=adapters,
+        matching=adapters,
+        verification=adapters,
+    )
+    with pytest.raises(Phase2ReplayIdentityError, match="conflicts with the persisted run"):
+        replay_coordinator.replay(request, first.selected_inputs, first.observations.responses)
+
+
+def test_persisted_run_spec_carries_every_lead_acquisition_evidence(infrastructure, migrated_dsn):
+    """Normalization no longer depends on a process-local acquisition
+    cache, so the run spec must itself carry every lead's endpoint,
+    resolved URLs, and per-message inventory evidence."""
+    service, store = infrastructure
+    config, snapshot = _configuration(migrated_dsn)
+    request = _request(snapshot, run_id=f"run_{uuid.uuid4()}")
+    coordinator, _provider, _transports_by_model = _build(service, config, frozenset(MODELS))
+    result = coordinator.run(request)
+
+    spec = parse_run_spec(
+        store.get_verified(
+            result.selected_inputs.run_spec.storage_uri,
+            result.selected_inputs.run_spec.content_digest,
+        )
+    )
+    # The persisted configuration reproduces the live one exactly.
+    assert spec.configuration == config
+
+    pinned_roles = {
+        (root.model, root.source_lead_hours, root.field_role)
+        for root in result.selected_inputs.source_roots
+    }
+    persisted_roles: set[tuple[str, int, str]] = set()
+    for model in MODELS:
+        group = spec.group(model)
+        assert group.selected
+        assert group.source_cycle_reference_time == REFERENCE
+        # The persisted leads are exactly the leads that were actually
+        # acquired for this model -- derived from the registered roots
+        # rather than restated here, so the assertion cannot drift from
+        # production's own acquisition policy.
+        expected_leads = sorted(
+            {
+                root.source_lead_hours
+                for root in result.selected_inputs.source_roots
+                if root.model == model
+            }
+        )
+        assert list(group.source_lead_hours) == expected_leads
+        for lead in group.leads:
+            assert lead.endpoint
+            assert lead.resolved_index_url.startswith("http")
+            assert lead.resolved_grib_url.startswith("http")
+            assert lead.index_completed_at <= CUTOFF
+            assert lead.grib_completed_at <= CUTOFF
+            persisted_roles.add((model, lead.source_lead_hours, "index"))
+            for message in lead.selected_messages:
+                assert message.inventory_row
+                assert message.byte_end > message.byte_start
+                persisted_roles.add((model, lead.source_lead_hours, message.field_role))
+    # Every registered root is described, and nothing extra is claimed.
+    assert persisted_roles == pinned_roles
+    # Target horizons 1..36 are covered for every selected model.
+    assert set(spec.target_horizons) == set(HORIZONS)
 
 
 def test_partial_cycle_rejects_whole_model_without_splicing(infrastructure, migrated_dsn):
@@ -706,7 +1006,7 @@ def test_information_cutoff_rejects_a_late_cycle_and_falls_back_deterministicall
         sleeper=sleeper,
     )
     discovery = provider.discover(request)
-    retained = provider.acquisitions_for(request.run_id)
+    retained = provider.retained_acquisitions_for(request.run_id)
     assert retained == {}, (
         "no model may be selected when every candidate cycle is after the information cutoff"
     )
@@ -738,6 +1038,6 @@ def test_late_acquisition_is_rejected_even_when_the_cycle_predates_the_cutoff(
         sleeper=sleeper,
     )
     provider.discover(request)
-    assert provider.acquisitions_for(request.run_id) == {}, (
+    assert provider.retained_acquisitions_for(request.run_id) == {}, (
         "an acquisition completed after the information cutoff must never be retained"
     )

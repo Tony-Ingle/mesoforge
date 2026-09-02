@@ -109,6 +109,24 @@ class TestRegisterSource:
         assert first.artifact_id == second.artifact_id
         assert len(uow_factory.artifacts) == 1
 
+    def test_immutable_source_identity_rejects_different_retry_bytes(self, service_and_uow) -> None:
+        service, uow_factory, _ = service_and_uow
+        request = _source_request(
+            source_authority="aviationweather.gov",
+            source_locator="phase2-metar://run_00000000-0000-0000-0000-000000000001",
+            source_revision="phase2.v1",
+            artifact_type="aviationweather-metar-response",
+            artifact_schema_version="aviationweather-metar-response.v1",
+        )
+        first = service.register_source(request, b"original-response")
+
+        with pytest.raises(IntegrityError, match="different bytes"):
+            service.register_source(request, b"substituted-response")
+
+        repeated = service.register_source(request, b"original-response")
+        assert repeated.artifact_id == first.artifact_id
+        assert len(uow_factory.artifacts) == 1
+
     def test_wrong_expected_checksum_raises_and_creates_no_manifest(self, service_and_uow) -> None:
         service, uow_factory, _ = service_and_uow
         request = _source_request(expected_content_digest="sha256:" + "0" * 64)

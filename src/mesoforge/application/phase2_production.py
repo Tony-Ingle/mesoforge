@@ -51,6 +51,12 @@ from mesoforge.application.phase2_adapters import (
     Phase2ArtifactOperations,
     Phase2ProductionAdapters,
 )
+from mesoforge.application.phase2_replay import (
+    PersistedLeadAcquisition,
+    PersistedModelGroup,
+    Phase2PersistedRun,
+    Phase2ReplayIdentityError,
+)
 from mesoforge.catalog.configuration import Phase2Configuration
 from mesoforge.common.identifiers import ArtifactId, Digest, GridId, RunId, StationId
 from mesoforge.contracts.artifacts import ArtifactManifest, Availability
@@ -82,6 +88,7 @@ from mesoforge.forecasting.scalar_blend import Contribution, blend_scalar
 from mesoforge.forecasting.vector_blend import blend_vector
 from mesoforge.guidance.acquisition_v2 import (
     Phase2LeadAcquisition,
+    SelectedMessage,
     acquire_gfs_lead,
     acquire_hrrr_phase2_lead,
     acquire_nbm_lead,
@@ -95,7 +102,7 @@ from mesoforge.guidance.cycle_selection import (
     generate_candidate_reference_times,
     select_model_cycle,
 )
-from mesoforge.guidance.interfaces import Clock, HttpTransport, Sleeper
+from mesoforge.guidance.interfaces import Clock, HttpResponse, HttpTransport, Sleeper
 from mesoforge.guidance.normalization_v2 import (
     normalize_gfs_cycle,
     normalize_hrrr_phase2_cycle,
@@ -237,6 +244,16 @@ def _group_normalization_payloads(
         }
         for variable_id, by_lead in grouped.items()
     }
+
+
+def _record_identity(message: SelectedMessage, ordinal: int) -> str:
+    """The stable per-message identity fragment shared by the registered
+    artifact's ``field_role`` and the persisted run spec.
+
+    Defining it once means acquisition and replay can never drift into
+    two different spellings of the same message.
+    """
+    return f"m{message.row.message_number}-o{message.row.byte_offset}-n{ordinal}"
 
 
 def _valid_map(value: object) -> None:
@@ -577,16 +594,6 @@ class Phase2ProductionProvider:
         # and the request/configuration digests -- so a replay is
         # reconstructed from persisted bytes rather than from whatever
         # mutable live configuration happens to be loaded at replay time.
-        run_spec_payload = self._run_spec_payload(request, discovery, acquisitions_by_model)
-        run_spec = self._register_source(
-            artifact_service,
-            request,
-            locator=f"phase2-run-spec://{request.run_id}",
-            artifact_type="phase2-run-spec",
-            schema="phase2-run-spec.v1",
-            payload=_JSON.serialize(run_spec_payload),
-        )
-
         # Codex re-review finding 5: the station snapshot must carry the
         # exact coordinates, elevation, provider identity, and every
         # other station field consumed downstream (alignment, METAR
@@ -594,10 +601,15 @@ class Phase2ProductionProvider:
         station_snapshot = self._register_source(
             artifact_service,
             request,
-            locator="phase2-station-catalog://grasston",
+            locator=f"phase2-station-catalog://{request.run_id}",
             artifact_type="station-catalog-snapshot",
             schema="station-catalog-snapshot.v1",
             payload=_JSON.serialize(self._station_snapshot_payload()),
+            # This immutable snapshot describes configuration already fixed
+            # for the run at the information cutoff. Persistence may happen
+            # later, but its authoritative information availability is the
+            # cutoff rather than the wall-clock registration time.
+            available_at=request.information_cutoff,
         )
 
         roots: list[SelectedSourceRoot] = []
@@ -626,9 +638,7 @@ class Phase2ProductionProvider:
                     )
                 )
                 for ordinal, message in enumerate(acquisition.selected_messages):
-                    record_identity = (
-                        f"m{message.row.message_number}-o{message.row.byte_offset}-n{ordinal}"
-                    )
+                    record_identity = _record_identity(message, ordinal)
                     message_artifact = self._register_source(
                         artifact_service,
                         request,
@@ -656,6 +666,22 @@ class Phase2ProductionProvider:
 
         model_order = {"HRRR": 0, "NBM": 1, "GFS": 2}
         roots.sort(key=lambda r: (model_order[r.model], r.source_lead_hours, r.field_role))
+        run_spec_payload = self._run_spec_payload(
+            request, discovery, acquisitions_by_model, station_snapshot, tuple(roots)
+        )
+        run_spec = self._register_source(
+            artifact_service,
+            request,
+            locator=f"phase2-run-spec://{request.run_id}",
+            artifact_type="phase2-run-spec",
+            schema="phase2-run-spec.v1",
+            payload=_JSON.serialize(run_spec_payload),
+            # The spec records only configuration and acquisitions whose
+            # availability has already been proved at the cutoff. Assigning
+            # the cutoff keeps legitimate post-cutoff orchestration compatible
+            # with create_run's fail-closed selected-input eligibility check.
+            available_at=request.information_cutoff,
+        )
         return Phase2SelectedInputs(
             run_spec=run_spec, source_roots=tuple(roots), station_snapshot=station_snapshot
         )
@@ -665,16 +691,28 @@ class Phase2ProductionProvider:
         request: Phase2Request,
         discovery: DiscoveryResult,
         acquisitions_by_model: dict[str, tuple[Phase2LeadAcquisition, ...]],
+        station_snapshot: ArtifactManifest,
+        source_roots: tuple[SelectedSourceRoot, ...],
     ) -> dict[str, Any]:
-        """Build the complete durable replay run spec (finding 5).
+        """Build the complete durable replay run spec (finding 5, and
+        Codex review ``t_652b155e``'s replay blocker).
 
         Everything a replay needs to reconstruct *what this run was
-        asked to compute* is persisted here: both cutoffs, the target
-        frame, the required source groups and the exact cycle/leads
-        actually selected for each, the cycle-selection policy that was
-        applied, the target horizons, and every request/configuration
-        identity digest. Replay therefore depends on these bytes, not on
-        the live ``Phase2Configuration`` object, which may have changed.
+        asked to compute* and *what it actually consumed* is persisted
+        here: both cutoffs, the target frame, the required source groups
+        with the exact cycle/leads selected and each lead's own
+        acquisition evidence (endpoint, resolved index/GRIB URLs,
+        completion timestamps, and every selected message's inventory
+        row, message number and byte range), the cycle-selection policy
+        applied, the target horizons, every request/configuration
+        identity digest, and the complete ``Phase2Configuration`` itself.
+
+        Persisting the configuration is what finally severs replay from
+        live objects: alignment, availability, blending, observation
+        normalization, matching, and verification all read policy back
+        out of these bytes. Persisting per-lead message evidence is what
+        severs normalization from the provider's process-local
+        ``_acquisitions_by_run`` cache.
         """
         cycle_policy = self._configuration.cycle_selection_policy
         required_groups = []
@@ -699,6 +737,11 @@ class Phase2ProductionProvider:
                     "canonical_variable_ids": sorted(
                         contract.canonical_variable_id for contract in settings.field_contracts
                     ),
+                    "source_grid_profile_id": _source_grid_profile_id(settings, model),
+                    "leads": [
+                        self._lead_payload(acquisition, source_roots, model)
+                        for acquisition in sorted(acquisitions, key=lambda a: a.forecast_hour)
+                    ],
                 }
             )
         return {
@@ -737,6 +780,62 @@ class Phase2ProductionProvider:
                 ),
                 "matching_policy": str(self._configuration.matching_policy.digest),
             },
+            "configuration": self._configuration.model_dump(mode="json"),
+            "station_snapshot": self._artifact_identity(station_snapshot),
+        }
+
+    @staticmethod
+    def _lead_payload(
+        acquisition: Phase2LeadAcquisition,
+        source_roots: tuple[SelectedSourceRoot, ...],
+        model: str,
+    ) -> dict[str, Any]:
+        """Persist one acquired lead's complete evidence.
+
+        ``record_identity`` is byte-identical to the fragment
+        :meth:`acquire` embeds in each registered message artifact's
+        ``field_role``, so a replay can bind persisted message metadata
+        to pinned source roots with no live acquisition object.
+        """
+        by_role = {
+            root.field_role: root.artifact
+            for root in source_roots
+            if root.model == model and root.source_lead_hours == acquisition.forecast_hour
+        }
+        return {
+            "source_lead_hours": acquisition.forecast_hour,
+            "endpoint": acquisition.endpoint,
+            "resolved_index_url": acquisition.resolved_index_url,
+            "resolved_grib_url": acquisition.resolved_grib_url,
+            "index_completed_at": acquisition.index_completed_at.isoformat(),
+            "grib_completed_at": acquisition.grib_completed_at.isoformat(),
+            "selected_messages": [
+                {
+                    "canonical_variable_id": message.canonical_variable_id,
+                    "record_identity": _record_identity(message, ordinal),
+                    "ordinal": ordinal,
+                    "message_number": message.row.message_number,
+                    "byte_offset": message.row.byte_offset,
+                    "byte_start": message.byte_start,
+                    "byte_end": message.byte_end,
+                    "inventory_row": message.row.line,
+                    "artifact": Phase2ProductionProvider._artifact_identity(
+                        by_role[
+                            f"message:{message.canonical_variable_id}:record:"
+                            f"{_record_identity(message, ordinal)}"
+                        ]
+                    ),
+                }
+                for ordinal, message in enumerate(acquisition.selected_messages)
+            ],
+            "index_artifact": Phase2ProductionProvider._artifact_identity(by_role["index"]),
+        }
+
+    @staticmethod
+    def _artifact_identity(manifest: ArtifactManifest) -> dict[str, str]:
+        return {
+            "artifact_id": str(manifest.artifact_id),
+            "content_digest": str(manifest.content_digest),
         }
 
     def _station_snapshot_payload(self) -> dict[str, Any]:
@@ -831,43 +930,120 @@ class Phase2ProductionProvider:
             payload,
         )
 
-    def acquisitions_for(self, run_id: RunId) -> dict[str, tuple[Phase2LeadAcquisition, ...]]:
-        """Expose retained per-lead acquisitions for the science
-        stages (grid/lineage identity, GFS previous-bucket chaining)."""
+    def retained_acquisitions_for(
+        self, run_id: RunId
+    ) -> dict[str, tuple[Phase2LeadAcquisition, ...]]:
+        """Diagnostic view of this instance's retained per-lead
+        acquisitions.
+
+        This is deliberately *not* a science input. Codex review
+        ``t_652b155e``: normalization and lineage used to read this
+        process-local cache, which made replay impossible in a fresh
+        process. Every fact they need is now persisted in the run spec
+        instead; this accessor exists only so selection/cutoff behavior
+        can be observed directly at the discovery boundary.
+        """
         return self._acquisitions_by_run.get(str(run_id), {})
+
+
+class Phase2UnavailableProvider:
+    """A provider that refuses discovery/acquisition outright.
+
+    Replay must never touch a source provider. Wiring this in makes that
+    structural rather than merely conventional: a coordinator built by
+    :func:`build_phase2_replay_adapters` cannot issue a provider request
+    even if a future change accidentally called ``run`` instead of
+    ``replay``.
+    """
+
+    def discover(self, request: Phase2Request) -> DiscoveryResult:
+        raise Phase2ReplayIdentityError(
+            "replay must not perform source discovery; it reconstructs the run from the "
+            "persisted run spec and pinned artifacts only"
+        )
+
+    def acquire(
+        self,
+        request: Phase2Request,
+        discovery: DiscoveryResult,
+        *,
+        artifact_service: ArtifactService,
+    ) -> Phase2SelectedInputs:
+        raise Phase2ReplayIdentityError(
+            "replay must not perform source acquisition; it reuses the run's pinned "
+            "source artifacts"
+        )
 
 
 class Phase2ProductionScience:
     """Concrete science stages backing ``Phase2ArtifactOperations``:
     real per-model normalization (``guidance.normalization_v2``),
     station alignment, availability, atomic blend generation, identity
-    correction, METAR acquisition/normalization, matching, and
-    verification -- composed from the pure domain functions plus the
-    production ``ArtifactService``. Never redefines the coordinator's
-    ordering; only supplies the eight injected stage callables."""
+    correction, METAR normalization, matching, and verification --
+    composed from the pure domain functions plus the production
+    ``ArtifactService``. Never redefines the coordinator's ordering;
+    only supplies the eight injected stage callables.
+
+    Codex review ``t_652b155e``: no stage reads a live
+    ``Phase2Configuration``, a live station catalog, or the provider's
+    process-local acquisition cache. Every policy value, station,
+    selected cycle, and per-lead acquisition fact comes from the
+    ``Phase2PersistedRun`` the coordinator reconstructed from the run's
+    own immutable ``phase2-run-spec.v1``/``station-catalog-snapshot.v1``
+    artifacts. A live configuration may still be supplied (production
+    wiring does), but it is then only ever *checked against* the
+    persisted identity and never read for policy -- so mutating it
+    cannot change a replay's result, and swapping it for a different
+    configuration fails closed.
+    """
 
     def __init__(
         self,
         *,
-        configuration: Phase2Configuration,
-        provider: Phase2ProductionProvider,
         aviationweather_transport: HttpTransport,
         clock: Clock,
         sleeper: Sleeper,
+        configuration: Phase2Configuration | None = None,
         aviationweather_rate_limiter: RequestRateLimiter | None = None,
     ) -> None:
         self._configuration = configuration
-        self._provider = provider
+        self._configuration_digest = (
+            Digest.of_bytes(_JSON.serialize(configuration.model_dump(mode="json")))
+            if configuration is not None
+            else None
+        )
         self._aviationweather_transport = aviationweather_transport
         self._clock = clock
         self._sleeper = sleeper
-        self._aviationweather_rate_limiter = (
-            aviationweather_rate_limiter
-            if aviationweather_rate_limiter is not None
-            else RequestRateLimiter(
-                min_interval_seconds=configuration.aviationweather.min_request_interval_seconds
-            )
-        )
+        self._explicit_rate_limiter = aviationweather_rate_limiter
+        self._rate_limiters: dict[float, RequestRateLimiter] = {}
+
+    def _require_persisted_identity(self, persisted: Phase2PersistedRun) -> None:
+        """Fail closed when a supplied live configuration conflicts with
+        the persisted run identity.
+
+        When no live configuration was supplied there is nothing that
+        *could* conflict -- the stage reads persisted bytes only.
+        """
+        if self._configuration_digest is not None:
+            persisted.require_configuration_identity(self._configuration_digest)
+
+    def _rate_limiter(self, persisted: Phase2PersistedRun) -> RequestRateLimiter:
+        """The AviationWeather rate limiter for this run's persisted
+        minimum request interval.
+
+        Limiters are cached per interval so repeated live runs share
+        pacing state; replay never reaches this path at all because it
+        reuses recorded response artifacts.
+        """
+        if self._explicit_rate_limiter is not None:
+            return self._explicit_rate_limiter
+        interval = float(persisted.aviationweather.min_request_interval_seconds)
+        limiter = self._rate_limiters.get(interval)
+        if limiter is None:
+            limiter = RequestRateLimiter(min_interval_seconds=interval)
+            self._rate_limiters[interval] = limiter
+        return limiter
 
     def operations(self) -> Phase2ArtifactOperations:
         return Phase2ArtifactOperations(
@@ -892,17 +1068,29 @@ class Phase2ProductionScience:
         inputs: Phase2SelectedInputs,
         *,
         artifact_service: ArtifactService,
+        persisted: Phase2PersistedRun,
     ) -> NormalizedGuidanceArtifacts:
-        acquisitions_by_model = self._provider.acquisitions_for(request.run_id)
+        self._require_persisted_identity(persisted)
         artifacts: list[ArtifactManifest] = []
         for model in _MODELS:
+            group = persisted.run_spec.group(model)
             model_roots = [
                 r
                 for r in inputs.source_roots
                 if r.model == model and r.field_role.startswith("message:")
             ]
-            if not model_roots:
+            if not group.selected:
+                if model_roots:
+                    raise GuidanceNormalizationProductionError(
+                        f"{model} has pinned message roots but the persisted run spec records "
+                        "no selected cycle for it"
+                    )
                 continue
+            if not model_roots:
+                raise GuidanceNormalizationProductionError(
+                    f"{model} was selected by the persisted run spec but no message roots "
+                    "were pinned"
+                )
             model_roots.sort(key=lambda r: (r.source_lead_hours, r.field_role))
             input_refs = tuple(
                 (f"{r.source_lead_hours}:{r.field_role.split(':', 1)[1]}", r.artifact.artifact_id)
@@ -913,12 +1101,18 @@ class Phase2ProductionScience:
                 for r in inputs.source_roots
                 if r.model == model and r.field_role == "index"
             )
-            reference_time = self._model_reference_time(acquisitions_by_model, model)
+            # Codex review t_652b155e: the selected cycle comes from the
+            # persisted run spec, not from the provider's process-local
+            # acquisition cache, so a fresh process replays identically.
+            reference_time = persisted.reference_time(model)
             cycle_age_hours = int(
-                (request.target_reference_time - reference_time).total_seconds() // 3600
+                (persisted.run_spec.target_reference_time - reference_time).total_seconds() // 3600
             )
-            target_source_leads = tuple(horizon + cycle_age_hours for horizon in _HORIZONS)
+            target_source_leads = tuple(
+                horizon + cycle_age_hours for horizon in persisted.target_horizons
+            )
             grid_id = GridId(f"phase2-{model.lower()}.v1")
+            settings = persisted.source_settings(model)
 
             # Codex re-review finding 3: every model -- not only GFS --
             # must create and reference a complete, real
@@ -933,8 +1127,8 @@ class Phase2ProductionScience:
                 grid_id=grid_id,
                 reference_time=reference_time,
                 source_leads=target_source_leads,
-                acquisitions=acquisitions_by_model.get(model, ()),
-                inputs=inputs,
+                group=group,
+                settings=settings,
                 input_refs=input_refs,
                 index_refs=index_refs,
             )
@@ -947,11 +1141,12 @@ class Phase2ProductionScience:
                     refs: tuple[tuple[str, ArtifactId], ...] = input_refs,
                     source_leads: tuple[int, ...] = target_source_leads,
                     cycle_reference_time: datetime = reference_time,
+                    gfs_settings: Any = settings,
                 ) -> dict[str, Any]:
                     field_payloads = _group_normalization_payloads(refs, raw)
                     self._require_contiguous_previous_leads(field_payloads, source_leads)
                     _dataset, lineage = normalize_gfs_cycle(
-                        settings=self._configuration.gfs,
+                        settings=gfs_settings,
                         forecast_reference_time=cycle_reference_time,
                         source_lead_hours=source_leads,
                         field_payloads=field_payloads,
@@ -1036,13 +1231,14 @@ class Phase2ProductionScience:
                 reference_time: datetime = reference_time,
                 source_leads: tuple[int, ...] = target_source_leads,
                 lineage_id: str = str(lineage_artifact.artifact_id),
+                model_settings: Any = settings,
             ) -> xr.Dataset:
                 field_payloads = _group_normalization_payloads(refs, raw[: len(refs)])
                 grid_id = f"phase2-{model.lower()}.v1"
                 cfg_id = str(request.configuration_snapshot_id)
                 if model == "HRRR":
                     return normalize_hrrr_phase2_cycle(
-                        settings=self._configuration.hrrr,
+                        settings=model_settings,
                         forecast_reference_time=reference_time,
                         source_lead_hours=source_leads,
                         field_payloads=field_payloads,
@@ -1052,7 +1248,7 @@ class Phase2ProductionScience:
                     )
                 if model == "NBM":
                     return normalize_nbm_cycle(
-                        settings=self._configuration.nbm,
+                        settings=model_settings,
                         forecast_reference_time=reference_time,
                         source_lead_hours=source_leads,
                         field_payloads=field_payloads,
@@ -1062,7 +1258,7 @@ class Phase2ProductionScience:
                     )
                 self._require_contiguous_previous_leads(field_payloads, source_leads)
                 dataset, _lineage = normalize_gfs_cycle(
-                    settings=self._configuration.gfs,
+                    settings=model_settings,
                     forecast_reference_time=reference_time,
                     source_lead_hours=source_leads,
                     field_payloads=field_payloads,
@@ -1091,8 +1287,8 @@ class Phase2ProductionScience:
         grid_id: GridId,
         reference_time: datetime,
         source_leads: tuple[int, ...],
-        acquisitions: tuple[Phase2LeadAcquisition, ...],
-        inputs: Phase2SelectedInputs,
+        group: PersistedModelGroup,
+        settings: Any,
         input_refs: tuple[tuple[str, ArtifactId], ...],
         index_refs: tuple[tuple[str, ArtifactId], ...],
     ) -> tuple[ArtifactManifest, dict[str, Any]]:
@@ -1107,14 +1303,19 @@ class Phase2ProductionScience:
         conversion, the wind-rotation policy, and the source/output grid
         identity. This is a derived artifact of the run, so its lineage
         edges reach every selected source root.
+
+        Codex review ``t_652b155e``: all of that evidence is read from
+        the persisted run spec's per-lead acquisition records
+        (``group``) and the persisted source settings, never from a live
+        acquisition object -- so a fresh process rebuilds a
+        byte-identical manifest.
         """
-        settings = getattr(self._configuration, model.lower())
         selector_builder = _SELECTOR_BUILDERS[model]
-        source_grid_profile_id = _source_grid_profile_id(settings, model)
+        source_grid_profile_id = group.source_grid_profile_id
         index_by_lead = {
             int(role.split(":", 1)[1]): artifact_id for role, artifact_id in index_refs
         }
-        acquisitions_by_lead = {a.forecast_hour: a for a in acquisitions}
+        leads_by_hour = group.leads_by_hour
         # role -> artifact for every selected message, keyed by
         # (lead, canonical_variable_id) so plural GFS APCP parents group.
         messages_by_key: dict[tuple[int, str], list[ArtifactId]] = {}
@@ -1122,28 +1323,23 @@ class Phase2ProductionScience:
             lead_text, variable_id, *_identity = role.split(":")
             messages_by_key.setdefault((int(lead_text), variable_id), []).append(artifact_id)
 
-        variable_ids = tuple(
-            sorted(contract.canonical_variable_id for contract in settings.field_contracts)
-        )
+        variable_ids = tuple(group.canonical_variable_ids)
         entries: list[dict[str, Any]] = []
         for lead in source_leads:
-            acquisition = acquisitions_by_lead.get(lead)
+            acquisition: PersistedLeadAcquisition | None = leads_by_hour.get(lead)
             index_artifact_id = index_by_lead.get(lead)
             if acquisition is None or index_artifact_id is None:
                 raise GuidanceNormalizationProductionError(
-                    f"{model} lead {lead!r} has no retained acquisition/index evidence; a "
+                    f"{model} lead {lead!r} has no persisted acquisition/index evidence; a "
                     "complete variable-lineage.v2 manifest cannot be built"
                 )
-            selected_by_variable: dict[str, list[Any]] = {}
-            for message in acquisition.selected_messages:
-                selected_by_variable.setdefault(message.canonical_variable_id, []).append(message)
             for variable_id in variable_ids:
-                messages = selected_by_variable.get(variable_id, [])
+                messages = acquisition.messages_for(variable_id)
                 artifact_ids = messages_by_key.get((lead, variable_id), [])
                 if not messages or len(messages) != len(artifact_ids):
                     raise GuidanceNormalizationProductionError(
                         f"{model} lead {lead!r} variable {variable_id!r} has "
-                        f"{len(messages)} selected message(s) but {len(artifact_ids)} "
+                        f"{len(messages)} persisted message(s) but {len(artifact_ids)} "
                         "registered artifact(s); lineage would be incomplete"
                     )
                 entries.append(
@@ -1152,9 +1348,9 @@ class Phase2ProductionScience:
                         "source_lead_hours": lead,
                         "index_artifact_id": str(index_artifact_id),
                         "selected_grib_artifact_ids": [str(a) for a in artifact_ids],
-                        "message_numbers": [m.row.message_number for m in messages],
+                        "message_numbers": [m.message_number for m in messages],
                         "byte_ranges": [[m.byte_start, m.byte_end] for m in messages],
-                        "inventory_rows": [m.row.line for m in messages],
+                        "inventory_rows": [m.inventory_row for m in messages],
                         "source_cycle": reference_time.isoformat(),
                         "endpoint": acquisition.endpoint,
                         "resolved_index_url": acquisition.resolved_index_url,
@@ -1206,23 +1402,6 @@ class Phase2ProductionScience:
         )
         return result.output, payload
 
-    def _model_reference_time(
-        self,
-        acquisitions_by_model: dict[str, tuple[Phase2LeadAcquisition, ...]],
-        model: str,
-    ) -> datetime:
-        acquisitions = acquisitions_by_model.get(model.upper(), ())
-        if not acquisitions:
-            raise ValueError(f"no retained acquisition metadata for model {model!r}")
-        first = acquisitions[0]
-        return datetime(
-            first.cycle_date.year,
-            first.cycle_date.month,
-            first.cycle_date.day,
-            first.cycle_hour,
-            tzinfo=UTC,
-        )
-
     def _require_contiguous_previous_leads(
         self,
         field_payloads: dict[str, dict[int, bytes | tuple[bytes, ...]]],
@@ -1256,7 +1435,9 @@ class Phase2ProductionScience:
         guidance: NormalizedGuidanceArtifacts,
         *,
         artifact_service: ArtifactService,
+        persisted: Phase2PersistedRun,
     ) -> AlignmentArtifacts:
+        self._require_persisted_identity(persisted)
         transformation = self._transformation(
             request,
             activity="align-stations",
@@ -1267,7 +1448,12 @@ class Phase2ProductionScience:
             artifact_type="aligned-station-guidance",
             schema="aligned-station-guidance.v1",
         )
-        stations = self._configuration.stations
+        # Stations and horizons come from the run's own persisted
+        # station snapshot/run spec, so mutating the live catalog cannot
+        # move a replay's extraction points (Codex review t_652b155e).
+        stations = persisted.stations
+        horizons = persisted.target_horizons
+        target_reference_time = persisted.run_spec.target_reference_time
 
         def _transform(*datasets: xr.Dataset) -> dict[str, Any]:
             models: list[str] = []
@@ -1284,9 +1470,9 @@ class Phase2ProductionScience:
                 crs = _crs_from_dataset(dataset)
                 model_values: dict[str, dict[str, float]] = {}
                 model_lineage: dict[str, dict[str, Any]] = {}
-                for horizon in _HORIZONS:
+                for horizon in horizons:
                     target_valid_time = np.datetime64(
-                        request.target_reference_time.replace(tzinfo=None), "ns"
+                        target_reference_time.replace(tzinfo=None), "ns"
                     ) + np.timedelta64(horizon, "h")
                     matching = np.flatnonzero(
                         dataset["source_valid_time"].values.astype("datetime64[ns]")
@@ -1321,7 +1507,7 @@ class Phase2ProductionScience:
                                 # target reference, not the selected (possibly
                                 # older) source cycle reference.
                                 target_reference_time=np.datetime64(
-                                    request.target_reference_time.replace(tzinfo=None), "ns"
+                                    target_reference_time.replace(tzinfo=None), "ns"
                                 ),
                             )
                             result = aligned.get(horizon)
@@ -1334,7 +1520,7 @@ class Phase2ProductionScience:
             return {
                 "schema_version": "aligned-station-guidance.v1",
                 "models": [m for m in _MODELS if m in models],
-                "shape": [len(models), len(_HORIZONS), len(stations)],
+                "shape": [len(models), len(horizons), len(stations)],
                 "values": values,
                 "lineage": lineage,
             }
@@ -1347,7 +1533,7 @@ class Phase2ProductionScience:
             input_validator=validate_canonical_guidance_v2,
             output_validator=lambda value: (
                 None
-                if value["shape"][1:] == [len(_HORIZONS), len(self._configuration.stations)]
+                if value["shape"][1:] == [len(horizons), len(stations)]
                 else (_ for _ in ()).throw(ValueError("wrong aligned shape"))
             ),
         )
@@ -1364,7 +1550,9 @@ class Phase2ProductionScience:
         alignment: AlignmentArtifacts,
         *,
         artifact_service: ArtifactService,
+        persisted: Phase2PersistedRun,
     ) -> AvailabilityArtifacts:
+        self._require_persisted_identity(persisted)
         cycle = artifact_service.execute_raw_transformation(
             self._transformation(
                 request,
@@ -1378,7 +1566,7 @@ class Phase2ProductionScience:
                 "schema_version": "model-cycle-selection.v1",
                 "selected_models": aligned["models"],
                 "rejected_models": [m for m in _MODELS if m not in aligned["models"]],
-                "cutoff": request.information_cutoff.isoformat(),
+                "cutoff": persisted.run_spec.information_cutoff.isoformat(),
             },
             serializer=_JSON,
             input_loader=_JSON.deserialize,
@@ -1393,7 +1581,7 @@ class Phase2ProductionScience:
                 artifact_type="model-availability-report",
                 schema="model-availability-report.v1",
             ),
-            transform=lambda aligned: self._available_payload(aligned),
+            transform=lambda aligned: self._available_payload(aligned, persisted),
             serializer=_JSON,
             input_loader=_JSON.deserialize,
             output_validator=lambda value: (
@@ -1404,12 +1592,17 @@ class Phase2ProductionScience:
         )
         return AvailabilityArtifacts(cycle_selection=cycle.output, report=report.output)
 
-    def _available_payload(self, aligned: dict[str, Any]) -> dict[str, Any]:
+    def _available_payload(
+        self, aligned: dict[str, Any], persisted: Phase2PersistedRun
+    ) -> dict[str, Any]:
+        stations = persisted.stations
+        horizons = persisted.target_horizons
+        blend = persisted.blend_configuration
         approved_models: set[str] = set(aligned["models"])
         for model in tuple(approved_models):
             try:
-                for horizon in _HORIZONS:
-                    for station in self._configuration.stations:
+                for horizon in horizons:
+                    for station in stations:
                         station_id = str(station.station_id)
                         by_point = aligned["values"][model][str(horizon)]
                         validate_source_gust(
@@ -1422,12 +1615,11 @@ class Phase2ProductionScience:
             except (KeyError, ValueError, GustDisqualificationError):
                 approved_models.remove(model)
         models = frozenset(approved_models)
-        stations = self._configuration.stations
         entries = []
         availability_objects = []
         for variable in _VARIABLES:
             for station in stations:
-                for horizon in _HORIZONS:
+                for horizon in horizons:
                     if variable == "probability_of_precipitation_1h":
                         value = evaluate_pop_availability(
                             location=str(station.station_id),
@@ -1436,9 +1628,9 @@ class Phase2ProductionScience:
                         )
                     else:
                         table = (
-                            self._configuration.blend_configuration.qpf_table
+                            blend.qpf_table
                             if variable == "liquid_equivalent_precipitation_amount_1h"
-                            else self._configuration.blend_configuration.scalar_vector_table
+                            else blend.scalar_vector_table
                         )
                         value = evaluate_scalar_vector_availability(
                             table=table,
@@ -1483,7 +1675,9 @@ class Phase2ProductionScience:
         availability: AvailabilityArtifacts,
         *,
         artifact_service: ArtifactService,
+        persisted: Phase2PersistedRun,
     ) -> AtomicForecastArtifacts:
+        self._require_persisted_identity(persisted)
         common_inputs = (
             ("aligned", alignment.aligned_guidance.artifact_id),
             ("availability", availability.report.artifact_id),
@@ -1508,7 +1702,9 @@ class Phase2ProductionScience:
         result = artifact_service.execute_atomic_raw_pair(
             forecast_request,
             contribution_request,
-            transform=lambda aligned, available: self._forecast_pair(aligned, available, request),
+            transform=lambda aligned, available: self._forecast_pair(
+                aligned, available, request, persisted
+            ),
             serializers=(_NETCDF, _JSON),
             input_loader=_JSON.deserialize,
             output_validators=(
@@ -1523,9 +1719,15 @@ class Phase2ProductionScience:
         )
 
     def _forecast_pair(
-        self, aligned: dict[str, Any], availability: dict[str, Any], request: Phase2Request
+        self,
+        aligned: dict[str, Any],
+        availability: dict[str, Any],
+        request: Phase2Request,
+        persisted: Phase2PersistedRun,
     ) -> tuple[xr.Dataset, dict[str, Any]]:
-        stations = tuple(str(s.station_id) for s in self._configuration.stations)
+        stations = persisted.station_ids
+        horizons = persisted.target_horizons
+        target_reference_time = persisted.run_spec.target_reference_time
         values: dict[tuple[str, str, int], float] = {}
         states: dict[tuple[str, str, int], str] = {}
         rows: list[BlendContributionRow] = []
@@ -1535,7 +1737,7 @@ class Phase2ProductionScience:
         }
         for variable in _VARIABLES:
             for station in stations:
-                for horizon in _HORIZONS:
+                for horizon in horizons:
                     key = (variable, station, horizon)
                     entry = entries[key]
                     states[key] = entry["state"]
@@ -1660,7 +1862,7 @@ class Phase2ProductionScience:
                             location=StationId(station),
                             target_horizon=horizon,
                             target_valid_time=(
-                                request.target_reference_time + timedelta(hours=horizon)
+                                target_reference_time + timedelta(hours=horizon)
                             ).isoformat(),
                             operator_id=f"phase2.{variable}.v1",
                             availability_state=entry["state"],
@@ -1673,25 +1875,24 @@ class Phase2ProductionScience:
         dataset = assemble_baseline_forecast_v2(
             values=values,
             states=states,
-            target_reference_time=np.datetime64(
-                request.target_reference_time.replace(tzinfo=None), "ns"
-            ),
+            target_reference_time=np.datetime64(target_reference_time.replace(tzinfo=None), "ns"),
             forecast_issue_time=np.datetime64(
-                request.forecast_issue_time.replace(tzinfo=None), "ns"
+                persisted.run_spec.forecast_issue_time.replace(tzinfo=None), "ns"
             ),
             uncorrected_blend_artifact_id="pending-atomic-output",
             identity_correction_artifact_id="not-yet-applied",
         )
         dataset.attrs["schema_version"] = "uncorrected-blend-forecast.v1"
+        digests = persisted.run_spec.request_identity
         manifest = BlendContributionManifest(
             rows=tuple(rows),
             expected_variable_ids=_VARIABLES,
             expected_locations=tuple(StationId(s) for s in stations),
-            expected_target_horizons=_HORIZONS,
-            configuration_digest=str(request.configuration_digest),
-            code_revision=request.code_revision,
-            environment_digest=str(request.environment_digest),
-            lockfile_digest=str(request.lockfile_digest),
+            expected_target_horizons=horizons,
+            configuration_digest=str(digests.configuration_digest),
+            code_revision=digests.code_revision,
+            environment_digest=str(digests.environment_digest),
+            lockfile_digest=str(digests.lockfile_digest),
         )
         return dataset, manifest.model_dump(mode="json")
 
@@ -1706,7 +1907,9 @@ class Phase2ProductionScience:
         forecast: AtomicForecastArtifacts,
         *,
         artifact_service: ArtifactService,
+        persisted: Phase2PersistedRun,
     ) -> CorrectedForecastArtifacts:
+        self._require_persisted_identity(persisted)
         correction = artifact_service.execute_raw_transformation(
             self._transformation(
                 request,
@@ -1770,45 +1973,74 @@ class Phase2ProductionScience:
         station_snapshot: ArtifactManifest,
         *,
         artifact_service: ArtifactService,
+        persisted: Phase2PersistedRun,
+        recorded_responses: tuple[ArtifactManifest, ...] | None,
     ) -> ObservationArtifacts:
-        settings = self._configuration.aviationweather
-        station_ids = tuple(s.provider_icao_id for s in self._configuration.stations)
-        query_date = request.verification_cutoff
-        fetched = acquire_metar_batch(
-            settings,
-            transport=self._aviationweather_transport,
-            clock=self._clock,
-            sleeper=self._sleeper,
-            station_ids=station_ids,
-            query_date=query_date,
-            rate_limiter=self._aviationweather_rate_limiter,
-        )
-        raw = artifact_service.register_source(
-            SourceRegistrationRequest(
-                source_authority="aviationweather.gov",
-                source_locator="metar",
-                source_revision="phase2.v1",
-                artifact_type="aviationweather-metar-response",
-                artifact_schema_version="aviationweather-metar-response.v1",
-                media_type="application/json",
-                created_at=self._clock.now(),
-                availability=Availability(
-                    available_at=fetched.completed_at,
-                    authority="aviationweather.gov",
-                    method="get",
-                ),
-                configuration_snapshot_id=request.configuration_snapshot_id,
-                configuration_digest=request.configuration_digest,
-                code_revision=request.code_revision,
-                environment_digest=request.environment_digest,
-            ),
-            fetched.payload,
-        )
+        """Normalize the run's METAR observations.
 
-        stations_by_icao = {s.provider_icao_id: s for s in self._configuration.stations}
+        On a first run ``recorded_responses`` is ``None``, so the
+        provider response is fetched once and registered as a source
+        artifact. On replay the coordinator supplies exactly the
+        artifacts that first run registered, and this stage reuses their
+        stored bytes -- ``acquire_metar_batch`` is never called, so
+        replay performs zero AviationWeather requests (Codex review
+        ``t_652b155e``).
+        """
+        self._require_persisted_identity(persisted)
+        stations = persisted.stations
+        query_date = persisted.run_spec.verification_cutoff
+        if recorded_responses is None:
+            fetched = acquire_metar_batch(
+                persisted.aviationweather,
+                transport=self._aviationweather_transport,
+                clock=self._clock,
+                sleeper=self._sleeper,
+                station_ids=tuple(s.provider_icao_id for s in stations),
+                query_date=query_date,
+                rate_limiter=self._rate_limiter(persisted),
+            )
+            digests = persisted.run_spec.request_identity
+            raw = artifact_service.register_source(
+                SourceRegistrationRequest(
+                    source_authority="aviationweather.gov",
+                    source_locator=f"phase2-metar://{persisted.run_spec.run_id}",
+                    source_revision="phase2.v1",
+                    artifact_type="aviationweather-metar-response",
+                    artifact_schema_version="aviationweather-metar-response.v1",
+                    media_type="application/json",
+                    created_at=self._clock.now(),
+                    availability=Availability(
+                        available_at=fetched.completed_at,
+                        authority="aviationweather.gov",
+                        method="get",
+                    ),
+                    configuration_snapshot_id=digests.configuration_snapshot_id,
+                    configuration_digest=digests.configuration_digest,
+                    code_revision=digests.code_revision,
+                    environment_digest=digests.environment_digest,
+                    run_id=persisted.run_spec.run_id,
+                ),
+                fetched.payload,
+            )
+            response_payload = fetched.payload
+        else:
+            if len(recorded_responses) != 1:
+                raise ValueError(
+                    "Phase 2 records exactly one AviationWeather response per run; replay "
+                    f"supplied {len(recorded_responses)}"
+                )
+            # Repository-authoritative manifest + integrity-verified
+            # bytes: replay never trusts the caller's copy.
+            raw, response_payload = artifact_service.load_verified_payload(
+                recorded_responses[0].artifact_id
+            )
+
+        stations_by_icao = {s.provider_icao_id: s for s in stations}
+        policy = persisted.observation_normalization_policy
+        query_window_start = persisted.run_spec.target_reference_time
 
         def _normalize(*_raw: Any) -> dict[str, Any]:
-            raw_records = parse_raw_metar_response(fetched.payload)
+            raw_records = parse_raw_metar_response(response_payload)
             rows: list[dict[str, Any]] = []
             for index, record in enumerate(raw_records):
                 station = stations_by_icao.get(record.icao_id)
@@ -1819,12 +2051,12 @@ class Phase2ProductionScience:
                     raw=_as_v2_record(record),
                     station=station_record,
                     station_id=station.station_id,
-                    policy=self._configuration.observation_normalization_policy,
+                    policy=policy,
                     raw_artifact_id=raw.artifact_id,
                     raw_record_index=index,
                     station_snapshot_artifact_id=station_snapshot.artifact_id,
                     ingested_at=self._clock.now(),
-                    query_window_start=request.target_reference_time,
+                    query_window_start=query_window_start,
                     query_window_end=query_date,
                 )
                 rows.append(normalized.model_dump(mode="json"))
@@ -1861,7 +2093,9 @@ class Phase2ProductionScience:
         observations: ObservationArtifacts,
         *,
         artifact_service: ArtifactService,
+        persisted: Phase2PersistedRun,
     ) -> MatchingArtifacts:
+        self._require_persisted_identity(persisted)
         matched_request = self._transformation(
             request,
             activity="match-phase2-observations",
@@ -1873,8 +2107,10 @@ class Phase2ProductionScience:
             artifact_type="matched-pairs",
             schema="matched-pairs.v2",
         )
-        stations = tuple(str(s.station_id) for s in self._configuration.stations)
-        matching_policy = self._configuration.matching_policy
+        stations = persisted.station_ids
+        horizons = persisted.target_horizons
+        matching_policy = persisted.matching_policy
+        verification_cutoff = persisted.run_spec.verification_cutoff
 
         def make_pairs(bound: Mapping[str, Any]) -> dict[str, Any]:
             obs = [
@@ -1884,10 +2120,10 @@ class Phase2ProductionScience:
             pair_rows = match_baseline_to_observations_v2(
                 baseline=bound["baseline"],
                 station_ids=stations,
-                target_horizons=_HORIZONS,
+                target_horizons=horizons,
                 observations=obs,
                 matching_policy=matching_policy,
-                verification_cutoff=request.verification_cutoff,
+                verification_cutoff=verification_cutoff,
                 baseline_artifact_id=baseline.artifact_id,
                 observations_artifact_id=observations.normalized.artifact_id,
             )
@@ -1918,8 +2154,10 @@ class Phase2ProductionScience:
         pairs: MatchingArtifacts,
         *,
         artifact_service: ArtifactService,
+        persisted: Phase2PersistedRun,
     ) -> VerificationArtifacts:
-        metric_set = self._configuration.metric_set
+        self._require_persisted_identity(persisted)
+        metric_set = persisted.metric_set
 
         def _calc(value: dict[str, Any]) -> dict[str, Any]:
             rows = [_model_from_json_value(MatchedPairRowV2, row) for row in value["rows"]]
@@ -2041,7 +2279,6 @@ def build_phase2_production_adapters(
     )
     science = Phase2ProductionScience(
         configuration=configuration,
-        provider=provider,
         aviationweather_transport=aviationweather_transport,
         clock=clock,
         sleeper=sleeper,
@@ -2051,4 +2288,61 @@ def build_phase2_production_adapters(
         artifact_service=artifact_service,
         providers=provider,
         science=science.operations(),
+    )
+
+
+class UnavailableHttpTransport:
+    """An ``HttpTransport`` whose every request raises.
+
+    Replay wiring injects this so a network call is not merely
+    discouraged but impossible: any residual transport use surfaces as a
+    loud failure instead of a silent refetch.
+    """
+
+    def get(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        timeout: tuple[float, float] | None = None,
+    ) -> HttpResponse:
+        raise Phase2ReplayIdentityError(
+            f"replay must perform no network access, but a GET was attempted for {url!r}"
+        )
+
+    def head(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        timeout: tuple[float, float] | None = None,
+    ) -> HttpResponse:
+        raise Phase2ReplayIdentityError(
+            f"replay must perform no network access, but a HEAD was attempted for {url!r}"
+        )
+
+
+def build_phase2_replay_adapters(
+    *,
+    artifact_service: ArtifactService,
+    clock: Clock,
+    sleeper: Sleeper,
+) -> Phase2ProductionAdapters:
+    """Compose adapters that can only replay from persisted artifacts.
+
+    No ``Phase2Configuration`` is supplied at all: every stage reads the
+    run's own persisted run spec and station snapshot. No provider and
+    no usable transport is supplied either, so discovery, acquisition,
+    and observation fetching are structurally impossible rather than
+    merely unused (Codex review ``t_652b155e``). This is the wiring an
+    operator uses to reproduce a historical run in a fresh process.
+    """
+    return Phase2ProductionAdapters(
+        artifact_service=artifact_service,
+        providers=Phase2UnavailableProvider(),
+        science=Phase2ProductionScience(
+            aviationweather_transport=UnavailableHttpTransport(),
+            clock=clock,
+            sleeper=sleeper,
+        ).operations(),
     )
