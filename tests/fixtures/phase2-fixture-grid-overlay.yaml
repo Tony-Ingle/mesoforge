@@ -1,0 +1,43 @@
+# Test-only configuration overlay: substitute the *approved registered*
+# reduced NBM fixture grid profile for the operational one.
+#
+# Codex re-review finding 2 made the NBM grid contract exact, which means
+# a decoded message must match the configured profile's projection,
+# shape, increments, scan flags, and coverage precisely. The operational
+# CONUS grid is 2345 x 1597; generating real eccodes GRIB2 fixtures at
+# that size for 3 models x 37 leads x 7 fields would be gigabytes of
+# synthetic data per acceptance run.
+#
+# This overlay therefore swaps in `nbm-core-conus-fixture.v1`, which is
+# itself a registered, approved profile in
+# `mesoforge.catalog.grid_profiles`: it shares the operational
+# projection parameters (LoV/LaD/Latin1/Latin2 and the spherical earth
+# radius) exactly and differs only in shape/increment/origin, while
+# still covering the whole configured Grasston bbox plus a halo.
+#
+# The substitution is *scoped and fail-closed*: the approved-profile
+# registry still rejects any unregistered or mutated grid, and
+# `tests/unit/catalog/test_grid_profiles.py` asserts that the production
+# `configs/phase2-grasston.yaml` declares the operational profile, so
+# this overlay can never silently weaken the shipped configuration.
+phase2:
+  nbm:
+    grid_profile:
+      profile_id: nbm-core-conus-fixture.v1
+      grid_type: lambert
+      nx: 24
+      ny: 22
+      dx_metres: 25000.0
+      dy_metres: 25000.0
+      lov_degrees: 265.0
+      lad_degrees: 25.0
+      latin1_degrees: 25.0
+      latin2_degrees: 25.0
+      earth_radius_metres: 6371200.0
+      first_latitude_degrees: 44.2
+      first_longitude_degrees: 264.5
+      last_latitude_degrees: 48.46694365058596
+      last_longitude_degrees: 271.5835203897349
+      i_scans_negatively: 0
+      j_scans_positively: 1
+      j_points_are_consecutive: 0

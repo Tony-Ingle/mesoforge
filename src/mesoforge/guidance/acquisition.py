@@ -1,5 +1,5 @@
 """Deterministic HRRR byte-range acquisition orchestration (plan Section
-2.1-2.3, Task 4).
+2.1-2.3, Task 4; Task 2 generalization).
 
 Depends only on ``guidance.interfaces`` protocol shapes (transport,
 clock, sleeper) -- unit tests inject a scripted fake; production wiring
@@ -7,20 +7,28 @@ injects ``RequestsHrrrHttpTransport``/real clock/``time.sleep``. No
 ``ArtifactService``/storage import here: this module returns plain,
 typed result objects that ``application/phase1.py`` registers as
 source artifacts.
+
+Task 2 extracted the shared deterministic retry/failover/ranged-fetch
+engine to ``guidance.http_fetch`` so NBM/GFS acquisition (Tasks 3/4)
+reuse it directly; this module re-exports ``RequestAttempt``,
+``FetchedObject``, and ``HrrrAcquisitionError`` under their original
+Phase 1 names for full backward compatibility.
 """
 
 from __future__ import annotations
 
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 
-from mesoforge.catalog.sources import HrrrSourceSettings, RetryPolicy
-from mesoforge.common.errors import MesoForgeError
-from mesoforge.guidance.interfaces import Clock, HttpResponse, HttpTransport, Sleeper
+from mesoforge.catalog.sources import HrrrSourceSettings
+from mesoforge.guidance.http_fetch import FetchedObject as FetchedObject
+from mesoforge.guidance.http_fetch import FetchError, RequestAttempt
+from mesoforge.guidance.http_fetch import fetch_with_range as _fetch_with_range
+from mesoforge.guidance.http_fetch import fetch_with_retry as _fetch_with_retry
+from mesoforge.guidance.http_fetch import header as _header
+from mesoforge.guidance.interfaces import Clock, HttpTransport, Sleeper
 from mesoforge.guidance.sources.hrrr import (
-    HrrrIndexError,
     IndexRow,
     build_grib_url,
     build_index_url,
@@ -30,159 +38,23 @@ from mesoforge.guidance.sources.hrrr import (
     select_field_row,
 )
 
-_RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+# Backward-compatible alias: HrrrAcquisitionError was this module's own
+# exception class in Phase 1; Task 2 generalized the shared retry/fetch
+# engine to guidance.http_fetch.FetchError (used by HRRR/NBM/GFS alike).
+# Both names refer to the exact same exception class.
+HrrrAcquisitionError = FetchError
 
-
-class HrrrAcquisitionError(MesoForgeError):
-    """Terminal HRRR acquisition failure (all endpoints/attempts
-    exhausted, a 404 past the cycle deadline, or an unrecoverable
-    integrity/range mismatch)."""
-
-
-@dataclass(frozen=True, slots=True)
-class RequestAttempt:
-    """One retained HTTP attempt for the acquisition manifest (plan
-    Section 2.3: 'Preserve response Date, ETag, Last-Modified, and
-    request-attempt history')."""
-
-    endpoint: str
-    url: str
-    status_code: int | None
-    error: str | None
-    headers: dict[str, str]
-
-
-@dataclass(frozen=True, slots=True)
-class FetchedObject:
-    endpoint: str
-    url: str
-    resolved_url: str
-    payload: bytes
-    headers: dict[str, str]
-    attempts: tuple[RequestAttempt, ...]
-    completed_at: datetime
-
-
-def _header(headers: dict[str, str], name: str) -> str | None:
-    for key, value in headers.items():
-        if key.lower() == name.lower():
-            return value
-    return None
-
-
-def _parse_retry_after(headers: dict[str, str], cap_seconds: float) -> float | None:
-    raw = _header(headers, "Retry-After")
-    if raw is None:
-        return None
-    try:
-        seconds = float(int(raw))
-    except ValueError:
-        return None
-    return min(seconds, cap_seconds)
-
-
-def _is_retryable_transport_error(exc: Exception) -> bool:
-    # Any transport-raised exception (connect/read timeout, connection
-    # error) is treated as retryable; HTTP status classification happens
-    # separately once a response object is obtained.
-    return True
-
-
-def _attempt_request(
-    transport: HttpTransport,
-    *,
-    method: str,
-    url: str,
-    endpoint: str,
-    timeout: tuple[float, float],
-    request_headers: dict[str, str] | None = None,
-) -> tuple[HttpResponse | None, RequestAttempt]:
-    try:
-        response = getattr(transport, method)(url, headers=request_headers, timeout=timeout)
-    except Exception as exc:  # noqa: BLE001 -- transport errors are all retryable here
-        return None, RequestAttempt(
-            endpoint=endpoint, url=url, status_code=None, error=str(exc), headers={}
-        )
-    headers = dict(response.headers)
-    return response, RequestAttempt(
-        endpoint=endpoint, url=url, status_code=response.status_code, error=None, headers=headers
-    )
-
-
-def _fetch_with_retry(
-    transport: HttpTransport,
-    clock: Clock,
-    sleeper: Sleeper,
-    *,
-    method: str,
-    urls_by_endpoint: Sequence[tuple[str, str]],
-    retry_policy: RetryPolicy,
-    cycle_deadline: datetime,
-    accept_status: frozenset[int] = frozenset({200}),
-) -> FetchedObject:
-    """Shared retry/failover engine for both the index GET and the
-    ranged GRIB GET (plan Section 2.3): bounded deterministic backoff
-    per endpoint, then endpoint failover only on a retryable
-    availability/transport failure -- never on selector ambiguity,
-    decode error, or semantic key mismatch (those are raised by the
-    caller after this function returns, and are never retried here)."""
-    all_attempts: list[RequestAttempt] = []
-    last_status: int | None = None
-
-    for endpoint, url in urls_by_endpoint:
-        for attempt_index in range(retry_policy.attempts_per_endpoint):
-            response, attempt = _attempt_request(
-                transport,
-                method=method,
-                url=url,
-                endpoint=endpoint,
-                timeout=(retry_policy.connect_timeout_seconds, retry_policy.read_timeout_seconds),
-            )
-            all_attempts.append(attempt)
-
-            if response is not None and response.status_code in accept_status:
-                return FetchedObject(
-                    endpoint=endpoint,
-                    url=url,
-                    resolved_url=url,
-                    payload=bytes(response.content),
-                    headers=dict(response.headers),
-                    attempts=tuple(all_attempts),
-                    completed_at=clock.now(),
-                )
-
-            if response is not None:
-                last_status = response.status_code
-                if response.status_code == 404:
-                    if clock.now() > cycle_deadline:
-                        raise HrrrAcquisitionError(
-                            f"404 for {url!r} past the cycle availability deadline "
-                            f"{cycle_deadline!r}; terminal missing source data"
-                        )
-                    # retryable until the deadline
-                elif response.status_code not in _RETRYABLE_STATUS_CODES:
-                    raise HrrrAcquisitionError(
-                        f"non-retryable HTTP {response.status_code} for {url!r}"
-                    )
-
-            is_last_attempt = attempt_index == retry_policy.attempts_per_endpoint - 1
-            if is_last_attempt:
-                break
-
-            retry_after = (
-                _parse_retry_after(dict(response.headers), retry_policy.retry_after_cap_seconds)
-                if response is not None
-                else None
-            )
-            backoff = retry_policy.backoff_seconds[
-                min(attempt_index, len(retry_policy.backoff_seconds) - 1)
-            ]
-            sleeper.sleep(retry_after if retry_after is not None else backoff)
-
-    raise HrrrAcquisitionError(
-        f"all endpoints/attempts exhausted for {method.upper()} across "
-        f"{[e for e, _ in urls_by_endpoint]!r}; last_status={last_status!r}"
-    )
+__all__ = [
+    "FetchedObject",
+    "HrrrAcquisitionError",
+    "HrrrLeadAcquisition",
+    "RealClock",
+    "RealSleeper",
+    "RequestAttempt",
+    "SelectedMessage",
+    "acquire_hrrr_lead",
+    "build_acquisition_manifest_payload",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,10 +128,7 @@ def acquire_hrrr_lead(
     )
 
     index_text = index_fetch.payload.decode("utf-8")
-    try:
-        rows = parse_index_rows(index_text)
-    except HrrrIndexError:
-        raise
+    rows = parse_index_rows(index_text)
 
     selected_rows: list[tuple[str, IndexRow]] = []
     for assertion in settings.field_assertions:
@@ -374,180 +243,6 @@ def acquire_hrrr_lead(
         full_object_last_modified=full_object_last_modified,
         full_object_content_length=full_object_content_length,
     )
-
-
-def _parse_content_range(value: str | None) -> tuple[int, int, int] | None:
-    """Strictly parse a ``Content-Range: bytes start-end/total`` header
-    value into ``(start, end, total)`` (end inclusive). Returns ``None``
-    for a missing or malformed value -- never partially trusts a
-    garbage/ambiguous header (plan Section 2.3/review finding 5: mere
-    header *presence* is insufficient; the exact start/end/total must
-    be validated)."""
-    if value is None:
-        return None
-    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", value.strip())
-    if match is None:
-        return None
-    start, end, total = (int(group) for group in match.groups())
-    if end < start or total <= end:
-        return None
-    return start, end, total
-
-
-_GRIB_MAGIC = b"GRIB"
-_GRIB_TRAILER = b"7777"
-_GRIB_EDITION_2 = 2
-# GRIB2 Section 0 (Indicator Section) is exactly 16 octets: "GRIB" (4),
-# reserved (2), discipline (1), edition number (1), then an 8-octet
-# big-endian unsigned total-message-length field (WMO Manual on Codes,
-# FM 92-XII GRIB2, Section 0).
-_GRIB2_SECTION0_LENGTH = 16
-
-
-def _validate_grib_message_boundaries(payload: bytes, *, url: str, range_header: str) -> None:
-    """Section 2.1/2.3 GRIB2 message framing: every selected message is
-    exactly one complete GRIB2 message. Residual review finding 2: mere
-    ``GRIB``/``7777`` prefix/suffix checks are insufficient (they accept
-    truncated/concatenated/other-edition payloads that merely happen to
-    start and end with those four bytes) -- this validates GRIB edition
-    2 and that Section 0's own encoded total-message-length field
-    equals the exact ranged payload length, i.e. the payload is one
-    single, complete, edition-2 GRIB message."""
-    if len(payload) < _GRIB2_SECTION0_LENGTH + len(_GRIB_TRAILER):
-        raise HrrrAcquisitionError(
-            f"selected GRIB message for {url!r} (range {range_header!r}) is only "
-            f"{len(payload)} bytes, too short to contain a GRIB2 Section 0 "
-            f"({_GRIB2_SECTION0_LENGTH} octets) plus the '7777' end section"
-        )
-    if not payload.startswith(_GRIB_MAGIC):
-        raise HrrrAcquisitionError(
-            f"selected GRIB message for {url!r} (range {range_header!r}) does not begin "
-            f"with the GRIB2 {_GRIB_MAGIC!r} indicator section; boundary integrity failed"
-        )
-    edition = payload[7]
-    if edition != _GRIB_EDITION_2:
-        raise HrrrAcquisitionError(
-            f"selected GRIB message for {url!r} (range {range_header!r}) declares "
-            f"GRIB edition {edition!r} in Section 0, expected edition "
-            f"{_GRIB_EDITION_2!r} (GRIB2); boundary integrity failed"
-        )
-    section0_total_length = int.from_bytes(payload[8:16], byteorder="big", signed=False)
-    if section0_total_length != len(payload):
-        raise HrrrAcquisitionError(
-            f"selected GRIB message for {url!r} (range {range_header!r}) declares a "
-            f"Section 0 total message length of {section0_total_length} octets, but the "
-            f"exact ranged payload is {len(payload)} bytes; the range must contain "
-            "exactly one complete GRIB2 message"
-        )
-    if not payload.endswith(_GRIB_TRAILER):
-        raise HrrrAcquisitionError(
-            f"selected GRIB message for {url!r} (range {range_header!r}) does not end "
-            f"with the GRIB2 {_GRIB_TRAILER!r} end section; boundary integrity failed"
-        )
-
-
-def _fetch_with_range(
-    transport: HttpTransport,
-    clock: Clock,
-    sleeper: Sleeper,
-    *,
-    endpoint: str,
-    url: str,
-    range_header: str,
-    byte_start: int,
-    byte_end: int,
-    retry_policy: RetryPolicy,
-    cycle_deadline: datetime,
-    expected_length: int,
-    full_object_length: int,
-) -> FetchedObject:
-    """Ranged GET with one extra integrity-mismatch retry (plan Section
-    2.3: 'Retry an integrity/range mismatch once from a fresh connection;
-    then fail closed'). Sends the exact ``Range`` header computed by the
-    caller (review finding 1: a computed range_header must actually be
-    transmitted) and validates the response's ``Content-Range`` and GRIB
-    message framing exactly (review finding 5). ``full_object_length`` is
-    always a valid, HEAD-established total (residual review finding 1):
-    the response's exact Content-Range ``total`` must equal it on every
-    selected range, not merely when a row happens to be the inventory's
-    final message."""
-    integrity_retries_remaining = 1
-    while True:
-        all_attempts: list[RequestAttempt] = []
-        response: HttpResponse | None = None
-        for attempt_index in range(retry_policy.attempts_per_endpoint):
-            resp, attempt = _attempt_request(
-                transport,
-                method="get",
-                url=url,
-                endpoint=endpoint,
-                timeout=(retry_policy.connect_timeout_seconds, retry_policy.read_timeout_seconds),
-                request_headers={"Range": range_header},
-            )
-            all_attempts.append(attempt)
-            if resp is not None and resp.status_code in (200, 206):
-                response = resp
-                break
-            if resp is not None and resp.status_code == 404 and clock.now() > cycle_deadline:
-                raise HrrrAcquisitionError(f"404 for {url!r} past the cycle availability deadline")
-            if resp is not None and resp.status_code not in _RETRYABLE_STATUS_CODES.union({404}):
-                raise HrrrAcquisitionError(f"non-retryable HTTP {resp.status_code} for {url!r}")
-
-            is_last = attempt_index == retry_policy.attempts_per_endpoint - 1
-            if is_last:
-                break
-            retry_after = (
-                _parse_retry_after(dict(resp.headers), retry_policy.retry_after_cap_seconds)
-                if resp is not None
-                else None
-            )
-            backoff = retry_policy.backoff_seconds[
-                min(attempt_index, len(retry_policy.backoff_seconds) - 1)
-            ]
-            sleeper.sleep(retry_after if retry_after is not None else backoff)
-
-        if response is None:
-            raise HrrrAcquisitionError(f"range GET exhausted retries for {url!r}")
-
-        if response.status_code == 200:
-            raise HrrrAcquisitionError(
-                f"provider ignored Range and returned full content (200) for {url!r}; "
-                "rejecting to avoid accidentally retaining the full product"
-            )
-
-        content_range = _header(dict(response.headers), "Content-Range")
-        parsed_range = _parse_content_range(content_range)
-        payload = bytes(response.content)
-
-        integrity_ok = (
-            len(payload) == expected_length
-            and parsed_range is not None
-            and parsed_range[0] == byte_start
-            and parsed_range[1] == byte_end - 1
-            and parsed_range[2] == full_object_length
-        )
-        if not integrity_ok:
-            if integrity_retries_remaining > 0:
-                integrity_retries_remaining -= 1
-                continue
-            raise HrrrAcquisitionError(
-                f"range integrity mismatch for {url!r} (range {range_header!r}): "
-                f"expected {expected_length} bytes at [{byte_start}, {byte_end}) "
-                f"(full_object_length={full_object_length!r}), got {len(payload)} bytes, "
-                f"Content-Range={content_range!r}"
-            )
-
-        _validate_grib_message_boundaries(payload, url=url, range_header=range_header)
-
-        return FetchedObject(
-            endpoint=endpoint,
-            url=url,
-            resolved_url=url,
-            payload=payload,
-            headers=dict(response.headers),
-            attempts=tuple(all_attempts),
-            completed_at=clock.now(),
-        )
 
 
 def build_acquisition_manifest_payload(

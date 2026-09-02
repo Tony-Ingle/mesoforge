@@ -217,6 +217,15 @@ class TransformationResult(BaseModel):
     output: ArtifactManifest
 
 
+class AtomicTransformationResult(BaseModel):
+    """Two artifacts committed as outputs of one idempotent activity."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    activity: ActivityManifest
+    outputs: tuple[ArtifactManifest, ArtifactManifest]
+
+
 class InputBinding:
     """A role-scoped ``(loader, validator)`` pair for
     ``execute_role_bound_transformation`` (plan Section 4.4).
@@ -246,11 +255,14 @@ def _parameters_digest(parameters: dict[str, object]) -> Digest:
 def _source_registration_digest(
     request: SourceRegistrationRequest, content_digest: Digest
 ) -> Digest:
+    immutable_source_identity = _uses_immutable_source_identity(request)
     payload = {
         "source_authority": request.source_authority,
         "source_locator": request.source_locator,
         "source_revision": request.source_revision,
-        "content_digest": str(content_digest),
+        "content_digest": (
+            "immutable-source-identity" if immutable_source_identity else str(content_digest)
+        ),
         "artifact_schema_version": request.artifact_schema_version,
         "configuration_digest": request.configuration_digest,
         "code_revision": request.code_revision,
@@ -258,6 +270,22 @@ def _source_registration_digest(
         "quality_state": request.quality_state,
     }
     return Digest.of_bytes(jcs.canonicalize(payload))
+
+
+def _uses_immutable_source_identity(request: SourceRegistrationRequest) -> bool:
+    """Reserve the Phase 2 METAR namespace as once-only per run.
+
+    This is derived from the validated source contract rather than a caller
+    flag, so a second caller cannot bypass byte immutability by omitting an
+    option while reusing the same authoritative observation identity.
+    """
+    return (
+        request.source_authority == "aviationweather.gov"
+        and request.source_locator.startswith("phase2-metar://run_")
+        and request.source_revision == "phase2.v1"
+        and request.artifact_type == "aviationweather-metar-response"
+        and request.artifact_schema_version == "aviationweather-metar-response.v1"
+    )
 
 
 class ArtifactService:
@@ -297,6 +325,28 @@ class ArtifactService:
             )
 
     # ------------------------------------------------------------------
+    # Authoritative artifact retrieval (immutable replay roots)
+    # ------------------------------------------------------------------
+
+    def load_verified_payload(self, artifact_id: ArtifactId) -> tuple[ArtifactManifest, bytes]:
+        """Load an artifact's repository-authoritative manifest and its
+        integrity-verified bytes.
+
+        Callers that must reconstruct a run from persisted state (Phase 2
+        replay) may not trust a caller-supplied manifest for
+        availability, quality state, configuration identity, or storage
+        location: the manifest is re-read from the repository by ID and
+        the payload is retrieved through ``get_verified``, so a tampered
+        object or a forged manifest fails closed before any policy is
+        reconstructed from it.
+        """
+        artifact_id = ArtifactId(artifact_id)
+        with self._unit_of_work_factory() as uow:
+            manifest = uow.artifacts.get(artifact_id)
+        payload = self._object_store.get_verified(manifest.storage_uri, manifest.content_digest)
+        return manifest, payload
+
+    # ------------------------------------------------------------------
     # Source registration (plan Section 5, first bullet)
     # ------------------------------------------------------------------
 
@@ -331,6 +381,13 @@ class ArtifactService:
                     source_registration_digest
                 )
                 if existing is not None:
+                    if (
+                        _uses_immutable_source_identity(request)
+                        and existing.content_digest != content_digest
+                    ):
+                        raise IntegrityError(
+                            "immutable source identity was already registered with different bytes"
+                        )
                     return existing
 
             stored_object = self._object_store.put_if_absent(
@@ -435,6 +492,172 @@ class ArtifactService:
             output_validator=output_validator,
             input_validator=None,
         )
+
+    def execute_atomic_raw_pair(
+        self,
+        first: TransformationRequest,
+        second: TransformationRequest,
+        transform: Callable[..., tuple[Any, Any]],
+        *,
+        serializers: tuple[Any, Any],
+        input_loader: Callable[[bytes], Any],
+        output_validators: tuple[Callable[[Any], None], Callable[[Any], None]],
+    ) -> AtomicTransformationResult:
+        """Execute and commit exactly two raw outputs under one activity.
+
+        Phase 2's forecast and contribution manifest are an atomic pair.  The
+        ordinary transformation API intentionally has one output, so this narrow
+        API provides the required all-or-nothing database edge without weakening
+        that simpler contract.
+        """
+        shared_fields = (
+            "activity_type",
+            "activity_version",
+            "inputs",
+            "parameters",
+            "configuration_snapshot_id",
+            "configuration_digest",
+            "code_revision",
+            "environment_digest",
+            "run_id",
+            "quality_state",
+        )
+        mismatched = [
+            name for name in shared_fields if getattr(first, name) != getattr(second, name)
+        ]
+        if mismatched:
+            raise ValueError(f"atomic pair requests differ in shared fields: {mismatched!r}")
+        if first.output_role == second.output_role:
+            raise ValueError("atomic pair output roles must be distinct")
+
+        ordered_inputs = tuple((ref.role, ref.artifact_id) for ref in first.inputs)
+        parameters_digest = _parameters_digest(first.parameters)
+        output_schema = (
+            f"{first.output_artifact_schema_version}+{second.output_artifact_schema_version}"
+        )
+        idempotency_digest = compute_idempotency_digest(
+            activity_type=first.activity_type,
+            activity_version=first.activity_version,
+            ordered_inputs=ordered_inputs,
+            configuration_digest=first.configuration_digest,
+            parameters_digest=parameters_digest,
+            code_revision=first.code_revision,
+            environment_digest=first.environment_digest,
+            output_schema=output_schema,
+        )
+        with self._idempotency_lock.acquire(idempotency_digest):
+            with self._unit_of_work_factory() as uow:
+                self._verify_configuration_consistency(
+                    uow,
+                    configuration_snapshot_id=first.configuration_snapshot_id,
+                    configuration_digest=first.configuration_digest,
+                )
+                existing = uow.activities.find_succeeded_by_idempotency(idempotency_digest)
+                if existing is not None:
+                    if len(existing.outputs) != 2:
+                        raise IntegrityError(
+                            "atomic pair activity does not have exactly two outputs"
+                        )
+                    manifests = uow.artifacts.get_many(
+                        tuple(reference.artifact_id for reference in existing.outputs)
+                    )
+                    return AtomicTransformationResult(
+                        activity=existing, outputs=(manifests[0], manifests[1])
+                    )
+                input_manifests = [
+                    uow.artifacts.get(artifact_id) for _, artifact_id in ordered_inputs
+                ]
+
+            inputs = [
+                input_loader(self._object_store.get_verified(item.storage_uri, item.content_digest))
+                for item in input_manifests
+            ]
+            activity_id = ActivityId(f"act_{uuid.uuid4()}")
+            started = ActivityManifest(
+                activity_id=activity_id,
+                activity_type=first.activity_type,
+                activity_version=first.activity_version,
+                status="started",
+                started_at=datetime.now(UTC),
+                idempotency_digest=idempotency_digest,
+                parameters_digest=parameters_digest,
+                configuration_snapshot_id=first.configuration_snapshot_id,
+                configuration_digest=first.configuration_digest,
+                code_revision=first.code_revision,
+                environment_digest=first.environment_digest,
+                run_id=first.run_id,
+                inputs=tuple(
+                    ActivityArtifactRef(role=role, artifact_id=artifact_id)
+                    for role, artifact_id in ordered_inputs
+                ),
+            )
+            with self._unit_of_work_factory() as uow:
+                uow.activities.add_started(started)
+                uow.commit()
+            try:
+                values = transform(*inputs)
+                if not isinstance(values, tuple) or len(values) != 2:
+                    raise ValueError("atomic pair transform must return exactly two values")
+                for validator, value in zip(output_validators, values, strict=True):
+                    validator(value)
+                payloads = tuple(
+                    serializer.serialize(value)
+                    for serializer, value in zip(serializers, values, strict=True)
+                )
+                stored = tuple(
+                    self._object_store.put_if_absent(
+                        Digest.of_bytes(payload), payload, request.output_media_type
+                    )
+                    for payload, request in zip(payloads, (first, second), strict=True)
+                )
+                completed_at = datetime.now(UTC)
+                parent_times = tuple(item.availability.available_at for item in input_manifests)
+                created: list[ArtifactManifest] = []
+                with self._unit_of_work_factory() as uow:
+                    for stored_object, request in zip(stored, (first, second), strict=True):
+                        uow.stored_objects.add_if_absent(stored_object)
+                        created.append(
+                            uow.artifacts.add_derived(
+                                artifact_id=ArtifactId.generate(),
+                                artifact_type=request.output_artifact_type,
+                                artifact_schema_version=request.output_artifact_schema_version,
+                                content_digest=stored_object.content_digest,
+                                created_at=completed_at,
+                                availability_authority="mesoforge.derived",
+                                availability_method=f"{first.activity_type}.{first.activity_version}",
+                                parent_available_ats=parent_times,
+                                activity_completed_at=completed_at,
+                                run_id=first.run_id,
+                                configuration_snapshot_id=first.configuration_snapshot_id,
+                                configuration_digest=first.configuration_digest,
+                                code_revision=first.code_revision,
+                                environment_digest=first.environment_digest,
+                                quality_state=request.quality_state,
+                                attributes=None,
+                            )
+                        )
+                    refs = tuple(
+                        ActivityArtifactRef(
+                            role=request.output_role, artifact_id=manifest.artifact_id
+                        )
+                        for request, manifest in zip((first, second), created, strict=True)
+                    )
+                    finished = uow.activities.finish_succeeded(activity_id, refs, completed_at)
+                    uow.commit()
+                return AtomicTransformationResult(
+                    activity=finished, outputs=(created[0], created[1])
+                )
+            except Exception as exc:
+                failure_time = datetime.now(UTC)
+                error = ActivityError(
+                    error_type=type(exc).__name__,
+                    message_digest=Digest.of_bytes(str(exc).encode()),
+                    retryable=not isinstance(exc, IntegrityError),
+                )
+                with self._unit_of_work_factory() as uow:
+                    uow.activities.finish_failed(activity_id, error, failure_time)
+                    uow.commit()
+                raise
 
     def execute_role_bound_transformation(
         self,

@@ -8,10 +8,14 @@ Pure validation -- no NetCDF/storage import.
 
 from __future__ import annotations
 
+from typing import Literal
+
 import numpy as np
 import xarray as xr
+from pydantic import BaseModel, ConfigDict
 
 from mesoforge.common.errors import MesoForgeError
+from mesoforge.common.identifiers import ArtifactId
 
 _EXPECTED_LOCATIONS = ("station.kcbg", "station.kjmr", "station.kros")
 _EXPECTED_LEAD_HOURS = tuple(range(7))
@@ -143,3 +147,94 @@ def validate_baseline_forecast(dataset: xr.Dataset) -> None:
             f"baseline forecast validation failed with {len(errors)} problem(s): "
             + "; ".join(errors)
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: baseline-forecast.v2 (plan Section 5.1, Task 10). Distinct
+# function from validate_baseline_forecast (v1, unchanged above);
+# dimensions ("target_horizon", "location"), 3 stations x 36 horizons,
+# named forecast variables with per-variable availability state.
+# ---------------------------------------------------------------------------
+
+_V2_EXPECTED_LOCATIONS = ("station.kcbg", "station.kjmr", "station.kros")
+_V2_EXPECTED_TARGET_HORIZONS = tuple(range(1, 37))
+_V2_FORECAST_VARIABLES = (
+    "air_temperature_2m",
+    "dew_point_temperature_2m",
+    "eastward_wind_10m",
+    "northward_wind_10m",
+    "wind_gust_10m",
+    "probability_of_precipitation_1h",
+    "liquid_equivalent_precipitation_amount_1h",
+)
+_V2_REQUIRED_DATASET_ATTRS = (
+    "schema_version",
+    "target_reference_time",
+    "forecast_issue_time",
+    "uncorrected_blend_artifact_id",
+    "identity_correction_artifact_id",
+)
+
+
+def validate_baseline_forecast_v2(dataset: xr.Dataset) -> None:
+    """Section 5.1: ``baseline-forecast.v2``. Exact dimensions
+    ``("target_horizon", "location")``, target reference/valid/interval
+    coordinates, named forecast variables, and per-variable state.
+    Never accepted by the v1 validator and vice versa."""
+    errors: list[str] = []
+
+    for attr in _V2_REQUIRED_DATASET_ATTRS:
+        if attr not in dataset.attrs:
+            errors.append(f"missing required dataset attribute {attr!r}")
+    if errors:
+        raise BaselineForecastValidationError(
+            f"baseline-forecast.v2 validation failed with {len(errors)} problem(s): "
+            + "; ".join(errors)
+        )
+
+    if dataset.attrs["schema_version"] != "baseline-forecast.v2":
+        errors.append(
+            f"schema_version must be 'baseline-forecast.v2', got "
+            f"{dataset.attrs['schema_version']!r}"
+        )
+
+    if "location" not in dataset.dims:
+        errors.append("missing 'location' dimension")
+    else:
+        locations = tuple(str(v) for v in dataset["location"].values)
+        if locations != _V2_EXPECTED_LOCATIONS:
+            errors.append(
+                f"location must be exactly {_V2_EXPECTED_LOCATIONS!r} in canonical order, got "
+                f"{locations!r}"
+            )
+
+    if "target_horizon" not in dataset.dims:
+        errors.append("missing 'target_horizon' dimension")
+    else:
+        horizons = tuple(int(v) for v in dataset["target_horizon"].values)
+        if horizons != _V2_EXPECTED_TARGET_HORIZONS:
+            errors.append(f"target_horizon must be exactly integers 1..36, got {horizons!r}")
+
+    for variable_id in _V2_FORECAST_VARIABLES:
+        state_name = f"{variable_id}_state"
+        if state_name not in dataset.data_vars:
+            errors.append(f"missing required per-variable state variable {state_name!r}")
+
+    if errors:
+        raise BaselineForecastValidationError(
+            f"baseline-forecast.v2 validation failed with {len(errors)} problem(s): "
+            + "; ".join(errors)
+        )
+
+
+class UncorrectedBlendForecast(BaseModel):
+    """Section 5.1: ``uncorrected-blend-forecast.v1``. Pre-identity-
+    correction blended values, referenced as an ancestor by the
+    baseline plus the contribution manifest."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal["uncorrected-blend-forecast.v1"] = "uncorrected-blend-forecast.v1"
+    contribution_manifest_artifact_id: ArtifactId
+    target_reference_time: str
+    forecast_issue_time: str

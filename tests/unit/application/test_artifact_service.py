@@ -109,6 +109,24 @@ class TestRegisterSource:
         assert first.artifact_id == second.artifact_id
         assert len(uow_factory.artifacts) == 1
 
+    def test_immutable_source_identity_rejects_different_retry_bytes(self, service_and_uow) -> None:
+        service, uow_factory, _ = service_and_uow
+        request = _source_request(
+            source_authority="aviationweather.gov",
+            source_locator="phase2-metar://run_00000000-0000-0000-0000-000000000001",
+            source_revision="phase2.v1",
+            artifact_type="aviationweather-metar-response",
+            artifact_schema_version="aviationweather-metar-response.v1",
+        )
+        first = service.register_source(request, b"original-response")
+
+        with pytest.raises(IntegrityError, match="different bytes"):
+            service.register_source(request, b"substituted-response")
+
+        repeated = service.register_source(request, b"original-response")
+        assert repeated.artifact_id == first.artifact_id
+        assert len(uow_factory.artifacts) == 1
+
     def test_wrong_expected_checksum_raises_and_creates_no_manifest(self, service_and_uow) -> None:
         service, uow_factory, _ = service_and_uow
         request = _source_request(expected_content_digest="sha256:" + "0" * 64)
@@ -196,6 +214,60 @@ class TestExecuteTransformation:
         )
         assert result.activity.status == "succeeded"
         assert result.output.artifact_type == "synthetic-derived"
+
+    def test_atomic_pair_registers_both_outputs_on_one_activity(self, service_and_uow) -> None:
+        service, _, _ = service_and_uow
+        source = service.register_source(_source_request(), b"input")
+        common = dict(
+            activity_type="atomic-pair",
+            activity_version="1.0.0",
+            inputs=(TransformationInputRef(role="primary", artifact_id=source.artifact_id),),
+            output_media_type="application/octet-stream",
+            configuration_snapshot_id=_STANDARD_SNAPSHOT_ID,
+            configuration_digest=_STANDARD_CONFIG_DIGEST,
+            code_revision="a" * 40,
+            environment_digest="sha256:" + "b" * 64,
+        )
+        left = TransformationRequest(
+            **common,
+            output_role="forecast",
+            output_artifact_type="uncorrected-blend-forecast",
+            output_artifact_schema_version="uncorrected-blend-forecast.v1",
+        )
+        right = TransformationRequest(
+            **common,
+            output_role="contributions",
+            output_artifact_type="blend-contribution-manifest",
+            output_artifact_schema_version="blend-contribution-manifest.v1",
+        )
+
+        class _Serializer:
+            def serialize(self, value: bytes) -> bytes:
+                return value
+
+        first = service.execute_atomic_raw_pair(
+            left,
+            right,
+            transform=lambda value: (value + b"-forecast", value + b"-contributions"),
+            serializers=(_Serializer(), _Serializer()),
+            input_loader=lambda payload: payload,
+            output_validators=(lambda _: None, lambda _: None),
+        )
+        second = service.execute_atomic_raw_pair(
+            left,
+            right,
+            transform=lambda value: (value + b"-forecast", value + b"-contributions"),
+            serializers=(_Serializer(), _Serializer()),
+            input_loader=lambda payload: payload,
+            output_validators=(lambda _: None, lambda _: None),
+        )
+        assert first.activity.outputs == second.activity.outputs
+        assert first.outputs == second.outputs
+        assert {ref.role for ref in first.activity.outputs} == {"forecast", "contributions"}
+        assert tuple(output.artifact_type for output in first.outputs) == (
+            "uncorrected-blend-forecast",
+            "blend-contribution-manifest",
+        )
 
     def test_repeat_identical_request_returns_same_output(self, service_and_uow) -> None:
         service, uow_factory, object_store = service_and_uow

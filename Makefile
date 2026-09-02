@@ -1,7 +1,8 @@
 .PHONY: sync lock-check fmt fmt-check lint typecheck import-lint docs-check \
         hygiene-check unit contract property integration acceptance \
         test test-all coverage services-up services-down migrate quality ci \
-        scientific phase1-acceptance smoke-live
+        scientific phase1-acceptance phase2-scientific phase2-offline \
+        phase2-acceptance smoke-live
 
 sync:
 	uv sync --all-groups
@@ -52,6 +53,15 @@ scientific:
 
 phase1-acceptance:
 	uv run pytest -m integration tests/acceptance/test_phase1_grasston_hrrr_metar_verification.py -q
+
+phase2-scientific:
+	uv run pytest -m scientific tests/unit tests/property -q
+
+phase2-offline: quality test phase2-scientific
+	uv run pytest tests/live -q
+
+phase2-acceptance:
+	uv run pytest -m integration tests/acceptance/test_phase2_multimodel_baseline.py -q
 
 smoke-live:
 	@if [ "$$MESOFORGE_LIVE_TESTS" != "1" ]; then \

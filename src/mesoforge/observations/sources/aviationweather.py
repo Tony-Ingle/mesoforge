@@ -15,6 +15,7 @@ from urllib.parse import urlencode
 from mesoforge.catalog.sources import AviationWeatherSettings
 from mesoforge.common.errors import MesoForgeError
 from mesoforge.contracts.observations import RawMetarRecord
+from mesoforge.contracts.observations_v2 import RawMetarRecordV2
 
 
 class AviationWeatherParseError(MesoForgeError):
@@ -40,7 +41,7 @@ _REQUIRED_CAMEL_KEYS: tuple[str, ...] = (
     "lon",
     "elev",
 )
-_OPTIONAL_CAMEL_KEYS: tuple[str, ...] = ("temp", "wdir", "wspd", "qcField")
+_OPTIONAL_CAMEL_KEYS: tuple[str, ...] = ("temp", "dewp", "wdir", "wspd", "wgst", "qcField")
 
 
 def _parse_epoch_seconds_instant(value: Any, *, field: str) -> datetime:
@@ -113,15 +114,17 @@ def parse_raw_metar_record(record: Mapping[str, Any]) -> RawMetarRecord:
     }
     for camel_key, snake_key in (
         ("temp", "temp"),
+        ("dewp", "dewp"),
         ("wdir", "wdir"),
         ("wspd", "wspd"),
+        ("wgst", "wgst"),
         ("qcField", "qc_field"),
     ):
         if camel_key in record:
             mapped[snake_key] = record[camel_key]
 
     try:
-        return RawMetarRecord.model_validate(mapped, strict=True)
+        return RawMetarRecordV2.model_validate(mapped, strict=True)
     except Exception as exc:  # noqa: BLE001 -- re-raised as a domain error with context
         raise AviationWeatherParseError(
             f"METAR record failed strict RawMetarRecord validation after camelCase mapping: {exc}"

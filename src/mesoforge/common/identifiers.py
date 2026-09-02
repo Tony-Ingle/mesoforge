@@ -185,6 +185,16 @@ class MetricSetId(_KebabDotId):
     """Identifier for a named verification metric set."""
 
 
+class ModelCycleSelectionPolicyId(_KebabDotId):
+    """Identifier for a Phase 2 deterministic cycle-selection policy
+    (plan Section 1.2, ``phase2-cycle-selection.v1``)."""
+
+
+class FallbackRowId(_KebabDotId):
+    """Identifier for one approved Phase 2 blend fallback weight row
+    (plan Section 4.2/4.4)."""
+
+
 def strip_prefix(value: str, prefix: str) -> str:
     """Strictly remove ``prefix`` from ``value``, raising ``InvalidIdentifier``
     if the prefix is absent. Unlike ``str.removeprefix``, this never

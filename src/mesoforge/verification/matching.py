@@ -15,7 +15,15 @@ import xarray as xr
 from mesoforge.catalog.configuration import MatchingPolicy
 from mesoforge.common.identifiers import ArtifactId, StationId
 from mesoforge.contracts.observations import NormalizedObservation
-from mesoforge.contracts.verification import FieldStatus, MatchedPairRow, RowStatus
+from mesoforge.contracts.observations_v2 import NormalizedObservationV2
+from mesoforge.contracts.verification import (
+    AvailabilityStateV2,
+    FieldStatus,
+    FieldStatusV2,
+    MatchedPairRow,
+    MatchedPairRowV2,
+    RowStatus,
+)
 
 _STATION_METADATA_CONFLICT_FLAG = "station_metadata_conflict"
 
@@ -321,6 +329,289 @@ def match_baseline_to_observations(
                 )
             )
 
+    return rows
+
+
+_V2_STATIONS = ("station.kcbg", "station.kjmr", "station.kros")
+_V2_HORIZONS = tuple(range(1, 37))
+_STATE_NAMES: dict[int, AvailabilityStateV2] = {
+    0: "complete",
+    1: "fallback",
+    2: "unavailable",
+    3: "inconsistent",
+}
+
+
+def _datetime_from_numpy(value: object) -> datetime:
+    naive: datetime = value.astype("datetime64[us]").item()  # type: ignore[attr-defined]
+    return naive.replace(tzinfo=UTC)
+
+
+def _select_observation_v2(
+    *,
+    station_id: StationId,
+    valid_time: datetime,
+    observations: list[NormalizedObservationV2],
+    tolerance: timedelta,
+    verification_cutoff: datetime,
+) -> tuple[NormalizedObservationV2 | None, bool]:
+    candidates = [
+        o
+        for o in observations
+        if o.station_id == station_id
+        and abs((o.event_time - valid_time).total_seconds()) <= tolerance.total_seconds()
+    ]
+    if not candidates:
+        return None, False
+    by_logical: dict[str, list[NormalizedObservationV2]] = {}
+    for candidate in candidates:
+        by_logical.setdefault(str(candidate.logical_observation_digest), []).append(candidate)
+    eligible_revisions: list[NormalizedObservationV2] = []
+    for revisions in by_logical.values():
+        eligible = [
+            o
+            for o in revisions
+            if o.provider_available_at <= verification_cutoff
+            and o.ingested_at <= verification_cutoff
+        ]
+        if eligible:
+            eligible_revisions.append(
+                max(
+                    eligible,
+                    key=lambda o: (o.provider_available_at, o.ingested_at, str(o.revision_digest)),
+                )
+            )
+    if not eligible_revisions:
+        return None, True
+    return min(
+        eligible_revisions,
+        key=lambda o: (
+            abs((o.event_time - valid_time).total_seconds()),
+            o.event_time,
+            str(o.logical_observation_digest),
+        ),
+    ), True
+
+
+def match_baseline_to_observations_v2(
+    *,
+    baseline: xr.Dataset,
+    station_ids: tuple[str, ...],
+    target_horizons: tuple[int, ...],
+    observations: list[NormalizedObservationV2],
+    matching_policy: MatchingPolicy,
+    verification_cutoff: datetime,
+    baseline_artifact_id: ArtifactId,
+    observations_artifact_id: ArtifactId,
+) -> list[MatchedPairRowV2]:
+    """Build the exact 3 x 36 ``matched-pairs.v2`` coverage frame."""
+    if station_ids != _V2_STATIONS or target_horizons != _V2_HORIZONS:
+        raise ValueError("Phase 2 matching requires canonical 3 stations x horizons 1..36")
+    if (
+        tuple(str(v) for v in baseline.location.values) != station_ids
+        or tuple(int(v) for v in baseline.target_horizon.values) != target_horizons
+    ):
+        raise ValueError("baseline coordinate frame does not match requested Phase 2 frame")
+    tolerance = timedelta(minutes=matching_policy.tolerance_minutes)
+    rows: list[MatchedPairRowV2] = []
+    variable_map = {
+        "temperature": "air_temperature_2m",
+        "dew_point": "dew_point_temperature_2m",
+        "eastward_component": "eastward_wind_10m",
+        "northward_component": "northward_wind_10m",
+        "gust": "wind_gust_10m",
+        "qpf": "liquid_equivalent_precipitation_amount_1h",
+        "pop": "probability_of_precipitation_1h",
+    }
+    state_rank = {"complete": 0, "fallback": 1, "unavailable": 2, "inconsistent": 3}
+    for station_id in station_ids:
+        for horizon in target_horizons:
+            selection = baseline.sel(location=station_id, target_horizon=horizon)
+            valid_time = _datetime_from_numpy(selection.target_valid_time.values)
+            forecast: dict[str, float | None] = {}
+            states: list[AvailabilityStateV2] = []
+            field_states: dict[str, AvailabilityStateV2] = {}
+            for field, variable in variable_map.items():
+                value = float(selection[variable].values)
+                forecast[field] = value if math.isfinite(value) else None
+                code = int(selection[f"{variable}_state"].values)
+                if code not in _STATE_NAMES:
+                    raise ValueError(f"invalid availability state code {code} for {variable}")
+                state = _STATE_NAMES[code]
+                states.append(state)
+                field_states[field] = state
+            u, v = forecast["eastward_component"], forecast["northward_component"]
+            if u is None or v is None:
+                forecast["wind_speed"] = forecast["wind_direction"] = None
+            else:
+                speed = math.hypot(u, v)
+                forecast["wind_speed"] = speed
+                forecast["wind_direction"] = (
+                    None if speed == 0 else (math.degrees(math.atan2(-u, -v)) % 360.0)
+                )
+            availability = max(states, key=state_rank.__getitem__)
+            wind_availability = max(
+                (field_states["eastward_component"], field_states["northward_component"]),
+                key=state_rank.__getitem__,
+            )
+            selected, had_candidate = _select_observation_v2(
+                station_id=StationId(station_id),
+                valid_time=valid_time,
+                observations=observations,
+                tolerance=tolerance,
+                verification_cutoff=verification_cutoff,
+            )
+            blanket: FieldStatusV2 = (
+                "revision_after_cutoff" if had_candidate else "no_report_within_tolerance"
+            )
+            statuses: dict[str, FieldStatusV2] = {
+                name: blanket
+                for name in (
+                    "temperature",
+                    "dew_point",
+                    "eastward_component",
+                    "northward_component",
+                    "wind_speed",
+                    "wind_direction",
+                    "gust",
+                    "qpf",
+                    "pop",
+                )
+            }
+            observed: dict[str, float | None] = {name: None for name in statuses}
+            if selected is not None:
+                if _STATION_METADATA_CONFLICT_FLAG in selected.quality_flags:
+                    statuses = dict.fromkeys(statuses, "station_metadata_conflict")
+                elif selected.mesoforge_qc_state == "rejected":
+                    statuses = dict.fromkeys(statuses, "observation_qc_rejected")
+                else:
+                    observed.update(
+                        {
+                            "temperature": selected.temperature_k,
+                            "dew_point": selected.dew_point_k,
+                            "eastward_component": selected.eastward_wind_10m_m_s,
+                            "northward_component": selected.northward_wind_10m_m_s,
+                            "wind_speed": selected.wind_speed_m_s,
+                            "wind_direction": selected.wind_from_direction_degrees,
+                            "gust": selected.wind_gust_m_s,
+                            "qpf": selected.precipitation_amount_kg_m2,
+                        }
+                    )
+                    for name in (
+                        "temperature",
+                        "dew_point",
+                        "eastward_component",
+                        "northward_component",
+                        "wind_speed",
+                        "gust",
+                    ):
+                        if forecast[name] is None:
+                            statuses[name] = "forecast_missing_or_invalid"
+                        else:
+                            statuses[name] = (
+                                "matched" if observed[name] is not None else "field_missing"
+                            )
+                    if forecast["wind_direction"] is None or observed["wind_direction"] is None:
+                        statuses["wind_direction"] = "field_missing"
+                    elif (forecast["wind_speed"] or 0) < matching_policy.calm_threshold_m_s or (
+                        observed["wind_speed"] or 0
+                    ) < matching_policy.calm_threshold_m_s:
+                        statuses["wind_direction"] = "calm_direction_excluded"
+                    else:
+                        statuses["wind_direction"] = "matched"
+                    interval_ok = (
+                        selected.precipitation_truth_status == "reported"
+                        and selected.precipitation_interval_start is not None
+                        and selected.precipitation_interval_end is not None
+                        and selected.precipitation_interval_end
+                        - selected.precipitation_interval_start
+                        == timedelta(hours=1)
+                        and abs((selected.precipitation_interval_end - valid_time).total_seconds())
+                        <= tolerance.total_seconds()
+                    )
+                    if interval_ok:
+                        statuses["qpf"] = (
+                            "matched"
+                            if forecast["qpf"] is not None
+                            else "forecast_missing_or_invalid"
+                        )
+                        statuses["pop"] = (
+                            "matched"
+                            if forecast["pop"] is not None
+                            else "forecast_missing_or_invalid"
+                        )
+                    else:
+                        statuses["qpf"] = statuses["pop"] = "precipitation_interval_mismatch"
+            for name in statuses:
+                if forecast.get(name) is None and statuses[name] == "matched":
+                    statuses[name] = "forecast_missing_or_invalid"
+            row_status: RowStatus = (
+                "matched_any_field" if "matched" in statuses.values() else "matched_no_fields"
+            )
+            rows.append(
+                MatchedPairRowV2(
+                    station_id=StationId(station_id),
+                    target_horizon_hours=horizon,
+                    valid_time=valid_time,
+                    precipitation_interval_start=valid_time - timedelta(hours=1),
+                    precipitation_interval_end=valid_time,
+                    baseline_artifact_id=baseline_artifact_id,
+                    observations_artifact_id=observations_artifact_id,
+                    matching_policy_id=matching_policy.matching_policy_id,
+                    matching_policy_digest=matching_policy.digest,
+                    verification_cutoff=verification_cutoff,
+                    availability_state=availability,
+                    temperature_availability_state=field_states["temperature"],
+                    dew_point_availability_state=field_states["dew_point"],
+                    eastward_wind_availability_state=field_states["eastward_component"],
+                    northward_wind_availability_state=field_states["northward_component"],
+                    wind_speed_availability_state=wind_availability,
+                    wind_direction_availability_state=wind_availability,
+                    gust_availability_state=field_states["gust"],
+                    qpf_availability_state=field_states["qpf"],
+                    pop_availability_state=field_states["pop"],
+                    selected_logical_observation_digest=(
+                        selected.logical_observation_digest if selected else None
+                    ),
+                    selected_revision_digest=(selected.revision_digest if selected else None),
+                    selected_event_time=(selected.event_time if selected else None),
+                    selected_provider_available_at=(
+                        selected.provider_available_at if selected else None
+                    ),
+                    delta_seconds=(
+                        abs((selected.event_time - valid_time).total_seconds())
+                        if selected
+                        else None
+                    ),
+                    forecast_temperature_k=forecast["temperature"],
+                    forecast_dew_point_k=forecast["dew_point"],
+                    forecast_eastward_wind_m_s=forecast["eastward_component"],
+                    forecast_northward_wind_m_s=forecast["northward_component"],
+                    forecast_wind_speed_m_s=forecast["wind_speed"],
+                    forecast_wind_from_direction_degrees=forecast["wind_direction"],
+                    forecast_wind_gust_m_s=forecast["gust"],
+                    forecast_qpf_kg_m2=forecast["qpf"],
+                    forecast_pop_probability=forecast["pop"],
+                    observed_temperature_k=observed["temperature"],
+                    observed_dew_point_k=observed["dew_point"],
+                    observed_eastward_wind_m_s=observed["eastward_component"],
+                    observed_northward_wind_m_s=observed["northward_component"],
+                    observed_wind_speed_m_s=observed["wind_speed"],
+                    observed_wind_from_direction_degrees=observed["wind_direction"],
+                    observed_wind_gust_m_s=observed["gust"],
+                    observed_qpf_kg_m2=observed["qpf"],
+                    row_status=row_status,
+                    temperature_status=statuses["temperature"],
+                    dew_point_status=statuses["dew_point"],
+                    eastward_component_status=statuses["eastward_component"],
+                    northward_component_status=statuses["northward_component"],
+                    wind_speed_status=statuses["wind_speed"],
+                    wind_direction_status=statuses["wind_direction"],
+                    gust_status=statuses["gust"],
+                    qpf_status=statuses["qpf"],
+                    pop_status=statuses["pop"],
+                )
+            )
     return rows
 
 

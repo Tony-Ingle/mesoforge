@@ -1,65 +1,77 @@
-"""Opt-in live HRRR provider contract smoke test (plan Task 14).
-
-Guarded by ``MESOFORGE_LIVE_TESTS=1``; skipped before any network
-construction otherwise. Never asserts meteorological values, station
-availability, byte sizes, or exact record counts -- only that the
-provider's URL/selector/key contract still matches what Phase 1 pins.
-"""
+"""Bounded opt-in HRRR Phase 2 provider contract canary."""
 
 from __future__ import annotations
 
-import os
-from datetime import datetime
 from pathlib import Path
-from typing import cast
 
 import pytest
 
-pytestmark = [
-    pytest.mark.live,
-    pytest.mark.skipif(
-        os.environ.get("MESOFORGE_LIVE_TESTS") != "1",
-        reason="live tests require MESOFORGE_LIVE_TESTS=1 (opt-in only)",
-    ),
-]
+from mesoforge.guidance.index_parsing import select_field_row
+from mesoforge.guidance.sources.hrrr import build_grib_url, build_index_url
+from mesoforge.guidance.sources.hrrr_phase2 import build_field_selector
+from tests.live.support import (
+    BoundedRequestsTransport,
+    decode_contract_message,
+    fetch_index,
+    fetch_rows,
+    load_phase2_configuration,
+    require_live_cycle,
+)
+
+pytestmark = pytest.mark.live
 
 
-def test_hrrr_live_contract(tmp_path: Path) -> None:
-    from mesoforge.catalog.configuration import load_configuration_source
-    from mesoforge.guidance.interfaces import HttpResponse
-    from mesoforge.guidance.sources.hrrr import (
-        build_index_url,
-        check_lead_step_type,
-        parse_index_rows,
-        select_field_row,
+def test_hrrr_phase2_live_contract(tmp_path: Path) -> None:
+    cycle, transport = require_live_cycle("HRRR", BoundedRequestsTransport)
+    settings = load_phase2_configuration().hrrr
+    assert (settings.model, settings.product, settings.sector) == ("hrrr", "sfc", "conus")
+    lead, endpoint = 6, settings.endpoint_order[0]
+    kwargs = dict(
+        endpoint=endpoint, cycle_date=cycle.date(), cycle_hour=cycle.hour, forecast_hour=lead
     )
-    from mesoforge.guidance.sources.hrrr_transport import RequestsHrrrHttpTransport
-
-    raw_cycle = os.environ.get("MESOFORGE_LIVE_HRRR_CYCLE")
-    if raw_cycle is None:
-        pytest.fail("MESOFORGE_LIVE_HRRR_CYCLE=YYYYMMDDTHH is required")
-    cycle = datetime.strptime(raw_cycle, "%Y%m%dT%H")
-    config, _ = load_configuration_source(
-        base_path=Path("configs/base.yaml"),
-        environment_path=Path("configs/phase1-grasston.yaml"),
+    rows = fetch_index(
+        transport,
+        endpoint=endpoint,
+        index_url=build_index_url(settings, **kwargs),
+        retry_policy=settings.retry_policy,
+        cycle=cycle,
+        deadline_minutes=settings.cycle_completion_deadline_minutes,
+        destination=tmp_path / "hrrr-f006.idx",
     )
-    assert config.phase1 is not None
-    settings = config.phase1.hrrr
-    url = build_index_url(
-        settings,
-        endpoint="aws",
-        cycle_date=cycle.date(),
-        cycle_hour=cycle.hour,
-        forecast_hour=0,
+    selectors = tuple(
+        build_field_selector(c.canonical_variable_id, forecast_hour=lead)
+        for c in settings.field_contracts
     )
-    response = cast(HttpResponse, RequestsHrrrHttpTransport().get(url, timeout=(10.0, 60.0)))
-    assert response.status_code == 200
-    rows = parse_index_rows(response.content.decode("utf-8"))
-    selected = tuple(
-        select_field_row(rows, assertion.inventory_selector)
-        for assertion in settings.field_assertions
+    assert selectors == (
+        ":TMP:2 m above ground:6 hour fcst:$",
+        ":DPT:2 m above ground:6 hour fcst:$",
+        ":UGRD:10 m above ground:6 hour fcst:$",
+        ":VGRD:10 m above ground:6 hour fcst:$",
+        ":GUST:surface:6 hour fcst:$",
+        r":APCP:surface:5-6 hour acc fcst:$",
     )
-    for row in selected:
-        check_lead_step_type(row, forecast_hour=0)
-    assert len(selected) == 3
-    assert list(tmp_path.iterdir()) == []
+    selected = tuple(select_field_row(rows, selector) for selector in selectors)
+    paths = fetch_rows(
+        transport,
+        endpoint=endpoint,
+        grib_url=build_grib_url(settings, **kwargs),
+        rows=rows,
+        selected=selected,
+        retry_policy=settings.retry_policy,
+        cycle=cycle,
+        deadline_minutes=settings.cycle_completion_deadline_minutes,
+        destination=tmp_path,
+    )
+    assert len(paths) == 6
+    for contract, path in zip(settings.field_contracts, paths, strict=True):
+        attrs = decode_contract_message(path, contract=contract, read_keys=settings.read_keys).attrs
+        assert attrs["GRIB_gridType"] == "lambert"
+        assert attrs["GRIB_Nx"] > 0 and attrs["GRIB_Ny"] > 0
+        assert attrs["GRIB_level"] == contract.level
+        assert attrs["GRIB_step"] == lead
+        if contract.is_accumulation:
+            assert (attrs["GRIB_stepType"], attrs["GRIB_startStep"], attrs["GRIB_endStep"]) == (
+                "accum",
+                lead - 1,
+                lead,
+            )

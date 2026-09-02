@@ -138,7 +138,13 @@ jobs:
           uv run alembic upgrade head
           uv run alembic downgrade base
           uv run alembic upgrade head
-      - name: Integration and acceptance tests
-        run: uv run pytest -m integration tests/integration tests/acceptance -q
+      - name: Integration and Phase 0 acceptance
+        run: >-
+          uv run pytest -m integration tests/integration
+          tests/acceptance/test_phase0_artifact_lineage.py -q
+      - name: Phase 1 acceptance
+        run: make phase1-acceptance
+      - name: Phase 2 acceptance
+        run: make phase2-acceptance
       - name: Full coverage threshold
         run: uv run pytest --cov=mesoforge --cov-report=term-missing --cov-fail-under=90 -q

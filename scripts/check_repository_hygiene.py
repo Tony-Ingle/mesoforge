@@ -3,7 +3,7 @@
 runtime artifacts that must never be committed.
 
 Checks (in order, all reported, not just the first):
-- forbidden file extensions/names: GRIB (.grib, .grib2, .idx), .env* files,
+- forbidden file extensions/names: GRIB/index/cfgrib caches, .env* files,
   common cache/venv directories, database/MinIO local data directories;
 - NetCDF/Zarr files anywhere outside ``tests/fixtures/`` (the only place a
   small, explicit, synthetic binary fixture is permitted);
@@ -23,7 +23,8 @@ from pathlib import Path
 
 MAX_FIXTURE_BYTES = 1024 * 1024  # 1 MiB
 
-FORBIDDEN_SUFFIXES = (".grib", ".grib2", ".idx")
+FORBIDDEN_SUFFIXES = (".grib", ".grb", ".grib2", ".grb2", ".idx", ".index")
+CFGRIB_CACHE_RE = re.compile(r".*\.idx(?:\.[0-9a-f]+)?$", re.IGNORECASE)
 FORBIDDEN_NAME_PATTERNS = (re.compile(r"^\.env(\..+)?$"),)
 ALLOWED_ENV_FILENAMES = {".env.example"}
 FORBIDDEN_DIR_NAMES = {
@@ -67,7 +68,7 @@ def check_forbidden_names(root: Path) -> list[str]:
         name = path.name
         suffix = path.suffix.lower()
 
-        if suffix in FORBIDDEN_SUFFIXES:
+        if suffix in FORBIDDEN_SUFFIXES or CFGRIB_CACHE_RE.fullmatch(name):
             errors.append(f"{rel}: forbidden GRIB/index file must not be committed")
             continue
 

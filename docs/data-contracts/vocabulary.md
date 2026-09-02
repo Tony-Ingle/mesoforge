@@ -1,6 +1,6 @@
 # MesoForge Vocabulary
 
-This document defines terms exactly as MesoForge Phase 0 uses them. Where a
+This document defines terms exactly as MesoForge uses them through Phase 2. Where a
 term has a common but looser meaning elsewhere in meteorology or software
 engineering, the definition here is authoritative for this codebase.
 
@@ -187,3 +187,26 @@ content-addressed.
   matched or missing status even when no observation value is usable.
 - **Calm threshold:** `1.5 m/s`; wind direction is scored only when forecast and observed
   speeds both meet or exceed it.
+
+## Phase 2 terms
+
+- **Available model set:** ordered subset of `(HRRR, NBM, GFS)` whose complete selected
+  cycles produced usable aligned values at one variable/station/horizon point.
+- **Fallback row:** immutable reviewed mapping from one available model set and horizon
+  band to a literal `(HRRR, NBM, GFS)` weight triple. It is selection, not dynamic
+  renormalization.
+- **Complete run:** every deterministic field has all three contributors and NBM PoP is
+  available at every required station/horizon.
+- **Degraded run:** every deterministic field remains available through an approved
+  fallback, but at least one fallback is used or NBM-only PoP is unavailable.
+- **Invalid run:** at least one deterministic field has no usable approved result at a
+  required station/horizon. Invalid does not mean publishable with missing values.
+- **Contribution manifest:** the artifact registered atomically with the uncorrected
+  blend that records each source value, exact configured weight, weighted contribution,
+  fallback row identity, and lineage for every output cell.
+- **Identity correction:** an explicit all-zero deterministic correction artifact. It
+  proves the correction seam and apply-once lineage; it is not learned bias correction.
+- **Physical replay:** re-execution from recorded selected source artifacts through the
+  production Phase 2 activity graph, without provider discovery or input reselection.
+
+See the [authoritative Phase 2 contract](phase-2.md) for equations and fixed scope.
