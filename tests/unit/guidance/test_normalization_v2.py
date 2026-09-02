@@ -106,37 +106,7 @@ _GFS_SETTINGS = make_gfs_settings(
     )
 )
 
-_NBM_SETTINGS = make_nbm_settings(
-    read_keys=(
-        "discipline",
-        "parameterCategory",
-        "parameterNumber",
-        "typeOfLevel",
-        "level",
-        "stepType",
-        "startStep",
-        "endStep",
-        "probabilityType",
-        "derivedForecast",
-        "typeOfStatisticalProcessing",
-        "percentileValue",
-        "step",
-        "dataDate",
-        "dataTime",
-        "units",
-        "gridType",
-        "Nx",
-        "Ny",
-        "Ni",
-        "Nj",
-        "latitudeOfFirstGridPointInDegrees",
-        "longitudeOfFirstGridPointInDegrees",
-        "validityDate",
-        "validityTime",
-        "scaledValueOfUpperLimit",
-        "scaleFactorOfUpperLimit",
-    )
-)
+_NBM_SETTINGS = make_nbm_settings()
 
 _CFG_SNAPSHOT_ID = "cfg_sha256_" + "0" * 64
 _LINEAGE_ID = "art_00000000-0000-0000-0000-000000000001"

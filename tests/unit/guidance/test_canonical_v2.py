@@ -54,6 +54,67 @@ def _base_kwargs(**overrides):
     return values
 
 
+class TestModelCompatibleGridProfile:
+    """Codex re-review finding 3: grid identifier *syntax* is not a grid
+    contract. A canonical artifact must carry the grid profile its own
+    model publishes, because blending values sampled on two different
+    geometries is a silent scientific error."""
+
+    def test_accepts_a_model_matching_grid(self) -> None:
+        for model, grid_id in (
+            ("nbm", "phase2-nbm.v1"),
+            ("hrrr", "hrrr-conus.v1"),
+            ("gfs", "gfs-0p25.v1"),
+        ):
+            dataset = _valid_dataset_for(model, grid_id)
+            validate_canonical_guidance_v2(dataset)
+
+    @pytest.mark.parametrize(
+        "model,grid_id",
+        [
+            ("nbm", "phase2-hrrr.v1"),
+            ("nbm", "phase2-gfs.v1"),
+            ("hrrr", "phase2-nbm.v1"),
+            ("gfs", "hrrr-conus.v1"),
+        ],
+    )
+    def test_rejects_a_model_incompatible_grid(self, model: str, grid_id: str) -> None:
+        dataset = _valid_dataset_for(model, grid_id)
+        with pytest.raises(CanonicalGuidanceV2Error, match="model-incompatible grid"):
+            validate_canonical_guidance_v2(dataset)
+
+    def test_rejects_a_grid_naming_no_model_at_all(self) -> None:
+        dataset = _valid_dataset_for("nbm", "synthetic-grid.v1")
+        with pytest.raises(CanonicalGuidanceV2Error, match="model-incompatible grid"):
+            validate_canonical_guidance_v2(dataset)
+
+    def test_rejects_a_grid_naming_two_models(self) -> None:
+        dataset = _valid_dataset_for("nbm", "nbm-hrrr-merged.v1")
+        with pytest.raises(CanonicalGuidanceV2Error, match="model-incompatible grid"):
+            validate_canonical_guidance_v2(dataset)
+
+
+def _valid_dataset_for(model: str, grid_id: str):
+    """A minimally valid canonical dataset for ``model`` on ``grid_id``.
+
+    HRRR/GFS never carry PoP (NBM is the sole PoP contributor), so the
+    interval field set differs by model.
+    """
+    interval_fields = {"liquid_equivalent_precipitation_amount_1h": np.full((3, 2, 2), 1.0)}
+    interval_start_hours = {"liquid_equivalent_precipitation_amount_1h": (0, 1, 2)}
+    if model == "nbm":
+        interval_fields["probability_of_precipitation_1h"] = np.full((3, 2, 2), 0.4)
+        interval_start_hours["probability_of_precipitation_1h"] = (0, 1, 2)
+    return assemble_canonical_guidance_v2(
+        **_base_kwargs(
+            model=model,
+            grid_id=grid_id,
+            interval_fields=interval_fields,
+            interval_start_hours=interval_start_hours,
+        )
+    )
+
+
 class TestAssembleCanonicalGuidanceV2:
     def test_assembles_valid_dataset(self) -> None:
         dataset = assemble_canonical_guidance_v2(**_base_kwargs())

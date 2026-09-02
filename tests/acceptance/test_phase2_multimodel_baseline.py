@@ -1,9 +1,15 @@
 """Offline Phase 2 multi-model acceptance proof (plan Task 14).
 
-The network boundary is deterministic fixture data.  Everything after that
-boundary runs through the production coordinator, production adapter composition,
-ArtifactService, PostgreSQL repositories, standalone MinIO, and the Phase 2 pure
-science modules.
+The **only** substitution is deterministic fixture *bytes* at the real
+``HttpTransport`` GET/HEAD/range boundary (Codex re-review finding 1).
+``Phase2ProductionProvider.discover()`` and ``acquire()`` run completely
+unchanged, so candidate discovery, index retrieval/parsing, selector
+matching and ambiguity handling, HEAD/Content-Length framing, byte-range
+framing and GRIB2 integrity validation, and retry/deadline/cutoff policy
+are all genuinely exercised. Everything after that boundary runs through
+the production coordinator, production adapter composition,
+ArtifactService, PostgreSQL repositories, standalone MinIO, and the
+Phase 2 pure science modules.
 """
 
 from __future__ import annotations
@@ -24,37 +30,39 @@ import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
 
-from mesoforge.application.artifacts import (
-    ArtifactService,
-    SourceRegistrationRequest,
-)
+from mesoforge.application.artifacts import ArtifactService
 from mesoforge.application.configuration import ConfigurationService
-from mesoforge.application.phase2 import DiscoveryResult, Phase2Coordinator, Phase2Request
+from mesoforge.application.phase2 import Phase2Coordinator, Phase2Request
 from mesoforge.application.phase2_adapters import Phase2ProductionAdapters
 from mesoforge.application.phase2_production import (
     Phase2ProductionProvider,
     Phase2ProductionScience,
 )
 from mesoforge.catalog.configuration import Phase2Configuration, load_configuration_source
-from mesoforge.common.identifiers import ArtifactId, Digest
-from mesoforge.contracts.artifacts import ArtifactManifest, Availability
+from mesoforge.common.identifiers import ArtifactId
 from mesoforge.contracts.forecasts import validate_baseline_forecast_v2
+from mesoforge.contracts.lineage_v2 import VariableLineageManifestV2
 from mesoforge.contracts.verification import MatchedPairRowV2, VerificationReportV2
 from mesoforge.forecasting.contributions import BlendContributionManifest
-from mesoforge.guidance.acquisition_v2 import Phase2LeadAcquisition, SelectedMessage
-from mesoforge.guidance.index_parsing import IndexRow
+from mesoforge.guidance.canonical_v2 import validate_canonical_guidance_lineage_v2
 from mesoforge.storage.json import CanonicalJsonSerializer
 from mesoforge.storage.netcdf import H5NetcdfDatasetSerializer
 from mesoforge.storage.postgres.idempotency_lock import PostgresIdempotencyLock
 from mesoforge.storage.postgres.repositories import PostgresUnitOfWork
 from mesoforge.storage.s3 import S3ArtifactObjectStore
 from mesoforge.verification.validation import validate_verification_report_v2
-from tests.fixtures import gfs_grib, hrrr_grib, nbm_grib
 from tests.support.phase1_fixture_transports import (
     FakeHttpResponse,
     FixedClock,
     FixtureAviationWeatherTransport,
     RecordingSleeper,
+)
+from tests.support.phase2_provider_transports import (
+    FrozenSleeper,
+    UnavailableTransport,
+    build_gfs_transport,
+    build_hrrr_transport,
+    build_nbm_transport,
 )
 
 pytestmark = [pytest.mark.acceptance, pytest.mark.integration]
@@ -76,6 +84,12 @@ VARIABLES = (
     "probability_of_precipitation_1h",
 )
 MODEL_VALUE = {"HRRR": 10.0, "NBM": 20.0, "GFS": 40.0}
+# The provider selects the current cycle, so target horizons 1..36 map
+# directly onto source leads 1..36; GFS additionally acquires lead 0's
+# APCP as the same-bucket previous-hour parent for lead 1.
+HRRR_LEADS = HORIZONS
+NBM_LEADS = HORIZONS
+GFS_LEADS = (0, *HORIZONS)
 JSON = CanonicalJsonSerializer()
 NETCDF = H5NetcdfDatasetSerializer()
 
@@ -115,16 +129,26 @@ def _configuration(dsn: str) -> tuple[Phase2Configuration, Any]:
     configuration, _ = load_configuration_source(
         base_path=ROOT / "configs/base.yaml",
         environment_path=ROOT / "configs/phase1-grasston.yaml",
-        additional_overlay_paths=(ROOT / "configs/phase2-grasston.yaml",),
+        additional_overlay_paths=(
+            ROOT / "configs/phase2-grasston.yaml",
+            # Approved reduced NBM fixture grid (see the overlay's own
+            # header): the exact operational projection at a fixture
+            # scale, so synthetic eccodes messages stay small while the
+            # grid contract is still enforced exactly.
+            ROOT / "tests/fixtures/phase2-fixture-grid-overlay.yaml",
+        ),
     )
     assert configuration.phase2 is not None
+    assert configuration.phase2.nbm.grid_profile.profile_id == "nbm-core-conus-fixture.v1", (
+        "the acceptance overlay must select the approved fixture grid profile"
+    )
     snapshot = ConfigurationService(unit_of_work_factory=lambda: PostgresUnitOfWork(dsn)).register(
         configuration
     )
     return configuration.phase2, snapshot
 
 
-def _request(snapshot: Any, *, run_id: str | None = None) -> Phase2Request:
+def _request(snapshot: Any, *, run_id: str | None = None, cutoff: datetime = CUTOFF):
     return Phase2Request(
         run_id=run_id or f"run_{uuid.uuid4()}",
         configuration_snapshot_id=snapshot.configuration_snapshot_id,
@@ -134,226 +158,56 @@ def _request(snapshot: Any, *, run_id: str | None = None) -> Phase2Request:
         lockfile_digest="sha256:" + "4" * 64,
         target_reference_time=REFERENCE,
         forecast_issue_time=ISSUE,
-        information_cutoff=CUTOFF,
+        information_cutoff=cutoff,
         verification_cutoff=VERIFY,
     )
 
 
-def _source(
-    service: ArtifactService,
-    request: Phase2Request,
+def _transports(
+    config: Phase2Configuration,
+    available: frozenset[str],
     *,
-    locator: str,
-    artifact_type: str,
-    schema: str,
-    payload: bytes,
-    available_at: datetime = REFERENCE,
-) -> ArtifactManifest:
-    return service.register_source(
-        SourceRegistrationRequest(
-            source_authority="fixture.offline",
-            source_locator=locator,
-            source_revision="fixture.v1",
-            artifact_type=artifact_type,
-            artifact_schema_version=schema,
-            media_type="application/octet-stream",
-            created_at=REFERENCE,
-            availability=Availability(
-                available_at=available_at, authority="fixture.offline", method="fixture.v1"
-            ),
-            configuration_snapshot_id=request.configuration_snapshot_id,
-            configuration_digest=request.configuration_digest,
-            code_revision=request.code_revision,
-            environment_digest=request.environment_digest,
-        ),
-        payload,
-    )
+    fault_scripts: dict[str, dict[str, list[Any]]] | None = None,
+) -> dict[str, Any]:
+    """Build the three provider transports.
 
-
-class FixtureProvider(Phase2ProductionProvider):
-    """Only the external-byte boundary is replaced for offline acceptance."""
-
-    def __init__(
-        self,
-        service: ArtifactService,
-        configuration: Phase2Configuration,
-        available: frozenset[str],
-        *,
-        partial_model: str | None = None,
-    ) -> None:
-        clock = FixedClock(REFERENCE)
-        sleeper = RecordingSleeper(clock)
-        super().__init__(
-            configuration=configuration,
-            hrrr_transport=None,  # type: ignore[arg-type]
-            nbm_transport=None,  # type: ignore[arg-type]
-            gfs_transport=None,  # type: ignore[arg-type]
-            clock=clock,
-            sleeper=sleeper,
-        )
-        self.service = service
-        self.available = available - ({partial_model} if partial_model else set())
-        self.partial_model = partial_model
-        self.network_calls = 0
-
-    def discover(self, request: Phase2Request) -> DiscoveryResult:
-        acquisitions = {
-            model: _fixture_acquisitions(model) for model in MODELS if model in self.available
-        }
-        self._acquisitions_by_run[str(request.run_id)] = acquisitions
-        return DiscoveryResult(
-            selection_digest=Digest.of_bytes(
-                json.dumps(
-                    {"available": sorted(self.available), "partial": self.partial_model}
-                ).encode()
-            )
-        )
-
-    # Inherit production acquire(): fixture injection ends at retained source bytes.
-
-
-def _selected(variable: str, payload: bytes, ordinal: int) -> SelectedMessage:
-    row = IndexRow(
-        ordinal + 1, ordinal * 1000, f"{ordinal + 1}:{ordinal * 1000}:fixture:{variable}"
-    )
-    return SelectedMessage(variable, row, 0, len(payload), payload)
-
-
-def _fixture_messages(model: str, lead: int) -> tuple[SelectedMessage, ...]:
-    base = MODEL_VALUE[model]
-    date = REFERENCE.strftime("%Y%m%d")
-    variables: list[tuple[str, bytes]] = []
-    if model == "HRRR":
-        shape = (hrrr_grib.NY, hrrr_grib.NX)
-        args = {"forecast_hour": lead, "cycle_date": date, "cycle_hour": REFERENCE.hour}
-        variables = [
-            (
-                "air_temperature_2m",
-                hrrr_grib.make_temperature_message(
-                    values_k=np.full(shape, 270 + base + lead / 10), **args
-                ),
-            ),
-            (
-                "dew_point_temperature_2m",
-                hrrr_grib.make_dew_point_message(
-                    values_k=np.full(shape, 268 + base + lead / 10), **args
-                ),
-            ),
-            (
-                "eastward_wind_10m",
-                hrrr_grib.make_wind_message(
-                    component="u", values_m_s=np.full(shape, base / 10), grid_relative=False, **args
-                ),
-            ),
-            (
-                "northward_wind_10m",
-                hrrr_grib.make_wind_message(
-                    component="v", values_m_s=np.full(shape, base / 20), grid_relative=False, **args
-                ),
-            ),
-            (
-                "wind_gust_10m",
-                hrrr_grib.make_gust_message(values_m_s=np.full(shape, base / 10 + 5), **args),
-            ),
-            (
-                "liquid_equivalent_precipitation_amount_1h",
-                hrrr_grib.make_apcp_message(
-                    values_kg_m2=np.full(shape, base / 100 + lead / 1000), **args
-                ),
-            ),
-        ]
-    elif model == "NBM":
-        shape = (nbm_grib.NY, nbm_grib.NX)
-        args = {"forecast_hour": lead, "cycle_date": date, "cycle_hour": REFERENCE.hour}
-        for variable, value in (
-            ("air_temperature_2m", 270 + base + lead / 10),
-            ("dew_point_temperature_2m", 268 + base + lead / 10),
-            ("wind_speed_10m", base / 10),
-            ("wind_from_direction_10m", 225.0),
-            ("wind_gust_10m", base / 10 + 5),
-        ):
-            variables.append(
-                (
-                    variable,
-                    nbm_grib.make_instantaneous_message(
-                        canonical_variable_id=variable, values=np.full(shape, value), **args
-                    ),
-                )
-            )
-        variables.extend(
-            (
-                (
-                    "liquid_equivalent_precipitation_amount_1h",
-                    nbm_grib.make_apcp_deterministic_message(
-                        values_kg_m2=np.full(shape, base / 100 + lead / 1000), **args
-                    ),
-                ),
-                (
-                    "probability_of_precipitation_1h",
-                    nbm_grib.make_pop01_message(
-                        values_percent=np.full(shape, min(99, 20 + lead)), **args
-                    ),
-                ),
-            )
+    A model that is not ``available`` gets a transport whose every
+    request 404s -- the real shape of an unpublished cycle. Production
+    discovery must then omit it entirely rather than splicing a partial
+    cycle, and that decision is made by production code, not by the test.
+    """
+    faults = fault_scripts or {}
+    if "HRRR" in available:
+        hrrr = build_hrrr_transport(
+            config.hrrr,
+            cycle=REFERENCE,
+            leads=HRRR_LEADS,
+            base_value=MODEL_VALUE["HRRR"],
+            fault_script=faults.get("HRRR"),
         )
     else:
-        shape = (gfs_grib.NY, gfs_grib.NX)
-        args = {"forecast_hour": lead, "cycle_date": date, "cycle_hour": REFERENCE.hour}
-        for variable, value in (
-            ("air_temperature_2m", 270 + base + lead / 10),
-            ("dew_point_temperature_2m", 268 + base + lead / 10),
-            ("eastward_wind_10m", base / 10),
-            ("northward_wind_10m", base / 20),
-            ("wind_gust_10m", base / 10 + 5),
-        ):
-            variables.append(
-                (
-                    variable,
-                    gfs_grib.make_instantaneous_message(
-                        canonical_variable_id=variable,
-                        values=np.full(shape, value),
-                        grid_relative_wind=False,
-                        **args,
-                    ),
-                )
-            )
-        bucket_start = 6 * ((lead - 1) // 6) if lead else 0
-        apcp = gfs_grib.make_apcp_message(
-            start_step=bucket_start,
-            end_step=lead,
-            values_kg_m2=np.full(shape, (lead - bucket_start) * (base / 100)),
-            cycle_date=date,
-            cycle_hour=REFERENCE.hour,
+        hrrr = UnavailableTransport()
+    if "NBM" in available:
+        nbm = build_nbm_transport(
+            config.nbm,
+            cycle=REFERENCE,
+            leads=NBM_LEADS,
+            base_value=MODEL_VALUE["NBM"],
+            fault_script=faults.get("NBM"),
         )
-        variables.append(("liquid_equivalent_precipitation_amount_1h", apcp))
-        if lead <= 5:
-            variables.append(("liquid_equivalent_precipitation_amount_1h", apcp))
-    return tuple(_selected(variable, payload, i) for i, (variable, payload) in enumerate(variables))
-
-
-def _fixture_acquisitions(model: str) -> tuple[Phase2LeadAcquisition, ...]:
-    leads = (0, *HORIZONS) if model == "GFS" else HORIZONS
-    return tuple(
-        Phase2LeadAcquisition(
-            model=model.lower(),
-            cycle_date=REFERENCE.date(),
-            cycle_hour=REFERENCE.hour,
-            forecast_hour=lead,
-            endpoint="fixture.offline",
-            resolved_grib_url=f"fixture://{model.lower()}/{REFERENCE:%Y%m%d%H}/f{lead:03d}",
-            resolved_index_url=f"fixture://{model.lower()}/{REFERENCE:%Y%m%d%H}/f{lead:03d}.idx",
-            index_payload=f"fixture index {model} {lead}".encode(),
-            index_attempts=(),
-            index_completed_at=REFERENCE,
-            selected_messages=_fixture_messages(model, lead),
-            grib_attempts=(),
-            grib_completed_at=REFERENCE,
-            full_object_etag="fixture",
-            full_object_last_modified=None,
-            full_object_content_length=sum(len(m.payload) for m in _fixture_messages(model, lead)),
+    else:
+        nbm = UnavailableTransport()
+    if "GFS" in available:
+        gfs = build_gfs_transport(
+            config.gfs,
+            cycle=REFERENCE,
+            leads=GFS_LEADS,
+            base_value=MODEL_VALUE["GFS"],
+            fault_script=faults.get("GFS"),
         )
-        for lead in leads
-    )
+    else:
+        gfs = UnavailableTransport()
+    return {"HRRR": hrrr, "NBM": nbm, "GFS": gfs}
 
 
 def _raw_metar_records() -> list[dict[str, object]]:
@@ -390,23 +244,34 @@ def _raw_metar_records() -> list[dict[str, object]]:
     return rows
 
 
-def _coordinator(service, provider, config):
-    aviation = FixtureAviationWeatherTransport()
-    response = FakeHttpResponse(
-        status_code=200,
-        headers={"Content-Type": "application/json"},
-        content=JSON.serialize(_raw_metar_records()),
+def _build(service, config, available, *, fault_scripts=None):
+    """Compose the production provider/science/coordinator, injecting
+    only scripted transports at the network boundary."""
+    transports = _transports(config, available, fault_scripts=fault_scripts)
+    # The clock sits at the information cutoff: every acquisition this
+    # run performs is therefore genuinely available by the cutoff, and a
+    # late one would be rejected by production's own cutoff check. The
+    # sleeper records backoffs without advancing that clock (see
+    # FrozenSleeper) so a source-availability scenario stays a
+    # source-availability scenario.
+    clock = FixedClock(CUTOFF)
+    sleeper = FrozenSleeper()
+    provider = Phase2ProductionProvider(
+        configuration=config,
+        hrrr_transport=transports["HRRR"],
+        nbm_transport=transports["NBM"],
+        gfs_transport=transports["GFS"],
+        clock=clock,
+        sleeper=sleeper,
     )
+    aviation = FixtureAviationWeatherTransport()
+    content = JSON.serialize(_raw_metar_records())
     aviation.metar_queue = [
         FakeHttpResponse(
-            status_code=response.status_code,
-            headers=response.headers,
-            content=response.content,
+            status_code=200, headers={"Content-Type": "application/json"}, content=content
         )
-        for _ in range(4)
+        for _ in range(16)
     ]
-    clock = FixedClock(REFERENCE)
-    sleeper = RecordingSleeper(clock)
     science = Phase2ProductionScience(
         configuration=config,
         provider=provider,
@@ -417,7 +282,7 @@ def _coordinator(service, provider, config):
     adapters = Phase2ProductionAdapters(
         artifact_service=service, providers=provider, science=science.operations()
     )
-    return Phase2Coordinator(
+    coordinator = Phase2Coordinator(
         artifact_service=service,
         discovery=adapters,
         acquisition=adapters,
@@ -430,6 +295,7 @@ def _coordinator(service, provider, config):
         matching=adapters,
         verification=adapters,
     )
+    return coordinator, provider, transports
 
 
 def _payload(store, manifest, serializer=JSON):
@@ -475,13 +341,12 @@ def test_complete_source_failure_matrix_uses_only_approved_rows(
     config, snapshot = _configuration(migrated_dsn)
     request = _request(snapshot)
     available = frozenset(MODELS) - failed
-    provider = FixtureProvider(service, config, available)
+    coordinator, _provider, _transports_by_model = _build(service, config, available)
     monkeypatch.setattr(
         socket,
         "create_connection",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("network forbidden")),
     )
-    coordinator = _coordinator(service, provider, config)
     if not available:
         with pytest.raises(ValueError, match="normalized guidance must not be empty"):
             coordinator.run(request)
@@ -549,8 +414,7 @@ def test_complete_cycle_proves_configuration_lineage_replay_and_concurrency(
     service, store = infrastructure
     config, snapshot = _configuration(migrated_dsn)
     request = _request(snapshot, run_id="run_00000000-0000-0000-0000-000000000014")
-    provider = FixtureProvider(service, config, frozenset(MODELS))
-    coordinator = _coordinator(service, provider, config)
+    coordinator, provider, transports = _build(service, config, frozenset(MODELS))
     first = coordinator.run(request)
 
     assert config.hrrr.allowed_cycle_hours == (0, 6, 12, 18)
@@ -566,6 +430,20 @@ def test_complete_cycle_proves_configuration_lineage_replay_and_concurrency(
             config.publication_enabled,
         )
     )
+
+    # Codex re-review finding 1: the real acquisition boundary ran. The
+    # provider issued genuine index GETs, HEAD requests, and ranged GETs
+    # carrying exact Range headers, and every retained payload is a
+    # complete GRIB2 message the range machinery validated.
+    for model in MODELS:
+        transport = transports[model]
+        assert transport.head_calls, f"{model} never issued a HEAD for the full-object length"
+        assert transport.range_headers, f"{model} never issued a ranged GET"
+        assert any(url.endswith(".idx") for url, _headers in transport.get_calls), (
+            f"{model} never retrieved a provider index"
+        )
+        assert all(header.startswith("bytes=") for header in transport.range_headers)
+
     assert len(first.selected_inputs.source_roots) > 3 * 36 * 2
     assert all(
         root.artifact.availability.available_at <= CUTOFF
@@ -634,23 +512,232 @@ def test_complete_cycle_proves_configuration_lineage_replay_and_concurrency(
     assert {item.atomic_forecast.activity.activity_id for item in concurrent} == {
         first.atomic_forecast.activity.activity_id
     }
-    assert provider.network_calls == 0
+    # Replay never touches the network again: no additional provider
+    # request was issued after the first run's acquisition.
+    calls_after = {model: len(transports[model].get_calls) for model in MODELS}
+    coordinator.replay(request, first.selected_inputs)
+    assert {model: len(transports[model].get_calls) for model in MODELS} == calls_after
+
     forbidden = ("mesoforge.rrfs", "mesoforge.ai", "mesoforge.bias", "mesoforge.publication")
     assert not any(
         name == prefix or name.startswith(prefix + ".")
         for name in sys.modules
         for prefix in forbidden
     )
+    _ = provider
 
 
 def test_partial_cycle_rejects_whole_model_without_splicing(infrastructure, migrated_dsn):
+    """A model whose mid-range lead is permanently missing (404 past its
+    completion deadline) must be dropped whole. Production decides this
+    from real 404 responses; the test never removes the model itself."""
     service, store = infrastructure
     config, snapshot = _configuration(migrated_dsn)
-    provider = FixtureProvider(service, config, frozenset(MODELS), partial_model="HRRR")
-    result = _coordinator(service, provider, config).run(_request(snapshot))
+    # HRRR lead 18 is never published on either endpoint, so every HRRR
+    # candidate cycle fails acquisition and HRRR is absent from the run.
+    faults = {
+        "HRRR": {
+            "wrfsfcf18.grib2": [FakeHttpResponse(status_code=404) for _ in range(64)],
+        }
+    }
+    coordinator, _provider, _transports = _build(
+        service, config, frozenset(MODELS), fault_scripts=faults
+    )
+    result = coordinator.run(_request(snapshot))
     assert all(root.model != "HRRR" for root in result.selected_inputs.source_roots)
     aligned = _payload(store, result.alignment.aligned_guidance)
     assert aligned["models"] == ["NBM", "GFS"]
     report = _payload(store, result.availability.report)
     assert report["run_state"] == "degraded"
     assert all("HRRR" not in entry["models"] for entry in report["entries"])
+
+
+def test_production_creates_complete_variable_lineage_for_every_model(infrastructure, migrated_dsn):
+    """Codex re-review finding 3: every model's canonical artifact must
+    reference a real, complete ``variable-lineage.v2`` manifest -- not a
+    raw message artifact, and not a GFS-QPF-only lineage record."""
+    service, store = infrastructure
+    config, snapshot = _configuration(migrated_dsn)
+    coordinator, _provider, _transports = _build(service, config, frozenset(MODELS))
+    result = coordinator.run(_request(snapshot))
+
+    engine = sa.create_engine(migrated_dsn)
+    try:
+        with engine.connect() as connection:
+            rows = connection.execute(
+                sa.text(
+                    "SELECT 'art_'||a.id::text, a.artifact_type, a.artifact_schema_version, "
+                    "s.storage_uri, a.content_digest FROM artifacts a "
+                    "JOIN stored_objects s ON s.content_digest = a.content_digest"
+                )
+            ).all()
+    finally:
+        engine.dispose()
+    by_id = {row[0]: row for row in rows}
+
+    seen_models: set[str] = set()
+    for artifact in result.normalized.artifacts:
+        dataset = _payload(store, artifact, NETCDF)
+        model = str(dataset.attrs["model"])
+        seen_models.add(model)
+        # The grid must name this model, never another's.
+        assert dataset.attrs["grid_id"] == f"phase2-{model}.v1"
+
+        lineage_id = str(dataset.attrs["variable_lineage_manifest_id"])
+        assert lineage_id in by_id, "lineage reference must resolve to a registered artifact"
+        _id, artifact_type, schema_version, storage_uri, content_digest = by_id[lineage_id]
+        assert artifact_type == "variable-lineage"
+        assert schema_version == "variable-lineage.v2"
+
+        manifest = VariableLineageManifestV2.model_validate_json(
+            store.get_verified(storage_uri, content_digest)
+        )
+        assert manifest.model == model
+        assert str(manifest.grid_id) == f"phase2-{model}.v1"
+        assert str(manifest.configuration_snapshot_id) == str(
+            dataset.attrs["configuration_snapshot_id"]
+        )
+        dataset_leads = {
+            int(value / np.timedelta64(1, "h")) for value in dataset["source_lead_time"].values
+        }
+        assert set(manifest.expected_source_lead_hours) == dataset_leads
+        # The lineage covers the model's source fields. NBM's canonical
+        # U/V are derived from its published speed/direction pair, so
+        # that pair -- not the derived components -- is what its lineage
+        # names. Validate through the production contract rather than
+        # restating the rule here.
+        validate_canonical_guidance_lineage_v2(
+            dataset,
+            lineage_manifest=manifest,
+            lineage_artifact_id=lineage_id,
+            lineage_artifact_type=artifact_type,
+            lineage_schema_version=schema_version,
+        )
+        # Every entry names real evidence, not a placeholder.
+        for entry in manifest.entries:
+            assert entry.selected_grib_artifact_ids
+            assert all(str(a) in by_id for a in entry.selected_grib_artifact_ids)
+            assert str(entry.index_artifact_id) in by_id
+            assert entry.inventory_rows and all(row for row in entry.inventory_rows)
+            assert entry.selector_expression
+            assert all(end > start for start, end in entry.byte_ranges)
+            assert entry.resolved_grib_url.startswith("http")
+    assert seen_models == {"hrrr", "nbm", "gfs"}
+
+
+def test_run_spec_and_station_snapshot_carry_complete_replay_inputs(infrastructure, migrated_dsn):
+    """Codex re-review finding 5: replay must be reconstructible from
+    persisted bytes, so the run spec and station snapshot must record
+    every input downstream science consumes."""
+    service, store = infrastructure
+    config, snapshot = _configuration(migrated_dsn)
+    request = _request(snapshot)
+    coordinator, _provider, _transports = _build(service, config, frozenset(MODELS))
+    result = coordinator.run(request)
+
+    run_spec = _payload(store, result.selected_inputs.run_spec)
+    assert run_spec["schema_version"] == "phase2-run-spec.v1"
+    assert run_spec["verification_cutoff"] == request.verification_cutoff.isoformat()
+    assert run_spec["information_cutoff"] == request.information_cutoff.isoformat()
+    assert run_spec["forecast_issue_time"] == request.forecast_issue_time.isoformat()
+    assert run_spec["target_horizons"] == list(HORIZONS)
+    assert run_spec["cycle_selection_policy"]["target_horizons"] == list(HORIZONS)
+    assert run_spec["request_digests"]["configuration_digest"] == str(request.configuration_digest)
+    assert run_spec["request_digests"]["lockfile_digest"] == str(request.lockfile_digest)
+    assert run_spec["configuration_digests"]["phase2_configuration"]
+    assert run_spec["configuration_digests"]["matching_policy"]
+
+    groups = {group["model"]: group for group in run_spec["required_groups"]}
+    assert set(groups) == set(MODELS)
+    for model in MODELS:
+        group = groups[model]
+        assert group["selected"] is True
+        assert group["source_cycle_reference_time"] == REFERENCE.isoformat()
+        assert group["source_lead_hours"]
+        assert group["endpoints"]
+        assert group["canonical_variable_ids"]
+        assert group["cycle_completion_deadline_minutes"] > 0
+
+    stations = _payload(store, result.selected_inputs.station_snapshot)
+    assert stations["schema_version"] == "station-catalog-snapshot.v1"
+    assert stations["station_ids"] == list(STATIONS)
+    by_id = {row["station_id"]: row for row in stations["stations"]}
+    assert set(by_id) == set(STATIONS)
+    for station in config.stations:
+        row = by_id[str(station.station_id)]
+        # Exact coordinates/elevation/provider identity, as consumed by
+        # bilinear alignment and METAR matching.
+        assert row["expected_latitude"] == station.expected_latitude
+        assert row["expected_longitude"] == station.expected_longitude
+        assert row["expected_elevation_m"] == station.expected_elevation_m
+        assert row["provider_icao_id"] == station.provider_icao_id
+        assert row["site_name"] == station.site_name
+        assert row["provider_site_types"] == list(station.provider_site_types)
+        assert row["provider_priority"] == station.provider_priority
+    assert stations["point_extraction_policy"]["policy_id"] == "bilinear-native-grid.v1"
+    assert stations["point_extraction_policy"]["allow_extrapolation"] is False
+
+
+def test_information_cutoff_rejects_a_late_cycle_and_falls_back_deterministically(
+    infrastructure, migrated_dsn
+):
+    """Codex re-review finding 4: no selected input may have an
+    ``available_at`` after the request's information cutoff.
+
+    The clock is pinned *before* the target cycle, so every acquisition
+    of that cycle completes after the cutoff. Production must reject the
+    whole run rather than retaining a late input.
+    """
+    service, _store = infrastructure
+    config, snapshot = _configuration(migrated_dsn)
+    # A cutoff one hour before the target reference time: the 12Z cycle
+    # itself is not yet entitled to be seen at all.
+    early_cutoff = REFERENCE - timedelta(hours=1)
+    request = _request(snapshot, cutoff=early_cutoff)
+    transports = _transports(config, frozenset(MODELS))
+    clock = FixedClock(REFERENCE)
+    sleeper = RecordingSleeper(clock)
+    provider = Phase2ProductionProvider(
+        configuration=config,
+        hrrr_transport=transports["HRRR"],
+        nbm_transport=transports["NBM"],
+        gfs_transport=transports["GFS"],
+        clock=clock,
+        sleeper=sleeper,
+    )
+    discovery = provider.discover(request)
+    retained = provider.acquisitions_for(request.run_id)
+    assert retained == {}, (
+        "no model may be selected when every candidate cycle is after the information cutoff"
+    )
+    assert discovery.selection_digest is not None
+
+
+def test_late_acquisition_is_rejected_even_when_the_cycle_predates_the_cutoff(
+    infrastructure, migrated_dsn
+):
+    """The cutoff applies to the acquisition timestamps, not merely to
+    the cycle reference time: a cycle that predates the cutoff but whose
+    bytes only appeared afterwards is still a leak of future
+    information."""
+    service, _store = infrastructure
+    config, snapshot = _configuration(migrated_dsn)
+    request = _request(snapshot)
+    transports = _transports(config, frozenset(MODELS))
+    # The clock (and therefore every acquisition's completed_at) sits an
+    # hour past the cutoff, while the candidate cycles themselves are
+    # comfortably before it.
+    clock = FixedClock(CUTOFF + timedelta(hours=1))
+    sleeper = RecordingSleeper(clock)
+    provider = Phase2ProductionProvider(
+        configuration=config,
+        hrrr_transport=transports["HRRR"],
+        nbm_transport=transports["NBM"],
+        gfs_transport=transports["GFS"],
+        clock=clock,
+        sleeper=sleeper,
+    )
+    provider.discover(request)
+    assert provider.acquisitions_for(request.run_id) == {}, (
+        "an acquisition completed after the information cutoff must never be retained"
+    )

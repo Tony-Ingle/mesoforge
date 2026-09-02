@@ -14,6 +14,16 @@ projection/grid keys, cycle/valid time, and array shape let a message
 carrying the wrong physical field or the wrong grid pass silently.
 Every one of those keys is now asserted here, matching the strictness
 HRRR's ``guidance.decoding`` already applies.
+
+Codex re-review (finding 2): the grid clause previously accepted *any*
+nonempty ``gridType`` and *any* positive ``Nx``/``Ny``, so a message on
+an entirely different projection, shape, or domain still passed. The
+decoder now asserts the exact approved operational grid contract
+declared by ``NbmSourceSettings.grid_profile``
+(``catalog.grid_profiles``): projection/grid type, exact shape, exact
+increments, every projection parameter, the earth figure, the scan
+flags, and first/last-point geographic coverage derived from the
+message's own declared geometry.
 """
 
 from __future__ import annotations
@@ -27,8 +37,21 @@ from typing import Any
 
 import xarray as xr
 
+from mesoforge.catalog.grid_profiles import NbmGridProfile
 from mesoforge.catalog.sources import NbmSourceSettings, Phase2FieldContract
 from mesoforge.common.errors import MesoForgeError
+from mesoforge.guidance.nbm_geometry import (
+    EARTH_RADIUS_TOLERANCE_M as _EARTH_RADIUS_TOLERANCE_M,
+)
+from mesoforge.guidance.nbm_geometry import (
+    GRID_ANGLE_TOLERANCE_DEGREES as _GRID_ANGLE_TOLERANCE_DEGREES,
+)
+from mesoforge.guidance.nbm_geometry import (
+    compute_last_grid_point,
+)
+from mesoforge.guidance.nbm_geometry import (
+    wrap_longitude_0_360 as _wrap_longitude_0_360,
+)
 
 _BACKEND_KWARGS_TEMPLATE: dict[str, Any] = {"indexpath": "", "errors": "raise"}
 
@@ -57,8 +80,6 @@ _GRIB_UNITS_BY_EXPECTED_UNIT: dict[str, frozenset[str]] = {
 # from ``NbmSourceSettings.probability_threshold_kg_m2``.
 _POP_PROBABILITY_TYPE = 3
 _POP_SCALE_FACTOR = 3
-
-_GRID_FLOAT_TOLERANCE = 1e-6
 
 
 class NbmDecodeError(MesoForgeError):
@@ -168,6 +189,139 @@ def _require_finite(attrs: dict[str, Any], key: str, errors: list[str]) -> float
         errors.append(f"required grid key {key!r} is not finite, got {value!r}")
         return None
     return numeric
+
+
+def _assert_grid_profile(
+    data_array: xr.DataArray, profile: NbmGridProfile, errors: list[str]
+) -> None:
+    """Assert one decoded NBM message against the exact approved
+    operational grid/projection contract (Codex re-review finding 2).
+
+    Every clause below independently fails closed: projection/grid type,
+    exact shape, exact increments, every projection parameter, the earth
+    figure, the scan flags, and the first/last-point geographic
+    coverage. Coverage is checked by projecting the declared first point
+    into the profile's own CRS, walking the declared shape/increments,
+    and inverse-projecting the far corner -- so a message that mutates
+    any projection parameter, increment, or dimension contradicts the
+    pinned corner even when each key looks individually plausible.
+    """
+    attrs = data_array.attrs
+
+    grid_type = attrs.get("GRIB_gridType")
+    if grid_type != profile.grid_type:
+        errors.append(
+            f"grid type mismatch: expected exactly {profile.grid_type!r} for approved profile "
+            f"{profile.profile_id!r}, got {grid_type!r}"
+        )
+        # Every remaining clause reads projected-grid keys a geographic
+        # mesh does not carry; reporting them all would bury the cause.
+        return
+
+    nx = attrs.get("GRIB_Nx")
+    ny = attrs.get("GRIB_Ny")
+    if nx != profile.nx or ny != profile.ny:
+        errors.append(
+            f"grid shape mismatch: expected exactly Nx={profile.nx!r}, Ny={profile.ny!r} for "
+            f"approved profile {profile.profile_id!r}, got Nx={nx!r}, Ny={ny!r}"
+        )
+    if data_array.shape[-2:] != profile.shape:
+        errors.append(
+            f"decoded array shape {data_array.shape[-2:]!r} does not match the approved grid "
+            f"shape {profile.shape!r} (Ny, Nx)"
+        )
+
+    for key, expected, tolerance in (
+        ("GRIB_DxInMetres", profile.dx_metres, profile.increment_tolerance_metres),
+        ("GRIB_DyInMetres", profile.dy_metres, profile.increment_tolerance_metres),
+    ):
+        actual = _require_finite(attrs, key, errors)
+        if actual is not None and abs(actual - expected) > tolerance:
+            errors.append(
+                f"grid increment mismatch: expected {key}={expected!r} m within "
+                f"{tolerance!r} m, got {actual!r}"
+            )
+
+    for key, expected in (
+        ("GRIB_LoVInDegrees", profile.lov_degrees),
+        ("GRIB_LaDInDegrees", profile.lad_degrees),
+        ("GRIB_Latin1InDegrees", profile.latin1_degrees),
+        ("GRIB_Latin2InDegrees", profile.latin2_degrees),
+    ):
+        actual = _require_finite(attrs, key, errors)
+        if actual is not None and abs(actual - expected) > _GRID_ANGLE_TOLERANCE_DEGREES:
+            errors.append(
+                f"projection parameter mismatch: expected {key}={expected!r} within "
+                f"{_GRID_ANGLE_TOLERANCE_DEGREES!r} degrees, got {actual!r}"
+            )
+
+    radius = _require_finite(attrs, "GRIB_radius", errors)
+    if radius is not None and abs(radius - profile.earth_radius_metres) > _EARTH_RADIUS_TOLERANCE_M:
+        errors.append(
+            f"earth figure mismatch: expected a spherical earth of radius "
+            f"{profile.earth_radius_metres!r} m within {_EARTH_RADIUS_TOLERANCE_M!r} m, "
+            f"got {radius!r}"
+        )
+
+    for key, expected in (
+        ("GRIB_iScansNegatively", profile.i_scans_negatively),
+        ("GRIB_jScansPositively", profile.j_scans_positively),
+        ("GRIB_jPointsAreConsecutive", profile.j_points_are_consecutive),
+    ):
+        actual_flag = attrs.get(key)
+        if actual_flag != expected:
+            errors.append(
+                f"scan flag mismatch: expected {key}={expected!r} for approved profile "
+                f"{profile.profile_id!r}, got {actual_flag!r}"
+            )
+
+    first_lat = _require_finite(attrs, "GRIB_latitudeOfFirstGridPointInDegrees", errors)
+    first_lon = _require_finite(attrs, "GRIB_longitudeOfFirstGridPointInDegrees", errors)
+    if first_lat is None or first_lon is None:
+        return
+    if abs(first_lat - profile.first_latitude_degrees) > profile.coordinate_tolerance_degrees or (
+        abs(_wrap_longitude_0_360(first_lon) - profile.first_longitude_degrees)
+        > profile.coordinate_tolerance_degrees
+    ):
+        errors.append(
+            "first grid point mismatch: expected "
+            f"({profile.first_latitude_degrees!r}, {profile.first_longitude_degrees!r}) within "
+            f"{profile.coordinate_tolerance_degrees!r} degrees, got ({first_lat!r}, "
+            f"{_wrap_longitude_0_360(first_lon)!r})"
+        )
+        return
+
+    # Last-point coverage, derived from the message's own declared
+    # shape/increments/projection rather than from the profile, so a
+    # wrong shape or increment produces a wrong corner here even if the
+    # individual keys were not separately compared.
+    declared_nx = nx if isinstance(nx, int) and nx > 0 else profile.nx
+    declared_ny = ny if isinstance(ny, int) and ny > 0 else profile.ny
+    declared_dx = attrs.get("GRIB_DxInMetres", profile.dx_metres)
+    declared_dy = attrs.get("GRIB_DyInMetres", profile.dy_metres)
+    try:
+        last_lat, last_lon = compute_last_grid_point(
+            profile,
+            nx=int(declared_nx),
+            ny=int(declared_ny),
+            dx_metres=float(declared_dx),
+            dy_metres=float(declared_dy),
+            first_latitude_degrees=first_lat,
+            first_longitude_degrees=first_lon,
+        )
+    except (TypeError, ValueError) as exc:
+        errors.append(f"could not derive last grid point coverage: {exc}")
+        return
+    if abs(last_lat - profile.last_latitude_degrees) > profile.coordinate_tolerance_degrees or (
+        abs(last_lon - profile.last_longitude_degrees) > profile.coordinate_tolerance_degrees
+    ):
+        errors.append(
+            "grid coverage mismatch: the declared projection/shape/increments place the last "
+            f"grid point at ({last_lat!r}, {last_lon!r}), but approved profile "
+            f"{profile.profile_id!r} requires ({profile.last_latitude_degrees!r}, "
+            f"{profile.last_longitude_degrees!r}) within "
+            f"{profile.coordinate_tolerance_degrees!r} degrees"
+        )
 
 
 def _assert_matches(
@@ -289,26 +443,8 @@ def _assert_matches(
                 f"scaleFactorOfUpperLimit={raw_scale_factor!r}"
             )
 
-    # -- required projection/grid keys and shape (finding 2) ----------
-    grid_type = attrs.get("GRIB_gridType")
-    if not isinstance(grid_type, str) or not grid_type:
-        errors.append(f"gridType is missing or empty, got {grid_type!r}")
-    nx = attrs.get("GRIB_Nx", attrs.get("GRIB_Ni"))
-    ny = attrs.get("GRIB_Ny", attrs.get("GRIB_Nj"))
-    if not isinstance(nx, int) or nx <= 0:
-        errors.append(f"required grid key Nx/Ni must be a positive integer, got {nx!r}")
-    if not isinstance(ny, int) or ny <= 0:
-        errors.append(f"required grid key Ny/Nj must be a positive integer, got {ny!r}")
-    first_lat = _require_finite(attrs, "GRIB_latitudeOfFirstGridPointInDegrees", errors)
-    first_lon = _require_finite(attrs, "GRIB_longitudeOfFirstGridPointInDegrees", errors)
-    del first_lat, first_lon
-    if isinstance(nx, int) and isinstance(ny, int) and nx > 0 and ny > 0:
-        expected_shape = (ny, nx)
-        if data_array.shape[-2:] != expected_shape:
-            errors.append(
-                f"decoded array shape {data_array.shape!r} does not match declared grid "
-                f"dimensions {expected_shape!r} (Ny, Nx)"
-            )
+    # -- exact approved projected grid contract (finding 2) -----------
+    _assert_grid_profile(data_array, settings.grid_profile, errors)
 
     # -- exact cycle/valid time (finding 2) ----------------------------
     expected_data_date = int(cycle_date.strftime("%Y%m%d"))

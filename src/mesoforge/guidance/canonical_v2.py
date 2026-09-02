@@ -218,6 +218,165 @@ _GRID_ID_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 _INTERVAL_WIDTH_NS = np.timedelta64(1, "h").astype("timedelta64[ns]")
 _INTERVAL_WIDTH_TOLERANCE_NS = np.timedelta64(0, "ns")
 
+# Codex re-review finding 3: a canonical artifact must carry the grid
+# profile its own model actually publishes. Identifier *syntax* alone
+# let an HRRR dataset claim the NBM grid (or an unrelated grid) and
+# still validate, which would silently blend fields sampled on
+# different geometries. A conforming grid identifier names its model as
+# one of its own dot/dash components (``phase2-hrrr.v1``,
+# ``hrrr-conus.v1``) and never names a different model.
+_GRID_ID_COMPONENT_RE = re.compile(r"[.\-_]")
+
+
+def _grid_id_models(grid_id: str) -> frozenset[str]:
+    """Every model token that appears as a component of ``grid_id``."""
+    components = set(_GRID_ID_COMPONENT_RE.split(grid_id))
+    return frozenset(components & _EXPECTED_MODELS)
+
+
+# NBM publishes wind speed and direction; the canonical earth-relative
+# U/V components are derived from that pair cornerwise on the native
+# grid before any interpolation. A lineage manifest therefore covers the
+# source pair while the canonical dataset carries the derived
+# components -- a legitimate, declared derivation, not a gap.
+_DERIVED_WIND_COMPONENTS = frozenset({"eastward_wind_10m", "northward_wind_10m"})
+_DERIVED_WIND_SOURCE_FIELDS = frozenset({"wind_speed_10m", "wind_from_direction_10m"})
+
+
+class CanonicalGuidanceLineageV2Error(CanonicalGuidanceV2Error):
+    """Raised when a ``canonical-guidance.v2`` dataset's declared
+    ``variable_lineage_manifest_id`` does not resolve to a real,
+    complete, model- and grid-consistent ``variable-lineage.v2``
+    manifest (Codex re-review finding 3)."""
+
+
+def validate_canonical_guidance_lineage_v2(
+    dataset: xr.Dataset,
+    *,
+    lineage_manifest: object,
+    lineage_artifact_id: str,
+    lineage_artifact_type: str,
+    lineage_schema_version: str,
+) -> None:
+    """Assert that ``dataset`` references a real ``variable-lineage.v2``
+    manifest whose *content* matches it (Codex re-review finding 3).
+
+    ``validate_canonical_guidance_v2`` can only check the shape of the
+    declared identifier, because it receives no artifact repository.
+    This function is the content half of the same contract and is called
+    by production normalization, where the manifest and its registered
+    artifact identity are both in hand. It rejects:
+
+    - a lineage reference pointing at a different artifact than the one
+      that was actually created;
+    - an artifact that is not of type/schema ``variable-lineage.v2``
+      (e.g. a raw GRIB message or a GFS-QPF-only lineage record);
+    - a manifest whose model, grid, cycle, or configuration snapshot
+      disagrees with the dataset it claims to describe;
+    - a manifest that does not cover exactly the dataset's own variables
+      and source leads.
+    """
+    from mesoforge.contracts.lineage_v2 import VariableLineageManifestV2
+
+    errors: list[str] = []
+    declared = dataset.attrs.get("variable_lineage_manifest_id")
+    if declared != lineage_artifact_id:
+        errors.append(
+            f"variable_lineage_manifest_id {declared!r} does not reference the created "
+            f"variable-lineage.v2 artifact {lineage_artifact_id!r}"
+        )
+    if lineage_artifact_type != "variable-lineage":
+        errors.append(
+            f"variable_lineage_manifest_id must reference a 'variable-lineage' artifact, got "
+            f"artifact_type {lineage_artifact_type!r}"
+        )
+    if lineage_schema_version != "variable-lineage.v2":
+        errors.append(
+            "variable_lineage_manifest_id must reference a 'variable-lineage.v2' artifact, got "
+            f"schema version {lineage_schema_version!r}"
+        )
+    if not isinstance(lineage_manifest, VariableLineageManifestV2):
+        errors.append(
+            f"lineage manifest must be a VariableLineageManifestV2, got {type(lineage_manifest)!r}"
+        )
+        raise CanonicalGuidanceLineageV2Error(
+            f"canonical-guidance.v2 lineage validation failed with {len(errors)} problem(s): "
+            + "; ".join(errors)
+        )
+
+    model = str(dataset.attrs.get("model"))
+    if lineage_manifest.model != model:
+        errors.append(
+            f"lineage manifest describes model {lineage_manifest.model!r}, but the dataset "
+            f"declares {model!r}"
+        )
+    grid_id = str(dataset.attrs.get("grid_id"))
+    if str(lineage_manifest.grid_id) != grid_id:
+        errors.append(
+            f"lineage manifest describes grid {lineage_manifest.grid_id!r}, but the dataset "
+            f"declares {grid_id!r}"
+        )
+    configuration_snapshot_id = str(dataset.attrs.get("configuration_snapshot_id"))
+    if str(lineage_manifest.configuration_snapshot_id) != configuration_snapshot_id:
+        errors.append(
+            "lineage manifest configuration_snapshot_id "
+            f"{lineage_manifest.configuration_snapshot_id!r} does not match the dataset's "
+            f"{configuration_snapshot_id!r}"
+        )
+
+    reference_time = np.datetime_as_string(
+        dataset["forecast_reference_time"].values.astype("datetime64[ns]"), unit="s"
+    )
+    if not str(lineage_manifest.forecast_reference_time).startswith(str(reference_time)):
+        errors.append(
+            f"lineage manifest forecast_reference_time "
+            f"{lineage_manifest.forecast_reference_time!r} does not match the dataset's "
+            f"{reference_time!r}"
+        )
+
+    dataset_leads = {
+        int(value / np.timedelta64(1, "h")) for value in dataset["source_lead_time"].values
+    }
+    manifest_leads = set(lineage_manifest.expected_source_lead_hours)
+    if manifest_leads != dataset_leads:
+        errors.append(
+            f"lineage manifest covers source leads {sorted(manifest_leads)!r}, but the dataset "
+            f"carries {sorted(dataset_leads)!r}"
+        )
+
+    dataset_variables = {
+        str(name)
+        for name in dataset.data_vars
+        if not str(name).endswith("_quality_mask") and not str(name).endswith("_interval_bounds")
+    }
+    manifest_variables = {str(v) for v in lineage_manifest.expected_canonical_variable_ids}
+    # The manifest covers the model's *source* fields, which are not
+    # always the canonical output fields: NBM publishes wind speed and
+    # direction, from which the canonical earth-relative U/V components
+    # are derived before interpolation. Every canonical variable must
+    # therefore either be covered directly or be a wind component whose
+    # source pair is covered.
+    uncovered = dataset_variables - manifest_variables
+    if uncovered and not (
+        uncovered <= _DERIVED_WIND_COMPONENTS and _DERIVED_WIND_SOURCE_FIELDS <= manifest_variables
+    ):
+        errors.append(
+            f"lineage manifest covers variables {sorted(manifest_variables)!r}, which does not "
+            f"account for dataset variable(s) {sorted(uncovered)!r}"
+        )
+    unused = manifest_variables - dataset_variables
+    if unused and not unused <= _DERIVED_WIND_SOURCE_FIELDS:
+        errors.append(
+            f"lineage manifest covers variable(s) {sorted(unused)!r} that the dataset does not "
+            "carry and that are not a declared derivation source"
+        )
+
+    if errors:
+        raise CanonicalGuidanceLineageV2Error(
+            f"canonical-guidance.v2 lineage validation failed with {len(errors)} problem(s): "
+            + "; ".join(errors)
+        )
+
 
 def validate_canonical_guidance_v2(dataset: xr.Dataset) -> None:
     """Section 5.1: distinct validator from ``validate_canonical_dataset``
@@ -258,6 +417,19 @@ def validate_canonical_guidance_v2(dataset: xr.Dataset) -> None:
         errors.append(
             f"grid_id must be a non-empty lowercase kebab/dot identifier, got {grid_id!r}"
         )
+    else:
+        # Codex re-review finding 3: the grid must be the one this
+        # model actually publishes, not merely a syntactically valid
+        # identifier. A model-incompatible grid means the dataset's
+        # values were sampled on a different geometry than the blend
+        # assumes.
+        named_models = _grid_id_models(grid_id)
+        if named_models != {model}:
+            errors.append(
+                f"model {model!r} requires a grid_id naming its own model profile (e.g. "
+                f"'phase2-{model}.v1'), got {grid_id!r} naming {sorted(named_models)!r}; a "
+                "model-incompatible grid profile is never blendable"
+            )
     configuration_snapshot_id = dataset.attrs.get("configuration_snapshot_id")
     if not isinstance(configuration_snapshot_id, str) or not _CONFIGURATION_SNAPSHOT_ID_RE.match(
         configuration_snapshot_id

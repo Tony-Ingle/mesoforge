@@ -196,6 +196,25 @@ phase2:
         expected_unit_id: percent
         is_accumulation: true
         is_probability: true
+    grid_profile:
+      profile_id: nbm-core-conus-operational.v1
+      grid_type: lambert
+      nx: 2345
+      ny: 1597
+      dx_metres: 2539.703
+      dy_metres: 2539.703
+      lov_degrees: 265.0
+      lad_degrees: 25.0
+      latin1_degrees: 25.0
+      latin2_degrees: 25.0
+      earth_radius_metres: 6371200.0
+      first_latitude_degrees: 19.229
+      first_longitude_degrees: 233.7234
+      last_latitude_degrees: 54.372790606545614
+      last_longitude_degrees: 300.9578099399543
+      i_scans_negatively: 0
+      j_scans_positively: 1
+      j_points_are_consecutive: 0
     read_keys:
       - discipline
       - parameterCategory
@@ -220,6 +239,11 @@ phase2:
       - Latin1InDegrees
       - Latin2InDegrees
       - LaDInDegrees
+      - iScansNegatively
+      - jScansPositively
+      - jPointsAreConsecutive
+      - shapeOfTheEarth
+      - radius
       - units
       - step
       - dataDate

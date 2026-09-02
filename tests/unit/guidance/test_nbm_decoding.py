@@ -9,6 +9,7 @@ from datetime import date
 import numpy as np
 import pytest
 
+from mesoforge.catalog.sources import NbmSourceSettings
 from mesoforge.guidance.sources.nbm_decoding import NbmDecodeError, decode_selected_message
 from tests.fixtures.nbm_grib import (
     NX,
@@ -17,43 +18,14 @@ from tests.fixtures.nbm_grib import (
     make_confounding_temperature_stddev_message,
     make_instantaneous_message,
     make_pop01_message,
+    mutate_grid_keys,
 )
 from tests.support.phase2_source_settings import make_nbm_settings
 
 _CYCLE_DATE = date(2026, 8, 30)
 _CYCLE_HOUR = 12
 
-_SETTINGS = make_nbm_settings(
-    read_keys=(
-        "discipline",
-        "parameterCategory",
-        "parameterNumber",
-        "typeOfLevel",
-        "level",
-        "stepType",
-        "startStep",
-        "endStep",
-        "probabilityType",
-        "derivedForecast",
-        "typeOfStatisticalProcessing",
-        "percentileValue",
-        "step",
-        "dataDate",
-        "dataTime",
-        "units",
-        "gridType",
-        "Nx",
-        "Ny",
-        "Ni",
-        "Nj",
-        "latitudeOfFirstGridPointInDegrees",
-        "longitudeOfFirstGridPointInDegrees",
-        "validityDate",
-        "validityTime",
-        "scaledValueOfUpperLimit",
-        "scaleFactorOfUpperLimit",
-    )
-)
+_SETTINGS = make_nbm_settings()
 
 
 def _contract(variable_id: str):
@@ -239,3 +211,172 @@ class TestDecodePop01:
                 cycle_date=_CYCLE_DATE,
                 cycle_hour=_CYCLE_HOUR,
             )
+
+
+class TestApprovedGridContract:
+    """Codex re-review finding 2: the approved operational NBM grid
+    contract must be enforced exactly. Each probe below mutates exactly
+    one independent clause -- projection, shape, increment, scan order,
+    or geographic coverage -- and each must be rejected on its own, not
+    merely as a side effect of another check.
+    """
+
+    def test_accepts_the_exact_approved_grid(self) -> None:
+        payload = make_instantaneous_message(
+            canonical_variable_id="air_temperature_2m",
+            forecast_hour=6,
+            values=np.full((NY, NX), 280.0),
+        )
+        result = _decode(payload, contract=_contract("air_temperature_2m"), forecast_hour=6)
+        profile = _SETTINGS.grid_profile
+        assert result.attrs["GRIB_gridType"] == "lambert"
+        assert result.shape == profile.shape
+        assert result.attrs["GRIB_DxInMetres"] == pytest.approx(profile.dx_metres)
+        assert result.attrs["GRIB_LoVInDegrees"] == pytest.approx(profile.lov_degrees)
+        assert result.attrs["GRIB_jScansPositively"] == profile.j_scans_positively
+
+    def test_rejects_wrong_projection(self) -> None:
+        """A geographic (regular_ll) mesh is not the NBM contract at all;
+        the previous validator accepted any nonempty gridType."""
+        payload = make_instantaneous_message(
+            canonical_variable_id="air_temperature_2m",
+            forecast_hour=6,
+            values=np.full((NY, NX), 280.0),
+            grid_keys=mutate_grid_keys(gridType="regular_ll"),
+        )
+        with pytest.raises(NbmDecodeError, match="grid type mismatch"):
+            _decode(payload, contract=_contract("air_temperature_2m"), forecast_hour=6)
+
+    def test_rejects_wrong_shape(self) -> None:
+        """A grid one column narrower than the approved profile."""
+        payload = make_instantaneous_message(
+            canonical_variable_id="air_temperature_2m",
+            forecast_hour=6,
+            values=np.full((NY, NX - 1), 280.0),
+            grid_keys=mutate_grid_keys(Nx=NX - 1),
+        )
+        with pytest.raises(NbmDecodeError, match="grid shape mismatch"):
+            _decode(payload, contract=_contract("air_temperature_2m"), forecast_hour=6)
+
+    def test_rejects_wrong_increment(self) -> None:
+        """Correct projection, shape, and origin, but the wrong grid
+        spacing -- a different physical domain entirely."""
+        payload = make_instantaneous_message(
+            canonical_variable_id="air_temperature_2m",
+            forecast_hour=6,
+            values=np.full((NY, NX), 280.0),
+            grid_keys=mutate_grid_keys(DxInMetres=13000.0, DyInMetres=13000.0),
+        )
+        with pytest.raises(NbmDecodeError, match="grid increment mismatch"):
+            _decode(payload, contract=_contract("air_temperature_2m"), forecast_hour=6)
+
+    def test_rejects_wrong_scan_order(self) -> None:
+        """Reversed j scan order means row 0 is the north edge, not the
+        south edge; every value would be vertically mirrored."""
+        payload = make_instantaneous_message(
+            canonical_variable_id="air_temperature_2m",
+            forecast_hour=6,
+            values=np.full((NY, NX), 280.0),
+            grid_keys=mutate_grid_keys(jScansPositively=0),
+        )
+        with pytest.raises(NbmDecodeError, match="scan flag mismatch"):
+            _decode(payload, contract=_contract("air_temperature_2m"), forecast_hour=6)
+
+    def test_rejects_wrong_first_point_coverage(self) -> None:
+        """A shifted origin covers a different domain."""
+        payload = make_instantaneous_message(
+            canonical_variable_id="air_temperature_2m",
+            forecast_hour=6,
+            values=np.full((NY, NX), 280.0),
+            grid_keys=mutate_grid_keys(
+                latitudeOfFirstGridPointInDegrees=40.0,
+                longitudeOfFirstGridPointInDegrees=260.0,
+            ),
+        )
+        with pytest.raises(NbmDecodeError, match="first grid point mismatch"):
+            _decode(payload, contract=_contract("air_temperature_2m"), forecast_hour=6)
+
+    def test_rejects_wrong_projection_parameters(self) -> None:
+        """The standard parallels/central meridian define where every
+        projected index actually lands on the earth."""
+        payload = make_instantaneous_message(
+            canonical_variable_id="air_temperature_2m",
+            forecast_hour=6,
+            values=np.full((NY, NX), 280.0),
+            grid_keys=mutate_grid_keys(
+                Latin1InDegrees=38.5, Latin2InDegrees=38.5, LaDInDegrees=38.5
+            ),
+        )
+        with pytest.raises(NbmDecodeError, match="projection parameter mismatch"):
+            _decode(payload, contract=_contract("air_temperature_2m"), forecast_hour=6)
+
+    def test_rejects_wrong_last_point_coverage_from_declared_geometry(self) -> None:
+        """The coverage clause is an independent cross-check, not a
+        restatement of the per-key comparisons: a message whose every
+        individual grid key matches must still be rejected when the
+        geometry those keys imply does not reach the profile's pinned
+        far corner.
+
+        ``model_construct`` deliberately bypasses the approved-profile
+        registry gate so this proves the *decoder's* coverage clause
+        fires on its own. The registry gate refusing the same mutated
+        profile at configuration time is proved separately by
+        ``test_configuration_rejects_an_unapproved_grid_profile``.
+        """
+        payload = make_instantaneous_message(
+            canonical_variable_id="air_temperature_2m",
+            forecast_hour=6,
+            values=np.full((NY, NX), 280.0),
+        )
+        shifted_profile = _SETTINGS.grid_profile.model_copy(
+            update={"last_latitude_degrees": _SETTINGS.grid_profile.last_latitude_degrees + 5.0}
+        )
+        settings = NbmSourceSettings.model_construct(
+            **{**_SETTINGS.model_dump(), "grid_profile": shifted_profile}
+        )
+        with pytest.raises(NbmDecodeError, match="grid coverage mismatch"):
+            decode_selected_message(
+                payload,
+                contract=_contract("air_temperature_2m"),
+                settings=settings,
+                forecast_hour=6,
+                cycle_date=_CYCLE_DATE,
+                cycle_hour=_CYCLE_HOUR,
+            )
+
+    def test_configuration_rejects_an_unapproved_grid_profile(self) -> None:
+        """A settings object may not introduce an unreviewed grid at
+        all: the approved-profile registry is the configuration-time
+        half of the same fail-closed contract."""
+        mutated = _SETTINGS.grid_profile.model_copy(update={"nx": NX + 1})
+        with pytest.raises(ValueError, match="does not match the approved profile"):
+            make_nbm_settings(grid_profile=mutated)
+
+    def test_configuration_rejects_read_keys_missing_a_grid_key(self) -> None:
+        """An unrequested key decodes as absent; the settings model must
+        refuse a read-key set that would make the assertion fail open."""
+        thinned = tuple(key for key in _SETTINGS.read_keys if key != "LoVInDegrees")
+        with pytest.raises(ValueError, match="must request every key"):
+            make_nbm_settings(read_keys=thinned)
+
+    def test_every_asserted_grid_key_is_requested_from_eccodes(self) -> None:
+        """An unrequested read key decodes as absent, which would make
+        the grid assertion silently fail open again."""
+        required = (
+            "gridType",
+            "Nx",
+            "Ny",
+            "DxInMetres",
+            "DyInMetres",
+            "LoVInDegrees",
+            "LaDInDegrees",
+            "Latin1InDegrees",
+            "Latin2InDegrees",
+            "latitudeOfFirstGridPointInDegrees",
+            "longitudeOfFirstGridPointInDegrees",
+            "iScansNegatively",
+            "jScansPositively",
+            "jPointsAreConsecutive",
+            "radius",
+        )
+        assert set(required) <= set(_SETTINGS.read_keys)

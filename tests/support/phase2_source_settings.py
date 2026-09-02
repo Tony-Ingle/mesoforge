@@ -5,12 +5,56 @@ retry policy / field contract boilerplate for HRRR/NBM/GFS.
 
 from __future__ import annotations
 
+from mesoforge.catalog.grid_profiles import NBM_CONUS_FIXTURE_GRID_PROFILE
 from mesoforge.catalog.sources import (
     GfsSourceSettings,
     HrrrPhase2SourceSettings,
     NbmSourceSettings,
     Phase2FieldContract,
     RetryPolicy,
+)
+
+# The full decode-time key set the NBM contract asserts: field identity,
+# temporal identity, probability identity, and the entire approved grid
+# contract (Codex re-review finding 2 -- an unrequested key decodes as
+# absent, which would make the assertion fail open).
+NBM_GRID_READ_KEYS: tuple[str, ...] = (
+    "discipline",
+    "parameterCategory",
+    "parameterNumber",
+    "typeOfLevel",
+    "level",
+    "stepType",
+    "startStep",
+    "endStep",
+    "probabilityType",
+    "derivedForecast",
+    "typeOfStatisticalProcessing",
+    "percentileValue",
+    "scaledValueOfUpperLimit",
+    "scaleFactorOfUpperLimit",
+    "step",
+    "dataDate",
+    "dataTime",
+    "validityDate",
+    "validityTime",
+    "units",
+    "gridType",
+    "Nx",
+    "Ny",
+    "DxInMetres",
+    "DyInMetres",
+    "LoVInDegrees",
+    "LaDInDegrees",
+    "Latin1InDegrees",
+    "Latin2InDegrees",
+    "latitudeOfFirstGridPointInDegrees",
+    "longitudeOfFirstGridPointInDegrees",
+    "iScansNegatively",
+    "jScansPositively",
+    "jPointsAreConsecutive",
+    "shapeOfTheEarth",
+    "radius",
 )
 
 RETRY_POLICY = RetryPolicy(
@@ -209,7 +253,11 @@ def make_nbm_settings(**overrides: object) -> NbmSourceSettings:
         "field_contracts": tuple(
             _field_contract(v, specs=_NBM_FIELD_SPECS) for v in _NBM_FIELD_IDS
         ),
-        "read_keys": ("discipline",),
+        # Unit/contract tests decode the reduced synthetic Lambert fixture
+        # grid, which is itself an approved registered profile sharing the
+        # operational projection parameters exactly.
+        "grid_profile": NBM_CONUS_FIXTURE_GRID_PROFILE,
+        "read_keys": NBM_GRID_READ_KEYS,
         "retry_policy": RETRY_POLICY,
         "max_age_hours": 3.0,
         "cycle_completion_deadline_minutes": 90.0,

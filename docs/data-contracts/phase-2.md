@@ -43,11 +43,46 @@ rules, and deadlines are pinned in configuration. Live canaries check only curre
 provider contract shape and are not forecast acceptance or provider-availability
 guarantees.
 
+Candidate selection is bounded by the request's `information_cutoff`, not merely by
+cycle age. `_try_candidates` takes the cutoff as an explicit input and rejects any
+candidate whose reference time is after it, and any candidate whose index or ranged
+message bytes completed after it. A late candidate is discarded whole and the walk
+continues to the next older candidate, so a run either uses inputs it was entitled
+to see or omits that model entirely; a late acquisition is never retained.
+
+NBM's native grid is an exactly pinned part of the contract, not incidental metadata.
+`NbmSourceSettings.grid_profile` declares an approved `nbm-grid-profile.v1` from the
+`mesoforge.catalog.grid_profiles` registry, and a configuration carrying an
+unregistered or mutated profile fails to load. The operational profile is the Lambert
+conformal conic CONUS core grid: 2345 x 1597 at 2.539703 km, LoV 265, LaD/Latin1/Latin2
+25, spherical earth radius 6371200 m, `iScansNegatively=0`/`jScansPositively=1`/
+`jPointsAreConsecutive=0`, first point (19.229 N, 233.7234 E). Decoding asserts every
+one of those clauses against each decoded message, plus first/last-point coverage
+derived from the message's own declared geometry, so a wrong projection, shape,
+increment, scan order, or domain fails closed. Normalization then builds the real
+projected CRS and inverse-projects the true lat/lon mesh rather than treating grid
+indices as a geographic mesh. A reduced but equally approved
+`nbm-core-conus-fixture.v1` profile — same projection parameters, smaller shape —
+backs synthetic fixtures so tests exercise the identical code path at a workable size.
+
 Every selected lead retains both the provider index evidence and the exact selected
 GRIB message bytes. Inventory selection is by GRIB identity keys, not display names.
 Canonical datasets retain source reference/valid/interval times, units, grid identity,
 selected-message lineage, decode arguments, configuration snapshot, and source
 artifact IDs. Ambiguous, duplicate, missing, or incompatible messages fail closed.
+
+Canonical guidance validation enforces grid and lineage *semantics*, not identifier
+syntax. A `canonical-guidance.v2` artifact must carry a grid identifier naming its own
+model and no other, and its `variable_lineage_manifest_id` must resolve to a real
+`variable-lineage.v2` artifact whose model, grid, cycle, configuration snapshot,
+variable set, and lead set all match the dataset. Production creates one such manifest
+per model — HRRR, NBM, and GFS alike — recording for every canonical variable at every
+source lead the retained index artifact, every selected message artifact (plural for
+GFS's dual-parent APCP), the exact inventory rows, message numbers and byte ranges, the
+resolved URLs and endpoint, the selector expression, decode backend and arguments, unit
+conversion, wind-rotation policy, and source/output grid identity. The GFS-specific
+`gfs-qpf-lineage.v1` record remains an additional input to normalization; it is not a
+substitute for the variable lineage manifest.
 
 Spatial extraction is native-grid bilinear interpolation under
 `bilinear-native-grid.v1`: four finite corners are required, weights sum within
@@ -184,11 +219,19 @@ bucket record and a duplicate continuous-total record, both parents plus the
 statistical process, unit, grid shape, and quality mask — are recorded in a
 `gfs-qpf-lineage.v1` artifact that is an input to canonical normalization.
 
-The offline acceptance proof substitutes fixture bytes **only** at the network
-boundary: it subclasses `Phase2ProductionProvider` and overrides `discover` to
-supply fixture GRIB2 payloads, then inherits the production `acquire` and uses
-`Phase2ProductionScience` unchanged. Removing any production science stage breaks
-the acceptance test, so the proof cannot drift from the shipped pipeline.
+The offline acceptance proof substitutes fixture bytes **only** at the real
+`HttpTransport` GET/HEAD/range boundary. `tests/support/phase2_provider_transports.py`
+serves, per model and lead, a genuine wgrib2-style `.idx` inventory whose offsets are
+the true offsets of a concatenated eccodes-generated GRIB2 message stream, a HEAD
+carrying the true `Content-Length`, and ranged GETs that honour the exact `Range`
+header production sent and answer HTTP 206 with a matching `Content-Range`.
+`Phase2ProductionProvider.discover()` and `acquire()` then run unchanged, so candidate
+discovery, index parsing, selector matching and ambiguity handling, HEAD/range framing,
+GRIB2 boundary and range-integrity validation, retry/deadline policy, and the
+information-cutoff check are all genuinely exercised. No test constructs a
+`Phase2LeadAcquisition`, `IndexRow`, or `SelectedMessage`. A model is made unavailable
+by serving real 404s, not by removing it from the run, so the decision to drop a whole
+partial cycle is made by production code.
 
 ## Observation, matching, and verification contracts
 
@@ -210,7 +253,18 @@ NaN or Infinity.
 ## Replay and acceptance
 
 Replay receives the recorded `Phase2SelectedInputs`; it does not rediscover a cycle,
-re-query providers, select later revisions, or reconstruct inputs by timestamps.
+re-query providers, select later revisions, or reconstruct inputs by timestamps. The
+durable inputs are complete enough to make that real. The `phase2-run-spec.v1`
+artifact records both cutoffs, the forecast issue time, the target horizons and random
+seed, the cycle-selection policy actually applied, the per-model required source groups
+(selected cycle reference time, acquired source leads, endpoints, deadlines, allowed
+cycle hours, canonical variable IDs), every request identity digest, and digests of the
+Phase 2 configuration, blend configuration, and matching policy. The
+`station-catalog-snapshot.v1` artifact records each station's exact expected
+coordinates and elevation, provider ICAO identity, site name, site types, priority, and
+exposure/instrument identities, plus the point-extraction policy — every station field
+downstream alignment, METAR normalization, and matching consume. Replay therefore
+reconstructs from persisted bytes rather than from mutable live configuration.
 Verified content digests protect object reads. Activity idempotency includes ordered
 roles, configuration/parameter/code/environment identities, and output schema.
 Identical replay, including concurrent replay, reuses the same activities and

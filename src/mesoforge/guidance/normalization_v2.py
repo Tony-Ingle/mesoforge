@@ -40,6 +40,7 @@ from mesoforge.catalog.sources import (
 )
 from mesoforge.common.errors import MesoForgeError
 from mesoforge.guidance.canonical_v2 import assemble_canonical_guidance_v2
+from mesoforge.guidance.nbm_geometry import compute_nbm_grid
 from mesoforge.guidance.normalization import (
     WindRotationError,
     build_lambert_conformal_crs,
@@ -549,6 +550,7 @@ def normalize_nbm_cycle(
     qpf_contract = _find_contract(contracts, "liquid_equivalent_precipitation_amount_1h")
     pop_contract = _find_contract(contracts, "probability_of_precipitation_1h")
 
+    nbm_crs: pyproj.CRS | None = None
     x: np.ndarray | None = None
     y: np.ndarray | None = None
     lat: np.ndarray | None = None
@@ -622,22 +624,15 @@ def normalize_nbm_cycle(
         )
 
         if x is None:
-            attrs = temperature.attrs
-            raw_nx = attrs.get("GRIB_Nx", attrs.get("GRIB_Ni"))
-            raw_ny = attrs.get("GRIB_Ny", attrs.get("GRIB_Nj"))
-            if raw_nx is None or raw_ny is None:
-                raise GuidanceNormalizationV2Error(
-                    "NBM lead is missing required grid key Nx/Ni or Ny/Nj"
-                )
-            ni = int(raw_nx)
-            nj = int(raw_ny)
-            dx = float(attrs["GRIB_iDirectionIncrementInDegrees"])
-            dy = float(attrs["GRIB_jDirectionIncrementInDegrees"])
-            first_lon = float(attrs["GRIB_longitudeOfFirstGridPointInDegrees"])
-            first_lat = float(attrs["GRIB_latitudeOfFirstGridPointInDegrees"])
-            x = first_lon + dx * np.arange(ni, dtype=np.float64)
-            y = first_lat + dy * np.arange(nj, dtype=np.float64)
-            lon, lat = np.meshgrid(x, y)
+            # Codex re-review finding 2: the NBM CONUS core product is a
+            # Lambert conformal conic *projected* grid. Building x/y from
+            # the first grid point plus a degree increment -- as this
+            # previously did -- fabricates a geographic mesh that is not
+            # the published grid, mislocating every station. Normalize on
+            # the approved profile's real projected CRS instead, and
+            # inverse-project for the true 2-D lat/lon mesh.
+            crs, x, y, lat, lon = compute_nbm_grid(settings.grid_profile)
+            nbm_crs = crs
 
         speed_values = speed.values
         direction_values = direction.values
@@ -666,6 +661,7 @@ def normalize_nbm_cycle(
         interval_start_hours.append(lead - 1)
 
     assert lat is not None and lon is not None and x is not None and y is not None
+    assert nbm_crs is not None
     return assemble_canonical_guidance_v2(
         model="nbm",
         forecast_reference_time=np.datetime64(forecast_reference_time.replace(tzinfo=None), "ns"),
@@ -692,4 +688,5 @@ def normalize_nbm_cycle(
         grid_id=grid_id,
         configuration_snapshot_id=configuration_snapshot_id,
         variable_lineage_manifest_id=variable_lineage_manifest_id,
+        crs_wkt2=nbm_crs.to_wkt(),
     )

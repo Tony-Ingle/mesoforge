@@ -14,6 +14,31 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from mesoforge.catalog.grid_profiles import NbmGridProfile, require_approved_nbm_grid_profile
+
+# Every eccodes key the approved NBM grid contract asserts in
+# ``guidance.sources.nbm_decoding``. Requesting them is mandatory: an
+# unrequested key decodes as absent, and an absent key would make the
+# grid assertion fail open again (Codex re-review finding 2).
+_NBM_REQUIRED_GRID_READ_KEYS: tuple[str, ...] = (
+    "gridType",
+    "Nx",
+    "Ny",
+    "DxInMetres",
+    "DyInMetres",
+    "LoVInDegrees",
+    "LaDInDegrees",
+    "Latin1InDegrees",
+    "Latin2InDegrees",
+    "latitudeOfFirstGridPointInDegrees",
+    "longitudeOfFirstGridPointInDegrees",
+    "iScansNegatively",
+    "jScansPositively",
+    "jPointsAreConsecutive",
+    "shapeOfTheEarth",
+    "radius",
+)
+
 
 class HrrrFieldAssertion(BaseModel):
     """One row of the Section 2.1 semantic-assertion table: the exact
@@ -255,7 +280,16 @@ class HrrrPhase2SourceSettings(BaseModel):
 class NbmSourceSettings(BaseModel):
     """Section 1.2/2.3: NBM CONUS core Phase 2 settings. PoP01 is the
     sole configured probability field; NBM is the sole PoP contributor
-    (Section 4.5)."""
+    (Section 4.5).
+
+    ``grid_profile`` pins the exact approved operational projected grid
+    (Codex re-review finding 2). It is validated against the approved
+    registry at load time, so a configuration cannot introduce an
+    unreviewed projection/shape/increment/scan/coverage combination, and
+    decoding/normalization assert every decoded message against it
+    rather than accepting any nonempty ``gridType`` and any positive
+    ``Nx``/``Ny``.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -269,11 +303,30 @@ class NbmSourceSettings(BaseModel):
     endpoint_order: tuple[Literal["noaa_s3", "nomads"], ...]
     endpoint_url_templates: dict[str, str]
     field_contracts: tuple[Phase2FieldContract, ...]
+    grid_profile: NbmGridProfile
     read_keys: tuple[str, ...]
     retry_policy: RetryPolicy
     max_age_hours: float
     cycle_completion_deadline_minutes: float
     probability_threshold_kg_m2: float
+
+    @model_validator(mode="after")
+    def _check_grid_profile_is_approved(self) -> NbmSourceSettings:
+        require_approved_nbm_grid_profile(self.grid_profile)
+        return self
+
+    @model_validator(mode="after")
+    def _check_read_keys_cover_the_grid_contract(self) -> NbmSourceSettings:
+        """Every grid/projection/scan key the decoder must assert has to
+        be requested from eccodes; otherwise the assertion would silently
+        see ``None`` and the contract would fail open again."""
+        missing = tuple(key for key in _NBM_REQUIRED_GRID_READ_KEYS if key not in self.read_keys)
+        if missing:
+            raise ValueError(
+                "NBM read_keys must request every key the approved grid contract asserts; "
+                f"missing {sorted(missing)!r}"
+            )
+        return self
 
     @model_validator(mode="after")
     def _check_endpoint_order(self) -> NbmSourceSettings:

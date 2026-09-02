@@ -52,9 +52,10 @@ from mesoforge.application.phase2_adapters import (
     Phase2ProductionAdapters,
 )
 from mesoforge.catalog.configuration import Phase2Configuration
-from mesoforge.common.identifiers import ArtifactId, Digest, RunId, StationId
+from mesoforge.common.identifiers import ArtifactId, Digest, GridId, RunId, StationId
 from mesoforge.contracts.artifacts import ArtifactManifest, Availability
 from mesoforge.contracts.forecasts import validate_baseline_forecast_v2
+from mesoforge.contracts.lineage_v2 import VariableLineageManifestV2
 from mesoforge.contracts.observations_v2 import NormalizedObservationV2, RawMetarRecordV2
 from mesoforge.contracts.runs import RunManifest
 from mesoforge.contracts.verification import MatchedPairRowV2, VerificationReportV2
@@ -85,7 +86,10 @@ from mesoforge.guidance.acquisition_v2 import (
     acquire_hrrr_phase2_lead,
     acquire_nbm_lead,
 )
-from mesoforge.guidance.canonical_v2 import validate_canonical_guidance_v2
+from mesoforge.guidance.canonical_v2 import (
+    validate_canonical_guidance_lineage_v2,
+    validate_canonical_guidance_v2,
+)
 from mesoforge.guidance.cycle_selection import (
     CandidateCycle,
     generate_candidate_reference_times,
@@ -98,6 +102,9 @@ from mesoforge.guidance.normalization_v2 import (
     normalize_nbm_cycle,
 )
 from mesoforge.guidance.precipitation import is_bucket_reset_hour
+from mesoforge.guidance.sources import gfs as gfs_source
+from mesoforge.guidance.sources import hrrr_phase2 as hrrr_phase2_source
+from mesoforge.guidance.sources import nbm as nbm_source
 from mesoforge.observations.acquisition import RequestRateLimiter, acquire_metar_batch
 from mesoforge.observations.normalization_v2 import normalize_metar_record_v2
 from mesoforge.observations.sources.aviationweather import parse_raw_metar_response
@@ -125,6 +132,71 @@ _VARIABLES = (
 
 _JSON = CanonicalJsonSerializer()
 _NETCDF = H5NetcdfDatasetSerializer()
+
+# Per-model selector builders, used to record the exact inventory
+# selector each variable/lead was chosen with in variable-lineage.v2
+# (Codex re-review finding 3).
+_SELECTOR_BUILDERS = {
+    "HRRR": hrrr_phase2_source.build_field_selector,
+    "NBM": nbm_source.build_field_selector,
+    "GFS": gfs_source.build_field_selector,
+}
+
+# The exact conversion applied to each canonical variable between the
+# decoded GRIB value and the canonical value. "identity" means the
+# provider unit already is the canonical unit.
+_UNIT_CONVERSIONS: dict[str, str] = {
+    "air_temperature_2m": "identity:K",
+    "dew_point_temperature_2m": "identity:K",
+    "eastward_wind_10m": "identity:m/s",
+    "northward_wind_10m": "identity:m/s",
+    "wind_speed_10m": "identity:m/s",
+    "wind_from_direction_10m": "identity:degree",
+    "wind_gust_10m": "identity:m/s",
+    "liquid_equivalent_precipitation_amount_1h": "identity:kg/m^2",
+    "probability_of_precipitation_1h": "percent-to-fraction:divide-by-100",
+}
+
+_WIND_VARIABLES = frozenset(
+    {
+        "eastward_wind_10m",
+        "northward_wind_10m",
+        "wind_speed_10m",
+        "wind_from_direction_10m",
+    }
+)
+
+
+def _wind_rotation_policy(model: str, variable_id: str) -> str | None:
+    """The rotation policy actually applied to a wind component.
+
+    HRRR/GFS decode U/V and rotate grid-relative components to
+    earth-relative with pyproj; NBM decodes speed/direction and converts
+    to earth-relative U/V cornerwise. Non-wind variables have no
+    rotation policy at all.
+    """
+    if variable_id not in _WIND_VARIABLES:
+        return None
+    if model == "NBM":
+        return "speed-direction-to-uv.v1"
+    return "grid-to-earth-pyproj.v1"
+
+
+def _source_grid_profile_id(settings: Any, model: str) -> str:
+    """The registered source-grid profile identity for one model.
+
+    NBM pins an explicit approved ``grid_profile`` (Codex re-review
+    finding 2); HRRR and GFS pin their native product profiles through
+    their own settings identities.
+    """
+    grid_profile = getattr(settings, "grid_profile", None)
+    if grid_profile is not None:
+        return str(grid_profile.profile_id)
+    product_profile = getattr(settings, "product_profile", None)
+    if product_profile is not None:
+        return str(product_profile)
+    return f"{model.lower()}-{settings.product}-{settings.sector}.v1"
+
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +244,25 @@ def _valid_map(value: object) -> None:
         raise TypeError(f"expected dict, got {type(value)!r}")
 
 
+def _late_acquisitions(
+    acquisitions: tuple[Phase2LeadAcquisition, ...], information_cutoff: datetime
+) -> tuple[datetime, ...]:
+    """Every acquisition timestamp in ``acquisitions`` that is strictly
+    after ``information_cutoff`` (Codex re-review finding 4).
+
+    Both the index retrieval and the ranged message retrieval count: a
+    forecast may only use input bytes that actually existed by the
+    cutoff, and an index that only appeared afterwards is just as much
+    a leak of future information as a late message.
+    """
+    late: list[datetime] = []
+    for acquisition in acquisitions:
+        for available_at in (acquisition.index_completed_at, acquisition.grib_completed_at):
+            if available_at > information_cutoff:
+                late.append(available_at)
+    return tuple(late)
+
+
 def _as_json_map(value: object) -> dict[str, Any]:
     """Narrow a transformation output to the canonical-JSON mapping type."""
     _valid_map(value)
@@ -190,6 +281,13 @@ def _validate_normalized_observations_v2(value: dict[str, list[object]]) -> None
         NormalizedObservationV2.model_validate_json(_JSON.serialize(_as_json_map(row)))
 
 
+def _validate_variable_lineage_v2(value: object) -> None:
+    """Validate a serialized ``variable-lineage.v2`` manifest through the
+    JSON entrypoint, so tuples that crossed the artifact boundary as
+    arrays are reconstructed under the strict contract."""
+    VariableLineageManifestV2.model_validate_json(_JSON.serialize(_as_json_map(value)))
+
+
 class Phase2NoAvailableCycleError(Exception):
     """Raised when discovery cannot find a single approved cycle for
     any of HRRR/NBM/GFS -- Phase 2's ``normalized guidance must not be
@@ -201,6 +299,33 @@ class GuidanceNormalizationProductionError(Exception):
     """Raised when the production science stage cannot normalize an
     acquired guidance cycle, e.g. a required adjacent-lead payload for
     same-bucket precipitation differencing was not acquired."""
+
+
+def _canonical_validator(lineage_artifact: ArtifactManifest, *, payload: dict[str, Any]) -> Any:
+    """Return the canonical-guidance validator bound to this model's own
+    lineage manifest (Codex re-review finding 3).
+
+    ``validate_canonical_guidance_v2`` alone can only check that the
+    declared ``variable_lineage_manifest_id`` has the right *shape*,
+    because it has no artifact repository. Binding the manifest that was
+    actually created here closes the content half of the contract in
+    production, not merely in tests: a canonical artifact can no longer
+    validate while pointing at a raw message, a QPF-only lineage record,
+    or a manifest describing a different model/grid/cycle/lead set.
+    """
+    manifest = VariableLineageManifestV2.model_validate_json(_JSON.serialize(payload))
+
+    def _validate(dataset: xr.Dataset) -> None:
+        validate_canonical_guidance_v2(dataset)
+        validate_canonical_guidance_lineage_v2(
+            dataset,
+            lineage_manifest=manifest,
+            lineage_artifact_id=str(lineage_artifact.artifact_id),
+            lineage_artifact_type=lineage_artifact.artifact_type,
+            lineage_schema_version=lineage_artifact.artifact_schema_version,
+        )
+
+    return _validate
 
 
 class Phase2ProductionProvider:
@@ -248,6 +373,7 @@ class Phase2ProductionProvider:
         self, request: Phase2Request
     ) -> dict[str, tuple[Phase2LeadAcquisition, ...]]:
         target = request.target_reference_time
+        cutoff = request.information_cutoff
         selected: dict[str, tuple[Phase2LeadAcquisition, ...]] = {}
 
         # HRRR
@@ -261,6 +387,7 @@ class Phase2ProductionProvider:
             model="hrrr",
             candidates=hrrr_candidates,
             target=target,
+            information_cutoff=cutoff,
             max_age_hours=hrrr_settings.max_age_hours,
             completion_deadline_minutes=hrrr_settings.cycle_completion_deadline_minutes,
             max_source_lead_hours=hrrr_settings.max_source_lead_hours,
@@ -288,6 +415,7 @@ class Phase2ProductionProvider:
             model="nbm",
             candidates=nbm_candidates,
             target=target,
+            information_cutoff=cutoff,
             max_age_hours=nbm_settings.max_age_hours,
             completion_deadline_minutes=nbm_settings.cycle_completion_deadline_minutes,
             # NBM may be selected up to three hours older than the target
@@ -321,6 +449,7 @@ class Phase2ProductionProvider:
             model="gfs",
             candidates=gfs_candidates,
             target=target,
+            information_cutoff=cutoff,
             max_age_hours=gfs_settings.max_age_hours,
             completion_deadline_minutes=gfs_settings.cycle_completion_deadline_minutes,
             max_source_lead_hours=gfs_settings.max_source_lead_hours,
@@ -347,15 +476,37 @@ class Phase2ProductionProvider:
         model: str,
         candidates: tuple[datetime, ...],
         target: datetime,
+        information_cutoff: datetime,
         max_age_hours: float,
         completion_deadline_minutes: float,
         max_source_lead_hours: int,
         include_previous_apcp_dependency: bool,
         acquire_lead: Any,
     ) -> tuple[Phase2LeadAcquisition, ...] | None:
+        """Try candidate cycles newest-first and return the first whose
+        complete required lead set acquires, satisfies the model's own
+        max-age/completion-deadline policy, *and* was fully available no
+        later than ``information_cutoff``.
+
+        Codex re-review finding 4: the cutoff is an explicit input here
+        rather than a downstream-only check. A candidate whose index or
+        message bytes only became available after the cutoff is rejected
+        at selection time and the walk continues to the next (older)
+        candidate, so the run deterministically falls back to a cycle
+        the forecast was actually entitled to see instead of failing
+        later -- or worse, retaining a late acquisition.
+        """
         for candidate in candidates:
             age_hours = (target - candidate).total_seconds() / 3600.0
             if age_hours > max_age_hours or age_hours < 0:
+                continue
+            if candidate > information_cutoff:
+                logger.debug(
+                    "candidate cycle %s for %s is after the information cutoff %s",
+                    candidate,
+                    model,
+                    information_cutoff,
+                )
                 continue
             lead_sets = _required_source_leads(
                 target_reference_time=target,
@@ -374,6 +525,19 @@ class Phase2ProductionProvider:
             except Exception as exc:  # noqa: BLE001 -- unavailable/incomplete candidate; try next
                 logger.debug(
                     "candidate cycle %s for %s failed acquisition: %s", candidate, model, exc
+                )
+                continue
+            late = _late_acquisitions(acquisitions, information_cutoff)
+            if late:
+                logger.debug(
+                    "candidate cycle %s for %s completed after the information cutoff %s "
+                    "(latest available_at %s across %d late lead(s)); rejecting the whole "
+                    "candidate rather than retaining a late input",
+                    candidate,
+                    model,
+                    information_cutoff,
+                    max(late),
+                    len(late),
                 )
                 continue
             completed_at = max(a.grib_completed_at for a in acquisitions)
@@ -406,12 +570,14 @@ class Phase2ProductionProvider:
                 "must run before acquire() on the same Phase2ProductionProvider instance"
             )
 
-        run_spec_payload = {
-            "schema_version": "phase2-run-spec.v1",
-            "run_id": str(request.run_id),
-            "target_reference_time": request.target_reference_time.isoformat(),
-            "selection_digest": str(discovery.selection_digest),
-        }
+        # Codex re-review finding 5: the run spec is the durable replay
+        # identity. It must carry every input that determines what the
+        # run computes -- the verification cutoff, the required source
+        # groups, the cycle policy actually applied, the target horizons,
+        # and the request/configuration digests -- so a replay is
+        # reconstructed from persisted bytes rather than from whatever
+        # mutable live configuration happens to be loaded at replay time.
+        run_spec_payload = self._run_spec_payload(request, discovery, acquisitions_by_model)
         run_spec = self._register_source(
             artifact_service,
             request,
@@ -421,17 +587,17 @@ class Phase2ProductionProvider:
             payload=_JSON.serialize(run_spec_payload),
         )
 
-        station_payload = {
-            "schema_version": "station-catalog-snapshot.v1",
-            "stations": list(_STATIONS),
-        }
+        # Codex re-review finding 5: the station snapshot must carry the
+        # exact coordinates, elevation, provider identity, and every
+        # other station field consumed downstream (alignment, METAR
+        # normalization, matching), not just a list of station IDs.
         station_snapshot = self._register_source(
             artifact_service,
             request,
             locator="phase2-station-catalog://grasston",
             artifact_type="station-catalog-snapshot",
             schema="station-catalog-snapshot.v1",
-            payload=_JSON.serialize(station_payload),
+            payload=_JSON.serialize(self._station_snapshot_payload()),
         )
 
         roots: list[SelectedSourceRoot] = []
@@ -492,6 +658,141 @@ class Phase2ProductionProvider:
         roots.sort(key=lambda r: (model_order[r.model], r.source_lead_hours, r.field_role))
         return Phase2SelectedInputs(
             run_spec=run_spec, source_roots=tuple(roots), station_snapshot=station_snapshot
+        )
+
+    def _run_spec_payload(
+        self,
+        request: Phase2Request,
+        discovery: DiscoveryResult,
+        acquisitions_by_model: dict[str, tuple[Phase2LeadAcquisition, ...]],
+    ) -> dict[str, Any]:
+        """Build the complete durable replay run spec (finding 5).
+
+        Everything a replay needs to reconstruct *what this run was
+        asked to compute* is persisted here: both cutoffs, the target
+        frame, the required source groups and the exact cycle/leads
+        actually selected for each, the cycle-selection policy that was
+        applied, the target horizons, and every request/configuration
+        identity digest. Replay therefore depends on these bytes, not on
+        the live ``Phase2Configuration`` object, which may have changed.
+        """
+        cycle_policy = self._configuration.cycle_selection_policy
+        required_groups = []
+        for model in _MODELS:
+            acquisitions = acquisitions_by_model.get(model, ())
+            settings = getattr(self._configuration, model.lower())
+            reference_time = (
+                self._reference_time_of(acquisitions[0]).isoformat() if acquisitions else None
+            )
+            required_groups.append(
+                {
+                    "model": model,
+                    "selected": bool(acquisitions),
+                    "source_cycle_reference_time": reference_time,
+                    "source_lead_hours": sorted(a.forecast_hour for a in acquisitions),
+                    "endpoints": sorted({a.endpoint for a in acquisitions}),
+                    "max_age_hours": settings.max_age_hours,
+                    "cycle_completion_deadline_minutes": (
+                        settings.cycle_completion_deadline_minutes
+                    ),
+                    "allowed_cycle_hours": list(getattr(settings, "allowed_cycle_hours", ())),
+                    "canonical_variable_ids": sorted(
+                        contract.canonical_variable_id for contract in settings.field_contracts
+                    ),
+                }
+            )
+        return {
+            "schema_version": "phase2-run-spec.v1",
+            "run_id": str(request.run_id),
+            "target_reference_time": request.target_reference_time.isoformat(),
+            "forecast_issue_time": request.forecast_issue_time.isoformat(),
+            "information_cutoff": request.information_cutoff.isoformat(),
+            "verification_cutoff": request.verification_cutoff.isoformat(),
+            "target_horizons": list(request.target_horizons),
+            "random_seed": request.random_seed,
+            "selection_digest": str(discovery.selection_digest),
+            "cycle_selection_policy": {
+                "schema_version": cycle_policy.schema_version,
+                "policy_id": str(cycle_policy.policy_id),
+                "target_horizons": list(cycle_policy.target_horizons),
+            },
+            "required_groups": required_groups,
+            "request_digests": {
+                "configuration_snapshot_id": str(request.configuration_snapshot_id),
+                "configuration_digest": str(request.configuration_digest),
+                "code_revision": request.code_revision,
+                "environment_digest": str(request.environment_digest),
+                "lockfile_digest": str(request.lockfile_digest),
+            },
+            "configuration_digests": {
+                "phase2_configuration": str(
+                    Digest.of_bytes(_JSON.serialize(self._configuration.model_dump(mode="json")))
+                ),
+                "blend_configuration": str(
+                    Digest.of_bytes(
+                        _JSON.serialize(
+                            self._configuration.blend_configuration.model_dump(mode="json")
+                        )
+                    )
+                ),
+                "matching_policy": str(self._configuration.matching_policy.digest),
+            },
+        }
+
+    def _station_snapshot_payload(self) -> dict[str, Any]:
+        """Build the complete durable station snapshot (finding 5).
+
+        Every station field the downstream science actually consumes is
+        persisted: the exact expected coordinates and elevation used by
+        bilinear alignment, the provider ICAO identity used to fetch and
+        match METAR reports, the site name/types/priority, and the
+        explicitly-unknown exposure/instrument identities. Replay reads
+        these bytes instead of re-deriving station geometry from live
+        configuration.
+        """
+        return {
+            "schema_version": "station-catalog-snapshot.v1",
+            "domain_id": str(self._configuration.domain.domain_id),
+            "station_ids": [str(station.station_id) for station in self._configuration.stations],
+            "stations": [
+                {
+                    "station_id": str(station.station_id),
+                    "provider_icao_id": station.provider_icao_id,
+                    "expected_latitude": station.expected_latitude,
+                    "expected_longitude": station.expected_longitude,
+                    "expected_elevation_m": station.expected_elevation_m,
+                    "site_name": station.site_name,
+                    "provider_site_types": list(station.provider_site_types),
+                    "provider_priority": station.provider_priority,
+                    "exposure_identity": station.exposure_identity,
+                    "instrument_identity": station.instrument_identity,
+                }
+                for station in self._configuration.stations
+            ],
+            "point_extraction_policy": {
+                "schema_version": (self._configuration.point_extraction_policy.schema_version),
+                "policy_id": self._configuration.point_extraction_policy.policy_id,
+                "allow_extrapolation": (
+                    self._configuration.point_extraction_policy.allow_extrapolation
+                ),
+                "require_four_corners_finite": (
+                    self._configuration.point_extraction_policy.require_four_corners_finite
+                ),
+                "halo_cells": self._configuration.point_extraction_policy.halo_cells,
+                "weight_sum_tolerance": (
+                    self._configuration.point_extraction_policy.weight_sum_tolerance
+                ),
+            },
+        }
+
+    @staticmethod
+    def _reference_time_of(acquisition: Phase2LeadAcquisition) -> datetime:
+        return datetime(
+            acquisition.cycle_date.year,
+            acquisition.cycle_date.month,
+            acquisition.cycle_date.day,
+            acquisition.cycle_hour,
+            tzinfo=UTC,
         )
 
     def _register_source(
@@ -617,7 +918,28 @@ class Phase2ProductionScience:
                 (request.target_reference_time - reference_time).total_seconds() // 3600
             )
             target_source_leads = tuple(horizon + cycle_age_hours for horizon in _HORIZONS)
-            lineage_artifact: ArtifactManifest | None = None
+            grid_id = GridId(f"phase2-{model.lower()}.v1")
+
+            # Codex re-review finding 3: every model -- not only GFS --
+            # must create and reference a complete, real
+            # ``variable-lineage.v2`` manifest. A GFS-QPF-only lineage
+            # artifact does not describe the other six variables, and
+            # pointing ``variable_lineage_manifest_id`` at a raw message
+            # artifact describes nothing at all.
+            lineage_artifact, lineage_payload = self._register_variable_lineage_v2(
+                request,
+                artifact_service,
+                model=model,
+                grid_id=grid_id,
+                reference_time=reference_time,
+                source_leads=target_source_leads,
+                acquisitions=acquisitions_by_model.get(model, ()),
+                inputs=inputs,
+                input_refs=input_refs,
+                index_refs=index_refs,
+            )
+
+            qpf_lineage_artifact: ArtifactManifest | None = None
             if model == "GFS":
 
                 def _lineage_transform(
@@ -684,14 +1006,15 @@ class Phase2ProductionScience:
                     input_loader=lambda payload: payload,
                     output_validator=_valid_map,
                 )
-                lineage_artifact = lineage_result.output
+                qpf_lineage_artifact = lineage_result.output
 
             canonical_input_refs = (
                 input_refs
                 + index_refs
+                + (("variable-lineage", lineage_artifact.artifact_id),)
                 + (
-                    (("qpf-lineage", lineage_artifact.artifact_id),)
-                    if lineage_artifact is not None
+                    (("qpf-lineage", qpf_lineage_artifact.artifact_id),)
+                    if qpf_lineage_artifact is not None
                     else ()
                 )
             )
@@ -712,11 +1035,7 @@ class Phase2ProductionScience:
                 refs: tuple[tuple[str, ArtifactId], ...] = input_refs,
                 reference_time: datetime = reference_time,
                 source_leads: tuple[int, ...] = target_source_leads,
-                lineage_id: str = (
-                    str(lineage_artifact.artifact_id)
-                    if lineage_artifact is not None
-                    else str(input_refs[0][1])
-                ),
+                lineage_id: str = str(lineage_artifact.artifact_id),
             ) -> xr.Dataset:
                 field_payloads = _group_normalization_payloads(refs, raw[: len(refs)])
                 grid_id = f"phase2-{model.lower()}.v1"
@@ -758,10 +1077,134 @@ class Phase2ProductionScience:
                 transform=_transform,
                 serializer=_NETCDF,
                 input_loader=lambda payload: payload,
-                output_validator=validate_canonical_guidance_v2,
+                output_validator=_canonical_validator(lineage_artifact, payload=lineage_payload),
             )
             artifacts.append(result.output)
         return NormalizedGuidanceArtifacts(artifacts=tuple(artifacts))
+
+    def _register_variable_lineage_v2(
+        self,
+        request: Phase2Request,
+        artifact_service: ArtifactService,
+        *,
+        model: str,
+        grid_id: GridId,
+        reference_time: datetime,
+        source_leads: tuple[int, ...],
+        acquisitions: tuple[Phase2LeadAcquisition, ...],
+        inputs: Phase2SelectedInputs,
+        input_refs: tuple[tuple[str, ArtifactId], ...],
+        index_refs: tuple[tuple[str, ArtifactId], ...],
+    ) -> tuple[ArtifactManifest, dict[str, Any]]:
+        """Create the model's complete ``variable-lineage.v2`` manifest
+        (Codex re-review finding 3).
+
+        Every canonical variable at every target source lead gets a real
+        entry naming the retained index artifact, every selected message
+        artifact that fed it, the exact inventory rows/message
+        numbers/byte ranges, the resolved URLs and endpoint, the
+        selector actually used, the decode arguments, the unit
+        conversion, the wind-rotation policy, and the source/output grid
+        identity. This is a derived artifact of the run, so its lineage
+        edges reach every selected source root.
+        """
+        settings = getattr(self._configuration, model.lower())
+        selector_builder = _SELECTOR_BUILDERS[model]
+        source_grid_profile_id = _source_grid_profile_id(settings, model)
+        index_by_lead = {
+            int(role.split(":", 1)[1]): artifact_id for role, artifact_id in index_refs
+        }
+        acquisitions_by_lead = {a.forecast_hour: a for a in acquisitions}
+        # role -> artifact for every selected message, keyed by
+        # (lead, canonical_variable_id) so plural GFS APCP parents group.
+        messages_by_key: dict[tuple[int, str], list[ArtifactId]] = {}
+        for role, artifact_id in input_refs:
+            lead_text, variable_id, *_identity = role.split(":")
+            messages_by_key.setdefault((int(lead_text), variable_id), []).append(artifact_id)
+
+        variable_ids = tuple(
+            sorted(contract.canonical_variable_id for contract in settings.field_contracts)
+        )
+        entries: list[dict[str, Any]] = []
+        for lead in source_leads:
+            acquisition = acquisitions_by_lead.get(lead)
+            index_artifact_id = index_by_lead.get(lead)
+            if acquisition is None or index_artifact_id is None:
+                raise GuidanceNormalizationProductionError(
+                    f"{model} lead {lead!r} has no retained acquisition/index evidence; a "
+                    "complete variable-lineage.v2 manifest cannot be built"
+                )
+            selected_by_variable: dict[str, list[Any]] = {}
+            for message in acquisition.selected_messages:
+                selected_by_variable.setdefault(message.canonical_variable_id, []).append(message)
+            for variable_id in variable_ids:
+                messages = selected_by_variable.get(variable_id, [])
+                artifact_ids = messages_by_key.get((lead, variable_id), [])
+                if not messages or len(messages) != len(artifact_ids):
+                    raise GuidanceNormalizationProductionError(
+                        f"{model} lead {lead!r} variable {variable_id!r} has "
+                        f"{len(messages)} selected message(s) but {len(artifact_ids)} "
+                        "registered artifact(s); lineage would be incomplete"
+                    )
+                entries.append(
+                    {
+                        "canonical_variable_id": variable_id,
+                        "source_lead_hours": lead,
+                        "index_artifact_id": str(index_artifact_id),
+                        "selected_grib_artifact_ids": [str(a) for a in artifact_ids],
+                        "message_numbers": [m.row.message_number for m in messages],
+                        "byte_ranges": [[m.byte_start, m.byte_end] for m in messages],
+                        "inventory_rows": [m.row.line for m in messages],
+                        "source_cycle": reference_time.isoformat(),
+                        "endpoint": acquisition.endpoint,
+                        "resolved_index_url": acquisition.resolved_index_url,
+                        "resolved_grib_url": acquisition.resolved_grib_url,
+                        "selector_expression": selector_builder(variable_id, forecast_hour=lead),
+                        "decode_backend": "cfgrib",
+                        "decode_backend_kwargs": {
+                            "indexpath": "",
+                            "errors": "raise",
+                            "read_keys": list(settings.read_keys),
+                        },
+                        "unit_conversion": _UNIT_CONVERSIONS[variable_id],
+                        "wind_rotation_policy": _wind_rotation_policy(model, variable_id),
+                        "source_grid_profile_id": source_grid_profile_id,
+                        "source_grid_id": source_grid_profile_id,
+                        "output_grid_id": grid_id,
+                    }
+                )
+
+        payload = {
+            "schema_version": "variable-lineage.v2",
+            "model": model.lower(),
+            "grid_id": grid_id,
+            "source_grid_profile_id": source_grid_profile_id,
+            "forecast_reference_time": reference_time.isoformat(),
+            "configuration_snapshot_id": str(request.configuration_snapshot_id),
+            "entries": entries,
+            "expected_canonical_variable_ids": list(variable_ids),
+            "expected_source_lead_hours": list(source_leads),
+        }
+        # Validate before registration so an incomplete manifest can
+        # never reach storage or be referenced by canonical guidance.
+        VariableLineageManifestV2.model_validate_json(_JSON.serialize(payload))
+
+        result = artifact_service.execute_raw_transformation(
+            self._transformation(
+                request,
+                activity=f"record-variable-lineage-{model.lower()}",
+                inputs=input_refs + index_refs,
+                output_role="variable-lineage",
+                artifact_type="variable-lineage",
+                schema="variable-lineage.v2",
+                parameters={"model": model},
+            ),
+            transform=lambda *_raw, payload=payload: payload,
+            serializer=_JSON,
+            input_loader=lambda payload: payload,
+            output_validator=_validate_variable_lineage_v2,
+        )
+        return result.output, payload
 
     def _model_reference_time(
         self,
