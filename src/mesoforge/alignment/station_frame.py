@@ -82,6 +82,10 @@ def align_station_to_model(
     )
     x = dataset["x"].values
     y = dataset["y"].values
+    # PROJ canonicalizes geographic longitude to [-180, 180], while NOAA
+    # regular-lat/lon GRIB grids commonly retain [0, 360] x coordinates.
+    if crs.is_geographic and x.min() >= 0.0 and station_x < 0.0:
+        station_x += 360.0
     lead_hours = np.asarray(
         dataset["source_lead_time"].values / np.timedelta64(1, "h"), dtype=np.int64
     )

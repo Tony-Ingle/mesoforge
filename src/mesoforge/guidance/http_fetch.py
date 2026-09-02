@@ -28,6 +28,10 @@ class FetchError(MesoForgeError):
     past the cycle deadline, or an unrecoverable integrity/range
     mismatch)."""
 
+    def __init__(self, message: str, *, attempts: tuple[RequestAttempt, ...] = ()) -> None:
+        super().__init__(message)
+        self.attempts = attempts
+
 
 @dataclass(frozen=True, slots=True)
 class RequestAttempt:
@@ -241,8 +245,9 @@ def fetch_with_range(
     once from a fresh connection on an integrity mismatch before
     failing closed."""
     integrity_retries_remaining = 1
+    preserved_attempts: list[RequestAttempt] = []
     while True:
-        all_attempts: list[RequestAttempt] = []
+        all_attempts: list[RequestAttempt] = list(preserved_attempts)
         response: HttpResponse | None = None
         for attempt_index in range(retry_policy.attempts_per_endpoint):
             resp, attempt = attempt_request(
@@ -298,12 +303,14 @@ def fetch_with_range(
         if not integrity_ok:
             if integrity_retries_remaining > 0:
                 integrity_retries_remaining -= 1
+                preserved_attempts = all_attempts
                 continue
             raise FetchError(
                 f"range integrity mismatch for {url!r} (range {range_header!r}): "
                 f"expected {expected_length} bytes at [{byte_start}, {byte_end}) "
                 f"(full_object_length={full_object_length!r}), got {len(payload)} bytes, "
-                f"Content-Range={content_range!r}"
+                f"Content-Range={content_range!r}",
+                attempts=tuple(all_attempts),
             )
 
         validate_grib_message_boundaries(payload, url=url, range_header=range_header)

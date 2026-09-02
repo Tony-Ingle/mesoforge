@@ -17,6 +17,21 @@ from mesoforge.forecasting.baseline_v2 import (
     assemble_baseline_forecast_v2,
 )
 
+
+def test_rejects_unknown_availability_state_directly() -> None:
+    values, states = _complete_inputs()
+    states[("air_temperature_2m", "station.kcbg", 1)] = "mystery"
+    with pytest.raises(BaselineV2AssemblyError, match="unknown availability state"):
+        assemble_baseline_forecast_v2(
+            values=values,
+            states=states,
+            target_reference_time=np.datetime64("2026-08-30T12:00:00"),
+            forecast_issue_time=np.datetime64("2026-08-30T12:05:00"),
+            uncorrected_blend_artifact_id="art_00000000-0000-0000-0000-000000000001",
+            identity_correction_artifact_id="art_00000000-0000-0000-0000-000000000002",
+        )
+
+
 _LOCATIONS = ("station.kcbg", "station.kjmr", "station.kros")
 _HORIZONS = tuple(range(1, 37))
 _VARIABLES = (

@@ -149,6 +149,47 @@ unrounded sum, fallback row ID/digest, source artifact IDs, and correction ident
 The verification artifact's ancestor graph reaches every selected index/message,
 station snapshot, and METAR response.
 
+## Production composition
+
+The graph above is realized by production code, not by test code. Two concrete
+classes in `mesoforge.application.phase2_production` implement the Phase 2
+application ports:
+
+- `Phase2ProductionProvider` implements discovery and acquisition. Discovery is
+  attempt-based: for each model it walks candidate reference times newest-first
+  and selects the first candidate whose complete required lead set acquires and
+  satisfies that model's own max-age and completion-deadline policy through
+  `guidance.cycle_selection.select_model_cycle`. A model with no viable candidate
+  is absent from the run; a partial cycle is never spliced. Acquisition is real
+  HRRR/NBM/GFS index-then-byte-range fetching via `guidance.acquisition_v2`, and
+  every fetched index and exact selected message is registered as a source
+  artifact.
+- `Phase2ProductionScience` supplies the eight injected stage callables backing
+  `Phase2ArtifactOperations`. It composes the pure domain functions:
+  `guidance.normalization_v2` for per-cycle decoding and canonical assembly,
+  `alignment.station_frame` for station alignment, `forecasting.availability` and
+  the blend modules for availability and atomic blend generation,
+  `observations.acquisition`/`observations.normalization_v2` for METAR truth, and
+  `verification.matching`/`verification.metrics` for matching and verification.
+
+Normalization performs the physical conversions the canonical contract requires
+*before* interpolation: HRRR and GFS winds are asserted through
+`uvRelativeToGrid` and rotated to earth-relative components with
+`guidance.normalization.rotate_wind_to_earth_relative`; NBM speed/direction is
+converted to earth-relative U/V cornerwise on the full native grid with
+`guidance.sources.nbm.convert_speed_direction_to_components`. GFS one-hour QPF is
+differenced within its own accumulation bucket, and when a lead carries both a
+bucket record and a duplicate continuous-total record, both parents plus the
+`validate_dual_parent_equivalence` result — comparing arrays, start/end steps,
+statistical process, unit, grid shape, and quality mask — are recorded in a
+`gfs-qpf-lineage.v1` artifact that is an input to canonical normalization.
+
+The offline acceptance proof substitutes fixture bytes **only** at the network
+boundary: it subclasses `Phase2ProductionProvider` and overrides `discover` to
+supply fixture GRIB2 payloads, then inherits the production `acquire` and uses
+`Phase2ProductionScience` unchanged. Removing any production science stage breaks
+the acceptance test, so the proof cannot drift from the shipped pipeline.
+
 ## Observation, matching, and verification contracts
 
 METAR temperature/dew point convert by `K = degC + 273.15`; wind/gust convert by

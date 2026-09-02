@@ -254,6 +254,35 @@ class TestFetchWithRange:
         )
         assert result.payload == message
 
+    def test_final_integrity_failure_preserves_both_attempts(self) -> None:
+        message = _grib_message()
+        transport = ScriptedTransport()
+        bad = FakeResponse(
+            206,
+            headers={"Content-Range": f"bytes 0-{len(message) - 2}/{len(message)}"},
+            content=message[:-1],
+        )
+        transport.queue("https://a/x.grib2", bad)
+        transport.queue("https://a/x.grib2", bad)
+        clock = FixedClock(_DEADLINE - timedelta(hours=1))
+        sleeper = RecordingSleeper(clock)
+        with pytest.raises(FetchError, match="integrity mismatch") as exc_info:
+            fetch_with_range(
+                transport,
+                clock,
+                sleeper,
+                endpoint="a",
+                url="https://a/x.grib2",
+                range_header=f"bytes=0-{len(message) - 1}",
+                byte_start=0,
+                byte_end=len(message),
+                retry_policy=_RETRY,
+                cycle_deadline=_DEADLINE,
+                expected_length=len(message),
+                full_object_length=len(message),
+            )
+        assert len(exc_info.value.attempts) == 2
+
     def test_integrity_mismatch_retries_once_then_succeeds(self) -> None:
         message = _grib_message()
         transport = ScriptedTransport()
@@ -292,6 +321,7 @@ class TestFetchWithRange:
             full_object_length=len(message),
         )
         assert result.payload == message
+        assert len(result.attempts) == 2
 
     def test_provider_ignoring_range_raises(self) -> None:
         message = _grib_message()

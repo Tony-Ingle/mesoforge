@@ -55,6 +55,12 @@ def blend_scalar(contributions: tuple[Contribution, ...]) -> ScalarBlendResult:
     if not contributions:
         raise ScalarBlendError("blend_scalar requires at least one contributor")
 
+    for c in contributions:
+        if not math.isfinite(c.weight) or c.weight < 0:
+            raise ScalarBlendError(
+                f"contributor {c.model!r} has a non-finite or negative weight {c.weight!r}"
+            )
+
     total_weight = math.fsum(c.weight for c in contributions)
     if abs(total_weight - 1.0) > _WEIGHT_SUM_TOLERANCE:
         raise ScalarBlendError(

@@ -116,14 +116,18 @@ def compute_one_hour_qpf(
 @dataclass(frozen=True, slots=True)
 class ApcpCandidateRecord:
     """One decoded APCP inventory candidate for a GFS lead: its exact
-    decoded start/end step and statistical process, used to select
-    between the required bucket record and a possible duplicate
-    continuous-total record at early leads."""
+    decoded start/end step, statistical process, unit, grid shape, and
+    quality mask, used to select between the required bucket record
+    and a possible duplicate continuous-total record at early leads
+    (finding 4: full identity, not values/start/end alone)."""
 
     start_step: int
     end_step: int
     is_accumulation: bool
     values_kg_m2: tuple[float, ...]
+    unit_id: str = "kg/m^2"
+    grid_shape: tuple[int, int] = (0, 0)
+    mask: tuple[int, ...] = ()
 
 
 def select_bucket_record(
@@ -149,8 +153,11 @@ def select_bucket_record(
             "accumulation statistical process found for the required GFS bucket record"
         )
     if len(matches) > 1:
+        canonical = matches[0]
+        if all(validate_dual_parent_equivalence(canonical, item) for item in matches[1:]):
+            return canonical
         raise GfsPrecipitationError(
-            f"multiple APCP candidates share startStep={expected_start!r}, "
+            f"multiple divergent APCP candidates share startStep={expected_start!r}, "
             f"endStep={forecast_hour!r}; ambiguous bucket selection"
         )
     return matches[0]
@@ -162,17 +169,23 @@ _EQUIVALENCE_TOLERANCE_KG_M2 = 1e-6
 def validate_dual_parent_equivalence(
     bucket_record: ApcpCandidateRecord, continuous_record: ApcpCandidateRecord
 ) -> bool:
-    """Section 2.4: for ``f=1..6`` the bucket and continuous
+    """Section 2.4 (finding 4): for ``f=1..6`` the bucket and continuous
     accumulation records are duplicates (``startStep=0``). Canonicalize
-    only when full arrays, start/end steps, and statistical process
-    are equivalent; return the equivalence result (never silently
-    assume equivalence -- the caller records both parents plus this
-    boolean in lineage)."""
+    only when full arrays, start/end steps, statistical process, unit,
+    grid shape, and quality mask are *all* equivalent; return the
+    equivalence result (never silently assume equivalence -- the
+    caller records both parents plus this boolean in lineage)."""
     if bucket_record.start_step != continuous_record.start_step:
         return False
     if bucket_record.end_step != continuous_record.end_step:
         return False
     if bucket_record.is_accumulation != continuous_record.is_accumulation:
+        return False
+    if bucket_record.unit_id != continuous_record.unit_id:
+        return False
+    if bucket_record.grid_shape != continuous_record.grid_shape:
+        return False
+    if bucket_record.mask != continuous_record.mask:
         return False
     if len(bucket_record.values_kg_m2) != len(continuous_record.values_kg_m2):
         return False

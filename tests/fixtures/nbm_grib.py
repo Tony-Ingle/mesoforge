@@ -19,6 +19,7 @@ def _base_message(*, forecast_hour: int, cycle_date: str, cycle_hour: int) -> in
     import eccodes
 
     gid = eccodes.codes_grib_new_from_samples("regular_ll_sfc_grib2")
+    eccodes.codes_set(gid, "centre", "kwbc")
     eccodes.codes_set(gid, "gridType", "regular_ll")
     eccodes.codes_set(gid, "Ni", NX)
     eccodes.codes_set(gid, "Nj", NY)
@@ -115,8 +116,8 @@ def make_pop01_message(
         eccodes.codes_set(gid, "endStep", forecast_hour)
         eccodes.codes_set(gid, "productDefinitionTemplateNumber", 9)
         eccodes.codes_set(gid, "probabilityType", 3)
-        eccodes.codes_set(gid, "scaledValueOfLowerLimit", 254)
-        eccodes.codes_set(gid, "scaleFactorOfLowerLimit", 3)
+        eccodes.codes_set(gid, "scaledValueOfUpperLimit", 254)
+        eccodes.codes_set(gid, "scaleFactorOfUpperLimit", 3)
         eccodes.codes_set_array(gid, "values", values_percent.astype(np.float64).ravel())
         return bytes(eccodes.codes_get_message(gid))
     finally:

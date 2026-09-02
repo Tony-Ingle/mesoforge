@@ -8,10 +8,16 @@ from datetime import UTC, datetime
 
 import pytest
 
+from mesoforge.catalog.configuration import ObservationNormalizationPolicy
+from mesoforge.catalog.stations import StationRecord
+from mesoforge.common.identifiers import ArtifactId
+from mesoforge.contracts.observations_v2 import RawMetarRecordV2
 from mesoforge.observations.normalization_v2 import (
+    MetarNormalizationError,
     convert_dew_point_c_to_k,
     convert_gust_knots_to_m_s,
     extract_hourly_precipitation,
+    normalize_metar_record_v2,
 )
 
 _REPORT_TIME = datetime(2026, 8, 30, 18, 0, tzinfo=UTC)
@@ -82,3 +88,83 @@ class TestExtractHourlyPrecipitation:
             raw_ob=raw_ob, metar_type="METAR", report_time=_REPORT_TIME
         )
         assert result.status == "missing"
+
+
+_POLICY = ObservationNormalizationPolicy(policy_id="metar-normalization.v1")
+
+_STATION = StationRecord(
+    station_id="station.kcbg",
+    provider_icao_id="KCBG",
+    latitude=45.557,
+    longitude=-93.264,
+    elevation_m=285.0,
+    site_name="Cambridge Muni",
+    site_types=("METAR",),
+)
+
+_WINDOW_START = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
+_WINDOW_END = datetime(2026, 8, 28, 19, 0, tzinfo=UTC)
+
+
+def _raw_v2(**overrides: object) -> RawMetarRecordV2:
+    values: dict[str, object] = dict(
+        icao_id="KCBG",
+        obs_time=datetime(2026, 8, 28, 18, 0, tzinfo=UTC),
+        report_time=datetime(2026, 8, 28, 18, 0, tzinfo=UTC),
+        receipt_time=datetime(2026, 8, 28, 18, 1, tzinfo=UTC),
+        temp=15.0,
+        dewp=10.0,
+        wdir=270.0,
+        wspd=10.0,
+        wgst=20.0,
+        qc_field=0.0,
+        metar_type="METAR",
+        raw_ob="KCBG 281800Z 27010KT 10SM CLR 15/10 A3000 RMK AO2 P0012",
+        lat=45.557,
+        lon=-93.264,
+        elev=285.0,
+    )
+    values.update(overrides)
+    return RawMetarRecordV2(**values)  # type: ignore[arg-type]
+
+
+def _normalize_v2(**overrides: object):
+    return normalize_metar_record_v2(
+        raw=_raw_v2(**overrides),
+        station=_STATION,
+        station_id="station.kcbg",
+        policy=_POLICY,
+        raw_artifact_id=ArtifactId.generate(),
+        raw_record_index=0,
+        station_snapshot_artifact_id=ArtifactId.generate(),
+        ingested_at=datetime(2026, 8, 28, 18, 2, tzinfo=UTC),
+        query_window_start=_WINDOW_START,
+        query_window_end=_WINDOW_END,
+    )
+
+
+class TestNormalizeMetarRecordV2:
+    def test_happy_path_converts_dew_point_gust_and_precipitation(self) -> None:
+        result = _normalize_v2()
+        assert result.dew_point_k == pytest.approx(convert_dew_point_c_to_k(10.0))
+        assert result.wind_gust_m_s == pytest.approx(convert_gust_knots_to_m_s(20.0))
+        assert result.precipitation_truth_status == "reported"
+        assert result.precipitation_amount_kg_m2 == pytest.approx(12 * 0.254)
+        assert result.mesoforge_qc_state == "eligible"
+
+    def test_missing_dew_point_leaves_field_null(self) -> None:
+        result = _normalize_v2(dewp=None)
+        assert result.dew_point_k is None
+
+    def test_missing_gust_leaves_field_null(self) -> None:
+        result = _normalize_v2(wgst=None)
+        assert result.wind_gust_m_s is None
+
+    def test_missing_precipitation_is_missing_not_zero(self) -> None:
+        result = _normalize_v2(raw_ob="KCBG 281800Z 27010KT 10SM CLR 15/10 A3000 RMK AO2")
+        assert result.precipitation_truth_status == "missing"
+        assert result.precipitation_amount_kg_m2 is None
+
+    def test_wrong_station_raises(self) -> None:
+        with pytest.raises(MetarNormalizationError):
+            _normalize_v2(icao_id="KXYZ")

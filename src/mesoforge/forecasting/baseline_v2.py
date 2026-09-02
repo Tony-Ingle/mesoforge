@@ -61,7 +61,12 @@ def assemble_baseline_forecast_v2(
                 if state is None:
                     missing.append(f"{key!r} missing state")
                     continue
-                state_array[h_index, l_index] = _STATE_CODES.get(state, 255)
+                if state not in _STATE_CODES:
+                    raise BaselineV2AssemblyError(
+                        f"{key!r} has unknown availability state {state!r}; expected one of "
+                        f"{sorted(_STATE_CODES)!r}"
+                    )
+                state_array[h_index, l_index] = _STATE_CODES[state]
                 if state in ("unavailable", "inconsistent"):
                     continue
                 value = values.get(key)

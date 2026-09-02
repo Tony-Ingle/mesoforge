@@ -227,3 +227,131 @@ class TestValidateDualParentEquivalence:
             start_step=0, end_step=6, is_accumulation=True, values_kg_m2=(3.5,)
         )
         assert validate_dual_parent_equivalence(bucket, continuous) is False
+
+    def test_different_unit_is_not_equivalent(self) -> None:
+        """Finding 4: identical arrays carrying different units are not
+        the same physical field and must never be canonicalized."""
+        bucket = ApcpCandidateRecord(
+            start_step=0,
+            end_step=6,
+            is_accumulation=True,
+            values_kg_m2=(3.0, 4.0),
+            unit_id="kg/m^2",
+            grid_shape=(1, 2),
+            mask=(0, 0),
+        )
+        continuous = ApcpCandidateRecord(
+            start_step=0,
+            end_step=6,
+            is_accumulation=True,
+            values_kg_m2=(3.0, 4.0),
+            unit_id="m",
+            grid_shape=(1, 2),
+            mask=(0, 0),
+        )
+        assert validate_dual_parent_equivalence(bucket, continuous) is False
+
+    def test_different_grid_shape_is_not_equivalent(self) -> None:
+        """Finding 4: the same flat values on a different grid shape
+        describe different points and are not equivalent."""
+        bucket = ApcpCandidateRecord(
+            start_step=0,
+            end_step=6,
+            is_accumulation=True,
+            values_kg_m2=(3.0, 4.0),
+            unit_id="kg/m^2",
+            grid_shape=(1, 2),
+            mask=(0, 0),
+        )
+        continuous = ApcpCandidateRecord(
+            start_step=0,
+            end_step=6,
+            is_accumulation=True,
+            values_kg_m2=(3.0, 4.0),
+            unit_id="kg/m^2",
+            grid_shape=(2, 1),
+            mask=(0, 0),
+        )
+        assert validate_dual_parent_equivalence(bucket, continuous) is False
+
+    def test_different_quality_mask_is_not_equivalent(self) -> None:
+        """Finding 4: candidates disagreeing on which points are usable
+        are not equivalent even when their finite values coincide."""
+        bucket = ApcpCandidateRecord(
+            start_step=0,
+            end_step=6,
+            is_accumulation=True,
+            values_kg_m2=(3.0, 4.0),
+            unit_id="kg/m^2",
+            grid_shape=(1, 2),
+            mask=(0, 0),
+        )
+        continuous = ApcpCandidateRecord(
+            start_step=0,
+            end_step=6,
+            is_accumulation=True,
+            values_kg_m2=(3.0, 4.0),
+            unit_id="kg/m^2",
+            grid_shape=(1, 2),
+            mask=(0, 1),
+        )
+        assert validate_dual_parent_equivalence(bucket, continuous) is False
+
+    def test_full_identity_match_is_equivalent(self) -> None:
+        bucket = ApcpCandidateRecord(
+            start_step=0,
+            end_step=6,
+            is_accumulation=True,
+            values_kg_m2=(3.0, 4.0),
+            unit_id="kg/m^2",
+            grid_shape=(1, 2),
+            mask=(0, 0),
+        )
+        continuous = ApcpCandidateRecord(
+            start_step=0,
+            end_step=6,
+            is_accumulation=True,
+            values_kg_m2=(3.0, 4.0),
+            unit_id="kg/m^2",
+            grid_shape=(1, 2),
+            mask=(0, 0),
+        )
+        assert validate_dual_parent_equivalence(bucket, continuous) is True
+
+
+class TestSelectBucketRecordFullIdentity:
+    """Finding 4: ``select_bucket_record`` canonicalizes duplicate
+    bucket-boundary candidates only on *full* identity equivalence --
+    a duplicate differing in unit, grid shape, or quality mask is an
+    ambiguous selection and must fail closed."""
+
+    @staticmethod
+    def _record(**overrides: object) -> ApcpCandidateRecord:
+        base: dict[str, object] = {
+            "start_step": 0,
+            "end_step": 6,
+            "is_accumulation": True,
+            "values_kg_m2": (3.0, 4.0),
+            "unit_id": "kg/m^2",
+            "grid_shape": (1, 2),
+            "mask": (0, 0),
+        }
+        base.update(overrides)
+        return ApcpCandidateRecord(**base)  # type: ignore[arg-type]
+
+    def test_fully_identical_duplicates_canonicalize(self) -> None:
+        candidates = (self._record(), self._record())
+        assert select_bucket_record(candidates, forecast_hour=6) == candidates[0]
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"unit_id": "m"},
+            {"grid_shape": (2, 1)},
+            {"mask": (0, 1)},
+        ],
+    )
+    def test_duplicate_differing_in_identity_fails_closed(self, override: dict) -> None:
+        candidates = (self._record(), self._record(**override))
+        with pytest.raises(GfsPrecipitationError, match="divergent APCP candidates"):
+            select_bucket_record(candidates, forecast_hour=6)

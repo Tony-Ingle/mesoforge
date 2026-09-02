@@ -16,6 +16,11 @@ from mesoforge.forecasting.scalar_blend import (
 
 
 class TestBlendScalar:
+    @pytest.mark.parametrize("weight", [-0.1, float("nan"), float("inf"), float("-inf")])
+    def test_rejects_negative_or_non_finite_weight(self, weight: float) -> None:
+        with pytest.raises(ScalarBlendError, match="weight"):
+            blend_scalar((Contribution(model="HRRR", value=280.0, weight=weight),))
+
     def test_weighted_mean_of_two_contributors(self) -> None:
         contributions = (
             Contribution(model="HRRR", value=280.0, weight=0.6),
