@@ -71,6 +71,44 @@ Canonical datasets retain source reference/valid/interval times, units, grid ide
 selected-message lineage, decode arguments, configuration snapshot, and source
 artifact IDs. Ambiguous, duplicate, missing, or incompatible messages fail closed.
 
+`canonical-guidance.v2` retains a **bounded window of each model's native grid**, not
+the full grid. The retained window is the smallest native-grid rectangle covering the
+configured inclusive `domain.bbox` plus `point_extraction_policy.halo_cells` complete
+source cells on every side — the same `compute_bbox_halo_subset_indices` rule Phase 1
+uses, under policy `bbox-halo-subset.v1`. Phase 2 produces values only at the three
+approved stations by native-grid bilinear interpolation, which reads one 2x2
+neighbourhood, so every source cell any approved extraction can read is inside that
+window and nothing outside it is scientifically reachable. Subsetting is applied to the
+*full decoded native geometry*, after GFS's `[0, 360)` longitude axis has been reordered
+onto the monotonic `[-180, 180)` axis and after GFS dual-parent APCP equivalence has
+been validated across the whole array, and every remaining per-point computation
+(HRRR/GFS wind rotation, NBM speed/direction-to-U/V, GFS same-bucket differencing,
+PoP percent-to-fraction) is pointwise. Retained values, retained coordinates, station
+enclosing cells, and interpolation weights are therefore bit-identical to full-grid
+processing; `tests/unit/guidance/test_canonical_subset_equivalence.py` proves this per
+model by normalizing the same bytes twice and comparing every station and variable. A
+domain whose bbox or halo the native grid cannot supply is a terminal normalization
+error, never a silently clipped artifact.
+
+Because the retained grid is not the native grid, the artifact must say exactly which
+window of which grid it carries. Every `canonical-guidance.v2` artifact declares
+`subset_policy_id`, the full source grid shape (`source_grid_ny`/`source_grid_nx`), the
+half-open native index bounds `[subset_y_start, subset_y_end) x [subset_x_start,
+subset_x_end)`, `subset_halo_cells`, and the four `subset_bbox_*` degrees; validation
+rejects a missing, partial, non-integer, out-of-range, or dimension-contradicting
+declaration, and rejects a halo below one cell. The corresponding `variable-lineage.v2`
+manifest carries the `canonical_retention_policy` the artifact was cut under, and lineage
+validation rejects a dataset whose declared window contradicts its manifest's policy.
+Full source-grid provenance is unchanged and still complete: source URLs, endpoints,
+byte ranges, inventory rows, message numbers, digests, the approved native grid profile
+identity and shape, provider publication and local retrieval timestamps, decode
+arguments, and the projection CRS all remain retained, so the full native grid can be
+reacquired and the retained window reproduced and audited from the artifact alone.
+Replay reads the bbox and halo from the run's own persisted run spec and station
+snapshot, never from live configuration, so a fresh process retains the identical
+window. Retained coordinate arrays, `grid_id`, and every downstream content-addressed
+artifact identity differ from full-grid Phase 2 runs; that is expected and approved.
+
 Canonical guidance validation enforces grid and lineage *semantics*, not identifier
 syntax. A `canonical-guidance.v2` artifact must carry a grid identifier naming its own
 model and no other, and its `variable_lineage_manifest_id` must resolve to a real
@@ -86,12 +124,13 @@ substitute for the variable lineage manifest.
 
 Spatial extraction is native-grid bilinear interpolation under
 `bilinear-native-grid.v1`: four finite corners are required, weights sum within
-`1e-12`, a one-cell halo may be acquired, and extrapolation is forbidden. Winds are
-earth-relative before blending. Temporal alignment requires exact target valid times
-and identical one-hour interval bounds; it does not interpolate. GFS one-hour QPF is
-derived from successive accumulations; only the explicitly bounded floating-point
-negative tolerance may be floored upstream. No terrain, elevation, lapse-rate,
-nearest-neighbor, or temporal fallback is applied.
+`1e-12`, a one-cell halo may be acquired, and extrapolation is forbidden. The halo
+width is also the retention halo `canonical-guidance.v2` is cut with, so the two are
+never independent. Winds are earth-relative before blending. Temporal alignment
+requires exact target valid times and identical one-hour interval bounds; it does not
+interpolate. GFS one-hour QPF is derived from successive accumulations; only the
+explicitly bounded floating-point negative tolerance may be floored upstream. No
+terrain, elevation, lapse-rate, nearest-neighbor, or temporal fallback is applied.
 
 ## Blend equations and invariants
 
@@ -115,10 +154,24 @@ direction_from = degrees(atan2(-U, -V)) mod 360
 
 Direction is undefined at exactly zero speed and is never angle-averaged. Before
 fallback selection, a source gust more than `0.1 m/s` below its sustained speed
-disqualifies that model cycle. A shortfall in `(0, 0.1] m/s` is floored and recorded.
+disqualifies that model's coupled `eastward_wind_10m`/`northward_wind_10m`/
+`wind_gust_10m` tuple **at that station and target horizon**. U/V and gust are
+rejected atomically because the gust operator's convexity invariant is stated
+against the *blended* wind, so dropping gust alone would leave a blended gust that
+no longer bounds the wind it was checked against. The model's independent variables
+at that point, and its wind/gust at every other point, remain valid contributors.
+The source values are never clamped or repaired; the point simply loses that
+contributor and falls back to the approved row for the models that remain.
+A shortfall in `(0, 0.1] m/s` is floored and recorded.
 Validated gusts use the scalar/vector row. A final gust shortfall no larger than
 `1e-6 m/s` is an explicitly recorded floating-point floor; a larger shortfall fails.
 Final gust must be finite and in `[0, 100] m/s`.
+
+Rejection escalates from the coupled point to the whole model cycle when the
+failure is not a localized cross-field tension but evidence the cycle is untrustworthy
+as a unit: a target horizon with no aligned values, an aligned point missing a
+required field, a non-finite source value, or a documented coverage, geometry,
+time-identity, lineage, or widespread-quality failure.
 
 QPF uses the separate QPF table and the same weighted equation, only across identical
 one-hour intervals. Inputs and output must be finite and nonnegative. PoP is not a
@@ -181,6 +234,16 @@ matched pairs
 
 Contribution rows preserve source value, literal weight, weighted contribution,
 unrounded sum, fallback row ID/digest, source artifact IDs, and correction identity.
+Each row also preserves an ordered `excluded_contributors` list: every model that was
+eligible for the run but rejected at that exact `(variable, station, horizon)`, with
+the cause, the rejection scope (`coupled-wind-gust-point` or `model-cycle`), the
+canonical fields the rejection removed, and the verbatim source gust/sustained values
+and tolerance it was judged against. `model-availability-report.v1` aggregates the
+same evidence run-wide: `models` names every model contributing to at least one
+output, `eligible_models` names the models that survived whole-cycle screening,
+`excluded_models` carries whole-cycle rejections, and `point_exclusions` carries every
+point-scoped rejection. The run-level summary aggregates that evidence; it never
+replaces it.
 The verification artifact's ancestor graph reaches every selected index/message,
 station snapshot, and METAR response.
 
@@ -330,6 +393,53 @@ proof and requires real PostgreSQL and S3-compatible storage. CI runs the latter
 PostgreSQL 16 and MinIO after an Alembic upgrade/downgrade/upgrade round trip, then
 runs the repository coverage threshold. Live tests require
 `MESOFORGE_LIVE_TESTS=1` plus explicit recent cycles and are never gating.
+
+## NBM 1h PoP versus deterministic QPF at the same valid hour
+
+**Status: mechanics verified and source-backed. The pairing is an advisory
+source-product tension only; no value is altered or disqualified.**
+
+The mechanical contract is verified and correct. For every NBM PoP/QPF point in the
+live Minnesota run (216 pairings checked):
+
+- both records are `:APCP:surface:{lead-1}-{lead} hour acc fcst:` — a true one-hour
+  window, never a 3/6/12-hour bucket;
+- the window ends exactly at the target valid time;
+- PoP and deterministic QPF are drawn from the *same* interval and the same lead;
+- PoP01 is confirmed by GRIB2 PDT 4.9 keys (`probabilityType = 1`,
+  `scaledValueOfUpperLimit`/`scaleFactorOfUpperLimit` = 254/10^3 = 0.254 kg m-2),
+  i.e. `P(1h accumulation > 0.254 kg m-2)`, converted once from percent;
+- deterministic QPF stays in `kg m-2` with no unit conversion.
+
+In the live run, 25 of 108 NBM points carry a deterministic 1h QPF above the
+0.254 kg m-2 event threshold while PoP01 for the identical hour is below 20%. The
+clearest instance is **KJMR, target horizon 24 (valid 2026-09-03T18:00Z, NBM cycle
+17Z lead 25)**:
+
+| field | value |
+| --- | --- |
+| NBM PoP01 (`P(>0.254 kg m-2)`) | 0.09 (9%) |
+| NBM deterministic 1h QPF | 3.6388 kg m-2 |
+| interval | 24-25 hour acc fcst, ending exactly at the valid time |
+
+This is not a decoding defect and not a mathematical contradiction. PoP01 is an
+exceedance probability, decoded from PDT 4.9 metadata that states exactly what it is.
+The captured GRIB2 metadata for the deterministic QPF record states its parameter,
+level, interval, and unit — it does **not** state which statistic of the NBM
+distribution the value represents. MesoForge therefore makes no claim about that
+statistic: an earlier version of this section described it as a central/expected-value
+style point estimate, which is not supported by any source MesoForge holds, and that
+claim is withdrawn. Any future characterization must cite authoritative NBM product
+documentation.
+
+Because the two records are decoded from different, individually valid products, a
+low-PoP/high-QPF hour is treated as an **advisory source-product tension** only. Both
+values are reported verbatim with their shared interval. Absent an authoritative rule
+that defines the relationship between the two statistics, MesoForge does not alter,
+suppress, synthesize, or disqualify either value, and the pairing does not affect
+availability state. The existing `check_probability_deterministic_tension` continues to
+flag only the degenerate endpoints (`PoP == 0` with `QPF >= 0.254`, or `PoP == 1` with
+`QPF == 0`); cases like KJMR h24 pass through unflagged and unreconciled.
 
 ## Explicit deferrals and limitations
 

@@ -229,9 +229,19 @@ def normalize_metar_record_v2(
             elif raw.wdir is None:
                 flags.append("wind_direction_missing")
             elif isinstance(raw.wdir, float) and direction_in_range(raw.wdir):
-                wind_from_direction_degrees = raw.wdir
+                # METAR reports due north as 360, not 0 (the same
+                # convention operational NBM WDIR uses). The canonical
+                # contract is the half-open [0, 360) circle, so 360 is
+                # canonicalized to 0 before it is retained or used.
+                # Doing it exactly here -- rather than trusting
+                # ``math.radians(360.0)`` -- avoids leaking a spurious
+                # -2.4e-16 * speed eastward component into a due north
+                # wind, and keeps the retained direction inside the
+                # bound that ``matched-pairs.v2`` enforces.
+                canonical_direction = 0.0 if raw.wdir == 360.0 else raw.wdir
+                wind_from_direction_degrees = canonical_direction
                 eastward, northward = derive_wind_components(
-                    wind_speed_m_s=converted_speed, direction_degrees=raw.wdir
+                    wind_speed_m_s=converted_speed, direction_degrees=canonical_direction
                 )
             else:
                 flags.append("wind_direction_out_of_range")

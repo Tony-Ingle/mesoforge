@@ -88,6 +88,17 @@ def build_field_selector(canonical_variable_id: str, *, forecast_hour: int) -> s
     explicitly excludes any probability-forecast suffix. PoP01 selects
     exactly the ``prob >0.254`` probability-forecast record and
     excludes the deterministic accumulation.
+
+    The operational NBM core inventory spells the PoP01 probability
+    record's trailing identity ``prob fcst {n}/{m}`` (e.g.
+    ``:APCP:surface:5-6 hour acc fcst:prob >0.254:prob fcst 255/255``),
+    not ``probability forecast``. The selector pins that exact live
+    identity; the record's *semantic* probability identity
+    (``probabilityType``, threshold scale/value) is separately and
+    non-negotiably asserted against the decoded GRIB keys in
+    ``guidance/sources/nbm_decoding.py``, so a provider that ever
+    re-spells the inventory text can never silently change which
+    physical field is used.
     """
     if forecast_hour < 1:
         raise ValueError(f"NBM forecast_hour must be >= 1, got {forecast_hour!r}")
@@ -104,7 +115,7 @@ def build_field_selector(canonical_variable_id: str, *, forecast_hour: int) -> s
     if canonical_variable_id == "probability_of_precipitation_1h":
         return (
             rf":APCP:surface:{lead_minus_one}-{forecast_hour} hour acc fcst:"
-            r"prob >0\.254:.*probability forecast:$"
+            r"prob >0\.254:prob fcst \d+/\d+$"
         )
 
     raise ValueError(f"unknown NBM canonical_variable_id {canonical_variable_id!r}")
@@ -120,17 +131,31 @@ def convert_speed_direction_to_components(
     ``v = -speed * cos(direction_degrees)``. Calm speed (exactly 0)
     yields ``u=v=0`` regardless of the reported direction (direction
     is ignored/undefined at calm). Rejects a negative speed or a
-    direction outside ``[0, 360)`` at nonzero speed.
+    direction outside ``[0, 360]`` at nonzero speed.
+
+    The operational NBM WDIR field reports due north as ``360``, not
+    ``0`` (the meteorological wind-from convention numbers directions in
+    ``(0, 360]``, reserving ``0`` for calm/variable). ``360`` is
+    therefore accepted and canonicalized to the identical direction
+    ``0`` *before* the trigonometry, which is exact: ``sin``/``cos`` of
+    a literal ``0`` return exactly ``0.0``/``1.0``, whereas
+    ``math.radians(360.0)`` carries a representation error that would
+    leak a spurious ``-2.4e-16 * speed`` eastward component into a due
+    north wind. Canonicalizing is thus more accurate than evaluating at
+    ``360``, and identical to how the same physical direction reported
+    as ``0`` is already handled.
     """
     if not math.isfinite(speed_m_s) or speed_m_s < 0:
         raise ValueError(f"speed_m_s must be finite and nonnegative, got {speed_m_s!r}")
     if speed_m_s == 0.0:
         return 0.0, 0.0
-    if not math.isfinite(direction_degrees) or not (0.0 <= direction_degrees < 360.0):
+    if not math.isfinite(direction_degrees) or not (0.0 <= direction_degrees <= 360.0):
         raise ValueError(
-            f"direction_degrees must be finite and in [0, 360) at nonzero speed, got "
+            f"direction_degrees must be finite and in [0, 360] at nonzero speed, got "
             f"{direction_degrees!r}"
         )
+    if direction_degrees == 360.0:
+        direction_degrees = 0.0
     radians = math.radians(direction_degrees)
     u = -speed_m_s * math.sin(radians)
     v = -speed_m_s * math.cos(radians)

@@ -17,7 +17,11 @@ from mesoforge.application.phase2_production import (
     _source_grid_profile_id,
     _wind_rotation_policy,
 )
-from mesoforge.guidance.acquisition_v2 import Phase2LeadAcquisition
+from mesoforge.guidance.acquisition_v2 import (
+    Phase2LeadAcquisition,
+    parse_provider_availability,
+    resolve_available_at,
+)
 from tests.support.phase2_source_settings import (
     make_gfs_settings,
     make_hrrr_phase2_settings,
@@ -27,7 +31,24 @@ from tests.support.phase2_source_settings import (
 _CUTOFF = datetime(2030, 8, 31, 12, 20, tzinfo=UTC)
 
 
-def _acquisition(*, index_at: datetime, grib_at: datetime, lead: int = 1) -> Phase2LeadAcquisition:
+def _acquisition(
+    *,
+    index_at: datetime,
+    grib_at: datetime,
+    lead: int = 1,
+    retrieved_at: datetime | None = None,
+) -> Phase2LeadAcquisition:
+    """Build one acquisition whose *provider availability* is
+    ``index_at``/``grib_at``.
+
+    ``retrieved_at`` is the unrelated local wall-clock moment the bytes
+    were fetched; it defaults to long after the availability instants so
+    that any test which still passes proves the policy reads
+    availability rather than retrieval time.
+    """
+    retrieved = (
+        retrieved_at if retrieved_at is not None else max(index_at, grib_at) + timedelta(hours=6)
+    )
     return Phase2LeadAcquisition(
         model="hrrr",
         cycle_date=date(2030, 8, 31),
@@ -38,13 +59,15 @@ def _acquisition(*, index_at: datetime, grib_at: datetime, lead: int = 1) -> Pha
         resolved_index_url="https://example/hrrr.grib2.idx",
         index_payload=b"1:0:d=2030083112:TMP:2 m above ground:1 hour fcst:\n",
         index_attempts=(),
-        index_completed_at=index_at,
+        index_completed_at=retrieved,
         selected_messages=(),
         grib_attempts=(),
-        grib_completed_at=grib_at,
+        grib_completed_at=retrieved,
         full_object_etag=None,
         full_object_last_modified=None,
         full_object_content_length=188,
+        index_available_at=index_at,
+        grib_available_at=grib_at,
     )
 
 
@@ -79,6 +102,64 @@ class TestInformationCutoffDetection:
 
     def test_an_empty_candidate_is_vacuously_on_time(self) -> None:
         assert _late_acquisitions((), _CUTOFF) == ()
+
+    def test_a_late_retrieval_of_a_punctually_published_object_is_not_late(self) -> None:
+        """The defect this closes: an already-published retrospective
+        cycle must not be rejected merely because this process fetched
+        it after the cutoff.
+
+        Publication is hours before the cutoff; retrieval is hours
+        after. Only publication may gate the cutoff, so nothing is late.
+        """
+        published = _CUTOFF - timedelta(hours=4)
+        retrieved = _CUTOFF + timedelta(hours=3)
+        acquisitions = (
+            _acquisition(index_at=published, grib_at=published, retrieved_at=retrieved),
+        )
+        assert acquisitions[0].index_completed_at > _CUTOFF
+        assert acquisitions[0].grib_completed_at > _CUTOFF
+        assert _late_acquisitions(acquisitions, _CUTOFF) == ()
+
+    def test_a_genuinely_late_publication_is_still_rejected(self) -> None:
+        """The converse must keep holding: an object the provider only
+        published after the cutoff is a real leak of future information
+        even when it was retrieved promptly afterwards.
+        """
+        published = _CUTOFF + timedelta(minutes=10)
+        acquisitions = (
+            _acquisition(
+                index_at=_CUTOFF,
+                grib_at=published,
+                retrieved_at=_CUTOFF + timedelta(minutes=11),
+            ),
+        )
+        assert _late_acquisitions(acquisitions, _CUTOFF) == (published,)
+
+
+class TestProviderAvailabilityParsing:
+    """The authoritative availability instant comes from the provider's
+    own ``Last-Modified`` assertion, never from the local clock."""
+
+    def test_parses_a_real_provider_http_date_as_utc(self) -> None:
+        parsed = parse_provider_availability("Wed, 02 Sep 2026 13:40:26 GMT")
+        assert parsed == datetime(2026, 9, 2, 13, 40, 26, tzinfo=UTC)
+
+    @pytest.mark.parametrize("value", [None, "", "not-a-date", "Wed, 99 Xxx 2026 13:40:26 GMT"])
+    def test_returns_none_for_a_missing_or_malformed_header(self, value: str | None) -> None:
+        assert parse_provider_availability(value) is None
+
+    def test_resolve_prefers_the_provider_assertion_over_retrieval_time(self) -> None:
+        retrieved = datetime(2026, 9, 2, 18, 33, tzinfo=UTC)
+        resolved = resolve_available_at("Wed, 02 Sep 2026 13:40:26 GMT", retrieved_at=retrieved)
+        assert resolved == datetime(2026, 9, 2, 13, 40, 26, tzinfo=UTC)
+
+    def test_resolve_falls_back_to_retrieval_time_when_the_provider_is_silent(self) -> None:
+        """A provider that asserts nothing gets the conservative
+        fallback: retrieval time is necessarily no earlier than
+        publication, so the fallback can only ever make an object look
+        later, never admit a genuinely late one."""
+        retrieved = datetime(2026, 9, 2, 18, 33, tzinfo=UTC)
+        assert resolve_available_at(None, retrieved_at=retrieved) == retrieved
 
 
 class TestLineageProvenanceHelpers:

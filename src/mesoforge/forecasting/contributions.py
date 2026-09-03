@@ -46,6 +46,45 @@ class ContributorRecord(BaseModel):
         return self
 
 
+class ExcludedContributorRecord(BaseModel):
+    """One model that was *eligible* for this row but excluded from it.
+
+    Section 4.1/4.3 disqualification is fail-closed, but the scope of a
+    disqualification is not always the whole cycle: a source gust below
+    its own sustained speed invalidates the coupled wind/gust tuple at
+    that exact station/horizon, not the model's independent temperature,
+    dew point, PoP, or QPF guidance (Codex review ``t_1564b30c``).
+    Whichever scope applied, the evidence has to survive into the
+    product, so this record carries the cause, the scope, the exact
+    source values, the tolerance they were judged against, and every
+    canonical field the exclusion removed. The row it lives on already
+    names the model's station, horizon, and valid time, so those are
+    never duplicated here.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    model: Literal["HRRR", "NBM", "GFS"]
+    reason: str
+    scope: Literal["coupled-wind-gust-point", "model-cycle"]
+    detail: str
+    affected_variable_ids: tuple[str, ...]
+    source_gust_m_s: float | None = None
+    source_sustained_speed_m_s: float | None = None
+    shortfall_m_s: float | None = None
+    shortfall_floor_tolerance_m_s: float | None = None
+
+    @model_validator(mode="after")
+    def _check_affected(self) -> ExcludedContributorRecord:
+        if not self.affected_variable_ids:
+            raise ValueError("an exclusion record must name at least one affected variable")
+        if len(set(self.affected_variable_ids)) != len(self.affected_variable_ids):
+            raise ValueError("affected_variable_ids must not repeat a variable")
+        if not self.reason or not self.detail:
+            raise ValueError("an exclusion record must carry a reason and a detail")
+        return self
+
+
 class BlendContributionRow(BaseModel):
     """One ``(variable, location, target_horizon)`` row of the
     contribution manifest (Section 4.7)."""
@@ -60,6 +99,7 @@ class BlendContributionRow(BaseModel):
     availability_state: VariableAvailabilityStateLiteral
     fallback_row_id: FallbackRowId | None
     contributors: tuple[ContributorRecord, ...]
+    excluded_contributors: tuple[ExcludedContributorRecord, ...] = ()
     unrounded_sum: float
     serialized_output: float
     gust_floor_applied: bool = False

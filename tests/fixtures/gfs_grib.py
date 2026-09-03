@@ -2,17 +2,31 @@
 2 tests (mirrors ``tests/fixtures/nbm_grib.py``/``hrrr_grib.py``): a
 tiny 0.25-degree regular lat/lon grid carrying the same discipline/
 category/number identity as the real GFS pgrb2 product.
+
+The grid is deliberately larger than the configured Grasston bbox: Phase
+2 canonical guidance retains the domain bbox plus a one-cell
+interpolation halo, so a fixture grid must be able to supply that halo
+on every side or it exercises a code path the operational global grid
+never takes.
+
+It also scans **north-to-south** (``jScansPositively=0``), exactly like
+the operational GFS 0.25-degree product: its first grid row is the
+northernmost and its last is the southernmost. A fixture that scanned
+south-to-north would silently hide a latitude-axis error that the real
+product exposes.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-NX = 12
-NY = 10
+NX = 18
+NY = 16
 DX_DEGREES = 0.25
-FIRST_LAT_DEGREES = 44.0
-FIRST_LON_DEGREES = 265.0  # -95.0
+# North-to-south scan: the first row is the northern edge.
+FIRST_LAT_DEGREES = 47.25
+LAST_LAT_DEGREES = FIRST_LAT_DEGREES - DX_DEGREES * (NY - 1)  # 43.5
+FIRST_LON_DEGREES = 264.5  # -95.5
 
 
 def _base_message(*, forecast_hour: int, cycle_date: str, cycle_hour: int) -> int:
@@ -25,12 +39,10 @@ def _base_message(*, forecast_hour: int, cycle_date: str, cycle_hour: int) -> in
     eccodes.codes_set(gid, "Nj", NY)
     eccodes.codes_set(gid, "iDirectionIncrementInDegrees", DX_DEGREES)
     eccodes.codes_set(gid, "jDirectionIncrementInDegrees", DX_DEGREES)
-    eccodes.codes_set(gid, "jScansPositively", 1)
+    eccodes.codes_set(gid, "jScansPositively", 0)
     eccodes.codes_set(gid, "latitudeOfFirstGridPointInDegrees", FIRST_LAT_DEGREES)
     eccodes.codes_set(gid, "longitudeOfFirstGridPointInDegrees", FIRST_LON_DEGREES)
-    eccodes.codes_set(
-        gid, "latitudeOfLastGridPointInDegrees", FIRST_LAT_DEGREES + DX_DEGREES * (NY - 1)
-    )
+    eccodes.codes_set(gid, "latitudeOfLastGridPointInDegrees", LAST_LAT_DEGREES)
     eccodes.codes_set(
         gid, "longitudeOfLastGridPointInDegrees", FIRST_LON_DEGREES + DX_DEGREES * (NX - 1)
     )

@@ -212,6 +212,36 @@ class TestDecodePop01:
                 cycle_hour=_CYCLE_HOUR,
             )
 
+    def test_pins_the_operational_probability_type(self) -> None:
+        """The operational NBM core PoP01 record is PDT 4.9 with
+        ``probabilityType=1`` ("probability of event above upper limit"),
+        which is exactly the ``prob >0.254`` semantics the inventory
+        advertises. Pin that decoded identity so a provider that ever
+        published a differently-typed probability (e.g. a below-limit or
+        between-limits record carrying the same threshold keys) fails
+        closed instead of being blended in as PoP.
+        """
+        payload = make_pop01_message(forecast_hour=6, values_percent=np.full((NY, NX), 40.0))
+        result = _decode(
+            payload, contract=_contract("probability_of_precipitation_1h"), forecast_hour=6
+        )
+        assert result.attrs["GRIB_probabilityType"] == 1
+        assert result.attrs["GRIB_scaledValueOfUpperLimit"] == 254
+        assert result.attrs["GRIB_scaleFactorOfUpperLimit"] == 3
+
+    def test_rejects_a_different_probability_type_at_the_same_threshold(self) -> None:
+        """probabilityType is asserted independently of the threshold: a
+        record carrying the correct >0.254 upper-limit keys but a
+        different probability type is a different physical quantity and
+        must not be accepted as PoP01."""
+        payload = make_pop01_message(
+            forecast_hour=6,
+            values_percent=np.full((NY, NX), 40.0),
+            probability_type=4,
+        )
+        with pytest.raises(NbmDecodeError, match="PoP01 probability identity mismatch"):
+            _decode(payload, contract=_contract("probability_of_precipitation_1h"), forecast_hour=6)
+
 
 class TestApprovedGridContract:
     """Codex re-review finding 2: the approved operational NBM grid

@@ -201,6 +201,7 @@ def make_pop01_message(
     cycle_date: str = "20260830",
     cycle_hour: int = 12,
     grid_keys: dict[str, Any] | None = None,
+    probability_type: int = 1,
 ) -> bytes:
     import eccodes
 
@@ -219,7 +220,12 @@ def make_pop01_message(
         eccodes.codes_set(gid, "startStep", forecast_hour - 1)
         eccodes.codes_set(gid, "endStep", forecast_hour)
         eccodes.codes_set(gid, "productDefinitionTemplateNumber", 9)
-        eccodes.codes_set(gid, "probabilityType", 3)
+        # Match the operational NBM core PoP01 encoding exactly: Code
+        # Table 4.9 value 1, "Probability of event above upper limit",
+        # with the >0.254 kg/m^2 threshold in the upper-limit keys.
+        # ``probability_type`` is overridable only so a test can build a
+        # deliberately wrong-typed decoy; production NBM is always 1.
+        eccodes.codes_set(gid, "probabilityType", probability_type)
         eccodes.codes_set(gid, "scaledValueOfUpperLimit", 254)
         eccodes.codes_set(gid, "scaleFactorOfUpperLimit", 3)
         eccodes.codes_set_array(gid, "values", values_percent.astype(np.float64).ravel())

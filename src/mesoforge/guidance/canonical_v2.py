@@ -12,6 +12,7 @@ variables/units are populated.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
@@ -20,6 +21,16 @@ import xarray as xr
 from mesoforge.common.errors import MesoForgeError
 
 ModelId = Literal["hrrr", "nbm", "gfs"]
+
+# Phase 2 bounded canonical retention (owner architecture decision).
+# ``canonical-guidance.v2`` no longer retains a model's full native grid:
+# it retains the configured domain bbox plus the point-extraction policy
+# halo, computed on the native grid with the same Phase 1 rule
+# (``guidance.normalization.compute_bbox_halo_subset_indices``). The
+# native grid identity, shape, and the exact retained index window are
+# recorded as artifact attributes so the full source grid remains
+# reconstructible and auditable from the retained evidence.
+SUBSET_POLICY_ID = "bbox-halo-subset.v1"
 
 _INSTANTANEOUS_VARIABLE_UNITS: dict[str, str] = {
     "air_temperature_2m": "K",
@@ -39,6 +50,57 @@ class CanonicalGuidanceV2Error(MesoForgeError):
     time or validation-time invariants."""
 
 
+@dataclass(frozen=True, slots=True)
+class RetainedGridSubset:
+    """The exact native-grid window a ``canonical-guidance.v2`` artifact
+    retains, plus the full source grid it was cut from.
+
+    Phase 2 produces values at three station points by native-grid
+    bilinear interpolation, which reads a single 2x2 neighbourhood. The
+    retained window is therefore the configured inclusive domain bbox
+    plus ``halo_cells`` complete source cells on every side -- every
+    source cell any approved station extraction can read -- and nothing
+    else. ``source_ny``/``source_nx`` and the half-open
+    ``[y_start, y_end) x [x_start, x_end)`` index bounds are retained so
+    the artifact's grid can be placed back onto the provider's native
+    grid exactly, without re-fetching it.
+    """
+
+    source_ny: int
+    source_nx: int
+    y_start: int
+    y_end: int
+    x_start: int
+    x_end: int
+    halo_cells: int
+    bbox_south: float
+    bbox_north: float
+    bbox_west: float
+    bbox_east: float
+    policy_id: str = SUBSET_POLICY_ID
+
+    @property
+    def retained_shape(self) -> tuple[int, int]:
+        return (self.y_end - self.y_start, self.x_end - self.x_start)
+
+    def as_attrs(self) -> dict[str, object]:
+        """Flat, netCDF-serializable provenance attributes."""
+        return {
+            "subset_policy_id": self.policy_id,
+            "source_grid_ny": int(self.source_ny),
+            "source_grid_nx": int(self.source_nx),
+            "subset_y_start": int(self.y_start),
+            "subset_y_end": int(self.y_end),
+            "subset_x_start": int(self.x_start),
+            "subset_x_end": int(self.x_end),
+            "subset_halo_cells": int(self.halo_cells),
+            "subset_bbox_south": float(self.bbox_south),
+            "subset_bbox_north": float(self.bbox_north),
+            "subset_bbox_west": float(self.bbox_west),
+            "subset_bbox_east": float(self.bbox_east),
+        }
+
+
 def assemble_canonical_guidance_v2(
     *,
     model: ModelId,
@@ -55,6 +117,7 @@ def assemble_canonical_guidance_v2(
     configuration_snapshot_id: str,
     variable_lineage_manifest_id: str,
     crs_wkt2: str | None = None,
+    retained_subset: RetainedGridSubset | None = None,
 ) -> xr.Dataset:
     """Assemble ``canonical-guidance.v2`` (plan Section 5.1) for one
     model's one selected cycle.
@@ -65,6 +128,11 @@ def assemble_canonical_guidance_v2(
     per-lead interval start hour (so ``APCP``'s ``(start, lead]``
     bound is retained exactly, including GFS bucket starts that are
     not simply ``lead - 1``).
+
+    ``x``/``y``/``lat``/``lon`` and every field are already the
+    *retained* bbox+halo subset of the native grid; ``retained_subset``
+    records which native window that is, and is written to the dataset
+    attributes as provenance.
     """
     n_lead = len(source_lead_hours)
     lead_time = np.array(
@@ -146,6 +214,14 @@ def assemble_canonical_guidance_v2(
             np.stack([interval_start, interval_end.astype("datetime64[ns]")], axis=1),
         )
 
+    if retained_subset is not None:
+        expected_shape = retained_subset.retained_shape
+        if lat.shape != expected_shape:
+            raise CanonicalGuidanceV2Error(
+                f"retained subset window {expected_shape!r} does not match the retained "
+                f"coordinate mesh shape {lat.shape!r}"
+            )
+
     dataset = xr.Dataset(
         data_vars=data_vars,
         coords={
@@ -165,6 +241,7 @@ def assemble_canonical_guidance_v2(
             "configuration_snapshot_id": configuration_snapshot_id,
             "variable_lineage_manifest_id": variable_lineage_manifest_id,
             **({"crs_wkt2": crs_wkt2} if crs_wkt2 is not None else {}),
+            **(retained_subset.as_attrs() if retained_subset is not None else {}),
         },
     )
     return dataset
@@ -371,11 +448,124 @@ def validate_canonical_guidance_lineage_v2(
             "carry and that are not a declared derivation source"
         )
 
+    # Bounded canonical retention (owner architecture decision): the
+    # dataset says which native window it retains; the manifest says
+    # under which policy it was cut. A dataset whose retained window
+    # contradicts its own declared policy is not auditable, so the two
+    # must agree exactly.
+    policy = lineage_manifest.canonical_retention_policy
+    if str(dataset.attrs.get("subset_policy_id")) != str(policy.policy_id):
+        errors.append(
+            f"dataset subset_policy_id {dataset.attrs.get('subset_policy_id')!r} does not match "
+            f"the lineage manifest's canonical retention policy {policy.policy_id!r}"
+        )
+    for attr_name, expected in (
+        ("subset_halo_cells", policy.halo_cells),
+        ("subset_bbox_south", policy.bbox_south),
+        ("subset_bbox_north", policy.bbox_north),
+        ("subset_bbox_west", policy.bbox_west),
+        ("subset_bbox_east", policy.bbox_east),
+    ):
+        actual = dataset.attrs.get(attr_name)
+        if actual is None or float(actual) != float(expected):
+            errors.append(
+                f"dataset {attr_name} {actual!r} does not match the lineage manifest's "
+                f"declared retention policy value {expected!r}"
+            )
+
     if errors:
         raise CanonicalGuidanceLineageV2Error(
             f"canonical-guidance.v2 lineage validation failed with {len(errors)} problem(s): "
             + "; ".join(errors)
         )
+
+
+_SUBSET_INT_ATTRS = (
+    "source_grid_ny",
+    "source_grid_nx",
+    "subset_y_start",
+    "subset_y_end",
+    "subset_x_start",
+    "subset_x_end",
+    "subset_halo_cells",
+)
+_SUBSET_FLOAT_ATTRS = (
+    "subset_bbox_south",
+    "subset_bbox_north",
+    "subset_bbox_west",
+    "subset_bbox_east",
+)
+
+
+def _validate_retained_subset_attrs(dataset: xr.Dataset, errors: list[str]) -> None:
+    """Validate the bounded-retention provenance a Phase 2 canonical
+    artifact carries (owner architecture decision).
+
+    ``canonical-guidance.v2`` retains only the configured bbox+halo
+    window of the model's native grid, so the artifact must say exactly
+    which window of which native grid that is, or the values cannot be
+    placed back onto the source grid and audited. The attributes are
+    all-or-nothing: a partially-declared subset is a broken contract,
+    not a full-grid artifact.
+    """
+    present = [name for name in (*_SUBSET_INT_ATTRS, *_SUBSET_FLOAT_ATTRS) if name in dataset.attrs]
+    if not present:
+        errors.append(
+            "canonical-guidance.v2 must declare its retained bbox+halo subset window "
+            f"(missing every one of {sorted((*_SUBSET_INT_ATTRS, *_SUBSET_FLOAT_ATTRS))!r})"
+        )
+        return
+    missing = [
+        name for name in (*_SUBSET_INT_ATTRS, *_SUBSET_FLOAT_ATTRS) if name not in dataset.attrs
+    ]
+    if missing:
+        errors.append(f"retained subset provenance is incomplete; missing {sorted(missing)!r}")
+        return
+
+    if dataset.attrs.get("subset_policy_id") != SUBSET_POLICY_ID:
+        errors.append(
+            f"subset_policy_id must be exactly {SUBSET_POLICY_ID!r}, got "
+            f"{dataset.attrs.get('subset_policy_id')!r}"
+        )
+
+    values: dict[str, int] = {}
+    for name in _SUBSET_INT_ATTRS:
+        raw = dataset.attrs[name]
+        try:
+            values[name] = int(raw)
+        except (TypeError, ValueError):
+            errors.append(f"{name!r} must be an integer, got {raw!r}")
+            return
+    for name in _SUBSET_FLOAT_ATTRS:
+        raw = dataset.attrs[name]
+        try:
+            float(raw)
+        except (TypeError, ValueError):
+            errors.append(f"{name!r} must be a float, got {raw!r}")
+
+    if values["subset_halo_cells"] < 1:
+        errors.append(
+            "subset_halo_cells must be at least 1 so every bilinear corner the domain can "
+            f"require is retained, got {values['subset_halo_cells']}"
+        )
+    for axis, start, end, extent in (
+        ("y", values["subset_y_start"], values["subset_y_end"], values["source_grid_ny"]),
+        ("x", values["subset_x_start"], values["subset_x_end"], values["source_grid_nx"]),
+    ):
+        if extent <= 0:
+            errors.append(f"source_grid_n{axis} must be positive, got {extent}")
+            continue
+        if start < 0 or end > extent or end <= start:
+            errors.append(
+                f"retained {axis} window [{start}, {end}) must be a nonempty half-open range "
+                f"inside the native extent [0, {extent})"
+            )
+            continue
+        if axis in dataset.dims and int(dataset.sizes[axis]) != end - start:
+            errors.append(
+                f"retained {axis} dimension size {int(dataset.sizes[axis])} does not match the "
+                f"declared window [{start}, {end})"
+            )
 
 
 def validate_canonical_guidance_v2(dataset: xr.Dataset) -> None:
@@ -446,6 +636,8 @@ def validate_canonical_guidance_v2(dataset: xr.Dataset) -> None:
             "variable_lineage_manifest_id must be a real artifact ID, got "
             f"{variable_lineage_manifest_id!r}"
         )
+
+    _validate_retained_subset_attrs(dataset, errors)
 
     if errors:
         raise CanonicalGuidanceV2Error(

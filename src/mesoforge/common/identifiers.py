@@ -195,6 +195,12 @@ class FallbackRowId(_KebabDotId):
     (plan Section 4.2/4.4)."""
 
 
+class CanonicalRetentionPolicyId(_KebabDotId):
+    """Identifier for the policy under which a Phase 2 canonical
+    guidance artifact retains a bounded window of its model's native
+    grid (``bbox-halo-subset.v1``)."""
+
+
 def strip_prefix(value: str, prefix: str) -> str:
     """Strictly remove ``prefix`` from ``value``, raising ``InvalidIdentifier``
     if the prefix is absent. Unlike ``str.removeprefix``, this never

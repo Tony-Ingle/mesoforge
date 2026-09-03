@@ -14,11 +14,13 @@ import numpy as np
 import pytest
 
 from mesoforge.contracts.lineage_v2 import (
+    CanonicalRetentionPolicyV2,
     VariableLineageEntryV2,
     VariableLineageManifestV2,
 )
 from mesoforge.guidance.canonical_v2 import (
     CanonicalGuidanceLineageV2Error,
+    RetainedGridSubset,
     assemble_canonical_guidance_v2,
     validate_canonical_guidance_lineage_v2,
 )
@@ -29,6 +31,27 @@ _MESSAGE = "art_00000000-0000-0000-0000-0000000000b1"
 _LINEAGE = "art_00000000-0000-0000-0000-0000000000c1"
 _REFERENCE = "2030-08-31T12:00:00+00:00"
 _LEADS = (1, 2)
+
+# Phase 2 bounded canonical retention: the configured domain bbox plus a
+# one-cell halo. The manifest declares the policy; the dataset declares
+# the resolved native window it produced.
+_BBOX = {
+    "bbox_south": 45.05265,
+    "bbox_north": 46.55265,
+    "bbox_west": -94.07956,
+    "bbox_east": -92.07956,
+}
+_RETENTION_POLICY = CanonicalRetentionPolicyV2(halo_cells=1, **_BBOX)  # type: ignore[arg-type]
+_SUBSET = RetainedGridSubset(
+    source_ny=8,
+    source_nx=9,
+    y_start=3,
+    y_end=5,
+    x_start=3,
+    x_end=6,
+    halo_cells=1,
+    **_BBOX,  # type: ignore[arg-type]
+)
 _HRRR_VARIABLES = (
     "air_temperature_2m",
     "dew_point_temperature_2m",
@@ -76,6 +99,7 @@ def _manifest(**overrides: object) -> VariableLineageManifestV2:
         ),
         "expected_canonical_variable_ids": _HRRR_VARIABLES,
         "expected_source_lead_hours": _LEADS,
+        "canonical_retention_policy": _RETENTION_POLICY,
     }
     values.update(overrides)
     return VariableLineageManifestV2(**values)  # type: ignore[arg-type]
@@ -189,6 +213,7 @@ def _dataset(model: str = "hrrr", grid_id: str = "phase2-hrrr.v1"):
         grid_id=grid_id,
         configuration_snapshot_id=_CFG,
         variable_lineage_manifest_id=_LINEAGE,
+        retained_subset=_SUBSET,
     )
 
 

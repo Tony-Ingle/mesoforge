@@ -53,7 +53,7 @@ def test_nbm_live_contract(tmp_path: Path) -> None:
         ":WDIR:10 m above ground:6 hour fcst:$",
         ":GUST:10 m above ground:6 hour fcst:$",
         r":APCP:surface:5-6 hour acc fcst:$",
-        r":APCP:surface:5-6 hour acc fcst:prob >0\.254:.*probability forecast:$",
+        r":APCP:surface:5-6 hour acc fcst:prob >0\.254:prob fcst \d+/\d+$",
     )
     selected = tuple(select_field_row(rows, selector) for selector in selectors)
     paths = fetch_rows(

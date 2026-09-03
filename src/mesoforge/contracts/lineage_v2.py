@@ -31,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 
 from mesoforge.common.identifiers import (
     ArtifactId,
+    CanonicalRetentionPolicyId,
     ConfigurationSnapshotId,
     GridId,
     VariableId,
@@ -102,6 +103,47 @@ class VariableLineageEntryV2(BaseModel):
         return self
 
 
+class CanonicalRetentionPolicyV2(BaseModel):
+    """The bounded-retention policy under which a Phase 2 canonical
+    artifact was cut from its model's full native grid (owner
+    architecture decision).
+
+    Phase 2 no longer retains full native grids: it retains the
+    configured inclusive domain bbox plus ``halo_cells`` complete source
+    cells on every side. The policy is recorded here, in lineage, while
+    the *resolved* index window for a specific native grid is recorded
+    on the canonical dataset itself -- together they state exactly which
+    provider cells the artifact carries and why.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    policy_id: CanonicalRetentionPolicyId = CanonicalRetentionPolicyId("bbox-halo-subset.v1")
+    halo_cells: int
+    bbox_south: float
+    bbox_north: float
+    bbox_west: float
+    bbox_east: float
+
+    @model_validator(mode="after")
+    def _check_policy(self) -> CanonicalRetentionPolicyV2:
+        if str(self.policy_id) != "bbox-halo-subset.v1":
+            raise ValueError(
+                "Phase 2 approves exactly one canonical retention policy, "
+                f"'bbox-halo-subset.v1'; got {self.policy_id!r}"
+            )
+        if self.halo_cells < 1:
+            raise ValueError(
+                "halo_cells must be at least 1 so every bilinear corner the domain can "
+                f"require is retained, got {self.halo_cells}"
+            )
+        if self.bbox_south >= self.bbox_north:
+            raise ValueError("bbox_south must be strictly less than bbox_north")
+        if self.bbox_west >= self.bbox_east:
+            raise ValueError("bbox_west must be strictly less than bbox_east")
+        return self
+
+
 class VariableLineageManifestV2(BaseModel):
     """Section 5.1: ``variable-lineage.v2``. Rejects a manifest that does
     not carry exactly one complete entry for every expected canonical
@@ -119,6 +161,7 @@ class VariableLineageManifestV2(BaseModel):
     entries: tuple[VariableLineageEntryV2, ...]
     expected_canonical_variable_ids: tuple[VariableId, ...]
     expected_source_lead_hours: tuple[int, ...]
+    canonical_retention_policy: CanonicalRetentionPolicyV2
 
     @model_validator(mode="after")
     def _check_completeness_and_identity(self) -> VariableLineageManifestV2:

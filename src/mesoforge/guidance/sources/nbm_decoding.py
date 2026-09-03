@@ -73,12 +73,19 @@ _GRIB_UNITS_BY_EXPECTED_UNIT: dict[str, frozenset[str]] = {
     "percent": frozenset({"%", "kg m**-2", "kg m-2"}),
 }
 
-# NBM PoP01's exact probability-forecast identity (plan Section 2.3):
-# probabilityType 3 ("above upper limit" is not used; NBM's ">0.254"
-# threshold is encoded by the upper-limit keys exposed by the live NBM
-# contract for probabilityType 3) and the exact scaled threshold derived
-# from ``NbmSourceSettings.probability_threshold_kg_m2``.
-_POP_PROBABILITY_TYPE = 3
+# NBM PoP01's exact probability-forecast identity (plan Section 2.3).
+#
+# The operational NBM core PoP01 record is GRIB2 product definition
+# template 4.9 with ``probabilityType = 1`` -- eccodes resolves that
+# Code Table 4.9 entry to ``"Probability of event above upper limit"``,
+# which is precisely the semantics of the inventory's ``prob >0.254``:
+# the probability that accumulation *exceeds* the upper limit encoded by
+# ``scaledValueOfUpperLimit``/``scaleFactorOfUpperLimit`` (254 / 10**3 =
+# 0.254 kg/m^2). The threshold keys are asserted separately below
+# against ``NbmSourceSettings.probability_threshold_kg_m2``, so the
+# physical field is pinned by its own GRIB semantics and not merely by
+# the inventory text.
+_POP_PROBABILITY_TYPE = 1
 _POP_SCALE_FACTOR = 3
 
 

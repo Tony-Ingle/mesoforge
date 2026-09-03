@@ -58,6 +58,7 @@ from mesoforge.application.phase2_replay import (
     Phase2ReplayIdentityError,
 )
 from mesoforge.catalog.configuration import Phase2Configuration
+from mesoforge.catalog.domains import BoundingBox
 from mesoforge.common.identifiers import ArtifactId, Digest, GridId, RunId, StationId
 from mesoforge.contracts.artifacts import ArtifactManifest, Availability
 from mesoforge.contracts.forecasts import validate_baseline_forecast_v2
@@ -75,9 +76,11 @@ from mesoforge.forecasting.contributions import (
     BlendContributionManifest,
     BlendContributionRow,
     ContributorRecord,
+    ExcludedContributorRecord,
     IdentityBiasCorrection,
 )
 from mesoforge.forecasting.gust_blend import (
+    SOURCE_GUST_SHORTFALL_FLOOR_TOLERANCE_M_S,
     GustDisqualificationError,
     blend_gust,
     validate_source_gust,
@@ -94,6 +97,7 @@ from mesoforge.guidance.acquisition_v2 import (
     acquire_nbm_lead,
 )
 from mesoforge.guidance.canonical_v2 import (
+    SUBSET_POLICY_ID,
     validate_canonical_guidance_lineage_v2,
     validate_canonical_guidance_v2,
 )
@@ -171,6 +175,20 @@ _WIND_VARIABLES = frozenset(
         "wind_speed_10m",
         "wind_from_direction_10m",
     }
+)
+
+# The atomic scientific unit a source gust inconsistency invalidates.
+# Gust is only meaningful against its own sustained wind, and the gust
+# operator's convexity invariant is stated against the *blended* wind,
+# so dropping gust alone at a point would leave a blended gust that no
+# longer bounds the blended wind it was checked against. U, V and gust
+# are therefore rejected together, and nothing else is (Codex review
+# t_1564b30c). Order is stable so the persisted provenance is
+# deterministic.
+_COUPLED_WIND_GUST_VARIABLES = (
+    "eastward_wind_10m",
+    "northward_wind_10m",
+    "wind_gust_10m",
 )
 
 
@@ -264,17 +282,25 @@ def _valid_map(value: object) -> None:
 def _late_acquisitions(
     acquisitions: tuple[Phase2LeadAcquisition, ...], information_cutoff: datetime
 ) -> tuple[datetime, ...]:
-    """Every acquisition timestamp in ``acquisitions`` that is strictly
-    after ``information_cutoff`` (Codex re-review finding 4).
+    """Every *authoritative provider availability* timestamp in
+    ``acquisitions`` that is strictly after ``information_cutoff``
+    (Codex re-review finding 4).
 
-    Both the index retrieval and the ranged message retrieval count: a
-    forecast may only use input bytes that actually existed by the
-    cutoff, and an index that only appeared afterwards is just as much
-    a leak of future information as a late message.
+    Both the index and the ranged message object count: a forecast may
+    only use input bytes that actually existed by the cutoff, and an
+    index that only appeared afterwards is just as much a leak of
+    future information as a late message.
+
+    The comparison uses ``*_available_at`` -- the provider's own
+    ``Last-Modified`` publication assertion -- not ``*_completed_at``,
+    which is merely when this process happened to retrieve the bytes.
+    Using retrieval time here would reject an already-published
+    retrospective cycle purely because the run started later, which is
+    not a leak of future information at all.
     """
     late: list[datetime] = []
     for acquisition in acquisitions:
-        for available_at in (acquisition.index_completed_at, acquisition.grib_completed_at):
+        for available_at in (acquisition.index_available_at, acquisition.grib_available_at):
             if available_at > information_cutoff:
                 late.append(available_at)
     return tuple(late)
@@ -557,7 +583,13 @@ class Phase2ProductionProvider:
                     len(late),
                 )
                 continue
-            completed_at = max(a.grib_completed_at for a in acquisitions)
+            # The cycle's completion instant is the provider's own
+            # publication assertion for the last object in the required
+            # set, not this process's retrieval wall time. Comparing
+            # retrieval time to the cycle-completion deadline would
+            # reject every legitimately-published retrospective cycle
+            # merely because it was fetched later.
+            completed_at = max(a.grib_available_at for a in acquisitions)
             selection = select_model_cycle(
                 model=model,  # type: ignore[arg-type]
                 target_reference_time=target,
@@ -626,7 +658,7 @@ class Phase2ProductionProvider:
                     schema=f"{model.lower()}-index.v1",
                     payload=acquisition.index_payload,
                     media_type="text/plain",
-                    available_at=acquisition.index_completed_at,
+                    available_at=acquisition.index_available_at,
                     source_revision=acquisition.endpoint,
                 )
                 roots.append(
@@ -650,7 +682,7 @@ class Phase2ProductionProvider:
                         schema=f"{model.lower()}-message.v1",
                         payload=message.payload,
                         media_type="application/octet-stream",
-                        available_at=acquisition.grib_completed_at,
+                        available_at=acquisition.grib_available_at,
                         source_revision=acquisition.endpoint,
                     )
                     roots.append(
@@ -807,8 +839,16 @@ class Phase2ProductionProvider:
             "endpoint": acquisition.endpoint,
             "resolved_index_url": acquisition.resolved_index_url,
             "resolved_grib_url": acquisition.resolved_grib_url,
+            # Local retrieval provenance of this process.
             "index_completed_at": acquisition.index_completed_at.isoformat(),
             "grib_completed_at": acquisition.grib_completed_at.isoformat(),
+            # Authoritative provider publication instants (the values the
+            # cutoff/deadline policy was actually applied to), plus the
+            # verbatim provider assertions they were derived from.
+            "index_available_at": acquisition.index_available_at.isoformat(),
+            "grib_available_at": acquisition.grib_available_at.isoformat(),
+            "index_last_modified": acquisition.index_last_modified,
+            "grib_last_modified": acquisition.full_object_last_modified,
             "selected_messages": [
                 {
                     "canonical_variable_id": message.canonical_variable_id,
@@ -1131,6 +1171,8 @@ class Phase2ProductionScience:
                 settings=settings,
                 input_refs=input_refs,
                 index_refs=index_refs,
+                domain_bbox=persisted.configuration.domain.bbox,
+                halo_cells=persisted.point_extraction_policy.halo_cells,
             )
 
             qpf_lineage_artifact: ArtifactManifest | None = None
@@ -1142,6 +1184,8 @@ class Phase2ProductionScience:
                     source_leads: tuple[int, ...] = target_source_leads,
                     cycle_reference_time: datetime = reference_time,
                     gfs_settings: Any = settings,
+                    domain_bbox: BoundingBox = persisted.configuration.domain.bbox,
+                    halo_cells: int = persisted.point_extraction_policy.halo_cells,
                 ) -> dict[str, Any]:
                     field_payloads = _group_normalization_payloads(refs, raw)
                     self._require_contiguous_previous_leads(field_payloads, source_leads)
@@ -1153,6 +1197,8 @@ class Phase2ProductionScience:
                         grid_id="phase2-gfs.v1",
                         configuration_snapshot_id=str(request.configuration_snapshot_id),
                         variable_lineage_manifest_id=str(refs[0][1]),
+                        domain_bbox=domain_bbox,
+                        halo_cells=halo_cells,
                     )
                     apcp_parents: dict[int, list[str]] = {}
                     for role, artifact_id in refs:
@@ -1232,6 +1278,14 @@ class Phase2ProductionScience:
                 source_leads: tuple[int, ...] = target_source_leads,
                 lineage_id: str = str(lineage_artifact.artifact_id),
                 model_settings: Any = settings,
+                # Bounded canonical retention (owner architecture
+                # decision). Both come from the run's own persisted
+                # evidence -- the run spec's embedded configuration and
+                # the station snapshot's point-extraction policy -- so a
+                # replay in a fresh process retains byte-identically the
+                # same window even if live configuration has moved.
+                domain_bbox: BoundingBox = persisted.configuration.domain.bbox,
+                halo_cells: int = persisted.point_extraction_policy.halo_cells,
             ) -> xr.Dataset:
                 field_payloads = _group_normalization_payloads(refs, raw[: len(refs)])
                 grid_id = f"phase2-{model.lower()}.v1"
@@ -1245,6 +1299,8 @@ class Phase2ProductionScience:
                         grid_id=grid_id,
                         configuration_snapshot_id=cfg_id,
                         variable_lineage_manifest_id=lineage_id,
+                        domain_bbox=domain_bbox,
+                        halo_cells=halo_cells,
                     )
                 if model == "NBM":
                     return normalize_nbm_cycle(
@@ -1255,6 +1311,8 @@ class Phase2ProductionScience:
                         grid_id=grid_id,
                         configuration_snapshot_id=cfg_id,
                         variable_lineage_manifest_id=lineage_id,
+                        domain_bbox=domain_bbox,
+                        halo_cells=halo_cells,
                     )
                 self._require_contiguous_previous_leads(field_payloads, source_leads)
                 dataset, _lineage = normalize_gfs_cycle(
@@ -1265,6 +1323,8 @@ class Phase2ProductionScience:
                     grid_id=grid_id,
                     configuration_snapshot_id=cfg_id,
                     variable_lineage_manifest_id=lineage_id,
+                    domain_bbox=domain_bbox,
+                    halo_cells=halo_cells,
                 )
                 return dataset
 
@@ -1291,6 +1351,8 @@ class Phase2ProductionScience:
         settings: Any,
         input_refs: tuple[tuple[str, ArtifactId], ...],
         index_refs: tuple[tuple[str, ArtifactId], ...],
+        domain_bbox: BoundingBox,
+        halo_cells: int,
     ) -> tuple[ArtifactManifest, dict[str, Any]]:
         """Create the model's complete ``variable-lineage.v2`` manifest
         (Codex re-review finding 3).
@@ -1380,6 +1442,17 @@ class Phase2ProductionScience:
             "entries": entries,
             "expected_canonical_variable_ids": list(variable_ids),
             "expected_source_lead_hours": list(source_leads),
+            # Bounded canonical retention (owner architecture decision):
+            # the policy the canonical artifact was cut under, read from
+            # the run's own persisted configuration and station snapshot.
+            "canonical_retention_policy": {
+                "policy_id": SUBSET_POLICY_ID,
+                "halo_cells": halo_cells,
+                "bbox_south": domain_bbox.south,
+                "bbox_north": domain_bbox.north,
+                "bbox_west": domain_bbox.west,
+                "bbox_east": domain_bbox.east,
+            },
         }
         # Validate before registration so an incomplete manifest can
         # never reach storage or be referenced by canonical guidance.
@@ -1592,39 +1665,183 @@ class Phase2ProductionScience:
         )
         return AvailabilityArtifacts(cycle_selection=cycle.output, report=report.output)
 
+    def _screen_model_guidance(
+        self,
+        *,
+        aligned: dict[str, Any],
+        model: str,
+        stations: Any,
+        horizons: Any,
+    ) -> tuple[dict[str, Any] | None, dict[tuple[str, int], dict[str, Any]]]:
+        """Screen one model's aligned guidance for source-level
+        disqualification, at the smallest scientifically valid scope.
+
+        Returns ``(cycle_exclusion, point_exclusions)``:
+
+        * ``cycle_exclusion`` is a whole-cycle rejection record, or
+          ``None``. Coverage failures -- a horizon this model has no
+          aligned values for, an aligned point missing a required
+          field -- and a non-finite/invalid source value stay
+          whole-cycle: they are evidence that the cycle's geometry,
+          time identity, or quality is not trustworthy as a unit.
+        * ``point_exclusions`` maps ``(station_id, horizon)`` to a
+          record for each point where this model's *coupled wind/gust
+          tuple* is invalid because the source gust falls below its own
+          sustained speed by more than the floor tolerance. That is a
+          source-product cross-field inconsistency at one point, not
+          evidence that the model's temperature, dew point, PoP or QPF
+          are corrupt (Codex review ``t_1564b30c``), so U/V and gust
+          are rejected together *there* and everything else is retained.
+
+        Nothing is ever clamped or repaired: the source values are
+        recorded verbatim on the exclusion record and the point simply
+        loses this contributor.
+        """
+        point_exclusions: dict[tuple[str, int], dict[str, Any]] = {}
+        for horizon in horizons:
+            by_point = aligned["values"].get(model, {}).get(str(horizon))
+            if by_point is None:
+                return (
+                    {
+                        "model": model,
+                        "scope": "model-cycle",
+                        "reason": "missing_aligned_horizon",
+                        "detail": f"no aligned values for horizon {horizon}",
+                        "target_horizon": horizon,
+                        "station": None,
+                    },
+                    {},
+                )
+            for station in stations:
+                station_id = str(station.station_id)
+                keys = {name: f"{station_id}|{name}" for name in _COUPLED_WIND_GUST_VARIABLES}
+                missing = [name for name, key in keys.items() if key not in by_point]
+                if missing:
+                    return (
+                        {
+                            "model": model,
+                            "scope": "model-cycle",
+                            "reason": "missing_aligned_point",
+                            "detail": (
+                                f"aligned point is missing {sorted(missing)!r} at "
+                                f"{station_id} horizon {horizon}"
+                            ),
+                            "target_horizon": horizon,
+                            "station": station_id,
+                        },
+                        {},
+                    )
+                # A non-finite or non-numeric aligned value is not a
+                # source-product tension between two valid fields; it
+                # means normalization's own finiteness contract did not
+                # hold for this cycle, so the cycle is rejected as a
+                # unit rather than at one point.
+                invalid = [
+                    name
+                    for name, key in keys.items()
+                    if not isinstance(by_point[key], (int, float))
+                    or isinstance(by_point[key], bool)
+                    or not math.isfinite(by_point[key])
+                ]
+                if invalid:
+                    return (
+                        {
+                            "model": model,
+                            "scope": "model-cycle",
+                            "reason": "invalid_source_value",
+                            "detail": (
+                                f"aligned {sorted(invalid)!r} is not a finite number at "
+                                f"{station_id} horizon {horizon}"
+                            ),
+                            "target_horizon": horizon,
+                            "station": station_id,
+                        },
+                        {},
+                    )
+                gust = by_point[keys["wind_gust_10m"]]
+                sustained = math.hypot(
+                    by_point[keys["eastward_wind_10m"]],
+                    by_point[keys["northward_wind_10m"]],
+                )
+                try:
+                    validate_source_gust(gust_m_s=gust, sustained_speed_m_s=sustained)
+                except GustDisqualificationError:
+                    point_exclusions[(station_id, horizon)] = {
+                        "model": model,
+                        "scope": "coupled-wind-gust-point",
+                        "reason": "source_gust_inconsistency",
+                        "detail": (
+                            f"source gust {gust!r} m/s is below sustained speed "
+                            f"{sustained!r} m/s beyond the floor tolerance "
+                            f"{SOURCE_GUST_SHORTFALL_FLOOR_TOLERANCE_M_S!r} m/s; the coupled "
+                            "wind/gust tuple is rejected at this point and the model's "
+                            "independent variables are retained"
+                        ),
+                        "station": station_id,
+                        "target_horizon": horizon,
+                        "affected_variable_ids": list(_COUPLED_WIND_GUST_VARIABLES),
+                        "source_gust_m_s": gust,
+                        "source_sustained_speed_m_s": sustained,
+                        "shortfall_m_s": sustained - gust,
+                        "shortfall_floor_tolerance_m_s": (
+                            SOURCE_GUST_SHORTFALL_FLOOR_TOLERANCE_M_S
+                        ),
+                    }
+        return None, point_exclusions
+
     def _available_payload(
         self, aligned: dict[str, Any], persisted: Phase2PersistedRun
     ) -> dict[str, Any]:
         stations = persisted.stations
         horizons = persisted.target_horizons
         blend = persisted.blend_configuration
-        approved_models: set[str] = set(aligned["models"])
-        for model in tuple(approved_models):
-            try:
-                for horizon in horizons:
-                    for station in stations:
-                        station_id = str(station.station_id)
-                        by_point = aligned["values"][model][str(horizon)]
-                        validate_source_gust(
-                            gust_m_s=by_point[f"{station_id}|wind_gust_10m"],
-                            sustained_speed_m_s=math.hypot(
-                                by_point[f"{station_id}|eastward_wind_10m"],
-                                by_point[f"{station_id}|northward_wind_10m"],
-                            ),
-                        )
-            except (KeyError, ValueError, GustDisqualificationError):
-                approved_models.remove(model)
-        models = frozenset(approved_models)
+        eligible_models: set[str] = set(aligned["models"])
+        # Section 4.1/4.3 stays fail-closed, but the *scope* of a
+        # rejection is now the smallest scientifically coupled unit
+        # (Codex review t_1564b30c). A localized gust-below-sustained
+        # inconsistency rejects that model's U/V/gust tuple at the
+        # affected station/horizon only; coverage/geometry/quality
+        # failures still reject the whole cycle. Either way the cause,
+        # the source values, and the tolerance are persisted so an
+        # excluded contributor can never vanish from the product
+        # without auditable provenance (AGENTS.md: "Model guidance
+        # provenance must be retained").
+        cycle_exclusions: list[dict[str, Any]] = []
+        point_exclusions: dict[tuple[str, int], list[dict[str, Any]]] = {}
+        for model in tuple(eligible_models):
+            cycle_exclusion, model_points = self._screen_model_guidance(
+                aligned=aligned, model=model, stations=stations, horizons=horizons
+            )
+            if cycle_exclusion is not None:
+                eligible_models.remove(model)
+                cycle_exclusions.append(cycle_exclusion)
+                continue
+            for key, record in model_points.items():
+                point_exclusions.setdefault(key, []).append(record)
+        eligible = frozenset(eligible_models)
         entries = []
         availability_objects = []
+        contributing: set[str] = set()
         for variable in _VARIABLES:
+            coupled = variable in _COUPLED_WIND_GUST_VARIABLES
             for station in stations:
+                station_id = str(station.station_id)
                 for horizon in horizons:
+                    excluded_here = (
+                        [
+                            record
+                            for record in point_exclusions.get((station_id, horizon), ())
+                            if record["model"] in eligible
+                        ]
+                        if coupled
+                        else []
+                    )
+                    usable = eligible - {record["model"] for record in excluded_here}
                     if variable == "probability_of_precipitation_1h":
                         value = evaluate_pop_availability(
-                            location=str(station.station_id),
+                            location=station_id,
                             target_horizon=horizon,
-                            nbm_available="NBM" in models,
+                            nbm_available="NBM" in usable,
                         )
                     else:
                         table = (
@@ -1635,18 +1852,38 @@ class Phase2ProductionScience:
                         value = evaluate_scalar_vector_availability(
                             table=table,
                             variable_id=variable,
-                            location=str(station.station_id),
+                            location=station_id,
                             target_horizon=horizon,
-                            available_models=models,
+                            available_models=usable,
                         )
                     availability_objects.append(value)
+                    contributing.update(value.available_models)
                     entries.append(
                         {
                             "variable": variable,
-                            "station": str(station.station_id),
+                            "station": station_id,
                             "horizon": horizon,
                             "state": value.state,
                             "models": list(value.available_models),
+                            "excluded": [
+                                {
+                                    key: record[key]
+                                    for key in (
+                                        "model",
+                                        "scope",
+                                        "reason",
+                                        "detail",
+                                        "affected_variable_ids",
+                                        "source_gust_m_s",
+                                        "source_sustained_speed_m_s",
+                                        "shortfall_m_s",
+                                        "shortfall_floor_tolerance_m_s",
+                                    )
+                                }
+                                for record in sorted(
+                                    excluded_here, key=lambda item: _MODELS.index(item["model"])
+                                )
+                            ],
                             "row_id": (
                                 str(value.fallback_row.row_id) if value.fallback_row else None
                             ),
@@ -1659,7 +1896,30 @@ class Phase2ProductionScience:
         return {
             "schema_version": "model-availability-report.v1",
             "run_state": summary.state,
-            "models": [m for m in _MODELS if m in models],
+            # ``models`` is the truthful run-wide contributor label:
+            # every model that contributes to at least one output. A
+            # model excluded at some points but retained at others is
+            # listed here and its per-point exclusions are on the
+            # entries themselves.
+            "models": [m for m in _MODELS if m in contributing],
+            "eligible_models": [m for m in _MODELS if m in eligible],
+            "excluded_models": sorted(
+                cycle_exclusions,
+                key=lambda item: _MODELS.index(item["model"]),
+            ),
+            "point_exclusions": sorted(
+                (
+                    record
+                    for records in point_exclusions.values()
+                    for record in records
+                    if record["model"] in eligible
+                ),
+                key=lambda item: (
+                    _MODELS.index(item["model"]),
+                    item["station"],
+                    item["target_horizon"],
+                ),
+            ),
             "entries": entries,
         }
 
@@ -1742,6 +2002,27 @@ class Phase2ProductionScience:
                     entry = entries[key]
                     states[key] = entry["state"]
                     contributors: list[ContributorRecord] = []
+                    gust_floor_applied = False
+                    final_gust_epsilon_floor_applied = False
+                    # Every model that was eligible for this row but was
+                    # rejected here, with the cause and the verbatim
+                    # source values. This is the row-level half of the
+                    # exclusion provenance; the availability report
+                    # aggregates the same records run-wide.
+                    excluded = tuple(
+                        ExcludedContributorRecord(
+                            model=record["model"],
+                            reason=record["reason"],
+                            scope=record["scope"],
+                            detail=record["detail"],
+                            affected_variable_ids=tuple(record["affected_variable_ids"]),
+                            source_gust_m_s=record["source_gust_m_s"],
+                            source_sustained_speed_m_s=record["source_sustained_speed_m_s"],
+                            shortfall_m_s=record["shortfall_m_s"],
+                            shortfall_floor_tolerance_m_s=record["shortfall_floor_tolerance_m_s"],
+                        )
+                        for record in entry.get("excluded", ())
+                    )
                     if entry["state"] == "unavailable":
                         result = 0.0
                     else:
@@ -1833,21 +2114,55 @@ class Phase2ProductionScience:
                                 eastward_contributions=eastward,
                                 northward_contributions=northward,
                             )
-                            scalar = [
-                                Contribution(
-                                    model=c.model,
-                                    value=validate_source_gust(
-                                        gust_m_s=c.value,
-                                        sustained_speed_m_s=math.hypot(u.value, v.value),
-                                    ).validated_gust_m_s,
-                                    weight=c.weight,
+                            validations = [
+                                validate_source_gust(
+                                    gust_m_s=c.value,
+                                    sustained_speed_m_s=math.hypot(u.value, v.value),
                                 )
                                 for c, u, v in zip(scalar, eastward, northward, strict=True)
                             ]
+                            scalar = [
+                                Contribution(
+                                    model=c.model,
+                                    value=validation.validated_gust_m_s,
+                                    weight=c.weight,
+                                )
+                                for c, validation in zip(scalar, validations, strict=True)
+                            ]
+                            # The gust operator consumes the *validated*
+                            # source gust, so the contributor records must
+                            # carry that same value or the manifest cannot
+                            # reconstruct the blended output it claims to
+                            # explain. Section 4.3's sub-tolerance floor is
+                            # an explicitly approved, recorded step, not a
+                            # silent repair: the flag below states it was
+                            # applied and the raw source value remains in
+                            # aligned-station-guidance.v1 and in the export's
+                            # per-model aligned-guidance column.
+                            contributors = [
+                                ContributorRecord(
+                                    model=record.model,
+                                    source_cycle_reference_time=(
+                                        record.source_cycle_reference_time
+                                    ),
+                                    source_forecast_hour=record.source_forecast_hour,
+                                    artifact_id=record.artifact_id,
+                                    aligned_value=contribution.value,
+                                    configured_weight=record.configured_weight,
+                                    weighted_contribution=(
+                                        contribution.value * record.configured_weight
+                                    ),
+                                )
+                                for record, contribution in zip(contributors, scalar, strict=True)
+                            ]
+                            gust_floor_applied = any(
+                                validation.source_gust_floor_applied for validation in validations
+                            )
                             gust = blend_gust(
                                 contributions=tuple(scalar),
                                 blended_sustained_speed_m_s=vector.speed_m_s,
                             )
+                            final_gust_epsilon_floor_applied = gust.final_gust_epsilon_floor_applied
                             result = gust.blended_gust_m_s
                         elif variable == "liquid_equivalent_precipitation_amount_1h":
                             result = blend_qpf(tuple(scalar))
@@ -1868,8 +2183,11 @@ class Phase2ProductionScience:
                             availability_state=entry["state"],
                             fallback_row_id=(entry["row_id"] and entry["row_id"]),
                             contributors=tuple(contributors),
+                            excluded_contributors=excluded,
                             unrounded_sum=result,
                             serialized_output=result,
+                            gust_floor_applied=gust_floor_applied,
+                            final_gust_epsilon_floor_applied=final_gust_epsilon_floor_applied,
                         )
                     )
         dataset = assemble_baseline_forecast_v2(
@@ -2045,6 +2363,18 @@ class Phase2ProductionScience:
             for index, record in enumerate(raw_records):
                 station = stations_by_icao.get(record.icao_id)
                 if station is None:
+                    continue
+                # AviationWeather answers a *date* query and returns
+                # whatever recent records it holds for those stations,
+                # including ones just before this run's window (a routine
+                # 17:55Z METAR for an 18:00Z reference). Selecting the
+                # records that fall in the window is this stage's job;
+                # ``normalize_metar_record_v2`` keeps its fail-closed
+                # contract and still rejects an out-of-window record if
+                # one is ever handed to it. Skipping here is the same
+                # treatment already given to a record for a station this
+                # run does not carry -- not a relaxation of the window.
+                if record.obs_time < query_window_start or record.obs_time > query_date:
                     continue
                 station_record = _station_record(station)
                 normalized = normalize_metar_record_v2(

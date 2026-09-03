@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 import numpy as np
 import pytest
 
+from mesoforge.catalog.domains import BoundingBox
 from mesoforge.guidance.canonical_v2 import validate_canonical_guidance_v2
 from mesoforge.guidance.normalization_v2 import (
     GuidanceNormalizationV2Error,
@@ -111,6 +112,12 @@ _NBM_SETTINGS = make_nbm_settings()
 _CFG_SNAPSHOT_ID = "cfg_sha256_" + "0" * 64
 _LINEAGE_ID = "art_00000000-0000-0000-0000-000000000001"
 
+# The configured Grasston domain bbox and the approved one-cell
+# interpolation halo: Phase 2 canonical guidance retains exactly this
+# window of each model's native grid.
+_BBOX = BoundingBox(south=45.05265, north=46.55265, west=-94.07956, east=-92.07956)
+_HALO_CELLS = 1
+
 
 def _hrrr_field_payloads(lead: int, *, grid_relative_wind: bool = True) -> dict:
     return {
@@ -167,10 +174,24 @@ class TestNormalizeHrrrPhase2Cycle:
             grid_id="fixture-hrrr.v1",
             configuration_snapshot_id=_CFG_SNAPSHOT_ID,
             variable_lineage_manifest_id=_LINEAGE_ID,
+            domain_bbox=_BBOX,
+            halo_cells=_HALO_CELLS,
         )
         validate_canonical_guidance_v2(dataset)
         assert dataset.attrs["model"] == "hrrr"
-        assert dataset["eastward_wind_10m"].shape == (2, HRRR_NY, HRRR_NX)
+        # Only the configured bbox+halo window of the native grid is
+        # retained, and the artifact declares exactly which window of
+        # which native grid that is.
+        assert dataset["eastward_wind_10m"].shape[0] == 2
+        assert dataset["eastward_wind_10m"].shape[1:] < (HRRR_NY, HRRR_NX)
+        assert dataset.attrs["source_grid_ny"] == HRRR_NY
+        assert dataset.attrs["source_grid_nx"] == HRRR_NX
+        assert dataset.attrs["subset_policy_id"] == "bbox-halo-subset.v1"
+        assert dataset.attrs["subset_halo_cells"] == _HALO_CELLS
+        assert dataset["eastward_wind_10m"].shape[1:] == (
+            dataset.attrs["subset_y_end"] - dataset.attrs["subset_y_start"],
+            dataset.attrs["subset_x_end"] - dataset.attrs["subset_x_start"],
+        )
 
     def test_rejects_disagreeing_uv_relative_to_grid(self) -> None:
         lead = 6
@@ -192,6 +213,8 @@ class TestNormalizeHrrrPhase2Cycle:
                 grid_id="fixture-hrrr.v1",
                 configuration_snapshot_id=_CFG_SNAPSHOT_ID,
                 variable_lineage_manifest_id=_LINEAGE_ID,
+                domain_bbox=_BBOX,
+                halo_cells=_HALO_CELLS,
             )
 
     def test_missing_field_payload_raises(self) -> None:
@@ -207,6 +230,8 @@ class TestNormalizeHrrrPhase2Cycle:
                 grid_id="fixture-hrrr.v1",
                 configuration_snapshot_id=_CFG_SNAPSHOT_ID,
                 variable_lineage_manifest_id=_LINEAGE_ID,
+                domain_bbox=_BBOX,
+                halo_cells=_HALO_CELLS,
             )
 
 
@@ -286,6 +311,8 @@ class TestNormalizeGfsCycle:
             grid_id="fixture-gfs.v1",
             configuration_snapshot_id=_CFG_SNAPSHOT_ID,
             variable_lineage_manifest_id=_LINEAGE_ID,
+            domain_bbox=_BBOX,
+            halo_cells=_HALO_CELLS,
         )
         validate_canonical_guidance_v2(dataset)
         assert lineage[0].duplicate is not None
@@ -303,6 +330,8 @@ class TestNormalizeGfsCycle:
             grid_id="fixture-gfs.v1",
             configuration_snapshot_id=_CFG_SNAPSHOT_ID,
             variable_lineage_manifest_id=_LINEAGE_ID,
+            domain_bbox=_BBOX,
+            halo_cells=_HALO_CELLS,
         )
         validate_canonical_guidance_v2(dataset)
         assert len(lineage) == 1
@@ -339,6 +368,8 @@ class TestNormalizeGfsCycle:
             grid_id="fixture-gfs.v1",
             configuration_snapshot_id=_CFG_SNAPSHOT_ID,
             variable_lineage_manifest_id=_LINEAGE_ID,
+            domain_bbox=_BBOX,
+            halo_cells=_HALO_CELLS,
         )
         validate_canonical_guidance_v2(dataset)
         assert len(lineage) == 2
@@ -408,6 +439,8 @@ class TestNormalizeNbmCycle:
             grid_id="fixture-nbm.v1",
             configuration_snapshot_id=_CFG_SNAPSHOT_ID,
             variable_lineage_manifest_id=_LINEAGE_ID,
+            domain_bbox=_BBOX,
+            halo_cells=_HALO_CELLS,
         )
         validate_canonical_guidance_v2(dataset)
         # speed=5, direction=180 -> u=-5*sin(180)=0, v=-5*cos(180)=5

@@ -142,7 +142,17 @@ class PersistedSelectedMessage(_FrozenModel):
 
 
 class PersistedLeadAcquisition(_FrozenModel):
-    """Everything one acquired source lead contributed to the run."""
+    """Everything one acquired source lead contributed to the run.
+
+    ``*_completed_at`` is local retrieval provenance: when the original
+    process finished fetching the bytes. ``*_available_at`` is the
+    authoritative provider publication instant (derived from the
+    provider's own ``Last-Modified`` assertion, retained verbatim in
+    ``*_last_modified``) and is the value the run's information-cutoff
+    and cycle-completion-deadline policy was actually applied to.
+    Keeping both persisted means a replay can audit the distinction
+    rather than having to re-derive it.
+    """
 
     source_lead_hours: int
     endpoint: str
@@ -150,6 +160,10 @@ class PersistedLeadAcquisition(_FrozenModel):
     resolved_grib_url: str
     index_completed_at: UtcInstant
     grib_completed_at: UtcInstant
+    index_available_at: UtcInstant
+    grib_available_at: UtcInstant
+    index_last_modified: str | None = None
+    grib_last_modified: str | None = None
     selected_messages: tuple[PersistedSelectedMessage, ...]
     index_artifact: PersistedArtifactIdentity
 

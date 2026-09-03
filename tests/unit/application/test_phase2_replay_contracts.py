@@ -128,8 +128,11 @@ def _acquisition(model: str, lead: int, variables: tuple[str, ...]) -> Phase2Lea
         grib_attempts=(),
         grib_completed_at=CUTOFF - timedelta(minutes=4),
         full_object_etag=None,
-        full_object_last_modified=None,
+        full_object_last_modified="Sat, 31 Aug 2030 11:50:00 GMT",
         full_object_content_length=4096,
+        index_last_modified="Sat, 31 Aug 2030 11:49:00 GMT",
+        index_available_at=CUTOFF - timedelta(minutes=31),
+        grib_available_at=CUTOFF - timedelta(minutes=30),
     )
 
 
