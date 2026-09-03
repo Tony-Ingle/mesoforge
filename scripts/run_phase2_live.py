@@ -348,6 +348,14 @@ def _comparison_rows(
             "fallback_row_id": row["fallback_row_id"],
             "blended_value": row["serialized_output"],
             "blend_unrounded_sum": row["unrounded_sum"],
+            # Section 4.3's two explicitly approved, recorded floors. When
+            # ``source_gust_floor_applied`` is true, the contributor value
+            # in this row is the floored gust the operator actually
+            # consumed; the raw source value is still published in the
+            # ``{model}_aligned_guidance_value`` column below and in
+            # aligned-station-guidance.v1.
+            "source_gust_floor_applied": row.get("gust_floor_applied", False),
+            "final_gust_epsilon_floor_applied": row.get("final_gust_epsilon_floor_applied", False),
             # Per-row exclusion provenance, written by the pipeline. A
             # model that was eligible for the run but rejected at this
             # exact point appears here with its cause and its verbatim

@@ -2002,6 +2002,8 @@ class Phase2ProductionScience:
                     entry = entries[key]
                     states[key] = entry["state"]
                     contributors: list[ContributorRecord] = []
+                    gust_floor_applied = False
+                    final_gust_epsilon_floor_applied = False
                     # Every model that was eligible for this row but was
                     # rejected here, with the cause and the verbatim
                     # source values. This is the row-level half of the
@@ -2112,21 +2114,55 @@ class Phase2ProductionScience:
                                 eastward_contributions=eastward,
                                 northward_contributions=northward,
                             )
-                            scalar = [
-                                Contribution(
-                                    model=c.model,
-                                    value=validate_source_gust(
-                                        gust_m_s=c.value,
-                                        sustained_speed_m_s=math.hypot(u.value, v.value),
-                                    ).validated_gust_m_s,
-                                    weight=c.weight,
+                            validations = [
+                                validate_source_gust(
+                                    gust_m_s=c.value,
+                                    sustained_speed_m_s=math.hypot(u.value, v.value),
                                 )
                                 for c, u, v in zip(scalar, eastward, northward, strict=True)
                             ]
+                            scalar = [
+                                Contribution(
+                                    model=c.model,
+                                    value=validation.validated_gust_m_s,
+                                    weight=c.weight,
+                                )
+                                for c, validation in zip(scalar, validations, strict=True)
+                            ]
+                            # The gust operator consumes the *validated*
+                            # source gust, so the contributor records must
+                            # carry that same value or the manifest cannot
+                            # reconstruct the blended output it claims to
+                            # explain. Section 4.3's sub-tolerance floor is
+                            # an explicitly approved, recorded step, not a
+                            # silent repair: the flag below states it was
+                            # applied and the raw source value remains in
+                            # aligned-station-guidance.v1 and in the export's
+                            # per-model aligned-guidance column.
+                            contributors = [
+                                ContributorRecord(
+                                    model=record.model,
+                                    source_cycle_reference_time=(
+                                        record.source_cycle_reference_time
+                                    ),
+                                    source_forecast_hour=record.source_forecast_hour,
+                                    artifact_id=record.artifact_id,
+                                    aligned_value=contribution.value,
+                                    configured_weight=record.configured_weight,
+                                    weighted_contribution=(
+                                        contribution.value * record.configured_weight
+                                    ),
+                                )
+                                for record, contribution in zip(contributors, scalar, strict=True)
+                            ]
+                            gust_floor_applied = any(
+                                validation.source_gust_floor_applied for validation in validations
+                            )
                             gust = blend_gust(
                                 contributions=tuple(scalar),
                                 blended_sustained_speed_m_s=vector.speed_m_s,
                             )
+                            final_gust_epsilon_floor_applied = gust.final_gust_epsilon_floor_applied
                             result = gust.blended_gust_m_s
                         elif variable == "liquid_equivalent_precipitation_amount_1h":
                             result = blend_qpf(tuple(scalar))
@@ -2150,6 +2186,8 @@ class Phase2ProductionScience:
                             excluded_contributors=excluded,
                             unrounded_sum=result,
                             serialized_output=result,
+                            gust_floor_applied=gust_floor_applied,
+                            final_gust_epsilon_floor_applied=final_gust_epsilon_floor_applied,
                         )
                     )
         dataset = assemble_baseline_forecast_v2(

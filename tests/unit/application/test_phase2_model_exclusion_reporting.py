@@ -32,6 +32,8 @@ from typing import Any
 import pytest
 
 from mesoforge.application.phase2_production import Phase2ProductionScience
+from mesoforge.common.identifiers import StationId
+from mesoforge.forecasting.contributions import BlendContributionRow, ContributorRecord
 from mesoforge.forecasting.gust_blend import SOURCE_GUST_SHORTFALL_FLOOR_TOLERANCE_M_S
 
 _SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "run_phase2_live.py"
@@ -268,6 +270,82 @@ class TestLiveMinnesotaViolations:
                 if (station, horizon) in points:
                     continue
                 assert (station, horizon) not in points
+
+
+class TestGustFloorReconstruction:
+    """A sub-tolerance gust floor is an approved, recorded step -- but the
+    contributor records must carry the value the operator actually
+    consumed, or the manifest cannot reconstruct the output it claims to
+    explain.
+
+    This is the defect the first instrumented run exposed once GFS was
+    retained instead of discarded: at KJMR h4 a floored GFS gust made the
+    weighted contributions sum to 2.3573 while ``unrounded_sum`` was
+    2.3707, and `blend-contribution-manifest.v1` correctly refused it.
+    """
+
+    @staticmethod
+    def _row(*, aligned_value: float, unrounded_sum: float) -> BlendContributionRow:
+        return BlendContributionRow(
+            variable_id="wind_gust_10m",
+            location=StationId("station.kjmr"),
+            target_horizon=4,
+            target_valid_time="2026-09-02T22:00:00+00:00",
+            operator_id="phase2.wind_gust_10m.v1",
+            availability_state="complete",
+            fallback_row_id=None,
+            contributors=(
+                ContributorRecord(
+                    model="GFS",
+                    source_cycle_reference_time="2026-09-02T12:00:00+00:00",
+                    source_forecast_hour=10,
+                    artifact_id="art_gfs",
+                    aligned_value=aligned_value,
+                    configured_weight=1.0,
+                    weighted_contribution=aligned_value,
+                ),
+            ),
+            unrounded_sum=unrounded_sum,
+            serialized_output=unrounded_sum,
+            gust_floor_applied=True,
+        )
+
+    def test_unfloored_contributor_value_fails_reconstruction(self) -> None:
+        with pytest.raises(ValueError, match="does not reconstruct"):
+            self._row(aligned_value=2.3573256835967356, unrounded_sum=2.370659362805913)
+
+    def test_floored_contributor_value_reconstructs(self) -> None:
+        row = self._row(aligned_value=2.370659362805913, unrounded_sum=2.370659362805913)
+        assert row.gust_floor_applied is True
+        assert row.contributors[0].aligned_value == 2.370659362805913
+
+    def test_comparison_row_publishes_the_floor_flags(self) -> None:
+        """A floored gust must be visible in the export, not silent."""
+        runner = _load_runner()
+        rows = runner._comparison_rows(
+            contribution_manifest={
+                "rows": [
+                    {
+                        "variable_id": "wind_gust_10m",
+                        "location": "station.kjmr",
+                        "target_horizon": 4,
+                        "target_valid_time": "2026-09-02T22:00:00+00:00",
+                        "availability_state": "complete",
+                        "operator_id": "phase2.wind_gust_10m.v1",
+                        "fallback_row_id": None,
+                        "serialized_output": 2.370659362805913,
+                        "unrounded_sum": 2.370659362805913,
+                        "contributors": [],
+                        "gust_floor_applied": True,
+                        "final_gust_epsilon_floor_applied": False,
+                    }
+                ]
+            },
+            aligned={"values": {}},
+            target_reference_time=None,
+        )
+        assert rows[0]["source_gust_floor_applied"] is True
+        assert rows[0]["final_gust_epsilon_floor_applied"] is False
 
 
 class TestMarkdownReporting:
