@@ -76,9 +76,11 @@ from mesoforge.forecasting.contributions import (
     BlendContributionManifest,
     BlendContributionRow,
     ContributorRecord,
+    ExcludedContributorRecord,
     IdentityBiasCorrection,
 )
 from mesoforge.forecasting.gust_blend import (
+    SOURCE_GUST_SHORTFALL_FLOOR_TOLERANCE_M_S,
     GustDisqualificationError,
     blend_gust,
     validate_source_gust,
@@ -173,6 +175,20 @@ _WIND_VARIABLES = frozenset(
         "wind_speed_10m",
         "wind_from_direction_10m",
     }
+)
+
+# The atomic scientific unit a source gust inconsistency invalidates.
+# Gust is only meaningful against its own sustained wind, and the gust
+# operator's convexity invariant is stated against the *blended* wind,
+# so dropping gust alone at a point would leave a blended gust that no
+# longer bounds the blended wind it was checked against. U, V and gust
+# are therefore rejected together, and nothing else is (Codex review
+# t_1564b30c). Order is stable so the persisted provenance is
+# deterministic.
+_COUPLED_WIND_GUST_VARIABLES = (
+    "eastward_wind_10m",
+    "northward_wind_10m",
+    "wind_gust_10m",
 )
 
 
@@ -1649,56 +1665,99 @@ class Phase2ProductionScience:
         )
         return AvailabilityArtifacts(cycle_selection=cycle.output, report=report.output)
 
-    def _screen_model_cycle(
+    def _screen_model_guidance(
         self,
         *,
         aligned: dict[str, Any],
         model: str,
         stations: Any,
         horizons: Any,
-    ) -> dict[str, Any] | None:
-        """Screen one model cycle for source-level disqualification.
+    ) -> tuple[dict[str, Any] | None, dict[tuple[str, int], dict[str, Any]]]:
+        """Screen one model's aligned guidance for source-level
+        disqualification, at the smallest scientifically valid scope.
 
-        Returns ``None`` when the cycle is usable, otherwise a
-        structured exclusion record naming the precise cause and the
-        first offending point.
+        Returns ``(cycle_exclusion, point_exclusions)``:
 
-        The previous implementation wrapped this scan in a single
-        ``except (KeyError, ValueError, GustDisqualificationError)``,
-        which conflated three materially different causes -- a genuine
-        gust inconsistency, a *missing* aligned point (``KeyError``),
-        and a non-finite/invalid value (``ValueError``) -- and then
-        dropped the model with no record of which occurred. Each is
-        now classified and reported separately.
+        * ``cycle_exclusion`` is a whole-cycle rejection record, or
+          ``None``. Coverage failures -- a horizon this model has no
+          aligned values for, an aligned point missing a required
+          field -- and a non-finite/invalid source value stay
+          whole-cycle: they are evidence that the cycle's geometry,
+          time identity, or quality is not trustworthy as a unit.
+        * ``point_exclusions`` maps ``(station_id, horizon)`` to a
+          record for each point where this model's *coupled wind/gust
+          tuple* is invalid because the source gust falls below its own
+          sustained speed by more than the floor tolerance. That is a
+          source-product cross-field inconsistency at one point, not
+          evidence that the model's temperature, dew point, PoP or QPF
+          are corrupt (Codex review ``t_1564b30c``), so U/V and gust
+          are rejected together *there* and everything else is retained.
+
+        Nothing is ever clamped or repaired: the source values are
+        recorded verbatim on the exclusion record and the point simply
+        loses this contributor.
         """
+        point_exclusions: dict[tuple[str, int], dict[str, Any]] = {}
         for horizon in horizons:
             by_point = aligned["values"].get(model, {}).get(str(horizon))
             if by_point is None:
-                return {
-                    "model": model,
-                    "reason": "missing_aligned_horizon",
-                    "detail": f"no aligned values for horizon {horizon}",
-                    "target_horizon": horizon,
-                    "station": None,
-                }
+                return (
+                    {
+                        "model": model,
+                        "scope": "model-cycle",
+                        "reason": "missing_aligned_horizon",
+                        "detail": f"no aligned values for horizon {horizon}",
+                        "target_horizon": horizon,
+                        "station": None,
+                    },
+                    {},
+                )
             for station in stations:
                 station_id = str(station.station_id)
-                keys = {
-                    name: f"{station_id}|{name}"
-                    for name in ("wind_gust_10m", "eastward_wind_10m", "northward_wind_10m")
-                }
+                keys = {name: f"{station_id}|{name}" for name in _COUPLED_WIND_GUST_VARIABLES}
                 missing = [name for name, key in keys.items() if key not in by_point]
                 if missing:
-                    return {
-                        "model": model,
-                        "reason": "missing_aligned_point",
-                        "detail": (
-                            f"aligned point is missing {sorted(missing)!r} at "
-                            f"{station_id} horizon {horizon}"
-                        ),
-                        "target_horizon": horizon,
-                        "station": station_id,
-                    }
+                    return (
+                        {
+                            "model": model,
+                            "scope": "model-cycle",
+                            "reason": "missing_aligned_point",
+                            "detail": (
+                                f"aligned point is missing {sorted(missing)!r} at "
+                                f"{station_id} horizon {horizon}"
+                            ),
+                            "target_horizon": horizon,
+                            "station": station_id,
+                        },
+                        {},
+                    )
+                # A non-finite or non-numeric aligned value is not a
+                # source-product tension between two valid fields; it
+                # means normalization's own finiteness contract did not
+                # hold for this cycle, so the cycle is rejected as a
+                # unit rather than at one point.
+                invalid = [
+                    name
+                    for name, key in keys.items()
+                    if not isinstance(by_point[key], (int, float))
+                    or isinstance(by_point[key], bool)
+                    or not math.isfinite(by_point[key])
+                ]
+                if invalid:
+                    return (
+                        {
+                            "model": model,
+                            "scope": "model-cycle",
+                            "reason": "invalid_source_value",
+                            "detail": (
+                                f"aligned {sorted(invalid)!r} is not a finite number at "
+                                f"{station_id} horizon {horizon}"
+                            ),
+                            "target_horizon": horizon,
+                            "station": station_id,
+                        },
+                        {},
+                    )
                 gust = by_point[keys["wind_gust_10m"]]
                 sustained = math.hypot(
                     by_point[keys["eastward_wind_10m"]],
@@ -1707,28 +1766,28 @@ class Phase2ProductionScience:
                 try:
                     validate_source_gust(gust_m_s=gust, sustained_speed_m_s=sustained)
                 except GustDisqualificationError:
-                    return {
+                    point_exclusions[(station_id, horizon)] = {
                         "model": model,
+                        "scope": "coupled-wind-gust-point",
                         "reason": "source_gust_inconsistency",
                         "detail": (
                             f"source gust {gust!r} m/s is below sustained speed "
-                            f"{sustained!r} m/s beyond the floor tolerance"
+                            f"{sustained!r} m/s beyond the floor tolerance "
+                            f"{SOURCE_GUST_SHORTFALL_FLOOR_TOLERANCE_M_S!r} m/s; the coupled "
+                            "wind/gust tuple is rejected at this point and the model's "
+                            "independent variables are retained"
                         ),
-                        "target_horizon": horizon,
                         "station": station_id,
-                        "gust_m_s": gust,
-                        "sustained_speed_m_s": sustained,
+                        "target_horizon": horizon,
+                        "affected_variable_ids": list(_COUPLED_WIND_GUST_VARIABLES),
+                        "source_gust_m_s": gust,
+                        "source_sustained_speed_m_s": sustained,
                         "shortfall_m_s": sustained - gust,
+                        "shortfall_floor_tolerance_m_s": (
+                            SOURCE_GUST_SHORTFALL_FLOOR_TOLERANCE_M_S
+                        ),
                     }
-                except ValueError as exc:
-                    return {
-                        "model": model,
-                        "reason": "invalid_source_value",
-                        "detail": f"{exc} at {station_id} horizon {horizon}",
-                        "target_horizon": horizon,
-                        "station": station_id,
-                    }
-        return None
+        return None, point_exclusions
 
     def _available_payload(
         self, aligned: dict[str, Any], persisted: Phase2PersistedRun
@@ -1736,33 +1795,53 @@ class Phase2ProductionScience:
         stations = persisted.stations
         horizons = persisted.target_horizons
         blend = persisted.blend_configuration
-        approved_models: set[str] = set(aligned["models"])
-        # Section 4.1/4.3: a source-level gust inconsistency disqualifies
-        # the *entire* model cycle (variable-only fallback is forbidden).
-        # That scope is deliberate and unchanged here. What is recorded
-        # is the granularity: the exact cause, the first offending point,
-        # and the measured shortfall, so an excluded model can never
-        # vanish from the product without auditable provenance
-        # (AGENTS.md: "Model guidance provenance must be retained").
-        exclusions: list[dict[str, Any]] = []
-        for model in tuple(approved_models):
-            exclusion = self._screen_model_cycle(
+        eligible_models: set[str] = set(aligned["models"])
+        # Section 4.1/4.3 stays fail-closed, but the *scope* of a
+        # rejection is now the smallest scientifically coupled unit
+        # (Codex review t_1564b30c). A localized gust-below-sustained
+        # inconsistency rejects that model's U/V/gust tuple at the
+        # affected station/horizon only; coverage/geometry/quality
+        # failures still reject the whole cycle. Either way the cause,
+        # the source values, and the tolerance are persisted so an
+        # excluded contributor can never vanish from the product
+        # without auditable provenance (AGENTS.md: "Model guidance
+        # provenance must be retained").
+        cycle_exclusions: list[dict[str, Any]] = []
+        point_exclusions: dict[tuple[str, int], list[dict[str, Any]]] = {}
+        for model in tuple(eligible_models):
+            cycle_exclusion, model_points = self._screen_model_guidance(
                 aligned=aligned, model=model, stations=stations, horizons=horizons
             )
-            if exclusion is not None:
-                approved_models.remove(model)
-                exclusions.append(exclusion)
-        models = frozenset(approved_models)
+            if cycle_exclusion is not None:
+                eligible_models.remove(model)
+                cycle_exclusions.append(cycle_exclusion)
+                continue
+            for key, record in model_points.items():
+                point_exclusions.setdefault(key, []).append(record)
+        eligible = frozenset(eligible_models)
         entries = []
         availability_objects = []
+        contributing: set[str] = set()
         for variable in _VARIABLES:
+            coupled = variable in _COUPLED_WIND_GUST_VARIABLES
             for station in stations:
+                station_id = str(station.station_id)
                 for horizon in horizons:
+                    excluded_here = (
+                        [
+                            record
+                            for record in point_exclusions.get((station_id, horizon), ())
+                            if record["model"] in eligible
+                        ]
+                        if coupled
+                        else []
+                    )
+                    usable = eligible - {record["model"] for record in excluded_here}
                     if variable == "probability_of_precipitation_1h":
                         value = evaluate_pop_availability(
-                            location=str(station.station_id),
+                            location=station_id,
                             target_horizon=horizon,
-                            nbm_available="NBM" in models,
+                            nbm_available="NBM" in usable,
                         )
                     else:
                         table = (
@@ -1773,18 +1852,38 @@ class Phase2ProductionScience:
                         value = evaluate_scalar_vector_availability(
                             table=table,
                             variable_id=variable,
-                            location=str(station.station_id),
+                            location=station_id,
                             target_horizon=horizon,
-                            available_models=models,
+                            available_models=usable,
                         )
                     availability_objects.append(value)
+                    contributing.update(value.available_models)
                     entries.append(
                         {
                             "variable": variable,
-                            "station": str(station.station_id),
+                            "station": station_id,
                             "horizon": horizon,
                             "state": value.state,
                             "models": list(value.available_models),
+                            "excluded": [
+                                {
+                                    key: record[key]
+                                    for key in (
+                                        "model",
+                                        "scope",
+                                        "reason",
+                                        "detail",
+                                        "affected_variable_ids",
+                                        "source_gust_m_s",
+                                        "source_sustained_speed_m_s",
+                                        "shortfall_m_s",
+                                        "shortfall_floor_tolerance_m_s",
+                                    )
+                                }
+                                for record in sorted(
+                                    excluded_here, key=lambda item: _MODELS.index(item["model"])
+                                )
+                            ],
                             "row_id": (
                                 str(value.fallback_row.row_id) if value.fallback_row else None
                             ),
@@ -1797,10 +1896,29 @@ class Phase2ProductionScience:
         return {
             "schema_version": "model-availability-report.v1",
             "run_state": summary.state,
-            "models": [m for m in _MODELS if m in models],
+            # ``models`` is the truthful run-wide contributor label:
+            # every model that contributes to at least one output. A
+            # model excluded at some points but retained at others is
+            # listed here and its per-point exclusions are on the
+            # entries themselves.
+            "models": [m for m in _MODELS if m in contributing],
+            "eligible_models": [m for m in _MODELS if m in eligible],
             "excluded_models": sorted(
-                exclusions,
+                cycle_exclusions,
                 key=lambda item: _MODELS.index(item["model"]),
+            ),
+            "point_exclusions": sorted(
+                (
+                    record
+                    for records in point_exclusions.values()
+                    for record in records
+                    if record["model"] in eligible
+                ),
+                key=lambda item: (
+                    _MODELS.index(item["model"]),
+                    item["station"],
+                    item["target_horizon"],
+                ),
             ),
             "entries": entries,
         }
@@ -1884,6 +2002,25 @@ class Phase2ProductionScience:
                     entry = entries[key]
                     states[key] = entry["state"]
                     contributors: list[ContributorRecord] = []
+                    # Every model that was eligible for this row but was
+                    # rejected here, with the cause and the verbatim
+                    # source values. This is the row-level half of the
+                    # exclusion provenance; the availability report
+                    # aggregates the same records run-wide.
+                    excluded = tuple(
+                        ExcludedContributorRecord(
+                            model=record["model"],
+                            reason=record["reason"],
+                            scope=record["scope"],
+                            detail=record["detail"],
+                            affected_variable_ids=tuple(record["affected_variable_ids"]),
+                            source_gust_m_s=record["source_gust_m_s"],
+                            source_sustained_speed_m_s=record["source_sustained_speed_m_s"],
+                            shortfall_m_s=record["shortfall_m_s"],
+                            shortfall_floor_tolerance_m_s=record["shortfall_floor_tolerance_m_s"],
+                        )
+                        for record in entry.get("excluded", ())
+                    )
                     if entry["state"] == "unavailable":
                         result = 0.0
                     else:
@@ -2010,6 +2147,7 @@ class Phase2ProductionScience:
                             availability_state=entry["state"],
                             fallback_row_id=(entry["row_id"] and entry["row_id"]),
                             contributors=tuple(contributors),
+                            excluded_contributors=excluded,
                             unrounded_sum=result,
                             serialized_output=result,
                         )

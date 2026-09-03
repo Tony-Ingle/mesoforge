@@ -63,10 +63,18 @@ def evaluate_scalar_vector_availability(
 
     ``available_models`` is the set of model families with a
     successfully aligned, scientifically consistent value at this
-    exact point (post source-cycle disqualification). A model present
-    in ``inconsistent_models`` is treated as unavailable for this
-    variable/point (Section 4.1: "A source-level inconsistency
-    disqualifies that entire model cycle before fallback selection").
+    exact point (post disqualification). A model present in
+    ``inconsistent_models`` is treated as unavailable for this
+    variable/point.
+
+    Disqualification scope is decided by the caller, at the smallest
+    scientifically coupled unit: a source gust below its own sustained
+    speed rejects that model's U/V/gust tuple at that station/horizon,
+    while coverage, geometry, time-identity, lineage, or a documented
+    widespread-quality failure escalates to the model cycle (Codex
+    review ``t_1564b30c``). Either way this function only ever selects
+    an explicitly approved fallback row for whatever set remains; it
+    never renormalizes weights and never invents a row.
     """
     usable = frozenset(available_models) - frozenset(inconsistent_models)
 

@@ -348,6 +348,25 @@ def _comparison_rows(
             "fallback_row_id": row["fallback_row_id"],
             "blended_value": row["serialized_output"],
             "blend_unrounded_sum": row["unrounded_sum"],
+            # Per-row exclusion provenance, written by the pipeline. A
+            # model that was eligible for the run but rejected at this
+            # exact point appears here with its cause and its verbatim
+            # source values, so a missing contributor is never silent.
+            "excluded_models": ";".join(
+                sorted(item["model"] for item in row.get("excluded_contributors", ()))
+            ),
+            "exclusion_causes": ";".join(
+                f"{item['model']}:{item['reason']}:{item['scope']}"
+                for item in sorted(
+                    row.get("excluded_contributors", ()), key=lambda item: item["model"]
+                )
+            ),
+            "exclusion_detail": " | ".join(
+                item["detail"]
+                for item in sorted(
+                    row.get("excluded_contributors", ()), key=lambda item: item["model"]
+                )
+            ),
         }
         for model in MODELS:
             record[f"{model}_value"] = None
@@ -415,24 +434,62 @@ def _parse_utc(value: Any) -> datetime | None:
 def _availability_lines(availability: dict[str, Any]) -> list[str]:
     """Build the availability/blend-identity section.
 
-    The availability report publishes the approved contributor set under
-    ``models``; an earlier version read ``available_models``, a key that
-    never exists, so the report printed "none" even when HRRR and NBM
-    were contributing to every row.
+    ``models`` is the run-wide *contributing* set: every model that
+    contributes to at least one output. ``eligible_models`` is the set
+    that survived whole-cycle screening; a model can be eligible and
+    still be excluded at individual points, so both are reported and
+    neither is presented as the other.
     """
     lines = [f"- run state: **{availability.get('run_state', 'unknown')}**"]
     contributing = availability.get("models", [])
-    lines.append(f"- contributing models: {', '.join(contributing) or 'none'}")
+    lines.append(
+        f"- models contributing to at least one output: {', '.join(contributing) or 'none'}"
+    )
+    eligible = availability.get("eligible_models")
+    if eligible is not None:
+        lines.append(
+            f"- models eligible after whole-cycle screening: {', '.join(eligible) or 'none'}"
+        )
     for excluded in availability.get("excluded_models", []):
         location = excluded.get("station") or "--"
         horizon = excluded.get("target_horizon")
-        detail = f"- excluded model: **{excluded['model']}** ({excluded['reason']})"
+        detail = (
+            f"- excluded model cycle: **{excluded['model']}** ({excluded['reason']}), whole cycle"
+        )
         if horizon is not None:
-            detail += f" first seen at {location} horizon {horizon}"
-        shortfall = excluded.get("shortfall_m_s")
-        if shortfall is not None:
-            detail += f", gust shortfall {shortfall:.4f} m s-1"
+            detail += f", first seen at {location} horizon {horizon}"
         lines.append(detail)
+    point_exclusions = availability.get("point_exclusions", [])
+    if point_exclusions:
+        lines.append(
+            f"- point-level exclusions: {len(point_exclusions)}; each rejects only the "
+            "named coupled fields at that station/horizon, leaving that model's other "
+            "variables and its unaffected points contributing"
+        )
+        lines.append("")
+        lines.append(
+            "| model | station | horizon | cause | scope | affected fields | "
+            "source gust (m s-1) | source sustained (m s-1) | shortfall (m s-1) | "
+            "tolerance (m s-1) |"
+        )
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+        for record in point_exclusions:
+            lines.append(
+                f"| {record['model']} | {record.get('station', '--')} | "
+                f"{record.get('target_horizon', '--')} | {record['reason']} | "
+                f"{record['scope']} | "
+                f"{', '.join(record.get('affected_variable_ids', ()))} | "
+                f"{_fmt(record.get('source_gust_m_s'))} | "
+                f"{_fmt(record.get('source_sustained_speed_m_s'))} | "
+                f"{_fmt(record.get('shortfall_m_s'))} | "
+                f"{_fmt(record.get('shortfall_floor_tolerance_m_s'))} |"
+            )
+        lines.append("")
+        lines.append(
+            "Source values are reported verbatim. Nothing is clamped, repaired, or "
+            "synthesized; the affected point simply loses that contributor and falls "
+            "back to the approved row for the models that remain."
+        )
     return lines
 
 
@@ -586,17 +643,20 @@ def _markdown(
                 "window ending exactly at the valid time, decoded from GRIB2 PDT 4.9 "
                 "and converted once from percent. It is an exceedance probability, "
                 "not an expected amount, so it is not directly comparable to the "
-                'deterministic QPF below. See "Open question: NBM 1h PoP versus '
-                'deterministic QPF" in `docs/data-contracts/phase-2.md`.'
+                'deterministic QPF below. See "NBM 1h PoP versus deterministic QPF" '
+                "in `docs/data-contracts/phase-2.md`."
             )
             lines.append("")
         if variable_id == "liquid_equivalent_precipitation_amount_1h":
             lines.append(
-                "Deterministic 1h QPF is drawn from the same one-hour interval and "
-                "lead as PoP01 above. Hours with a QPF above the 0.254 kg m-2 event "
-                "threshold but a low PoP01 (for example KJMR horizon 24) are a "
-                "documented open interpretation question, not a decoding defect; "
-                "both values are reported verbatim and nothing is reconciled."
+                "Deterministic 1h QPF is reported verbatim in `kg m-2`, drawn from the "
+                "same one-hour interval and lead as PoP01 above. MesoForge makes no "
+                "claim about which statistic of the NBM distribution this value "
+                "represents: the captured GRIB2 metadata does not state one. Hours "
+                "with a QPF above the 0.254 kg m-2 event threshold but a low PoP01 "
+                "(for example KJMR horizon 24) are an advisory source-product tension "
+                "only; both values are reported verbatim and nothing is altered, "
+                "disqualified, or reconciled."
             )
             lines.append("")
         lines.append(

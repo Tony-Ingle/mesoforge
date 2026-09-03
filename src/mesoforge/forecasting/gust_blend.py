@@ -1,9 +1,14 @@
 """Deterministic gust blend operator (plan Section 4.3, Task 9).
 
-1. At each aligned source point, disqualify the entire model cycle
-   (before availability/fallback evaluation) if gust < sustained_speed
-   - 0.1 m/s; a shortfall in [0, 0.1] m/s floors that source gust to
-   sustained speed and records ``source_gust_floor_applied``.
+1. At each aligned source point, compare the source gust against the
+   source sustained speed. A shortfall in [0, 0.1] m/s floors that
+   source gust to sustained speed and records
+   ``source_gust_floor_applied``; a larger shortfall disqualifies that
+   model's coupled wind/gust tuple *at that station/horizon* (U, V and
+   gust are rejected atomically, because dropping gust alone would
+   break gust-versus-blended-wind consistency). The source value is
+   never clamped or repaired, and the model's independent variables at
+   that point stay valid.
 2. Weighted mean of validated/floored source gusts using the same
    contributor row as U/V.
 3. Blended sustained speed from blended U/V; convexity guarantees
@@ -25,12 +30,26 @@ _SHORTFALL_FLOOR_TOLERANCE_M_S = 0.1
 _FINAL_EPSILON_FLOOR_M_S = 1e-6
 _VALID_MAX_M_S = 100.0
 
+#: The public spelling of the source-gust floor tolerance, so callers that
+#: must *report* the tolerance a disqualification was judged against
+#: (contribution/availability provenance) cite the same literal the
+#: operator enforces rather than re-declaring their own copy.
+SOURCE_GUST_SHORTFALL_FLOOR_TOLERANCE_M_S = _SHORTFALL_FLOOR_TOLERANCE_M_S
+
 
 class GustDisqualificationError(MesoForgeError):
     """Raised when a source gust is materially below sustained speed
-    (shortfall > the configured floor tolerance) -- the entire model
-    cycle is disqualified for this run before availability/fallback
-    evaluation; variable-only fallback is forbidden."""
+    (shortfall > the configured floor tolerance).
+
+    The operator states the *fact* of the inconsistency; it does not
+    choose the rejection scope. The caller applies the smallest
+    scientifically coupled scope: gust and its own U/V are one atomic
+    tuple, so all three are rejected together at the affected
+    station/horizon, and coarser model/variable-family/cycle rejection
+    is reserved for coverage, geometry, time-identity, lineage, or a
+    documented widespread-quality failure (Codex review ``t_1564b30c``).
+    Repairing or clamping the source value is never permitted.
+    """
 
 
 class GustInvariantError(MesoForgeError):
@@ -64,7 +83,8 @@ def validate_source_gust(
     raise GustDisqualificationError(
         f"source gust {gust_m_s!r} m/s is below sustained speed {sustained_speed_m_s!r} m/s "
         f"by {shortfall!r} m/s, exceeding the floor tolerance "
-        f"{shortfall_floor_tolerance_m_s!r} m/s; the entire model cycle is disqualified"
+        f"{shortfall_floor_tolerance_m_s!r} m/s; this model's coupled wind/gust tuple is "
+        "disqualified at this point"
     )
 
 

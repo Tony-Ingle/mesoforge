@@ -154,10 +154,24 @@ direction_from = degrees(atan2(-U, -V)) mod 360
 
 Direction is undefined at exactly zero speed and is never angle-averaged. Before
 fallback selection, a source gust more than `0.1 m/s` below its sustained speed
-disqualifies that model cycle. A shortfall in `(0, 0.1] m/s` is floored and recorded.
+disqualifies that model's coupled `eastward_wind_10m`/`northward_wind_10m`/
+`wind_gust_10m` tuple **at that station and target horizon**. U/V and gust are
+rejected atomically because the gust operator's convexity invariant is stated
+against the *blended* wind, so dropping gust alone would leave a blended gust that
+no longer bounds the wind it was checked against. The model's independent variables
+at that point, and its wind/gust at every other point, remain valid contributors.
+The source values are never clamped or repaired; the point simply loses that
+contributor and falls back to the approved row for the models that remain.
+A shortfall in `(0, 0.1] m/s` is floored and recorded.
 Validated gusts use the scalar/vector row. A final gust shortfall no larger than
 `1e-6 m/s` is an explicitly recorded floating-point floor; a larger shortfall fails.
 Final gust must be finite and in `[0, 100] m/s`.
+
+Rejection escalates from the coupled point to the whole model cycle when the
+failure is not a localized cross-field tension but evidence the cycle is untrustworthy
+as a unit: a target horizon with no aligned values, an aligned point missing a
+required field, a non-finite source value, or a documented coverage, geometry,
+time-identity, lineage, or widespread-quality failure.
 
 QPF uses the separate QPF table and the same weighted equation, only across identical
 one-hour intervals. Inputs and output must be finite and nonnegative. PoP is not a
@@ -220,6 +234,16 @@ matched pairs
 
 Contribution rows preserve source value, literal weight, weighted contribution,
 unrounded sum, fallback row ID/digest, source artifact IDs, and correction identity.
+Each row also preserves an ordered `excluded_contributors` list: every model that was
+eligible for the run but rejected at that exact `(variable, station, horizon)`, with
+the cause, the rejection scope (`coupled-wind-gust-point` or `model-cycle`), the
+canonical fields the rejection removed, and the verbatim source gust/sustained values
+and tolerance it was judged against. `model-availability-report.v1` aggregates the
+same evidence run-wide: `models` names every model contributing to at least one
+output, `eligible_models` names the models that survived whole-cycle screening,
+`excluded_models` carries whole-cycle rejections, and `point_exclusions` carries every
+point-scoped rejection. The run-level summary aggregates that evidence; it never
+replaces it.
 The verification artifact's ancestor graph reaches every selected index/message,
 station snapshot, and METAR response.
 
@@ -370,10 +394,10 @@ PostgreSQL 16 and MinIO after an Alembic upgrade/downgrade/upgrade round trip, t
 runs the repository coverage threshold. Live tests require
 `MESOFORGE_LIVE_TESTS=1` plus explicit recent cycles and are never gating.
 
-## Open question: NBM 1h PoP versus deterministic QPF at the same valid hour
+## NBM 1h PoP versus deterministic QPF at the same valid hour
 
-**Status: unresolved, documented deliberately rather than guessed. Needs a
-meteorological/product decision before Phase 3.**
+**Status: mechanics verified and source-backed. The pairing is an advisory
+source-product tension only; no value is altered or disqualified.**
 
 The mechanical contract is verified and correct. For every NBM PoP/QPF point in the
 live Minnesota run (216 pairings checked):
@@ -384,12 +408,13 @@ live Minnesota run (216 pairings checked):
 - PoP and deterministic QPF are drawn from the *same* interval and the same lead;
 - PoP01 is confirmed by GRIB2 PDT 4.9 keys (`probabilityType = 1`,
   `scaledValueOfUpperLimit`/`scaleFactorOfUpperLimit` = 254/10^3 = 0.254 kg m-2),
-  i.e. `P(1h accumulation > 0.254 kg m-2)`, converted once from percent.
+  i.e. `P(1h accumulation > 0.254 kg m-2)`, converted once from percent;
+- deterministic QPF stays in `kg m-2` with no unit conversion.
 
-What is *not* settled is how to interpret the two together. In the live run, 25 of 108
-NBM points carry a deterministic 1h QPF above the 0.254 kg m-2 event threshold while
-PoP01 for the identical hour is below 20%. The clearest instance is
-**KJMR, target horizon 24 (valid 2026-09-03T18:00Z, NBM cycle 17Z lead 25)**:
+In the live run, 25 of 108 NBM points carry a deterministic 1h QPF above the
+0.254 kg m-2 event threshold while PoP01 for the identical hour is below 20%. The
+clearest instance is **KJMR, target horizon 24 (valid 2026-09-03T18:00Z, NBM cycle
+17Z lead 25)**:
 
 | field | value |
 | --- | --- |
@@ -397,28 +422,24 @@ PoP01 for the identical hour is below 20%. The clearest instance is
 | NBM deterministic 1h QPF | 3.6388 kg m-2 |
 | interval | 24-25 hour acc fcst, ending exactly at the valid time |
 
-This is not a decoding defect and not a mathematical contradiction. The two records
-are different statistics of the same predictand: PoP01 is an exceedance *probability*
-over the NBM distribution, while deterministic QPF is a central/expected-value style
-point estimate. A low exceedance probability with a non-trivial conditional amount is
-a legitimate NBM signature (a small chance of a locally heavy hour). The existing
-`check_probability_deterministic_tension` only flags the degenerate endpoints
-(`PoP == 0` with `QPF >= 0.254`, or `PoP == 1` with `QPF == 0`), so cases like KJMR h24
-are currently neither flagged nor reconciled — they simply pass through.
+This is not a decoding defect and not a mathematical contradiction. PoP01 is an
+exceedance probability, decoded from PDT 4.9 metadata that states exactly what it is.
+The captured GRIB2 metadata for the deterministic QPF record states its parameter,
+level, interval, and unit — it does **not** state which statistic of the NBM
+distribution the value represents. MesoForge therefore makes no claim about that
+statistic: an earlier version of this section described it as a central/expected-value
+style point estimate, which is not supported by any source MesoForge holds, and that
+claim is withdrawn. Any future characterization must cite authoritative NBM product
+documentation.
 
-The unresolved questions, for Codex/product to decide:
-
-1. Is a low-PoP/high-QPF hour supposed to be flagged as a soft tension at all, or is it
-   expected NBM behavior that must pass through untouched?
-2. If it should be flagged, what threshold pair defines it, and is the flag advisory
-   only (Phase 2 mutates nothing) or does it affect availability state?
-3. Should the deterministic QPF ever be interpreted as conditional-on-precipitation
-   (which would make the pairing consistent by construction), or strictly as an
-   unconditional expected amount?
-
-Until this is decided, MesoForge reports both values verbatim with their shared
-interval and takes no reconciling action. No value is altered, suppressed, or
-synthesized on the basis of this open question.
+Because the two records are decoded from different, individually valid products, a
+low-PoP/high-QPF hour is treated as an **advisory source-product tension** only. Both
+values are reported verbatim with their shared interval. Absent an authoritative rule
+that defines the relationship between the two statistics, MesoForge does not alter,
+suppress, synthesize, or disqualify either value, and the pairing does not affect
+availability state. The existing `check_probability_deterministic_tension` continues to
+flag only the degenerate endpoints (`PoP == 0` with `QPF >= 0.254`, or `PoP == 1` with
+`QPF == 0`); cases like KJMR h24 pass through unflagged and unreconciled.
 
 ## Explicit deferrals and limitations
 
