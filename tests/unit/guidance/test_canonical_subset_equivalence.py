@@ -40,6 +40,8 @@ from mesoforge.guidance.normalization_v2 import (
     normalize_hrrr_phase2_cycle,
     normalize_nbm_cycle,
 )
+from tests.fixtures.gfs_grib import FIRST_LAT_DEGREES as GFS_FIRST_LAT
+from tests.fixtures.gfs_grib import LAST_LAT_DEGREES as GFS_LAST_LAT
 from tests.fixtures.gfs_grib import NX as GFS_NX
 from tests.fixtures.gfs_grib import NY as GFS_NY
 from tests.fixtures.gfs_grib import make_apcp_message as make_gfs_apcp_message
@@ -525,10 +527,36 @@ class TestSubsetEquivalence:
         assert int(subset.attrs["subset_x_end"]) <= int(subset.attrs["source_grid_nx"])
 
 
-class TestSubsetFailsClosed:
-    """A domain the source grid cannot supply with its halo is a
-    terminal normalization error, never a silently clipped artifact."""
+class TestGfsLatitudeAxisFollowsScanDirection:
+    """The operational GFS 0.25-degree product scans north-to-south
+    (``jScansPositively=0``): its first grid row is the northernmost.
 
+    Deriving the latitude axis as ``first_lat + increment * arange``
+    fabricates an axis running *away* from the grid (for the real
+    product, 90..270) that is not a latitude at all, so no station is
+    ever located. The axis must follow the message's own declared first
+    and last latitudes.
+    """
+
+    def test_latitude_axis_descends_and_matches_the_declared_extent(self) -> None:
+        dataset = _full_grid("gfs")
+        latitudes = dataset["latitude"].values[:, 0]
+        assert latitudes[0] == pytest.approx(GFS_FIRST_LAT)
+        assert latitudes[-1] == pytest.approx(GFS_LAST_LAT)
+        assert np.all(np.diff(latitudes) < 0)
+        assert float(latitudes.min()) == pytest.approx(GFS_LAST_LAT)
+        assert float(latitudes.max()) == pytest.approx(GFS_FIRST_LAT)
+
+    def test_stations_are_locatable_on_the_retained_window(self) -> None:
+        """The end-to-end consequence: with a fabricated axis the domain
+        bbox does not intersect the grid at all and subsetting fails."""
+        subset = _normalize("gfs", _DOMAIN_BBOX)
+        latitudes = subset["latitude"].values
+        for _icao, latitude, _longitude in _STATIONS:
+            assert latitudes.min() <= latitude <= latitudes.max()
+
+
+class TestSubsetFailsClosed:
     def test_rejects_a_domain_outside_the_native_grid(self) -> None:
         outside = BoundingBox(south=-40.0, north=-38.0, west=20.0, east=22.0)
         with pytest.raises(GuidanceNormalizationV2Error, match="cannot supply the configured"):

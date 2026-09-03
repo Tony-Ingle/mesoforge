@@ -77,6 +77,12 @@ from mesoforge.guidance.sources.nbm_decoding import decode_selected_message as d
 
 FieldPayloads = dict[str, dict[int, bytes | tuple[bytes, ...]]]
 
+# Latitudes are published to at least 6 decimal places; this tolerance
+# only absorbs that rounding when cross-checking a regular lat/lon
+# message's declared first/last latitudes against its declared
+# increment.
+_GRID_SPAN_TOLERANCE_DEG = 1e-6
+
 
 class GuidanceNormalizationV2Error(MesoForgeError):
     """Raised when Phase 2 per-cycle normalization cannot assemble a
@@ -497,6 +503,7 @@ def normalize_gfs_cycle(
             dy = float(attrs["GRIB_jDirectionIncrementInDegrees"])
             first_lon = float(attrs["GRIB_longitudeOfFirstGridPointInDegrees"])
             first_lat = float(attrs["GRIB_latitudeOfFirstGridPointInDegrees"])
+            last_lat = float(attrs["GRIB_latitudeOfLastGridPointInDegrees"])
             source_x = first_lon + dx * np.arange(ni, dtype=np.float64)
             normalized_x = (source_x + 180.0) % 360.0 - 180.0
             # GFS publishes 0..360 longitudes. Point lookup uses a
@@ -504,7 +511,23 @@ def normalize_gfs_cycle(
             # before interpolation while retaining source longitudes.
             x_order = np.argsort(normalized_x)
             x = normalized_x[x_order]
-            y = first_lat + dy * np.arange(nj, dtype=np.float64)
+            # The operational GFS 0.25-degree product scans
+            # north-to-south (jScansPositively=0): its first grid row is
+            # +90 and its last is -90. Building the latitude axis as
+            # ``first_lat + dy * arange`` therefore fabricates a 90..270
+            # axis that is not a latitude at all, mislocating every row.
+            # Derive the axis from the message's own declared first and
+            # last latitudes instead, and require the declared increment
+            # to agree with that span so a contradictory geometry fails
+            # closed rather than silently producing a wrong grid.
+            y = np.linspace(first_lat, last_lat, nj, dtype=np.float64)
+            expected_span = dy * (nj - 1)
+            if nj > 1 and abs(abs(last_lat - first_lat) - expected_span) > _GRID_SPAN_TOLERANCE_DEG:
+                raise GuidanceNormalizationV2Error(
+                    f"GFS declared latitude span {abs(last_lat - first_lat)!r} disagrees with "
+                    f"jDirectionIncrementInDegrees {dy!r} over {nj} rows (expected "
+                    f"{expected_span!r}); the message's declared geometry is self-contradictory"
+                )
             lon, lat = np.meshgrid(source_x[x_order], y)
             crs = pyproj.CRS.from_epsg(4326)
             grid_shape = (nj, ni)
