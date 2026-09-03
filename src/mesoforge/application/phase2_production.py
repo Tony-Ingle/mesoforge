@@ -58,6 +58,7 @@ from mesoforge.application.phase2_replay import (
     Phase2ReplayIdentityError,
 )
 from mesoforge.catalog.configuration import Phase2Configuration
+from mesoforge.catalog.domains import BoundingBox
 from mesoforge.common.identifiers import ArtifactId, Digest, GridId, RunId, StationId
 from mesoforge.contracts.artifacts import ArtifactManifest, Availability
 from mesoforge.contracts.forecasts import validate_baseline_forecast_v2
@@ -94,6 +95,7 @@ from mesoforge.guidance.acquisition_v2 import (
     acquire_nbm_lead,
 )
 from mesoforge.guidance.canonical_v2 import (
+    SUBSET_POLICY_ID,
     validate_canonical_guidance_lineage_v2,
     validate_canonical_guidance_v2,
 )
@@ -1153,6 +1155,8 @@ class Phase2ProductionScience:
                 settings=settings,
                 input_refs=input_refs,
                 index_refs=index_refs,
+                domain_bbox=persisted.configuration.domain.bbox,
+                halo_cells=persisted.point_extraction_policy.halo_cells,
             )
 
             qpf_lineage_artifact: ArtifactManifest | None = None
@@ -1164,6 +1168,8 @@ class Phase2ProductionScience:
                     source_leads: tuple[int, ...] = target_source_leads,
                     cycle_reference_time: datetime = reference_time,
                     gfs_settings: Any = settings,
+                    domain_bbox: BoundingBox = persisted.configuration.domain.bbox,
+                    halo_cells: int = persisted.point_extraction_policy.halo_cells,
                 ) -> dict[str, Any]:
                     field_payloads = _group_normalization_payloads(refs, raw)
                     self._require_contiguous_previous_leads(field_payloads, source_leads)
@@ -1175,6 +1181,8 @@ class Phase2ProductionScience:
                         grid_id="phase2-gfs.v1",
                         configuration_snapshot_id=str(request.configuration_snapshot_id),
                         variable_lineage_manifest_id=str(refs[0][1]),
+                        domain_bbox=domain_bbox,
+                        halo_cells=halo_cells,
                     )
                     apcp_parents: dict[int, list[str]] = {}
                     for role, artifact_id in refs:
@@ -1254,6 +1262,14 @@ class Phase2ProductionScience:
                 source_leads: tuple[int, ...] = target_source_leads,
                 lineage_id: str = str(lineage_artifact.artifact_id),
                 model_settings: Any = settings,
+                # Bounded canonical retention (owner architecture
+                # decision). Both come from the run's own persisted
+                # evidence -- the run spec's embedded configuration and
+                # the station snapshot's point-extraction policy -- so a
+                # replay in a fresh process retains byte-identically the
+                # same window even if live configuration has moved.
+                domain_bbox: BoundingBox = persisted.configuration.domain.bbox,
+                halo_cells: int = persisted.point_extraction_policy.halo_cells,
             ) -> xr.Dataset:
                 field_payloads = _group_normalization_payloads(refs, raw[: len(refs)])
                 grid_id = f"phase2-{model.lower()}.v1"
@@ -1267,6 +1283,8 @@ class Phase2ProductionScience:
                         grid_id=grid_id,
                         configuration_snapshot_id=cfg_id,
                         variable_lineage_manifest_id=lineage_id,
+                        domain_bbox=domain_bbox,
+                        halo_cells=halo_cells,
                     )
                 if model == "NBM":
                     return normalize_nbm_cycle(
@@ -1277,6 +1295,8 @@ class Phase2ProductionScience:
                         grid_id=grid_id,
                         configuration_snapshot_id=cfg_id,
                         variable_lineage_manifest_id=lineage_id,
+                        domain_bbox=domain_bbox,
+                        halo_cells=halo_cells,
                     )
                 self._require_contiguous_previous_leads(field_payloads, source_leads)
                 dataset, _lineage = normalize_gfs_cycle(
@@ -1287,6 +1307,8 @@ class Phase2ProductionScience:
                     grid_id=grid_id,
                     configuration_snapshot_id=cfg_id,
                     variable_lineage_manifest_id=lineage_id,
+                    domain_bbox=domain_bbox,
+                    halo_cells=halo_cells,
                 )
                 return dataset
 
@@ -1313,6 +1335,8 @@ class Phase2ProductionScience:
         settings: Any,
         input_refs: tuple[tuple[str, ArtifactId], ...],
         index_refs: tuple[tuple[str, ArtifactId], ...],
+        domain_bbox: BoundingBox,
+        halo_cells: int,
     ) -> tuple[ArtifactManifest, dict[str, Any]]:
         """Create the model's complete ``variable-lineage.v2`` manifest
         (Codex re-review finding 3).
@@ -1402,6 +1426,17 @@ class Phase2ProductionScience:
             "entries": entries,
             "expected_canonical_variable_ids": list(variable_ids),
             "expected_source_lead_hours": list(source_leads),
+            # Bounded canonical retention (owner architecture decision):
+            # the policy the canonical artifact was cut under, read from
+            # the run's own persisted configuration and station snapshot.
+            "canonical_retention_policy": {
+                "policy_id": SUBSET_POLICY_ID,
+                "halo_cells": halo_cells,
+                "bbox_south": domain_bbox.south,
+                "bbox_north": domain_bbox.north,
+                "bbox_west": domain_bbox.west,
+                "bbox_east": domain_bbox.east,
+            },
         }
         # Validate before registration so an incomplete manifest can
         # never reach storage or be referenced by canonical guidance.

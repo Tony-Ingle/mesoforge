@@ -9,6 +9,7 @@ import pytest
 
 from mesoforge.guidance.canonical_v2 import (
     CanonicalGuidanceV2Error,
+    RetainedGridSubset,
     assemble_canonical_guidance_v2,
     validate_canonical_guidance_v2,
 )
@@ -20,6 +21,22 @@ _Y = np.array([0.0, 1.0])
 _REF_TIME = np.datetime64("2026-08-30T12:00:00")
 _CFG_SNAPSHOT_ID = "cfg_sha256_" + "0" * 64
 _LINEAGE_ID = "art_00000000-0000-0000-0000-000000000001"
+
+# A 2x2 retained window cut from a 6x6 native grid with a one-cell halo
+# (Phase 2 bounded canonical retention).
+_SUBSET = RetainedGridSubset(
+    source_ny=6,
+    source_nx=6,
+    y_start=2,
+    y_end=4,
+    x_start=2,
+    x_end=4,
+    halo_cells=1,
+    bbox_south=45.05265,
+    bbox_north=46.55265,
+    bbox_west=-94.07956,
+    bbox_east=-92.07956,
+)
 
 
 def _base_kwargs(**overrides):
@@ -49,6 +66,7 @@ def _base_kwargs(**overrides):
         grid_id="nbm-conus.v1",
         configuration_snapshot_id=_CFG_SNAPSHOT_ID,
         variable_lineage_manifest_id=_LINEAGE_ID,
+        retained_subset=_SUBSET,
     )
     values.update(overrides)
     return values

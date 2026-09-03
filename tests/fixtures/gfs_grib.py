@@ -2,17 +2,23 @@
 2 tests (mirrors ``tests/fixtures/nbm_grib.py``/``hrrr_grib.py``): a
 tiny 0.25-degree regular lat/lon grid carrying the same discipline/
 category/number identity as the real GFS pgrb2 product.
+
+The grid is deliberately larger than the configured Grasston bbox: Phase
+2 canonical guidance retains the domain bbox plus a one-cell
+interpolation halo, so a fixture grid must be able to supply that halo
+on every side or it exercises a code path the operational global grid
+never takes.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-NX = 12
-NY = 10
+NX = 18
+NY = 16
 DX_DEGREES = 0.25
-FIRST_LAT_DEGREES = 44.0
-FIRST_LON_DEGREES = 265.0  # -95.0
+FIRST_LAT_DEGREES = 43.5
+FIRST_LON_DEGREES = 264.5  # -95.5
 
 
 def _base_message(*, forecast_hour: int, cycle_date: str, cycle_hour: int) -> int:

@@ -71,6 +71,44 @@ Canonical datasets retain source reference/valid/interval times, units, grid ide
 selected-message lineage, decode arguments, configuration snapshot, and source
 artifact IDs. Ambiguous, duplicate, missing, or incompatible messages fail closed.
 
+`canonical-guidance.v2` retains a **bounded window of each model's native grid**, not
+the full grid. The retained window is the smallest native-grid rectangle covering the
+configured inclusive `domain.bbox` plus `point_extraction_policy.halo_cells` complete
+source cells on every side — the same `compute_bbox_halo_subset_indices` rule Phase 1
+uses, under policy `bbox-halo-subset.v1`. Phase 2 produces values only at the three
+approved stations by native-grid bilinear interpolation, which reads one 2x2
+neighbourhood, so every source cell any approved extraction can read is inside that
+window and nothing outside it is scientifically reachable. Subsetting is applied to the
+*full decoded native geometry*, after GFS's `[0, 360)` longitude axis has been reordered
+onto the monotonic `[-180, 180)` axis and after GFS dual-parent APCP equivalence has
+been validated across the whole array, and every remaining per-point computation
+(HRRR/GFS wind rotation, NBM speed/direction-to-U/V, GFS same-bucket differencing,
+PoP percent-to-fraction) is pointwise. Retained values, retained coordinates, station
+enclosing cells, and interpolation weights are therefore bit-identical to full-grid
+processing; `tests/unit/guidance/test_canonical_subset_equivalence.py` proves this per
+model by normalizing the same bytes twice and comparing every station and variable. A
+domain whose bbox or halo the native grid cannot supply is a terminal normalization
+error, never a silently clipped artifact.
+
+Because the retained grid is not the native grid, the artifact must say exactly which
+window of which grid it carries. Every `canonical-guidance.v2` artifact declares
+`subset_policy_id`, the full source grid shape (`source_grid_ny`/`source_grid_nx`), the
+half-open native index bounds `[subset_y_start, subset_y_end) x [subset_x_start,
+subset_x_end)`, `subset_halo_cells`, and the four `subset_bbox_*` degrees; validation
+rejects a missing, partial, non-integer, out-of-range, or dimension-contradicting
+declaration, and rejects a halo below one cell. The corresponding `variable-lineage.v2`
+manifest carries the `canonical_retention_policy` the artifact was cut under, and lineage
+validation rejects a dataset whose declared window contradicts its manifest's policy.
+Full source-grid provenance is unchanged and still complete: source URLs, endpoints,
+byte ranges, inventory rows, message numbers, digests, the approved native grid profile
+identity and shape, provider publication and local retrieval timestamps, decode
+arguments, and the projection CRS all remain retained, so the full native grid can be
+reacquired and the retained window reproduced and audited from the artifact alone.
+Replay reads the bbox and halo from the run's own persisted run spec and station
+snapshot, never from live configuration, so a fresh process retains the identical
+window. Retained coordinate arrays, `grid_id`, and every downstream content-addressed
+artifact identity differ from full-grid Phase 2 runs; that is expected and approved.
+
 Canonical guidance validation enforces grid and lineage *semantics*, not identifier
 syntax. A `canonical-guidance.v2` artifact must carry a grid identifier naming its own
 model and no other, and its `variable_lineage_manifest_id` must resolve to a real
@@ -86,12 +124,13 @@ substitute for the variable lineage manifest.
 
 Spatial extraction is native-grid bilinear interpolation under
 `bilinear-native-grid.v1`: four finite corners are required, weights sum within
-`1e-12`, a one-cell halo may be acquired, and extrapolation is forbidden. Winds are
-earth-relative before blending. Temporal alignment requires exact target valid times
-and identical one-hour interval bounds; it does not interpolate. GFS one-hour QPF is
-derived from successive accumulations; only the explicitly bounded floating-point
-negative tolerance may be floored upstream. No terrain, elevation, lapse-rate,
-nearest-neighbor, or temporal fallback is applied.
+`1e-12`, a one-cell halo may be acquired, and extrapolation is forbidden. The halo
+width is also the retention halo `canonical-guidance.v2` is cut with, so the two are
+never independent. Winds are earth-relative before blending. Temporal alignment
+requires exact target valid times and identical one-hour interval bounds; it does not
+interpolate. GFS one-hour QPF is derived from successive accumulations; only the
+explicitly bounded floating-point negative tolerance may be floored upstream. No
+terrain, elevation, lapse-rate, nearest-neighbor, or temporal fallback is applied.
 
 ## Blend equations and invariants
 

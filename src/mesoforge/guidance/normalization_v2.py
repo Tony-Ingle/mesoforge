@@ -32,6 +32,7 @@ import numpy as np
 import pyproj
 import xarray as xr
 
+from mesoforge.catalog.domains import BoundingBox
 from mesoforge.catalog.sources import (
     GfsSourceSettings,
     HrrrPhase2SourceSettings,
@@ -39,11 +40,16 @@ from mesoforge.catalog.sources import (
     Phase2FieldContract,
 )
 from mesoforge.common.errors import MesoForgeError
-from mesoforge.guidance.canonical_v2 import assemble_canonical_guidance_v2
+from mesoforge.guidance.canonical_v2 import (
+    RetainedGridSubset,
+    assemble_canonical_guidance_v2,
+)
 from mesoforge.guidance.nbm_geometry import compute_nbm_grid
 from mesoforge.guidance.normalization import (
+    SubsettingError,
     WindRotationError,
     build_lambert_conformal_crs,
+    compute_bbox_halo_subset_indices,
     compute_latlon_grid,
     compute_projected_coordinates,
     rotate_wind_to_earth_relative,
@@ -123,6 +129,53 @@ def _apcp_field_payload(
     return by_lead[lead]
 
 
+def _retained_subset(
+    *,
+    model: str,
+    x: np.ndarray,
+    y: np.ndarray,
+    lat: np.ndarray,
+    lon: np.ndarray,
+    domain_bbox: BoundingBox,
+    halo_cells: int,
+) -> tuple[RetainedGridSubset, slice, slice]:
+    """Compute the native-grid bbox+halo window Phase 2 retains.
+
+    This is the identical Phase 1 rule
+    (``compute_bbox_halo_subset_indices``): the smallest native-grid
+    rectangle covering the inclusive configured domain bbox plus
+    ``halo_cells`` complete source cells on every side. Every source
+    cell any approved station's bilinear 2x2 neighbourhood can read is
+    inside it, so retained canonical values and interpolation weights
+    are identical to full-grid processing -- while the retained arrays
+    stay bounded on any host.
+    """
+    ny, nx = lat.shape
+    try:
+        indices = compute_bbox_halo_subset_indices(
+            x=x, y=y, lat=lat, lon=lon, bbox=domain_bbox, halo_cells=halo_cells
+        )
+    except SubsettingError as exc:
+        raise GuidanceNormalizationV2Error(
+            f"{model} native grid cannot supply the configured domain bbox plus "
+            f"{halo_cells}-cell halo: {exc}"
+        ) from exc
+    subset = RetainedGridSubset(
+        source_ny=ny,
+        source_nx=nx,
+        y_start=indices.y_start,
+        y_end=indices.y_end,
+        x_start=indices.x_start,
+        x_end=indices.x_end,
+        halo_cells=halo_cells,
+        bbox_south=domain_bbox.south,
+        bbox_north=domain_bbox.north,
+        bbox_west=domain_bbox.west,
+        bbox_east=domain_bbox.east,
+    )
+    return subset, slice(indices.y_start, indices.y_end), slice(indices.x_start, indices.x_end)
+
+
 def normalize_hrrr_phase2_cycle(
     *,
     settings: HrrrPhase2SourceSettings,
@@ -132,11 +185,22 @@ def normalize_hrrr_phase2_cycle(
     grid_id: str,
     configuration_snapshot_id: str,
     variable_lineage_manifest_id: str,
+    domain_bbox: BoundingBox,
+    halo_cells: int,
 ) -> xr.Dataset:
     """Decode every HRRR Phase 2 lead's per-field selected-message
     payloads and assemble ``canonical-guidance.v2``. Grid-relative
     winds (``uvRelativeToGrid``) are asserted and rotated to
-    earth-relative components before assembly (finding 5)."""
+    earth-relative components before assembly (finding 5).
+
+    Only the configured ``domain_bbox`` plus ``halo_cells`` of the
+    native grid is retained (owner architecture decision). The window
+    is computed from the full native geometry, so the retained cells,
+    their coordinates, and every value in them are exactly what
+    full-grid processing would have produced; the wind rotation basis
+    at a retained point depends only on that point's own projected
+    coordinate and the grid increment, both unchanged by subsetting.
+    """
     cycle_date = forecast_reference_time.date()
     cycle_hour = forecast_reference_time.hour
 
@@ -153,6 +217,9 @@ def normalize_hrrr_phase2_cycle(
     y: np.ndarray | None = None
     lat: np.ndarray | None = None
     lon: np.ndarray | None = None
+    subset: RetainedGridSubset | None = None
+    y_slice: slice | None = None
+    x_slice: slice | None = None
 
     temperature_leads: list[np.ndarray] = []
     dew_point_leads: list[np.ndarray] = []
@@ -230,6 +297,19 @@ def normalize_hrrr_phase2_cycle(
                 ny=int(attrs["GRIB_Ny"]),
             )
             lat, lon = compute_latlon_grid(crs, x=x, y=y)
+            subset, y_slice, x_slice = _retained_subset(
+                model="HRRR",
+                x=x,
+                y=y,
+                lat=lat,
+                lon=lon,
+                domain_bbox=domain_bbox,
+                halo_cells=halo_cells,
+            )
+            x = x[x_slice]
+            y = y[y_slice]
+            lat = lat[y_slice, x_slice]
+            lon = lon[y_slice, x_slice]
 
         u_relative = eastward.attrs.get("GRIB_uvRelativeToGrid")
         v_relative = northward.attrs.get("GRIB_uvRelativeToGrid")
@@ -239,10 +319,11 @@ def normalize_hrrr_phase2_cycle(
                 f"got U={u_relative!r}, V={v_relative!r}"
             )
         assert crs is not None and x is not None and y is not None
+        assert y_slice is not None and x_slice is not None
         try:
             rotated = rotate_wind_to_earth_relative(
-                u_grid=eastward.values,
-                v_grid=northward.values,
+                u_grid=eastward.values[y_slice, x_slice],
+                v_grid=northward.values[y_slice, x_slice],
                 x=x,
                 y=y,
                 crs=crs,
@@ -254,15 +335,16 @@ def normalize_hrrr_phase2_cycle(
                 f"HRRR lead {lead!r} wind rotation failed: {exc}"
             ) from exc
 
-        temperature_leads.append(temperature.values)
-        dew_point_leads.append(dew_point.values)
+        temperature_leads.append(temperature.values[y_slice, x_slice])
+        dew_point_leads.append(dew_point.values[y_slice, x_slice])
         eastward_leads.append(rotated.eastward)
         northward_leads.append(rotated.northward)
-        gust_leads.append(gust.values)
-        qpf_leads.append(qpf.values)
+        gust_leads.append(gust.values[y_slice, x_slice])
+        qpf_leads.append(qpf.values[y_slice, x_slice])
         qpf_start_hours.append(lead - 1)
 
     assert lat is not None and lon is not None and x is not None and y is not None
+    assert subset is not None
     return assemble_canonical_guidance_v2(
         model="hrrr",
         forecast_reference_time=np.datetime64(forecast_reference_time.replace(tzinfo=None), "ns"),
@@ -284,6 +366,7 @@ def normalize_hrrr_phase2_cycle(
         configuration_snapshot_id=configuration_snapshot_id,
         variable_lineage_manifest_id=variable_lineage_manifest_id,
         crs_wkt2=crs.to_wkt() if crs is not None else None,
+        retained_subset=subset,
     )
 
 
@@ -296,6 +379,8 @@ def normalize_gfs_cycle(
     grid_id: str,
     configuration_snapshot_id: str,
     variable_lineage_manifest_id: str,
+    domain_bbox: BoundingBox,
+    halo_cells: int,
 ) -> tuple[xr.Dataset, tuple[GfsQpfLineage, ...]]:
     """Decode every GFS lead and assemble ``canonical-guidance.v2``.
 
@@ -306,8 +391,16 @@ def normalize_gfs_cycle(
     cached across leads to avoid redundant decoding). Grid-relative
     winds are asserted and rotated (finding 5); every lead's bucket/
     duplicate APCP candidates are validated for dual-parent
-    equivalence and both parents are recorded in the returned
-    lineage (finding 4).
+    equivalence over their full native arrays, and both parents are
+    recorded in the returned lineage (finding 4).
+
+    Only the configured ``domain_bbox`` plus ``halo_cells`` of the
+    native grid is retained (owner architecture decision). Subsetting
+    happens after the provider's ``[0, 360)`` longitude axis has been
+    reordered onto the monotonic ``[-180, 180)`` axis and after
+    dual-parent equivalence has been checked on the full arrays, and
+    ``compute_one_hour_qpf`` is pointwise, so every retained value is
+    exactly what full-grid processing produced.
     """
     cycle_date = forecast_reference_time.date()
     cycle_hour = forecast_reference_time.hour
@@ -327,6 +420,9 @@ def normalize_gfs_cycle(
     lon: np.ndarray | None = None
     grid_shape: tuple[int, int] | None = None
     x_order: np.ndarray | None = None
+    subset: RetainedGridSubset | None = None
+    y_slice: slice | None = None
+    x_slice: slice | None = None
 
     temperature_leads: list[np.ndarray] = []
     dew_point_leads: list[np.ndarray] = []
@@ -412,6 +508,22 @@ def normalize_gfs_cycle(
             lon, lat = np.meshgrid(source_x[x_order], y)
             crs = pyproj.CRS.from_epsg(4326)
             grid_shape = (nj, ni)
+            # The bbox is expressed on the monotonic [-180, 180) axis,
+            # which is the axis station lookup uses; ``lon`` retains the
+            # provider's own [0, 360) longitudes as source evidence.
+            subset, y_slice, x_slice = _retained_subset(
+                model="GFS",
+                x=x,
+                y=y,
+                lat=lat,
+                lon=np.broadcast_to(x, lat.shape),
+                domain_bbox=domain_bbox,
+                halo_cells=halo_cells,
+            )
+            x = x[x_slice]
+            y = y[y_slice]
+            lat = lat[y_slice, x_slice]
+            lon = lon[y_slice, x_slice]
 
         u_relative = eastward.attrs.get("GRIB_uvRelativeToGrid")
         v_relative = northward.attrs.get("GRIB_uvRelativeToGrid")
@@ -421,10 +533,11 @@ def normalize_gfs_cycle(
                 f"got U={u_relative!r}, V={v_relative!r}"
             )
         assert x is not None and y is not None and crs is not None and x_order is not None
+        assert y_slice is not None and x_slice is not None
         try:
             rotated = rotate_wind_to_earth_relative(
-                u_grid=eastward.values[:, x_order],
-                v_grid=northward.values[:, x_order],
+                u_grid=eastward.values[:, x_order][y_slice, x_slice],
+                v_grid=northward.values[:, x_order][y_slice, x_slice],
                 x=x,
                 y=y,
                 crs=crs,
@@ -460,18 +573,31 @@ def normalize_gfs_cycle(
                 bucket_cache[lead - 1] = previous_bucket
 
         assert grid_shape is not None
-        n_points = grid_shape[0] * grid_shape[1]
-        one_hour = np.empty(n_points, dtype=np.float64)
+        # Same-bucket differencing is pointwise, so reordering onto the
+        # monotonic axis and cutting to the retained window before
+        # differencing yields exactly the values full-grid differencing
+        # would have produced at those same cells.
+        current_retained = np.asarray(bucket.values_kg_m2, dtype=np.float64).reshape(grid_shape)[
+            :, x_order
+        ][y_slice, x_slice]
+        previous_retained = (
+            None
+            if previous_bucket is None
+            else np.asarray(previous_bucket.values_kg_m2, dtype=np.float64).reshape(grid_shape)[
+                :, x_order
+            ][y_slice, x_slice]
+        )
+        flat_current = current_retained.ravel()
+        flat_previous = None if previous_retained is None else previous_retained.ravel()
+        one_hour = np.empty(flat_current.size, dtype=np.float64)
         result: BucketPrecipitationResult | None = None
-        for index in range(n_points):
-            current_value = bucket.values_kg_m2[index]
-            previous_value = (
-                None if previous_bucket is None else previous_bucket.values_kg_m2[index]
-            )
+        for index in range(flat_current.size):
             computation = compute_one_hour_qpf(
                 forecast_hour=lead,
-                bucket_value_current_kg_m2=current_value,
-                bucket_value_previous_kg_m2=previous_value,
+                bucket_value_current_kg_m2=float(flat_current[index]),
+                bucket_value_previous_kg_m2=(
+                    None if flat_previous is None else float(flat_previous[index])
+                ),
             )
             one_hour[index] = computation.one_hour_qpf_kg_m2
             result = computation
@@ -486,15 +612,16 @@ def normalize_gfs_cycle(
             )
         )
 
-        temperature_leads.append(temperature.values[:, x_order])
-        dew_point_leads.append(dew_point.values[:, x_order])
+        temperature_leads.append(temperature.values[:, x_order][y_slice, x_slice])
+        dew_point_leads.append(dew_point.values[:, x_order][y_slice, x_slice])
         eastward_leads.append(rotated.eastward)
         northward_leads.append(rotated.northward)
-        gust_leads.append(gust.values[:, x_order])
-        qpf_leads.append(one_hour.reshape(grid_shape)[:, x_order])
+        gust_leads.append(gust.values[:, x_order][y_slice, x_slice])
+        qpf_leads.append(one_hour.reshape(current_retained.shape))
         qpf_start_hours.append(lead - 1)
 
     assert lat is not None and lon is not None and x is not None and y is not None
+    assert subset is not None
     dataset = assemble_canonical_guidance_v2(
         model="gfs",
         forecast_reference_time=np.datetime64(forecast_reference_time.replace(tzinfo=None), "ns"),
@@ -516,6 +643,7 @@ def normalize_gfs_cycle(
         configuration_snapshot_id=configuration_snapshot_id,
         variable_lineage_manifest_id=variable_lineage_manifest_id,
         crs_wkt2=crs.to_wkt() if crs is not None else None,
+        retained_subset=subset,
     )
     return dataset, tuple(lineage)
 
@@ -529,15 +657,25 @@ def normalize_nbm_cycle(
     grid_id: str,
     configuration_snapshot_id: str,
     variable_lineage_manifest_id: str,
+    domain_bbox: BoundingBox,
+    halo_cells: int,
 ) -> xr.Dataset:
     """Decode every NBM lead and assemble ``canonical-guidance.v2``.
     Speed/direction is converted to earth-relative U/V cornerwise (on
-    the full native grid) *before* any spatial interpolation happens
-    downstream (finding 5) using
+    the retained native cells) *before* any spatial interpolation
+    happens downstream (finding 5) using
     ``guidance.sources.nbm.convert_speed_direction_to_components``.
     Deterministic APCP and PoP01 -- which can share an ambiguous
     decoded identity when concatenated -- are always decoded from
-    their own separate single-message payloads (``field_payloads``)."""
+    their own separate single-message payloads (``field_payloads``).
+
+    Only the configured ``domain_bbox`` plus ``halo_cells`` of the
+    approved native grid is retained (owner architecture decision).
+    The window is derived from the approved profile's full native
+    geometry, and the speed/direction conversion is pointwise, so
+    every retained value is exactly what full-grid processing
+    produced.
+    """
     cycle_date = forecast_reference_time.date()
     cycle_hour = forecast_reference_time.hour
 
@@ -555,6 +693,9 @@ def normalize_nbm_cycle(
     y: np.ndarray | None = None
     lat: np.ndarray | None = None
     lon: np.ndarray | None = None
+    subset: RetainedGridSubset | None = None
+    y_slice: slice | None = None
+    x_slice: slice | None = None
 
     temperature_leads: list[np.ndarray] = []
     dew_point_leads: list[np.ndarray] = []
@@ -633,9 +774,23 @@ def normalize_nbm_cycle(
             # inverse-project for the true 2-D lat/lon mesh.
             crs, x, y, lat, lon = compute_nbm_grid(settings.grid_profile)
             nbm_crs = crs
+            subset, y_slice, x_slice = _retained_subset(
+                model="NBM",
+                x=x,
+                y=y,
+                lat=lat,
+                lon=lon,
+                domain_bbox=domain_bbox,
+                halo_cells=halo_cells,
+            )
+            x = x[x_slice]
+            y = y[y_slice]
+            lat = lat[y_slice, x_slice]
+            lon = lon[y_slice, x_slice]
 
-        speed_values = speed.values
-        direction_values = direction.values
+        assert y_slice is not None and x_slice is not None
+        speed_values = speed.values[y_slice, x_slice]
+        direction_values = direction.values[y_slice, x_slice]
         flat_speed = speed_values.ravel()
         flat_direction = direction_values.ravel()
         flat_u = np.empty_like(flat_speed, dtype=np.float64)
@@ -649,19 +804,21 @@ def normalize_nbm_cycle(
         u_grid = flat_u.reshape(speed_values.shape)
         v_grid = flat_v.reshape(speed_values.shape)
 
-        temperature_leads.append(temperature.values)
-        dew_point_leads.append(dew_point.values)
+        temperature_leads.append(temperature.values[y_slice, x_slice])
+        dew_point_leads.append(dew_point.values[y_slice, x_slice])
         eastward_leads.append(u_grid)
         northward_leads.append(v_grid)
-        gust_leads.append(gust.values)
-        qpf_leads.append(qpf.values)
+        gust_leads.append(gust.values[y_slice, x_slice])
+        qpf_leads.append(qpf.values[y_slice, x_slice])
         pop_leads.append(
-            np.vectorize(convert_pop_percent_to_fraction)(pop.values.astype(np.float64))
+            np.vectorize(convert_pop_percent_to_fraction)(
+                pop.values[y_slice, x_slice].astype(np.float64)
+            )
         )
         interval_start_hours.append(lead - 1)
 
     assert lat is not None and lon is not None and x is not None and y is not None
-    assert nbm_crs is not None
+    assert nbm_crs is not None and subset is not None
     return assemble_canonical_guidance_v2(
         model="nbm",
         forecast_reference_time=np.datetime64(forecast_reference_time.replace(tzinfo=None), "ns"),
@@ -689,4 +846,5 @@ def normalize_nbm_cycle(
         configuration_snapshot_id=configuration_snapshot_id,
         variable_lineage_manifest_id=variable_lineage_manifest_id,
         crs_wkt2=nbm_crs.to_wkt(),
+        retained_subset=subset,
     )

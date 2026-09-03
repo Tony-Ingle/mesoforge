@@ -64,6 +64,7 @@ import mesoforge.storage as _storage_pkg
 from mesoforge.common.identifiers import (
     ActivityId,
     ArtifactId,
+    CanonicalRetentionPolicyId,
     ConfigurationSnapshotId,
     Digest,
     FallbackRowId,
@@ -94,6 +95,9 @@ _TYPED_IDENTIFIER_CLASSES = (
     # already satisfies this audit's intent.
     ModelCycleSelectionPolicyId,
     FallbackRowId,
+    # Phase 2 bounded canonical retention: the policy under which a
+    # canonical artifact was cut from its model's full native grid.
+    CanonicalRetentionPolicyId,
 )
 
 # Parameter/attribute names that look like an identifier/digest but are
