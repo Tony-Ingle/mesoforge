@@ -370,6 +370,56 @@ PostgreSQL 16 and MinIO after an Alembic upgrade/downgrade/upgrade round trip, t
 runs the repository coverage threshold. Live tests require
 `MESOFORGE_LIVE_TESTS=1` plus explicit recent cycles and are never gating.
 
+## Open question: NBM 1h PoP versus deterministic QPF at the same valid hour
+
+**Status: unresolved, documented deliberately rather than guessed. Needs a
+meteorological/product decision before Phase 3.**
+
+The mechanical contract is verified and correct. For every NBM PoP/QPF point in the
+live Minnesota run (216 pairings checked):
+
+- both records are `:APCP:surface:{lead-1}-{lead} hour acc fcst:` — a true one-hour
+  window, never a 3/6/12-hour bucket;
+- the window ends exactly at the target valid time;
+- PoP and deterministic QPF are drawn from the *same* interval and the same lead;
+- PoP01 is confirmed by GRIB2 PDT 4.9 keys (`probabilityType = 1`,
+  `scaledValueOfUpperLimit`/`scaleFactorOfUpperLimit` = 254/10^3 = 0.254 kg m-2),
+  i.e. `P(1h accumulation > 0.254 kg m-2)`, converted once from percent.
+
+What is *not* settled is how to interpret the two together. In the live run, 25 of 108
+NBM points carry a deterministic 1h QPF above the 0.254 kg m-2 event threshold while
+PoP01 for the identical hour is below 20%. The clearest instance is
+**KJMR, target horizon 24 (valid 2026-09-03T18:00Z, NBM cycle 17Z lead 25)**:
+
+| field | value |
+| --- | --- |
+| NBM PoP01 (`P(>0.254 kg m-2)`) | 0.09 (9%) |
+| NBM deterministic 1h QPF | 3.6388 kg m-2 |
+| interval | 24-25 hour acc fcst, ending exactly at the valid time |
+
+This is not a decoding defect and not a mathematical contradiction. The two records
+are different statistics of the same predictand: PoP01 is an exceedance *probability*
+over the NBM distribution, while deterministic QPF is a central/expected-value style
+point estimate. A low exceedance probability with a non-trivial conditional amount is
+a legitimate NBM signature (a small chance of a locally heavy hour). The existing
+`check_probability_deterministic_tension` only flags the degenerate endpoints
+(`PoP == 0` with `QPF >= 0.254`, or `PoP == 1` with `QPF == 0`), so cases like KJMR h24
+are currently neither flagged nor reconciled — they simply pass through.
+
+The unresolved questions, for Codex/product to decide:
+
+1. Is a low-PoP/high-QPF hour supposed to be flagged as a soft tension at all, or is it
+   expected NBM behavior that must pass through untouched?
+2. If it should be flagged, what threshold pair defines it, and is the flag advisory
+   only (Phase 2 mutates nothing) or does it affect availability state?
+3. Should the deterministic QPF ever be interpreted as conditional-on-precipitation
+   (which would make the pairing consistent by construction), or strictly as an
+   unconditional expected amount?
+
+Until this is decided, MesoForge reports both values verbatim with their shared
+interval and takes no reconciling action. No value is altered, suppressed, or
+synthesized on the basis of this open question.
+
 ## Explicit deferrals and limitations
 
 The strict Phase 2 configuration fixes all of these flags to false:

@@ -400,6 +400,101 @@ def _fmt(value: Any) -> str:
     return str(value)
 
 
+def _parse_utc(value: Any) -> datetime | None:
+    """Parse an exported ISO-8601 UTC timestamp, tolerating the
+    trailing ``Z`` spelling used by the serialized artifacts."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _availability_lines(availability: dict[str, Any]) -> list[str]:
+    """Build the availability/blend-identity section.
+
+    The availability report publishes the approved contributor set under
+    ``models``; an earlier version read ``available_models``, a key that
+    never exists, so the report printed "none" even when HRRR and NBM
+    were contributing to every row.
+    """
+    lines = [f"- run state: **{availability.get('run_state', 'unknown')}**"]
+    contributing = availability.get("models", [])
+    lines.append(f"- contributing models: {', '.join(contributing) or 'none'}")
+    for excluded in availability.get("excluded_models", []):
+        location = excluded.get("station") or "--"
+        horizon = excluded.get("target_horizon")
+        detail = f"- excluded model: **{excluded['model']}** ({excluded['reason']})"
+        if horizon is not None:
+            detail += f" first seen at {location} horizon {horizon}"
+        shortfall = excluded.get("shortfall_m_s")
+        if shortfall is not None:
+            detail += f", gust shortfall {shortfall:.4f} m s-1"
+        lines.append(detail)
+    return lines
+
+
+_OBSERVED_FIELDS = (
+    "observed_temperature_k",
+    "observed_dew_point_k",
+    "observed_eastward_wind_m_s",
+    "observed_northward_wind_m_s",
+    "observed_wind_speed_m_s",
+    "observed_wind_from_direction_degrees",
+    "observed_wind_gust_m_s",
+    "observed_qpf_kg_m2",
+)
+
+
+def _verification_lines(matched_pairs: dict[str, Any]) -> list[str]:
+    """Build the verification section.
+
+    matched-pairs.v2 rows carry no scalar ``observed_value`` key; each
+    observed field is its own column. Counting ``observed_value``
+    therefore always yielded 0 and understated the observations actually
+    matched. The prior text also unconditionally asserted that every
+    target valid time was in the future, which is false whenever the
+    verification cutoff is later than some target valid times.
+    """
+    pair_rows = matched_pairs.get("rows", [])
+    rows_with_observation = sum(
+        1 for row in pair_rows if any(row.get(field) is not None for field in _OBSERVED_FIELDS)
+    )
+    field_counts = {
+        field: sum(1 for row in pair_rows if row.get(field) is not None)
+        for field in _OBSERVED_FIELDS
+    }
+    cutoff = _parse_utc(matched_pairs.get("verification_cutoff")) or _parse_utc(
+        pair_rows[0].get("verification_cutoff") if pair_rows else None
+    )
+    verifiable = [
+        row
+        for row in pair_rows
+        if cutoff is not None
+        and (valid := _parse_utc(row.get("valid_time"))) is not None
+        and valid <= cutoff
+    ]
+    lines = [
+        f"- matched pairs: {len(pair_rows)} rows, {rows_with_observation} with at least one "
+        f"observed field",
+        f"- rows whose target valid time is at or before the verification cutoff "
+        f"(verifiable now): {len(verifiable)}; the remaining "
+        f"{len(pair_rows) - len(verifiable)} are still in the future and are forecasts, "
+        f"not verified outcomes",
+    ]
+    populated = {field: count for field, count in field_counts.items() if count}
+    if populated:
+        lines.append(
+            "- observed field coverage: "
+            + ", ".join(f"`{field}` {count}" for field, count in sorted(populated.items()))
+        )
+    else:
+        lines.append("- observed field coverage: no observed field was populated in any row")
+    return lines
+
+
 def _markdown(
     *,
     result: Phase2Result,
@@ -463,10 +558,7 @@ def _markdown(
 
     lines.append("## Availability and blend identity")
     lines.append("")
-    lines.append(f"- run state: **{availability.get('run_state', 'unknown')}**")
-    lines.append(
-        f"- contributing models: {', '.join(availability.get('available_models', [])) or 'none'}"
-    )
+    lines.extend(_availability_lines(availability))
     lines.append("")
 
     lines.append("## Model versus blend comparison")
@@ -488,6 +580,25 @@ def _markdown(
             continue
         lines.append(f"### {variable_id} ({CANONICAL_UNITS[variable_id]})")
         lines.append("")
+        if variable_id == "probability_of_precipitation_1h":
+            lines.append(
+                "NBM PoP01 is `P(1h accumulation > 0.254 kg m-2)` over the one-hour "
+                "window ending exactly at the valid time, decoded from GRIB2 PDT 4.9 "
+                "and converted once from percent. It is an exceedance probability, "
+                "not an expected amount, so it is not directly comparable to the "
+                'deterministic QPF below. See "Open question: NBM 1h PoP versus '
+                'deterministic QPF" in `docs/data-contracts/phase-2.md`.'
+            )
+            lines.append("")
+        if variable_id == "liquid_equivalent_precipitation_amount_1h":
+            lines.append(
+                "Deterministic 1h QPF is drawn from the same one-hour interval and "
+                "lead as PoP01 above. Hours with a QPF above the 0.254 kg m-2 event "
+                "threshold but a low PoP01 (for example KJMR horizon 24) are a "
+                "documented open interpretation question, not a decoding defect; "
+                "both values are reported verbatim and nothing is reconciled."
+            )
+            lines.append("")
         lines.append(
             "| station | horizon | valid time | HRRR | NBM | GFS | "
             "blend | weights (HRRR/NBM/GFS) | state |"
@@ -506,14 +617,7 @@ def _markdown(
 
     lines.append("## Verification")
     lines.append("")
-    pair_rows = matched_pairs.get("rows", [])
-    matched = sum(1 for row in pair_rows if row.get("observed_value") is not None)
-    lines.append(f"- matched pairs: {len(pair_rows)} rows, {matched} with an observed value")
-    lines.append(
-        "- every target valid time is in the future relative to this run's verification "
-        "cutoff, so forecast-only rows with no later truth are the correct outcome; these "
-        "are forecasts, not verified outcomes"
-    )
+    lines.extend(_verification_lines(matched_pairs))
     lines.append("")
 
     lines.append("## Artifact identities")

@@ -1649,6 +1649,87 @@ class Phase2ProductionScience:
         )
         return AvailabilityArtifacts(cycle_selection=cycle.output, report=report.output)
 
+    def _screen_model_cycle(
+        self,
+        *,
+        aligned: dict[str, Any],
+        model: str,
+        stations: Any,
+        horizons: Any,
+    ) -> dict[str, Any] | None:
+        """Screen one model cycle for source-level disqualification.
+
+        Returns ``None`` when the cycle is usable, otherwise a
+        structured exclusion record naming the precise cause and the
+        first offending point.
+
+        The previous implementation wrapped this scan in a single
+        ``except (KeyError, ValueError, GustDisqualificationError)``,
+        which conflated three materially different causes -- a genuine
+        gust inconsistency, a *missing* aligned point (``KeyError``),
+        and a non-finite/invalid value (``ValueError``) -- and then
+        dropped the model with no record of which occurred. Each is
+        now classified and reported separately.
+        """
+        for horizon in horizons:
+            by_point = aligned["values"].get(model, {}).get(str(horizon))
+            if by_point is None:
+                return {
+                    "model": model,
+                    "reason": "missing_aligned_horizon",
+                    "detail": f"no aligned values for horizon {horizon}",
+                    "target_horizon": horizon,
+                    "station": None,
+                }
+            for station in stations:
+                station_id = str(station.station_id)
+                keys = {
+                    name: f"{station_id}|{name}"
+                    for name in ("wind_gust_10m", "eastward_wind_10m", "northward_wind_10m")
+                }
+                missing = [name for name, key in keys.items() if key not in by_point]
+                if missing:
+                    return {
+                        "model": model,
+                        "reason": "missing_aligned_point",
+                        "detail": (
+                            f"aligned point is missing {sorted(missing)!r} at "
+                            f"{station_id} horizon {horizon}"
+                        ),
+                        "target_horizon": horizon,
+                        "station": station_id,
+                    }
+                gust = by_point[keys["wind_gust_10m"]]
+                sustained = math.hypot(
+                    by_point[keys["eastward_wind_10m"]],
+                    by_point[keys["northward_wind_10m"]],
+                )
+                try:
+                    validate_source_gust(gust_m_s=gust, sustained_speed_m_s=sustained)
+                except GustDisqualificationError:
+                    return {
+                        "model": model,
+                        "reason": "source_gust_inconsistency",
+                        "detail": (
+                            f"source gust {gust!r} m/s is below sustained speed "
+                            f"{sustained!r} m/s beyond the floor tolerance"
+                        ),
+                        "target_horizon": horizon,
+                        "station": station_id,
+                        "gust_m_s": gust,
+                        "sustained_speed_m_s": sustained,
+                        "shortfall_m_s": sustained - gust,
+                    }
+                except ValueError as exc:
+                    return {
+                        "model": model,
+                        "reason": "invalid_source_value",
+                        "detail": f"{exc} at {station_id} horizon {horizon}",
+                        "target_horizon": horizon,
+                        "station": station_id,
+                    }
+        return None
+
     def _available_payload(
         self, aligned: dict[str, Any], persisted: Phase2PersistedRun
     ) -> dict[str, Any]:
@@ -1656,21 +1737,21 @@ class Phase2ProductionScience:
         horizons = persisted.target_horizons
         blend = persisted.blend_configuration
         approved_models: set[str] = set(aligned["models"])
+        # Section 4.1/4.3: a source-level gust inconsistency disqualifies
+        # the *entire* model cycle (variable-only fallback is forbidden).
+        # That scope is deliberate and unchanged here. What is recorded
+        # is the granularity: the exact cause, the first offending point,
+        # and the measured shortfall, so an excluded model can never
+        # vanish from the product without auditable provenance
+        # (AGENTS.md: "Model guidance provenance must be retained").
+        exclusions: list[dict[str, Any]] = []
         for model in tuple(approved_models):
-            try:
-                for horizon in horizons:
-                    for station in stations:
-                        station_id = str(station.station_id)
-                        by_point = aligned["values"][model][str(horizon)]
-                        validate_source_gust(
-                            gust_m_s=by_point[f"{station_id}|wind_gust_10m"],
-                            sustained_speed_m_s=math.hypot(
-                                by_point[f"{station_id}|eastward_wind_10m"],
-                                by_point[f"{station_id}|northward_wind_10m"],
-                            ),
-                        )
-            except (KeyError, ValueError, GustDisqualificationError):
+            exclusion = self._screen_model_cycle(
+                aligned=aligned, model=model, stations=stations, horizons=horizons
+            )
+            if exclusion is not None:
                 approved_models.remove(model)
+                exclusions.append(exclusion)
         models = frozenset(approved_models)
         entries = []
         availability_objects = []
@@ -1717,6 +1798,10 @@ class Phase2ProductionScience:
             "schema_version": "model-availability-report.v1",
             "run_state": summary.state,
             "models": [m for m in _MODELS if m in models],
+            "excluded_models": sorted(
+                exclusions,
+                key=lambda item: _MODELS.index(item["model"]),
+            ),
             "entries": entries,
         }
 
