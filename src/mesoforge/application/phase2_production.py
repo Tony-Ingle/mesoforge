@@ -2103,6 +2103,18 @@ class Phase2ProductionScience:
                 station = stations_by_icao.get(record.icao_id)
                 if station is None:
                     continue
+                # AviationWeather answers a *date* query and returns
+                # whatever recent records it holds for those stations,
+                # including ones just before this run's window (a routine
+                # 17:55Z METAR for an 18:00Z reference). Selecting the
+                # records that fall in the window is this stage's job;
+                # ``normalize_metar_record_v2`` keeps its fail-closed
+                # contract and still rejects an out-of-window record if
+                # one is ever handed to it. Skipping here is the same
+                # treatment already given to a record for a station this
+                # run does not carry -- not a relaxation of the window.
+                if record.obs_time < query_window_start or record.obs_time > query_date:
+                    continue
                 station_record = _station_record(station)
                 normalized = normalize_metar_record_v2(
                     raw=_as_v2_record(record),

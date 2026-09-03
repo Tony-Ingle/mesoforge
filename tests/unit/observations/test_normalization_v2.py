@@ -168,3 +168,29 @@ class TestNormalizeMetarRecordV2:
     def test_wrong_station_raises(self) -> None:
         with pytest.raises(MetarNormalizationError):
             _normalize_v2(icao_id="KXYZ")
+
+    def test_due_north_360_is_canonicalized_to_zero(self) -> None:
+        """METAR reports due north as 360, but the canonical contract --
+        and ``matched-pairs.v2``'s own validator -- is the half-open
+        [0, 360) circle. A retained 360 makes every matched pair carrying
+        a due north observation fail validation, which is exactly what
+        the real KCBG/KJMR/KROS records produced.
+
+        The canonicalization must be exact: ``math.radians(360.0)`` is
+        not identically zero, so deriving the components from 360 leaks a
+        spurious westward/eastward component into a due north wind.
+        """
+        result = _normalize_v2(wdir=360.0)
+        assert result.wind_from_direction_degrees == 0.0
+        assert result.eastward_wind_10m_m_s == 0.0
+        # Due north wind blows FROM the north, i.e. toward the south.
+        assert result.northward_wind_10m_m_s is not None
+        assert result.northward_wind_10m_m_s < 0.0
+        assert "wind_direction_out_of_range" not in result.quality_flags
+
+    def test_due_north_360_matches_an_explicit_zero_exactly(self) -> None:
+        from_360 = _normalize_v2(wdir=360.0)
+        from_zero = _normalize_v2(wdir=0.0)
+        assert from_360.wind_from_direction_degrees == from_zero.wind_from_direction_degrees
+        assert from_360.eastward_wind_10m_m_s == from_zero.eastward_wind_10m_m_s
+        assert from_360.northward_wind_10m_m_s == from_zero.northward_wind_10m_m_s
