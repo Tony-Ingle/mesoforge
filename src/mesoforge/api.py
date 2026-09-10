@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -14,7 +15,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException
 
-from mesoforge.application.issuance import read_issued_forecast
+from mesoforge.application.issuance import (
+    read_issued_forecast,
+    select_issued_forecast_hours,
+    validate_hour_selection,
+)
 from mesoforge.application.point_forecast import (
     PreparedPointForecast,
     UnsupportedCoordinateError,
@@ -34,6 +39,21 @@ def _error(message: str, status_code: int, prepared: PreparedPointForecast) -> J
     )
 
 
+def _hour_query_error() -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": {
+                "code": "invalid_issued_forecast_hour_query",
+                "message": (
+                    "Provide finite geographic lat/lon and timezone-aware ISO start_valid_time "
+                    "and end_valid_time, with start before end (end excluded)."
+                ),
+            }
+        },
+    )
+
+
 def create_app(directory: Path) -> FastAPI:
     """Read and close prepared files once, before accepting any forecast request."""
     prepared = PreparedPointForecast.from_directory(directory)
@@ -47,6 +67,8 @@ def create_app(directory: Path) -> FastAPI:
 
     @app.exception_handler(RequestValidationError)
     async def invalid_parameters(request: Request, exc: RequestValidationError) -> JSONResponse:
+        if request.url.path == "/issued-forecast-hours":
+            return _hour_query_error()
         return _error(
             "Provide numeric lat and lon query parameters within the demo region.", 422, prepared
         )
@@ -102,6 +124,33 @@ def create_app(directory: Path) -> FastAPI:
                     "error": {
                         "code": "issued_forecast_read_failed",
                         "message": "Could not read and verify the saved issued forecast.",
+                    }
+                },
+            )
+
+    @app.get("/issued-forecast-hours", response_model=None)
+    def issued_forecast_hours(
+        lat: float, lon: float, start_valid_time: str, end_valid_time: str
+    ) -> dict[str, Any] | JSONResponse:
+        try:
+            start, end = (
+                datetime.fromisoformat(start_valid_time),
+                datetime.fromisoformat(end_valid_time),
+            )
+            validate_hour_selection(lat, lon, start, end)
+        except ValueError:
+            return _hour_query_error()
+        try:
+            return select_issued_forecast_hours(
+                latitude=lat, longitude=lon, start_valid_time=start, end_valid_time=end
+            )
+        except Exception:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": {
+                        "code": "issued_forecast_hour_selection_failed",
+                        "message": "Could not read and verify the saved forecast hours.",
                     }
                 },
             )

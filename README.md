@@ -39,12 +39,14 @@ using the existing PostgreSQL/S3 storage. Each explicit run has a new batch ID;
 location failures do not stop later coordinates. One-off `GET /forecast` remains
 read-only. `GET /issued-forecasts/{issued_forecast_id}` now retrieves one exact saved
 version, including its complete forecast and provenance, without calculation or writes.
-For retrieval, **304 offline and 29 PostgreSQL/MinIO integration tests passed**.
-Actual HTTP retrieval of two retained versions matched their stored payloads exactly
-and left all storage unchanged. Temporary services were stopped. Full database/storage
-acceptance and coverage remain unverified. See [saved-version retrieval](#retrieve-one-issued-version)
-for the endpoint and evidence. Proposed next milestone: a bounded read-only query to
-find previously issued forecast hours due for observation matching at an explicit cutoff.
+`GET /issued-forecast-hours` also selects saved hours for one exact coordinate and a
+valid-time window, keeping overlapping issued versions separate. **327 offline and
+33 PostgreSQL/MinIO integration tests passed** for this selection milestone. Actual
+HTTP selection returned three hours from each of two retained versions, with original
+payloads and unchanged storage. Temporary services were stopped. Full database/storage
+acceptance and coverage remain unverified. See [saved-hour selection](#select-saved-forecast-hours).
+Proposed next milestone: match one selected hour to an automatically chosen observation
+proxy from retained inputs, after agreeing the temperature-source suitability rules.
 
 Future direction: configure locations using latitude/longitude only, with geographic
 context and suitable observation sources derived internally. The intended VPS workflow
@@ -448,6 +450,57 @@ were stopped afterward, preserving their data outside Git. Evidence and captured
 responses are in `%LOCALAPPDATA%\MesoForge\baselines\20260910-issued-retrieval`.
 Quality checks passed; the full acceptance, coverage, live-provider, backup/restore,
 and deployment gaps above remain. Observation matching and verification are future work.
+
+### Select saved forecast hours
+
+Use the same API startup and PostgreSQL/S3 settings as saved-version retrieval:
+
+```text
+GET http://127.0.0.1:8765/issued-forecast-hours?lat=45.8&lon=-93.1&start_valid_time=2026-09-10T13:00:00Z&end_valid_time=2026-09-10T16:00:00Z
+```
+
+Coordinates match the stored latitude/longitude exactly; there is no nearest-location
+search. Supply timezone-aware ISO timestamps with **start before end**. Offsets normalize
+to UTC; the window includes the start and excludes the end (`[start, end)`). Each
+matching saved hour appears separately in `results`, including every issued version
+for the same valid time. Results sort by valid time, issuance time, then issuance ID.
+An empty window match or a valid coordinate with no history returns HTTP 200 and
+`"results": []`. Invalid/missing query parameters return 422 with
+`invalid_issued_forecast_hour_query`.
+
+Each result contains `issued` (original ID, issuance time, coordinate, batch ID,
+target reference time, and the complete saved object's `content_digest`), the stored
+`code_identity`, `forecast_context` (all forecast-level metadata except the hours list),
+and one unchanged `hour`. That hour retains its valid time, value/unit, model cycles,
+leads, weights, source checksums, and missing reasons. Null values remain explicit.
+The digest identifies the complete original saved forecast, not this selected view.
+
+Selection reads each saved version for the exact coordinate through the existing
+checksum-verified reader and filters its **actual saved valid times**. It neither
+regenerates forecasts nor reads observations, scores error, or writes storage. It
+does not apply an issuance cutoff or declare a forecast eligible for verification;
+historically issued demonstration records retain their distinct issuance/valid times.
+No versions are silently dropped at the repository's usual 100-record listing limit.
+This initial implementation reads all versions for that coordinate; it has no pagination
+or hour-level query index. A storage/integrity failure returns 500 with
+`issued_forecast_hour_selection_failed`, without a partial successful result.
+
+On September 10, the example query returned **six matches**: 13:00, 14:00, and 15:00 UTC
+from each of `b80e231a-c6e6-4066-ab4c-1e5d38bc2592` and
+`cb485961-fd26-4927-a670-38831f76b3b3`. Every hour and its provenance matched the original
+stored JSON. A September 12 01:00–03:00 UTC query returned no matches. Repeated queries
+left **four forecast rows, four object-metadata rows, and four MinIO objects (134,510
+bytes)** unchanged. PostgreSQL, MinIO, and the localhost API were stopped afterward.
+Evidence is outside Git in `%LOCALAPPDATA%\MesoForge\baselines\20260910-issued-hour-selection`.
+
+**179 focused offline API/preparation/batch/issuance tests plus 148 retained Phase 2
+tests passed**. **33 real PostgreSQL/MinIO integration tests passed**, including a
+101-version completeness check, interval boundaries, exact coordinates, empty results,
+unchanged storage, and missing/corrupt payloads. The new unit module is
+`tests/unit/test_issued_forecast_hours.py`; it was run alongside the six offline modules
+listed above. The same three integration modules above were rerun. Quality checks
+passed. Full acceptance, coverage, live-provider, backup/restore, and deployment remain
+unvalidated. No observations were fetched or verification performed.
 
 ### Prepare real inputs before serving
 

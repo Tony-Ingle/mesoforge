@@ -408,3 +408,168 @@ def test_api_retrieval_does_not_create_a_misconfigured_missing_bucket(
         item["Name"] for item in object_store._client.list_buckets()["Buckets"]
     }
     assert storage_inventory(migrated_dsn, object_store) == before
+
+
+def test_api_selects_each_saved_hour_version_without_writes_or_calculation(
+    tmp_path: Path,
+    prepared_guidance: Path,
+    migrated_dsn: str,
+    service: ForecastIssuanceService,
+    object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = write_config(tmp_path, [FIRST, LAST])
+    later_issuer = ForecastIssuanceService(
+        object_store,
+        lambda: PostgresUnitOfWork(migrated_dsn),
+        code_identity=CODE_IDENTITY,
+        clock=lambda: datetime(2026, 9, 10, 13, tzinfo=UTC),
+    )
+    originals = []
+    for issuer in (service, later_issuer):
+        batch = run_batch(config, prepared_guidance, issuer=issuer)
+        assert [row["status"] for row in batch["results"]] == ["ok", "ok"]
+        row = batch["results"][0]
+        stored = object_store._client.get_object(
+            Bucket=object_store._bucket,
+            Key=content_addressed_key(Digest(row["issued"]["content_digest"])),
+        )
+        envelope = json.loads(stored["Body"].read())
+        assert envelope["forecast"] == row["forecast"]
+        originals.append((row["issued"], envelope))
+
+    # Issuance is deliberately later than these historical valid times: selection
+    # must not invent an issuance cutoff or choose just the newest version.
+    expected_results = []
+    for index in range(3):
+        for issued, envelope in originals:
+            hour = envelope["forecast"]["hours"][index]
+            assert hour["temperature"]["value"] == pytest.approx(283 + index, abs=1e-6)
+            assert hour["temperature"]["unit"] == "K"
+            expected_results.append(
+                {
+                    "issued": issued,
+                    "code_identity": envelope["code_identity"],
+                    "forecast_context": {
+                        key: value for key, value in envelope["forecast"].items() if key != "hours"
+                    },
+                    "hour": hour,
+                }
+            )
+    before = storage_inventory(migrated_dsn, object_store)
+    assert tuple(len(items) for items in before) == (4, 4, 4)
+    forbidden = forbid_retrieval_writes_and_calculation(monkeypatch)
+    with TestClient(api.create_app(prepared_guidance)) as client:
+        for _ in range(2):
+            response = client.get(
+                "/issued-forecast-hours",
+                params={
+                    **FIRST,
+                    "start_valid_time": "2026-08-30T14:00:00+01:00",
+                    "end_valid_time": "2026-08-30T17:00:00+01:00",
+                },
+            )
+            assert response.status_code == 200
+            assert response.json() == {
+                "latitude": FIRST["lat"],
+                "longitude": FIRST["lon"],
+                "start_valid_time": "2026-08-30T13:00:00Z",
+                "end_valid_time": "2026-08-30T16:00:00Z",
+                "interval_closure": "left_closed_right_open",
+                "results": expected_results,
+            }
+        # The first saved valid time is the excluded end of this adjacent window.
+        for coordinate, start, end in (
+            (FIRST, "2026-08-30T12:00:00Z", "2026-08-30T13:00:00Z"),
+            (OUTSIDE, "2026-08-30T13:00:00Z", "2026-08-30T16:00:00Z"),
+            (
+                {"lat": FIRST["lat"] + 0.000001, "lon": FIRST["lon"]},
+                "2026-08-30T13:00:00Z",
+                "2026-08-30T16:00:00Z",
+            ),
+        ):
+            response = client.get(
+                "/issued-forecast-hours",
+                params={**coordinate, "start_valid_time": start, "end_valid_time": end},
+            )
+            assert response.status_code == 200
+            assert response.json()["results"] == []
+    forbidden.assert_not_called()
+    assert storage_inventory(migrated_dsn, object_store) == before
+
+
+def test_api_hour_selection_includes_versions_beyond_repository_default_limit(
+    prepared_guidance: Path,
+    migrated_dsn: str,
+    service: ForecastIssuanceService,
+    object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    forecast = PreparedPointForecast.from_directory(prepared_guidance).forecast(
+        latitude=FIRST["lat"], longitude=FIRST["lon"]
+    )
+    records = [service.issue(forecast, batch_run_id=uuid4(), location_index=0) for _ in range(101)]
+    with PostgresUnitOfWork(migrated_dsn) as uow:
+        assert len(uow.issued_forecasts.list_for_coordinate(FIRST["lat"], FIRST["lon"])) == 100
+    before = storage_inventory(migrated_dsn, object_store)
+    assert tuple(len(items) for items in before) == (101, 101, 101)
+    forbidden = forbid_retrieval_writes_and_calculation(monkeypatch)
+    with TestClient(api.create_app(prepared_guidance)) as client:
+        response = client.get(
+            "/issued-forecast-hours",
+            params={
+                **FIRST,
+                "start_valid_time": "2026-08-30T13:00:00Z",
+                "end_valid_time": "2026-08-30T14:00:00Z",
+            },
+        )
+    assert response.status_code == 200
+    results = response.json()["results"]
+    assert len(results) == 101
+    assert [row["issued"]["issued_forecast_id"] for row in results] == sorted(
+        str(record.issued_forecast_id) for record in records
+    )
+    assert all(row["hour"] == forecast["hours"][0] for row in results)
+    forbidden.assert_not_called()
+    assert storage_inventory(migrated_dsn, object_store) == before
+
+
+@pytest.mark.parametrize("damage", ["corrupt", "missing"])
+def test_api_hour_selection_reports_storage_damage_without_partial_success(
+    prepared_guidance: Path,
+    migrated_dsn: str,
+    service: ForecastIssuanceService,
+    object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+    damage: str,
+) -> None:
+    forecast = PreparedPointForecast.from_directory(prepared_guidance).forecast(
+        latitude=FIRST["lat"], longitude=FIRST["lon"]
+    )
+    service.issue(forecast, batch_run_id=uuid4(), location_index=0)
+    damaged = service.issue(forecast, batch_run_id=uuid4(), location_index=0)
+    key = content_addressed_key(damaged.content_digest)
+    if damage == "corrupt":
+        object_store._client.put_object(Bucket=object_store._bucket, Key=key, Body=b"{}")
+    else:
+        object_store._client.delete_object(Bucket=object_store._bucket, Key=key)
+    before = storage_inventory(migrated_dsn, object_store)
+    forbidden = forbid_retrieval_writes_and_calculation(monkeypatch)
+    with TestClient(api.create_app(prepared_guidance)) as client:
+        response = client.get(
+            "/issued-forecast-hours",
+            params={
+                **FIRST,
+                "start_valid_time": "2026-08-30T13:00:00Z",
+                "end_valid_time": "2026-08-30T14:00:00Z",
+            },
+        )
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "issued_forecast_hour_selection_failed"
+    assert response.json()["error"]["message"]
+    assert "results" not in response.json()
+    forbidden.assert_not_called()
+    assert storage_inventory(migrated_dsn, object_store) == before

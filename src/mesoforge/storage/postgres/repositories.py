@@ -659,10 +659,11 @@ class PostgresIssuedForecastRepository:
         return _issued_forecast_row_to_record(row)
 
     def list_for_coordinate(
-        self, latitude: float, longitude: float, *, limit: int = 100
+        self, latitude: float, longitude: float, *, limit: int | None = 100
     ) -> tuple[IssuedForecastRecord, ...]:
-        if type(limit) is not int or not 1 <= limit <= 1000:
-            raise ValueError("limit must be an integer between 1 and 1000")
+        # Explicit None permits complete history queries; existing callers stay bounded.
+        if limit is not None and (type(limit) is not int or not 1 <= limit <= 1000):
+            raise ValueError("limit must be None or an integer between 1 and 1000")
         for value, bound in ((latitude, 90), (longitude, 180)):
             if (
                 type(value) not in (int, float)

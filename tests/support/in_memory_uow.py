@@ -297,7 +297,7 @@ class _InMemoryIssuedForecastRepository:
         return self._store[issued_forecast_id]
 
     def list_for_coordinate(
-        self, latitude: float, longitude: float, *, limit: int = 100
+        self, latitude: float, longitude: float, *, limit: int | None = 100
     ) -> tuple[IssuedForecastRecord, ...]:
         records = (
             row

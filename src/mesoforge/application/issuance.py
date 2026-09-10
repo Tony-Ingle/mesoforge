@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -10,6 +11,7 @@ from uuid import UUID, uuid4
 
 from mesoforge.common.errors import IntegrityError, NotFound
 from mesoforge.common.identifiers import Digest
+from mesoforge.common.time import IntervalClosure, IntervalDefinition
 from mesoforge.contracts.issued_forecasts import IssuedForecastRecord
 from mesoforge.storage.interfaces import ArtifactObjectStore, IssuanceUnitOfWork
 from mesoforge.storage.json import CanonicalJsonSerializer
@@ -20,6 +22,24 @@ from mesoforge.storage.s3 import S3ArtifactObjectStore
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def validate_hour_selection(
+    latitude: float, longitude: float, start_valid_time: datetime, end_valid_time: datetime
+) -> IntervalDefinition:
+    """Validate exact geographic coordinates and an aware, start-inclusive time window."""
+    for value, bound in ((latitude, 90), (longitude, 180)):
+        if (
+            type(value) not in (int, float)
+            or not math.isfinite(value)
+            or not -bound <= value <= bound
+        ):
+            raise ValueError("latitude and longitude must be finite geographic coordinates")
+    return IntervalDefinition(
+        start=start_valid_time,
+        end=end_valid_time,
+        closure=IntervalClosure.left_closed_right_open,
+    )
 
 
 class ForecastIssuanceService:
@@ -101,8 +121,54 @@ class ForecastIssuanceService:
             raise IntegrityError("Issued forecast payload is missing") from exc
         return self._serializer.deserialize(payload)
 
+    def select_hours(
+        self,
+        *,
+        latitude: float,
+        longitude: float,
+        start_valid_time: datetime,
+        end_valid_time: datetime,
+    ) -> dict[str, Any]:
+        """Select saved hours by actual valid time, retaining every matching issued version."""
+        window = validate_hour_selection(latitude, longitude, start_valid_time, end_valid_time)
+        with self._uow_factory() as uow:
+            records = uow.issued_forecasts.list_for_coordinate(latitude, longitude, limit=None)
+        results: list[dict[str, Any]] = []
+        for record in records:
+            saved = self.read(record.issued_forecast_id)
+            forecast = saved["forecast"]
+            context = {key: value for key, value in forecast.items() if key != "hours"}
+            for hour in forecast["hours"]:
+                valid_time = datetime.fromisoformat(hour["valid_time"])
+                if valid_time.tzinfo is None:
+                    raise IntegrityError("Saved forecast hour has no valid-time timezone")
+                if window.start <= valid_time < window.end:
+                    results.append(
+                        {
+                            "issued": record.model_dump(mode="json"),
+                            "code_identity": saved["code_identity"],
+                            "forecast_context": context,
+                            "hour": hour,
+                        }
+                    )
+        results.sort(
+            key=lambda row: (
+                datetime.fromisoformat(row["hour"]["valid_time"]),
+                datetime.fromisoformat(row["issued"]["issued_at"]),
+                row["issued"]["issued_forecast_id"],
+            )
+        )
+        return {
+            "latitude": latitude,
+            "longitude": longitude,
+            "start_valid_time": window.start.isoformat().replace("+00:00", "Z"),
+            "end_valid_time": window.end.isoformat().replace("+00:00", "Z"),
+            "interval_closure": window.closure.value,
+            "results": results,
+        }
 
-def read_issued_forecast(issued_forecast_id: UUID) -> dict[str, Any]:
+
+def _configured_reader() -> ForecastIssuanceService:
     """Use existing configured storage without bucket creation or issuance setup."""
     dsn = resolve_database_dsn("MESOFORGE_DATABASE_DSN")
     objects = S3ArtifactObjectStore(
@@ -113,6 +179,22 @@ def read_issued_forecast(issued_forecast_id: UUID) -> dict[str, Any]:
         ensure_bucket=False,
     )
     # Readback returns the stored code identity; current issuance identity is unused.
-    return ForecastIssuanceService(objects, lambda: PostgresUnitOfWork(dsn), code_identity={}).read(
-        issued_forecast_id
+    return ForecastIssuanceService(objects, lambda: PostgresUnitOfWork(dsn), code_identity={})
+
+
+def read_issued_forecast(issued_forecast_id: UUID) -> dict[str, Any]:
+    """Read one exact saved version through the existing configured storage path."""
+    return _configured_reader().read(issued_forecast_id)
+
+
+def select_issued_forecast_hours(
+    *, latitude: float, longitude: float, start_valid_time: datetime, end_valid_time: datetime
+) -> dict[str, Any]:
+    """Read matching saved hours without creating buckets, objects, or database rows."""
+    validate_hour_selection(latitude, longitude, start_valid_time, end_valid_time)
+    return _configured_reader().select_hours(
+        latitude=latitude,
+        longitude=longitude,
+        start_valid_time=start_valid_time,
+        end_valid_time=end_valid_time,
     )
