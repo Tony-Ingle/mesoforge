@@ -222,6 +222,13 @@ def _write_bytes(path: Path, payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _write_prepared_file(directory: Path, model: str, dataset: xr.Dataset) -> dict[str, str]:
+    path = directory / f"{model}.nc"
+    with path.open("x+b") as output:
+        dataset.to_netcdf(output, engine="h5netcdf", format="NETCDF4")
+    return {"file": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
 def _code_identity() -> dict[str, Any]:
     package = Path(__file__).resolve().parents[1]
     paths = (
@@ -342,13 +349,7 @@ def prepare_temperature_guidance(
             source_cycle=cycle,
             payloads_by_lead=payloads,
         )
-        path = directory / f"{model}.nc"
-        with path.open("x+b") as output:
-            dataset.to_netcdf(output, engine="h5netcdf", format="NETCDF4")
-        prepared_files[model] = {
-            "file": path.name,
-            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        }
+        prepared_files[model] = _write_prepared_file(directory, model, dataset)
     manifest = {
         "data_kind": _DATA_KIND,
         "target_reference_time": _iso(target_reference_time),
@@ -369,6 +370,102 @@ def prepare_temperature_guidance(
             "Provider Last-Modified where available, else retrieval time; "
             "no operational cutoff applied."
         ),
+    }
+    _write_bytes(directory / "manifest.json", json.dumps(manifest, indent=2).encode())
+    return manifest
+
+
+def rebuild_temperature_guidance(
+    source_directory: Path,
+    directory: Path,
+    *,
+    configuration: Phase2Configuration,
+    clock: Clock,
+) -> dict[str, Any]:
+    """Re-decode retained raw messages into a new snapshot, without provider access.
+
+    The source NetCDF files are not needed. Source acquisition evidence is copied
+    unchanged; the new manifest records this preparation separately from acquisition.
+    """
+    source_directory = source_directory.resolve()
+    source_payload = (source_directory / "manifest.json").read_bytes()
+    source = json.loads(source_payload)
+    configuration_hash = hashlib.sha256(configuration.model_dump_json().encode()).hexdigest()
+    if (
+        source.get("data_kind") != _DATA_KIND
+        or source.get("configuration_sha256") != configuration_hash
+    ):
+        raise ValueError("Rebuild requires real guidance and the original source configuration")
+    retained: dict[str, bytes] = {}
+    models: list[tuple[str, datetime, dict[int, bytes]]] = []
+    try:
+        target = _hour(datetime.fromisoformat(source["target_reference_time"]))
+        if len(source["inputs"]) != 6 or {r["model"] for r in source["inputs"]} != {
+            "HRRR",
+            "GFS",
+        }:
+            raise ValueError("Rebuild requires exactly six HRRR/GFS source messages")
+        for model in ("HRRR", "GFS"):
+            rows = [row for row in source["inputs"] if row["model"] == model]
+            cycle = _hour(datetime.fromisoformat(rows[0]["cycle"]))
+            leads = _leads(target, cycle)
+            if len(rows) != 3 or {r["source_lead_hours"] for r in rows} != set(leads):
+                raise ValueError(f"{model}: retained source leads are incomplete or duplicated")
+            payloads: dict[int, bytes] = {}
+            for row in rows:
+                lead = row["source_lead_hours"]
+                if row["cycle"] != _iso(cycle) or row["valid_time"] != _iso(
+                    cycle + timedelta(hours=lead)
+                ):
+                    raise ValueError(f"{model}: retained source cycle/valid time disagrees")
+                for prefix, suffix in (("raw", "grib2"), ("index", "idx")):
+                    filename = row[f"{prefix}_file"]
+                    path = (source_directory / filename).resolve()
+                    if filename != f"raw/{model}-f{lead:03d}.{suffix}" or not path.is_relative_to(
+                        source_directory
+                    ):
+                        raise ValueError("Invalid retained input path")
+                    payload = path.read_bytes()
+                    if (
+                        len(payload) != row[f"{prefix}_bytes"]
+                        or hashlib.sha256(payload).hexdigest() != row[f"{prefix}_sha256"]
+                    ):
+                        raise ValueError(f"Checksum or byte count mismatch for {filename}")
+                    retained[filename] = payload
+                payloads[lead] = retained[row["raw_file"]]
+            models.append((model, cycle, payloads))
+    except (KeyError, TypeError, IndexError) as exc:
+        raise ValueError("Incomplete retained guidance manifest") from exc
+    directory.mkdir(parents=True, exist_ok=True)
+    if any(directory.iterdir()):
+        raise ValueError("Rebuild requires an empty output directory; existing files are retained")
+    (directory / "raw").mkdir()
+    for filename, payload in retained.items():
+        _write_bytes(directory / filename, payload)
+    for row in source["inputs"]:
+        _write_bytes(
+            directory / row["raw_file"].replace(".grib2", ".json"),
+            json.dumps(row, indent=2).encode(),
+        )
+    prepared_files: dict[str, dict[str, str]] = {}
+    for model, cycle, payloads in models:
+        dataset = normalize_temperature_messages(
+            model=model,
+            settings=configuration.hrrr if model == "HRRR" else configuration.gfs,
+            target_reference_time=target,
+            source_cycle=cycle,
+            payloads_by_lead=payloads,
+        )
+        prepared_files[model] = _write_prepared_file(directory, model, dataset)
+    manifest = {
+        **source,
+        "created_at": _iso(clock.now()),
+        "prepared_files": prepared_files,
+        "downloaded_bytes": 0,
+        "preparation_code_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "code_identity": _code_identity(),
+        "source_manifest_file": "source-manifest.json",
+        "source_manifest_sha256": _write_bytes(directory / "source-manifest.json", source_payload),
     }
     _write_bytes(directory / "manifest.json", json.dumps(manifest, indent=2).encode())
     return manifest
@@ -431,13 +528,22 @@ class BoundedHttpTransport(RequestsHrrrHttpTransport):
         self._session.close()
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Prepare six real HRRR/GFS temperature messages")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--target-reference-time", type=datetime.fromisoformat, required=True)
-    parser.add_argument("--hrrr-cycle", type=datetime.fromisoformat, required=True)
-    parser.add_argument("--gfs-cycle", type=datetime.fromisoformat, required=True)
-    args = parser.parse_args()
+    parser.add_argument("--target-reference-time", type=datetime.fromisoformat)
+    parser.add_argument("--hrrr-cycle", type=datetime.fromisoformat)
+    parser.add_argument("--gfs-cycle", type=datetime.fromisoformat)
+    parser.add_argument(
+        "--from-raw", type=Path, help="Rebuild offline from this snapshot's manifest and raw files."
+    )
+    args = parser.parse_args(argv)
+    times = (args.target_reference_time, args.hrrr_cycle, args.gfs_cycle)
+    if args.from_raw is not None:
+        if any(value is not None for value in times):
+            parser.error("--from-raw uses retained times; do not also supply cycles or target time")
+    elif any(value is None for value in times):
+        parser.error("Acquisition requires --target-reference-time, --hrrr-cycle and --gfs-cycle")
     configuration, _ = load_configuration_source(
         base_path=Path("configs/base.yaml"),
         additional_overlay_paths=(
@@ -447,20 +553,28 @@ def main() -> None:
     )
     if configuration.phase2 is None:
         raise ValueError("Phase 2 source settings are required")
-    transport = BoundedHttpTransport()
-    try:
-        manifest = prepare_temperature_guidance(
+    if args.from_raw is not None:
+        manifest = rebuild_temperature_guidance(
+            args.from_raw,
             args.output_dir,
             configuration=configuration.phase2,
-            target_reference_time=args.target_reference_time,
-            hrrr_cycle=args.hrrr_cycle,
-            gfs_cycle=args.gfs_cycle,
-            transport=transport,
             clock=SystemClock(),
-            sleeper=SystemSleeper(),
         )
-    finally:
-        transport.close()
+    else:
+        transport = BoundedHttpTransport()
+        try:
+            manifest = prepare_temperature_guidance(
+                args.output_dir,
+                configuration=configuration.phase2,
+                target_reference_time=args.target_reference_time,
+                hrrr_cycle=args.hrrr_cycle,
+                gfs_cycle=args.gfs_cycle,
+                transport=transport,
+                clock=SystemClock(),
+                sleeper=SystemSleeper(),
+            )
+        finally:
+            transport.close()
     print(
         json.dumps(
             {"directory": str(args.output_dir), "downloaded_bytes": manifest["downloaded_bytes"]}

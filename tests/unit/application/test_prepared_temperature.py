@@ -14,13 +14,15 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock
 
 import numpy as np
 import pyproj
 import pytest
 import xarray as xr
 
+from mesoforge.application import prepared_temperature
+from mesoforge.application.point_forecast import PreparedPointForecast
 from mesoforge.application.prepared_temperature import (
     BoundedHttpTransport,
     normalize_temperature_messages,
@@ -300,6 +302,216 @@ def test_preparation_refuses_to_overwrite_an_existing_snapshot(tmp_path: Path) -
         )
     assert existing.read_text() == "Keep this input"
     assert transport.calls == []
+
+
+@pytest.mark.parametrize("remove_prepared", [False, True])
+def test_raw_rebuild_reproduces_values_without_network_or_changing_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, remove_prepared: bool
+) -> None:
+    source = tmp_path / "source"
+    original, _ = prepare_fixture_guidance(source)
+    points = ((45.8, -93.1), (45.625, -93.375))
+    forecast = PreparedPointForecast.from_directory(source)
+    before_forecasts = {
+        point: forecast.forecast(latitude=point[0], longitude=point[1]) for point in points
+    }
+    if remove_prepared:
+        for model in ("HRRR", "GFS"):
+            (source / f"{model}.nc").unlink()
+    source_bytes = {
+        path.relative_to(source): path.read_bytes() for path in source.rglob("*") if path.is_file()
+    }
+    network = Mock(side_effect=AssertionError("Raw rebuild attempted a network session"))
+    monkeypatch.setattr("requests.Session", network)
+
+    class RebuildClock:
+        def now(self) -> datetime:
+            return datetime(2026, 9, 2, 12, tzinfo=UTC)
+
+    destination = tmp_path / "rebuilt"
+    rebuilt = prepared_temperature.rebuild_temperature_guidance(
+        source,
+        destination,
+        configuration=phase2_configuration(),
+        clock=RebuildClock(),
+    )
+    after_forecast = PreparedPointForecast.from_directory(destination)
+    for point in points:
+        before = before_forecasts[point]
+        after = after_forecast.forecast(latitude=point[0], longitude=point[1])
+        # Rebuilding has to reproduce values exactly with the same environment.
+        assert [hour["temperature"] for hour in after["hours"]] == [
+            hour["temperature"] for hour in before["hours"]
+        ]
+        # Independently calculated: 70% of 280 K plus 30% of 290 K is
+        # 283 K; both fixture models increase by exactly 1 K per hour.
+        assert [hour["temperature"]["value"] for hour in after["hours"]] == pytest.approx(
+            [283.0, 284.0, 285.0], abs=1e-6
+        )
+        assert [hour["valid_time"] for hour in after["hours"]] == [
+            "2026-08-30T13:00:00Z",
+            "2026-08-30T14:00:00Z",
+            "2026-08-30T15:00:00Z",
+        ]
+        assert all(hour["missing_reasons"] == [] for hour in after["hours"])
+        for hour in after["hours"]:
+            assert hour["temperature"]["unit"] == "K"
+            assert [item["weight"] for item in hour["sources"]] == [0.7, 0.3]
+    assert rebuilt == json.loads((destination / "manifest.json").read_text())
+    assert rebuilt["inputs"] == original["inputs"]
+    assert rebuilt["created_at"] == "2026-09-02T12:00:00Z"
+    assert rebuilt["downloaded_bytes"] == 0
+    assert (
+        rebuilt["source_manifest_sha256"]
+        == hashlib.sha256(source_bytes[Path("manifest.json")]).hexdigest()
+    )
+    assert (destination / rebuilt["source_manifest_file"]).read_bytes() == source_bytes[
+        Path("manifest.json")
+    ]
+    assert rebuilt["configuration_sha256"] == original["configuration_sha256"]
+    assert (
+        rebuilt["preparation_code_sha256"]
+        == hashlib.sha256(Path(prepared_temperature.__file__).read_bytes()).hexdigest()
+    )
+    assert rebuilt["code_identity"] == original["code_identity"]
+    for item in original["inputs"]:
+        for kind in ("raw", "index"):
+            filename = item[f"{kind}_file"]
+            assert (destination / filename).read_bytes() == source_bytes[Path(filename)]
+    assert {
+        path.relative_to(source): path.read_bytes() for path in source.rglob("*") if path.is_file()
+    } == source_bytes
+    network.assert_not_called()
+
+
+@pytest.mark.parametrize("kind", ["raw", "index"])
+@pytest.mark.parametrize("damage", ["changed", "missing", "escape"])
+def test_raw_rebuild_rejects_unusable_retained_evidence(
+    tmp_path: Path, kind: str, damage: str
+) -> None:
+    source = tmp_path / "source"
+    manifest, _ = prepare_fixture_guidance(source)
+    item = manifest["inputs"][0]
+    path = source / item[f"{kind}_file"]
+    if damage == "changed":
+        path.write_bytes(path.read_bytes() + b"changed")
+    elif damage == "missing":
+        path.unlink()
+    else:
+        # Even correctly checksummed evidence must remain within its snapshot.
+        outside = tmp_path / "outside"
+        outside.write_bytes(path.read_bytes())
+        item[f"{kind}_file"] = "../outside"
+        (source / "manifest.json").write_text(json.dumps(manifest))
+    destination = tmp_path / "rebuilt"
+    with pytest.raises(FileNotFoundError if damage == "missing" else ValueError):
+        prepared_temperature.rebuild_temperature_guidance(
+            source,
+            destination,
+            configuration=phase2_configuration(),
+            clock=FixtureClock(),
+        )
+    assert not (destination / "manifest.json").exists()
+
+
+@pytest.mark.parametrize("damage", ["configuration", "missing_hour", "duplicate_hour", "time"])
+def test_raw_rebuild_rejects_incompatible_or_incomplete_manifest(
+    tmp_path: Path, damage: str
+) -> None:
+    source = tmp_path / "source"
+    manifest, _ = prepare_fixture_guidance(source)
+    if damage == "configuration":
+        manifest["configuration_sha256"] = "0" * 64
+    elif damage == "missing_hour":
+        manifest["inputs"].pop()
+    elif damage == "duplicate_hour":
+        manifest["inputs"][1] = manifest["inputs"][0]
+    else:
+        manifest["inputs"][0]["valid_time"] = "2026-08-30T14:00:00Z"
+    (source / "manifest.json").write_text(json.dumps(manifest))
+    destination = tmp_path / "rebuilt"
+    with pytest.raises(ValueError):
+        prepared_temperature.rebuild_temperature_guidance(
+            source,
+            destination,
+            configuration=phase2_configuration(),
+            clock=FixtureClock(),
+        )
+    assert not (destination / "manifest.json").exists()
+
+
+def test_raw_rebuild_preserves_an_occupied_destination(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    prepare_fixture_guidance(source)
+    destination = tmp_path / "rebuilt"
+    destination.mkdir()
+    existing = destination / "operator-owned.txt"
+    existing.write_bytes(b"keep")
+    with pytest.raises(ValueError):
+        prepared_temperature.rebuild_temperature_guidance(
+            source,
+            destination,
+            configuration=phase2_configuration(),
+            clock=FixtureClock(),
+        )
+    assert list(destination.iterdir()) == [existing]
+    assert existing.read_bytes() == b"keep"
+
+
+def test_cli_rebuild_uses_manifest_times_without_constructing_http_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = tmp_path / "source"
+    prepare_fixture_guidance(source)
+    for model in ("HRRR", "GFS"):
+        (source / f"{model}.nc").unlink()
+    network = Mock(side_effect=AssertionError("Raw rebuild created an HTTP transport"))
+    monkeypatch.setattr(prepared_temperature, "BoundedHttpTransport", network)
+    destination = tmp_path / "rebuilt"
+    prepared_temperature.main(["--output-dir", str(destination), "--from-raw", str(source)])
+    assert json.loads(capsys.readouterr().out) == {
+        "directory": str(destination),
+        "downloaded_bytes": 0,
+    }
+    assert (
+        PreparedPointForecast.from_directory(destination).forecast(latitude=45.8, longitude=-93.1)[
+            "target_reference_time"
+        ]
+        == "2026-08-30T12:00:00Z"
+    )
+    network.assert_not_called()
+
+
+@pytest.mark.parametrize("cycle_option", ["--target-reference-time", "--hrrr-cycle", "--gfs-cycle"])
+def test_cli_rebuild_rejects_reinterpreting_retained_times(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cycle_option: str
+) -> None:
+    network = Mock(side_effect=AssertionError("Invalid CLI options created HTTP transport"))
+    monkeypatch.setattr(prepared_temperature, "BoundedHttpTransport", network)
+    with pytest.raises(SystemExit) as error:
+        prepared_temperature.main(
+            [
+                "--output-dir",
+                str(tmp_path / "output"),
+                "--from-raw",
+                str(tmp_path / "source"),
+                cycle_option,
+                "2026-08-30T12:00:00Z",
+            ]
+        )
+    assert error.value.code == 2
+    network.assert_not_called()
+
+
+def test_cli_acquisition_requires_all_explicit_times_before_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    network = Mock(side_effect=AssertionError("Invalid CLI options created HTTP transport"))
+    monkeypatch.setattr(prepared_temperature, "BoundedHttpTransport", network)
+    with pytest.raises(SystemExit) as error:
+        prepared_temperature.main(["--output-dir", str(tmp_path)])
+    assert error.value.code == 2
+    network.assert_not_called()
 
 
 @pytest.mark.parametrize("model", ["HRRR", "GFS"])
