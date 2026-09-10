@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import Mock
 from uuid import UUID, uuid4
 
 import pytest
@@ -18,8 +20,9 @@ from mesoforge import api
 from mesoforge.application.batch_forecast import run_batch
 from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.point_forecast import PreparedPointForecast
+from mesoforge.common.identifiers import Digest
 from mesoforge.storage.postgres.repositories import PostgresUnitOfWork
-from mesoforge.storage.s3 import S3ArtifactObjectStore
+from mesoforge.storage.s3 import S3ArtifactObjectStore, content_addressed_key
 from tests.unit.application.test_batch_forecast import FIRST, LAST, OUTSIDE, write_config
 from tests.unit.application.test_prepared_temperature import (
     EXTENDED_HORIZONS,
@@ -66,6 +69,59 @@ def prepared_guidance(tmp_path_factory: pytest.TempPathFactory) -> Path:
     directory = tmp_path_factory.mktemp("stored-batch-guidance")
     prepare_fixture_guidance(directory, EXTENDED_HORIZONS)
     return directory
+
+
+@pytest.fixture()
+def configured_retrieval_storage(
+    migrated_dsn: str, object_store: S3ArtifactObjectStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Use the endpoint's production configuration path against the isolated services."""
+    monkeypatch.setenv("MESOFORGE_DATABASE_DSN", migrated_dsn)
+    monkeypatch.setenv("MESOFORGE_S3_BUCKET", object_store._bucket)
+    for setting, default in (
+        ("ENDPOINT", "http://127.0.0.1:19100"),
+        ("ACCESS_KEY", "mesoforge_test"),
+        ("SECRET_KEY", "mesoforge_test_password"),
+    ):
+        monkeypatch.setenv(
+            f"MESOFORGE_S3_{setting}", os.environ.get(f"MESOFORGE_TEST_S3_{setting}", default)
+        )
+
+
+def storage_inventory(dsn: str, object_store: S3ArtifactObjectStore) -> tuple:
+    """Capture actual row identities and S3 object identities, sizes, and ETags."""
+    engine = sa.create_engine(dsn)
+    try:
+        with engine.connect() as connection:
+            headers = tuple(
+                connection.execute(
+                    sa.text("SELECT * FROM issued_forecasts ORDER BY issued_forecast_id")
+                )
+            )
+            metadata = tuple(
+                connection.execute(sa.text("SELECT * FROM stored_objects ORDER BY content_digest"))
+            )
+    finally:
+        engine.dispose()
+    objects = object_store._client.list_objects_v2(Bucket=object_store._bucket)
+    assert not objects.get("IsTruncated", False)
+    entries = tuple(
+        sorted((item["Key"], item["ETag"], item["Size"]) for item in objects.get("Contents", []))
+    )
+    return headers, metadata, entries
+
+
+def forbid_retrieval_writes_and_calculation(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    forbidden = Mock(side_effect=AssertionError("Retrieval attempted a write or calculation"))
+    for owner, method in (
+        (ForecastIssuanceService, "issue"),
+        (PreparedPointForecast, "forecast"),
+        (PostgresUnitOfWork, "commit"),
+        (S3ArtifactObjectStore, "put_if_absent"),
+        (S3ArtifactObjectStore, "_ensure_bucket"),
+    ):
+        monkeypatch.setattr(owner, method, forbidden)
+    return forbidden
 
 
 def test_two_batch_runs_keep_both_versions_and_one_off_api_does_not_issue(
@@ -226,3 +282,129 @@ def test_failed_database_commit_rolls_back_header_and_metadata_then_batch_contin
     with PostgresUnitOfWork(migrated_dsn) as uow:
         assert uow.issued_forecasts.list_for_coordinate(FIRST["lat"], FIRST["lon"]) == ()
         assert len(uow.issued_forecasts.list_for_coordinate(LAST["lat"], LAST["lon"])) == 1
+
+
+def test_api_retrieves_each_exact_issued_version_without_writes_or_calculation(
+    tmp_path: Path,
+    prepared_guidance: Path,
+    migrated_dsn: str,
+    service: ForecastIssuanceService,
+    object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = write_config(tmp_path, [FIRST])
+    original_envelopes = {}
+    for _ in range(2):
+        result = run_batch(config, prepared_guidance, issuer=service)["results"][0]
+        assert result["status"] == "ok"
+        identifier = result["issued"]["issued_forecast_id"]
+        # Compare HTTP output to the original JSON actually stored in MinIO,
+        # independently of the service reader used by the endpoint.
+        response = object_store._client.get_object(
+            Bucket=object_store._bucket,
+            Key=content_addressed_key(Digest(result["issued"]["content_digest"])),
+        )
+        envelope = json.loads(response["Body"].read())
+        assert envelope["issued_forecast_id"] == identifier
+        assert envelope["forecast"] == result["forecast"]
+        assert envelope["code_identity"] == CODE_IDENTITY
+        original_envelopes[identifier] = envelope
+    assert len(original_envelopes) == 2
+    before = storage_inventory(migrated_dsn, object_store)
+    assert tuple(len(items) for items in before) == (2, 2, 2)
+    forbidden = forbid_retrieval_writes_and_calculation(monkeypatch)
+
+    with TestClient(api.create_app(prepared_guidance)) as client:
+        for _ in range(2):
+            for identifier, envelope in original_envelopes.items():
+                response = client.get(f"/issued-forecasts/{identifier}")
+                assert response.status_code == 200
+                assert response.json() == envelope
+    forbidden.assert_not_called()
+    assert storage_inventory(migrated_dsn, object_store) == before
+
+
+def test_api_retrieval_rejects_malformed_and_unknown_ids_without_writes(
+    prepared_guidance: Path,
+    migrated_dsn: str,
+    object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before = storage_inventory(migrated_dsn, object_store)
+    assert tuple(len(items) for items in before) == (0, 0, 0)
+    forbidden = forbid_retrieval_writes_and_calculation(monkeypatch)
+    with TestClient(api.create_app(prepared_guidance)) as client:
+        for identifier, status, code in (
+            ("not-a-uuid", 422, "invalid_issued_forecast_id"),
+            (str(uuid4()), 404, "issued_forecast_not_found"),
+        ):
+            response = client.get(f"/issued-forecasts/{identifier}")
+            assert response.status_code == status
+            assert response.json()["error"]["code"] == code
+            assert response.json()["error"]["message"]
+    forbidden.assert_not_called()
+    assert storage_inventory(migrated_dsn, object_store) == before
+
+
+@pytest.mark.parametrize("damage", ["corrupt", "missing"])
+def test_api_retrieval_reports_saved_payload_damage_without_recalculation(
+    prepared_guidance: Path,
+    migrated_dsn: str,
+    service: ForecastIssuanceService,
+    object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+    damage: str,
+) -> None:
+    forecast = PreparedPointForecast.from_directory(prepared_guidance).forecast(
+        latitude=FIRST["lat"], longitude=FIRST["lon"]
+    )
+    record = service.issue(forecast, batch_run_id=uuid4(), location_index=0)
+    key = content_addressed_key(record.content_digest)
+    # Deliberately damage only this test's dedicated random bucket. A missing
+    # payload is a storage failure, not an unknown issued-forecast ID.
+    if damage == "corrupt":
+        object_store._client.put_object(Bucket=object_store._bucket, Key=key, Body=b"{}")
+    else:
+        object_store._client.delete_object(Bucket=object_store._bucket, Key=key)
+    before = storage_inventory(migrated_dsn, object_store)
+    forbidden = forbid_retrieval_writes_and_calculation(monkeypatch)
+    with TestClient(api.create_app(prepared_guidance)) as client:
+        response = client.get(f"/issued-forecasts/{record.issued_forecast_id}")
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "issued_forecast_read_failed"
+    assert response.json()["error"]["message"]
+    forbidden.assert_not_called()
+    assert storage_inventory(migrated_dsn, object_store) == before
+
+
+def test_api_retrieval_does_not_create_a_misconfigured_missing_bucket(
+    prepared_guidance: Path,
+    migrated_dsn: str,
+    service: ForecastIssuanceService,
+    object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    forecast = PreparedPointForecast.from_directory(prepared_guidance).forecast(
+        latitude=FIRST["lat"], longitude=FIRST["lon"]
+    )
+    record = service.issue(forecast, batch_run_id=uuid4(), location_index=0)
+    missing_bucket = f"mesoforge-absent-{uuid4().hex[:8]}"
+    monkeypatch.setenv("MESOFORGE_S3_BUCKET", missing_bucket)
+    before = storage_inventory(migrated_dsn, object_store)
+    assert missing_bucket not in {
+        item["Name"] for item in object_store._client.list_buckets()["Buckets"]
+    }
+    forbidden = forbid_retrieval_writes_and_calculation(monkeypatch)
+    with TestClient(api.create_app(prepared_guidance)) as client:
+        response = client.get(f"/issued-forecasts/{record.issued_forecast_id}")
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "issued_forecast_read_failed"
+    forbidden.assert_not_called()
+    assert missing_bucket not in {
+        item["Name"] for item in object_store._client.list_buckets()["Buckets"]
+    }
+    assert storage_inventory(migrated_dsn, object_store) == before

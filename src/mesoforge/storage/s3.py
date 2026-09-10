@@ -79,7 +79,15 @@ def _is_not_found(exc: ClientError) -> bool:
 
 
 class S3ArtifactObjectStore:
-    def __init__(self, *, bucket: str, endpoint_url: str, access_key: str, secret_key: str) -> None:
+    def __init__(
+        self,
+        *,
+        bucket: str,
+        endpoint_url: str,
+        access_key: str,
+        secret_key: str,
+        ensure_bucket: bool = True,
+    ) -> None:
         self._bucket = bucket
         self._client = boto3.client(
             "s3",
@@ -87,7 +95,9 @@ class S3ArtifactObjectStore:
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
         )
-        self._ensure_bucket()
+        # Readers must not create a bucket when storage is missing or misconfigured.
+        if ensure_bucket:
+            self._ensure_bucket()
 
     def _ensure_bucket(self) -> None:
         try:

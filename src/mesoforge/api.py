@@ -1,4 +1,4 @@
-"""Localhost-only temperature endpoint over fixed, prepared model guidance."""
+"""Localhost prepared-temperature calculation and immutable issued-version retrieval."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 import tempfile
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -13,11 +14,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException
 
+from mesoforge.application.issuance import read_issued_forecast
 from mesoforge.application.point_forecast import (
     PreparedPointForecast,
     UnsupportedCoordinateError,
     prepare_demo_files,
 )
+from mesoforge.common.errors import NotFound
 
 
 def _error(message: str, status_code: int, prepared: PreparedPointForecast) -> JSONResponse:
@@ -64,6 +67,44 @@ def create_app(directory: Path) -> FastAPI:
             return prepared.forecast(latitude=lat, longitude=lon)
         except UnsupportedCoordinateError as exc:
             return _error(str(exc), 422, prepared)
+
+    @app.get("/issued-forecasts/{issued_forecast_id}", response_model=None)
+    def issued_forecast(issued_forecast_id: str) -> dict[str, Any] | JSONResponse:
+        # Validate here so saved-version errors never inherit prepared-data labels.
+        try:
+            identifier = UUID(issued_forecast_id)
+        except ValueError:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": {
+                        "code": "invalid_issued_forecast_id",
+                        "message": "Provide an issued-forecast ID in UUID format.",
+                    }
+                },
+            )
+        try:
+            return read_issued_forecast(identifier)
+        except NotFound:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": {
+                        "code": "issued_forecast_not_found",
+                        "message": "No saved issued forecast exists for this ID.",
+                    }
+                },
+            )
+        except Exception:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": {
+                        "code": "issued_forecast_read_failed",
+                        "message": "Could not read and verify the saved issued forecast.",
+                    }
+                },
+            )
 
     return app
 

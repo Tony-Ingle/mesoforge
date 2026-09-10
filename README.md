@@ -37,12 +37,14 @@ its required configuration overlay, and historical readers remain.
 The local batch command now saves immutable issued versions of its 36-hour forecasts
 using the existing PostgreSQL/S3 storage. Each explicit run has a new batch ID;
 location failures do not stop later coordinates. One-off `GET /forecast` remains
-read-only. **24 PostgreSQL/MinIO integration tests passed**, alongside 376 offline
-checks. Two actual batch runs retained two versions per supported coordinate; full
-payload readback matched, and HTTP requests created no history. Temporary services
-were stopped. Full database/storage acceptance and coverage remain unverified.
-See [the batch command](#local-coordinate-batch) for setup and evidence.
-Proposed next milestone: read-only API access to saved versions.
+read-only. `GET /issued-forecasts/{issued_forecast_id}` now retrieves one exact saved
+version, including its complete forecast and provenance, without calculation or writes.
+For retrieval, **304 offline and 29 PostgreSQL/MinIO integration tests passed**.
+Actual HTTP retrieval of two retained versions matched their stored payloads exactly
+and left all storage unchanged. Temporary services were stopped. Full database/storage
+acceptance and coverage remain unverified. See [saved-version retrieval](#retrieve-one-issued-version)
+for the endpoint and evidence. Proposed next milestone: a bounded read-only query to
+find previously issued forecast hours due for observation matching at an explicit cutoff.
 
 Future direction: configure locations using latitude/longitude only, with geographic
 context and suitable observation sources derived internally. The intended VPS workflow
@@ -259,7 +261,7 @@ and one existing **36-hour** prepared snapshot. Save this as `locations.json`:
 Each location contains only numeric `lat` and `lon`; no station IDs, counties,
 bounding boxes, or other geographic configuration is needed. **Batch runs now issue
 and persist forecasts**, so they require migrated PostgreSQL and an S3-compatible
-object store. One-off API requests still need only the prepared files.
+object store. One-off `/forecast` requests still need only the prepared files.
 
 Use the existing storage environment variables, supplied outside Git:
 `MESOFORGE_DATABASE_DSN`, `MESOFORGE_S3_ENDPOINT`, `MESOFORGE_S3_BUCKET`,
@@ -312,7 +314,7 @@ three-hour snapshots. It loads and verifies guidance once, then reuses the same 
 for every coordinate without provider calls or per-location preparation. Network I/O
 is limited to the configured persistence services. It starts no HTTP server or location
 registration/scheduling process. Models, area, temperature scope, and fixed 70/30
-demonstration weights are unchanged. `GET /forecast` imports no issuance service and
+demonstration weights are unchanged. `GET /forecast` calls no issuance service and
 does not create history, even for coordinates previously issued by a batch.
 
 The earlier calculation-only demonstration on September 10 used HRRR 12Z / GFS 06Z:
@@ -397,6 +399,55 @@ outside Git and loopback listeners; both services and the temporary API were sto
 Data files remain locally. No Docker/WSL or permanent service setup was installed.
 Full Phase 2 database/storage acceptance, the coverage gate, live-provider canaries,
 backup/restore, and production deployment were not validated by this focused check.
+
+### Retrieve one issued version
+
+`GET /issued-forecasts/{issued_forecast_id}` returns the **complete saved JSON envelope**:
+issuance ID/time, batch ID, coordinates, target reference time, stored code/dependency
+identity, and the nested `forecast` with all values, units, source cycles/leads, valid
+times, weights, checksums, and explicit missingness. It uses the existing PostgreSQL
+metadata lookup and checksum-verified MinIO/S3 reader. It does not calculate a forecast,
+replace its provenance with current code/input identity, or create rows, buckets, or
+objects. It returns the saved version even if `/forecast` has different inputs loaded.
+
+Use the same `MESOFORGE_DATABASE_DSN` and `MESOFORGE_S3_*` variables documented for
+batch issuance and the existing API startup command. The existing launcher still loads
+prepared guidance for `/forecast`; that calculation route needs no storage connection.
+Retrieval requires the already-migrated issuance database and its original object
+bucket. No additional migration is needed. Example request using a retained local ID:
+
+```text
+GET http://127.0.0.1:8765/issued-forecasts/b80e231a-c6e6-4066-ab4c-1e5d38bc2592
+```
+
+This is distinct from `GET /forecast?lat=45.8&lon=-93.1`, which calculates from the
+currently loaded prepared guidance and returns no issuance header. An unknown valid
+UUID returns **404** with `issued_forecast_not_found`; a malformed UUID returns **422**
+with `invalid_issued_forecast_id`. Storage unavailability, missing bytes for a known
+version, or a checksum failure returns **500** with `issued_forecast_read_failed`.
+Retrieval never reconstructs a damaged version or exposes connection details in errors.
+
+September 10 validation: **156 API/batch/issuance/preparation offline tests** and the
+**148-test recorded Phase 2 selection** passed. **29 PostgreSQL/MinIO integration
+tests** passed, including exact repeated HTTP readback, no calculation/write calls,
+invalid/unknown IDs, corrupted/missing payloads, and no bucket creation. Commands run
+through the isolated Python 3.12 environment (`PYTHONPATH=src`):
+
+```text
+python -B -m pytest tests/unit/test_issued_forecast_api.py tests/unit/test_forecast_api.py tests/unit/test_real_forecast_api.py tests/unit/application/test_batch_forecast.py tests/unit/application/test_forecast_issuance.py tests/unit/application/test_prepared_temperature.py -q -p no:cacheprovider
+python -B -m pytest tests/integration/application/test_batch_issuance.py tests/integration/storage/test_migrations.py tests/integration/storage/test_s3_object_store.py -q -p no:cacheprovider
+```
+
+Actual localhost requests retrieved the two prior versions for `(45.8, -93.1)`:
+`b80e231a-c6e6-4066-ab4c-1e5d38bc2592` and `cb485961-fd26-4927-a670-38831f76b3b3`.
+Both returned 200 and matched the complete original JSON and MinIO checksums. Repeated
+retrieval, malformed/unknown ID requests, and a normal `/forecast` GET left **four
+issuance rows, four metadata rows, and four objects (134,510 bytes)** unchanged.
+No new forecasts or guidance downloads were needed. The API, PostgreSQL, and MinIO
+were stopped afterward, preserving their data outside Git. Evidence and captured
+responses are in `%LOCALAPPDATA%\MesoForge\baselines\20260910-issued-retrieval`.
+Quality checks passed; the full acceptance, coverage, live-provider, backup/restore,
+and deployment gaps above remain. Observation matching and verification are future work.
 
 ### Prepare real inputs before serving
 

@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from mesoforge.common.errors import IntegrityError
+from mesoforge.common.errors import IntegrityError, NotFound
 from mesoforge.common.identifiers import Digest
 from mesoforge.contracts.issued_forecasts import IssuedForecastRecord
 from mesoforge.storage.interfaces import ArtifactObjectStore, IssuanceUnitOfWork
 from mesoforge.storage.json import CanonicalJsonSerializer
+from mesoforge.storage.postgres.database import resolve_database_dsn
+from mesoforge.storage.postgres.repositories import PostgresUnitOfWork
+from mesoforge.storage.s3 import S3ArtifactObjectStore
 
 
 def _now() -> datetime:
@@ -87,7 +91,28 @@ class ForecastIssuanceService:
         """Read one exact saved version and verify its stored content checksum."""
         with self._uow_factory() as uow:
             record = uow.issued_forecasts.get(issued_forecast_id)
-            stored = uow.stored_objects.get(record.content_digest)
-        return self._serializer.deserialize(
-            self._objects.get_verified(stored.storage_uri, record.content_digest)
-        )
+            try:
+                stored = uow.stored_objects.get(record.content_digest)
+            except NotFound as exc:
+                raise IntegrityError("Issued forecast object metadata is missing") from exc
+        try:
+            payload = self._objects.get_verified(stored.storage_uri, record.content_digest)
+        except NotFound as exc:
+            raise IntegrityError("Issued forecast payload is missing") from exc
+        return self._serializer.deserialize(payload)
+
+
+def read_issued_forecast(issued_forecast_id: UUID) -> dict[str, Any]:
+    """Use existing configured storage without bucket creation or issuance setup."""
+    dsn = resolve_database_dsn("MESOFORGE_DATABASE_DSN")
+    objects = S3ArtifactObjectStore(
+        bucket=os.environ["MESOFORGE_S3_BUCKET"],
+        endpoint_url=os.environ["MESOFORGE_S3_ENDPOINT"],
+        access_key=os.environ["MESOFORGE_S3_ACCESS_KEY"],
+        secret_key=os.environ["MESOFORGE_S3_SECRET_KEY"],
+        ensure_bucket=False,
+    )
+    # Readback returns the stored code identity; current issuance identity is unused.
+    return ForecastIssuanceService(objects, lambda: PostgresUnitOfWork(dsn), code_identity={}).read(
+        issued_forecast_id
+    )
