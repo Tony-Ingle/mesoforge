@@ -7,6 +7,7 @@ operational forecast-skill claim about the retrospective preparation fixtures.
 
 from __future__ import annotations
 
+import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
@@ -512,4 +513,99 @@ def test_prepared_metar_bytes_feed_existing_window_and_rebuild_without_http(
     repeat = verifier.verify_window(**query)
     assert repeat["summary"] == {**first["summary"], "verified": 0, "already_existing": 4}
     assert complete_storage_inventory(migrated_dsn, object_store) == after
+    assert len(transport.get_calls) == 1
+
+
+def test_automatic_window_acquires_once_reuses_real_snapshot_and_skips_empty_window(
+    tmp_path: Path,
+    prepared_guidance: Path,
+    migrated_dsn: str,
+    object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mesoforge.application import automatic_verification, prepared_observations
+
+    # Retained synthetic fixtures must never satisfy the automatic real-source lookup.
+    synthetic = seed_observation_preview_inputs(migrated_dsn, object_store, VALID_TIME)
+    monkeypatch.setenv("MESOFORGE_OBSERVATIONS_ARTIFACT_ID", str(synthetic.artifact_id))
+    monkeypatch.setenv("MESOFORGE_OBSERVATIONS_DIR", str(tmp_path / "observations"))
+    transport = FixtureAviationWeatherTransport()
+    payload = JSON.serialize(
+        [
+            _record(
+                obsTime=int(datetime(2026, 8, 30, hour, 10, tzinfo=UTC).timestamp()),
+                reportTime=f"2026-08-30T{hour}:10:00Z",
+                receiptTime=f"2026-08-30T{hour}:12:00Z",
+            )
+            for hour in (13, 15)
+        ]
+    )
+    transport.metar_queue.append(FakeHttpResponse(200, {}, payload))
+    monkeypatch.setattr(
+        prepared_observations, "RequestsAviationWeatherHttpTransport", lambda: transport
+    )
+    issuer = make_issuer(migrated_dsn, object_store)
+    forecast = PreparedPointForecast.from_directory(prepared_guidance).forecast(
+        latitude=FIRST["lat"],
+        longitude=FIRST["lon"],
+    )
+    issued = [issuer.issue(forecast, batch_run_id=uuid4(), location_index=0) for _ in range(2)]
+    before = complete_storage_inventory(migrated_dsn, object_store)
+    query = dict(
+        latitude=FIRST["lat"],
+        longitude=FIRST["lon"],
+        start_valid_time=VALID_TIME,
+        end_valid_time=datetime(2026, 8, 30, 16, tzinfo=UTC),
+    )
+    first = automatic_verification.run_window(**query)
+    assert first["preflight"]["query_window_start"] == "2026-08-30T12:45:00+00:00"
+    assert first["preflight"]["query_window_end"] == "2026-08-30T15:15:00+00:00"
+    assert first["preflight"]["station_ids"] == ["KCBG", "KJMR", "KROS"]
+    assert first["downloaded_bytes"] == len(payload)
+    assert first["observations_reused"] is False
+    assert first["verification"]["summary"] == {
+        "verified": 4,
+        "already_existing": 0,
+        "unavailable": 2,
+        "ineligible": 0,
+        "errors": 0,
+    }
+    assert {row["issued_forecast_id"] for row in first["verification"]["results"]} == {
+        str(row.issued_forecast_id) for row in issued
+    }
+    assert os.environ["MESOFORGE_OBSERVATIONS_ARTIFACT_ID"] == str(synthetic.artifact_id)
+    after = complete_storage_inventory(migrated_dsn, object_store)
+    assert_forecasts_unchanged(before, after, object_store)
+    repeated = automatic_verification.run_window(**query)
+    assert repeated["observations_artifact_id"] == first["observations_artifact_id"]
+    assert repeated["observations_reused"] is True
+    assert repeated["downloaded_bytes"] == 0
+    assert repeated["verification"]["summary"] == {
+        **first["verification"]["summary"],
+        "verified": 0,
+        "already_existing": 4,
+    }
+    # An overlapping narrower request reuses the same original snapshot too.
+    subset = automatic_verification.run_window(
+        **{**query, "end_valid_time": datetime(2026, 8, 30, 14, tzinfo=UTC)}
+    )
+    assert subset["observations_artifact_id"] == first["observations_artifact_id"]
+    assert subset["verification"]["summary"]["already_existing"] == 2
+    empty = automatic_verification.run_window(
+        **{**query, "start_valid_time": ISSUED_AT, "end_valid_time": VALID_TIME}
+    )
+    assert empty["status"] == "nothing_to_verify"
+    assert empty["downloaded_bytes"] == 0
+    assert len(transport.get_calls) == 1
+    assert complete_storage_inventory(migrated_dsn, object_store) == after
+
+    # Broken retained evidence fails closed, without silently reacquiring different observations.
+    with PostgresUnitOfWork(migrated_dsn) as uow:
+        manifest = uow.artifacts.get(ArtifactId(first["observations_artifact_id"]))
+    object_store._client.put_object(
+        Bucket=object_store._bucket, Key=content_addressed_key(manifest.content_digest), Body=b"{}"
+    )
+    with pytest.raises(IntegrityError):
+        automatic_verification.run_window(**query)
     assert len(transport.get_calls) == 1

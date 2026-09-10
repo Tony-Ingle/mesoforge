@@ -70,35 +70,18 @@ def _identity() -> dict[str, Any]:
     return identity
 
 
-def acquire_bundle(
-    raw_dir: Path,
-    *,
-    latitude: float,
-    longitude: float,
-    start_valid_time: datetime,
-    end_valid_time: datetime,
-    transport: HttpTransport | None = None,
-    clock: Clock | None = None,
-    sleeper: Sleeper | None = None,
-) -> dict[str, Any]:
-    """Fetch once through the retained adapter; save bytes before parsing any records."""
-    validate_hour_selection(latitude, longitude, start_valid_time, end_valid_time)
-    if not (45.5 <= latitude <= 46.0 and -93.5 <= longitude <= -93.0):
-        raise ValueError("Coordinate is outside the supported Grasston demonstration area")
-    if end_valid_time - start_valid_time > timedelta(hours=6):
-        raise ValueError("This bounded preparation command accepts at most six hours per dataset")
-    clock = clock or SystemClock()
-    start = start_valid_time.astimezone(UTC) - timedelta(minutes=15)
-    end = end_valid_time.astimezone(UTC) + timedelta(minutes=15)
-    if end > clock.now():
-        raise ValueError("The entire window, including the 15-minute margin, must be in the past")
-    if raw_dir.resolve().is_relative_to(_ROOT):
-        raise ValueError("Raw observation data must be retained outside the repository")
+def load_observation_configuration() -> MesoForgeConfiguration:
     configuration, _ = load_configuration_source(
         base_path=_ROOT / "configs/base.yaml",
         environment_path=_ROOT / "configs/phase1-grasston.yaml",
         additional_overlay_paths=(_ROOT / "configs/phase2-grasston.yaml",),
     )
+    return configuration
+
+
+def retained_station_ids(
+    configuration: MesoForgeConfiguration, latitude: float, longitude: float
+) -> tuple[str, ...]:
     phase2 = configuration.phase2
     assert phase2 is not None
     geod = Geod(ellps="WGS84")
@@ -114,6 +97,85 @@ def acquire_bundle(
     )
     if not station_ids:
         raise ValueError("No retained METAR stations lie within 50 km")
+    return station_ids
+
+
+def acquire_bundle(
+    raw_dir: Path,
+    *,
+    latitude: float,
+    longitude: float,
+    start_valid_time: datetime,
+    end_valid_time: datetime,
+    transport: HttpTransport | None = None,
+    clock: Clock | None = None,
+    sleeper: Sleeper | None = None,
+) -> dict[str, Any]:
+    return _acquire_bundle(
+        raw_dir,
+        latitude=latitude,
+        longitude=longitude,
+        start_valid_time=start_valid_time,
+        end_valid_time=end_valid_time,
+        transport=transport,
+        clock=clock,
+        sleeper=sleeper,
+    )
+
+
+def acquire_for_valid_times(
+    raw_dir: Path, *, latitude: float, longitude: float, valid_times: tuple[datetime, ...]
+) -> dict[str, Any]:
+    """Pad the actual first/last eligible valid times, including a single valid hour."""
+    if not valid_times:
+        raise ValueError("No valid times require observation acquisition")
+    return _acquire_bundle(
+        raw_dir,
+        latitude=latitude,
+        longitude=longitude,
+        start_valid_time=min(valid_times),
+        end_valid_time=max(valid_times),
+        single_hour=True,
+    )
+
+
+def _acquire_bundle(
+    raw_dir: Path,
+    *,
+    latitude: float,
+    longitude: float,
+    start_valid_time: datetime,
+    end_valid_time: datetime,
+    transport: HttpTransport | None = None,
+    clock: Clock | None = None,
+    sleeper: Sleeper | None = None,
+    single_hour: bool = False,
+) -> dict[str, Any]:
+    """Fetch once through the retained adapter; save bytes before parsing any records."""
+    if single_hour and start_valid_time == end_valid_time:
+        validate_hour_selection(
+            latitude,
+            longitude,
+            start_valid_time - timedelta(minutes=15),
+            end_valid_time + timedelta(minutes=15),
+        )
+    else:
+        validate_hour_selection(latitude, longitude, start_valid_time, end_valid_time)
+    if not (45.5 <= latitude <= 46.0 and -93.5 <= longitude <= -93.0):
+        raise ValueError("Coordinate is outside the supported Grasston demonstration area")
+    if end_valid_time - start_valid_time > timedelta(hours=6):
+        raise ValueError("This bounded preparation command accepts at most six hours per dataset")
+    clock = clock or SystemClock()
+    start = start_valid_time.astimezone(UTC) - timedelta(minutes=15)
+    end = end_valid_time.astimezone(UTC) + timedelta(minutes=15)
+    if end > clock.now():
+        raise ValueError("The entire window, including the 15-minute margin, must be in the past")
+    if raw_dir.resolve().is_relative_to(_ROOT):
+        raise ValueError("Raw observation data must be retained outside the repository")
+    configuration = load_observation_configuration()
+    phase2 = configuration.phase2
+    assert phase2 is not None
+    station_ids = retained_station_ids(configuration, latitude, longitude)
     # Copy only the query duration; the retained Phase 2 defaults stay unchanged.
     settings = phase2.aviationweather.model_copy(
         update={"metar_window_hours": (end - start).total_seconds() / 3600}

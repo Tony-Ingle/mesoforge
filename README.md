@@ -70,8 +70,13 @@ The September 10 demonstration acquired 27 reports from three retained stations,
 saved four verification results across two issued versions, and safely reused all
 four on repeat. Raw observations and provenance remain outside Git and in existing
 artifact storage. See [real observation preparation](#prepare-one-real-metar-dataset).
-Proposed next milestone: derive one bounded observation-acquisition window from
-eligible saved past hours, then reuse this preparation and verification path on demand.
+The new [automatic verification command](#automatically-prepare-observations-and-verify)
+now derives that observation request from saved past hours using only coordinate and
+valid-time bounds. Its real demonstration saved six results, reused all six on repeat,
+and downloaded nothing for a window with no eligible hours. **75 focused offline and
+11 PostgreSQL/MinIO integration tests passed**; broader operational gaps remain below.
+Proposed next milestone: apply this command to the existing coordinate-list configuration,
+continuing when one location fails, before adding scheduling.
 
 Future direction: configure locations using latitude/longitude only, with geographic
 context and suitable observation sources derived internally. The intended VPS workflow
@@ -753,6 +758,82 @@ Ruff lint/format, mypy, all nine import contracts, documentation/hygiene checks,
 Full acceptance/coverage, operational input-cutoff validation, long-term provider
 reliability, and station metadata history remain unverified; this is not a skill claim.
 Temporary services were stopped after validation. No polling or scheduling was added.
+
+### Automatically prepare observations and verify
+
+With the existing PostgreSQL/MinIO services and storage environment configured,
+provide only latitude, longitude, and the saved forecast valid-time window:
+
+```text
+python -B -m mesoforge.application.automatic_verification --lat 45.8 --lon -93.1 --start-valid-time 2026-09-10T17:00:00Z --end-valid-time 2026-09-10T21:00:00Z
+```
+
+This exact command was demonstrated using the isolated interpreter and `PYTHONPATH=src`.
+It selects all issued versions in `[start, end)` and reuses the existing forecast-only
+eligibility checks. A finite Kelvin forecast must have valid source cycles, no missingness,
+and issuance before its valid time. Future hours and incomplete ±15-minute observation
+margins are deferred. These are **preflight** checks: station/observation QC, observation
+timing relative to issuance, and retained-input eligibility are still decided by the
+existing verifier after preparation. No observation is invented for preflight.
+
+For ready valid times, acquisition spans exactly **earliest time − 15 minutes** through
+**latest time + 15 minutes**. A single hour requests 30 minutes; duplicate issued versions
+do not widen the request. The retained six-hour limit applies to the span between ready
+valid times; a wider span fails explicitly before downloading rather than truncating hours.
+Station IDs come from the same retained catalog and 50 km rule. Users supply neither
+station IDs nor METAR query bounds. No models, forecast fields, weights, or matching rules change.
+
+The command first looks for an existing real observation preparation covering that
+coordinate, station set, time range, and configuration. It checks stored source/normalized
+checksums and transformation provenance and reuses the first suitable retained snapshot.
+Synthetic fixtures do not qualify. Otherwise it uses the existing acquisition/normalization
+and artifact storage. Raw bundles default to `%LOCALAPPDATA%\MesoForge\observations` on
+Windows, or `$XDG_DATA_HOME/MesoForge/observations` (otherwise `~/.local/share/MesoForge/observations`)
+on Linux. `MESOFORGE_OBSERVATIONS_DIR` optionally changes this service-level path; it must
+remain outside Git. The result reports the source URL, stations, bounds, bytes, raw directory
+when newly acquired, and observation artifact ID. Raw files can still use `--from-raw`.
+
+The existing verification window implementation then processes the original requested
+window, preserving all issued versions and explicit reasons. Its results are separate
+from preflight: an hour rejected before acquisition can subsequently appear as unavailable
+with its issuance/missingness reason because no observation was acquired for it.
+When **no hours are ready**, the command returns `status: "nothing_to_verify"`, per-hour
+reasons, `verification: null`, and `downloaded_bytes: 0`, without observation acquisition
+or preparation. Exit 0 means completed or nothing to verify, 1 means per-hour verification
+errors, and 2 means invalid input or orchestration failure.
+
+The real September 10 demonstration found two issued versions at each of 18:00, 19:00,
+and 20:00 UTC. It automatically requested **17:45–20:15 UTC** from **KCBG/KJMR/KROS**,
+receiving **24 METAR reports (eight each), 9,934 bytes**. Six verification facts were saved.
+For one issued version, errors were **+0.260793 K**, **+0.201773 K**, and **+0.365296 K**
+at those respective hours; the other version was independently verified with the same values.
+Both 17:00 hours failed preflight because issuance was later than valid time. The unchanged
+window verifier reported them unavailable with that explicit reason; no scores were saved.
+Repeating the command reused the exact observation artifact and all six verification IDs,
+with zero downloads and no new rows or objects. This no-eligible command also made no writes
+or downloads:
+
+```text
+python -B -m mesoforge.application.automatic_verification --lat 45.8 --lon -93.1 --start-valid-time 2026-09-10T17:00:00Z --end-valid-time 2026-09-10T18:00:00Z
+```
+
+Issued forecasts remained unchanged. Evidence and exact saved results are outside Git in
+`%LOCALAPPDATA%\MesoForge\baselines\20260910-automatic-verification`.
+**75 offline tests passed** in `test_automatic_verification.py`, `test_prepared_observations.py`,
+and `tests/unit/verification/test_issued_temperature.py`; **11 PostgreSQL/MinIO integration
+tests passed** in the existing verification module. New coverage is limited to nine unit
+cases and one integration case: exact bounds, separate versions, no-ready behavior, real
+input discovery, synthetic exclusion, overlapping-window reuse, unavailable hours, and
+corrupt retained evidence failing without reacquisition. Quality checks passed and temporary
+services were stopped.
+
+Repeats intentionally keep a fixed observation snapshot, including missing reports; this
+command does not refresh delayed/corrected observations automatically. Verification reuse
+continues to require the same inputs, policies, and code identity (including Git HEAD).
+Changing code or choosing a different snapshot can create another auditable verification
+fact; older facts remain immutable. Full acceptance, coverage, operational cutoff validation,
+and provider reliability remain unverified. This is still an on-demand command, with no
+scheduler or coordinate-collection orchestration.
 
 ### Prepare real inputs before serving
 

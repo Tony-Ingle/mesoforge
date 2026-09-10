@@ -417,6 +417,36 @@ class PostgresArtifactRepository:
         ).scalar_one_or_none()
         return _artifact_row_to_manifest(row) if row is not None else None
 
+    def find_real_metar_sources(
+        self, *, latitude: float, longitude: float, configuration_digest: Digest
+    ) -> tuple[ArtifactManifest, ...]:
+        """Find retained real acquisitions without selecting a new observation revision."""
+        configuration_digest = Digest(configuration_digest)
+        for value, bound in ((latitude, 90), (longitude, 180)):
+            if (
+                type(value) not in (int, float)
+                or not math.isfinite(value)
+                or not -bound <= value <= bound
+            ):
+                raise ValueError("latitude and longitude must be finite geographic coordinates")
+        rows = self._session.scalars(
+            sa.select(ArtifactRow)
+            .where(
+                ArtifactRow.artifact_type == "aviationweather-metar-response",
+                ArtifactRow.source_authority == "aviationweather.gov",
+                ArtifactRow.configuration_digest == str(configuration_digest),
+                ArtifactRow.attributes.contains(
+                    {
+                        "data_kind": "real_metar_observations",
+                        "latitude": latitude,
+                        "longitude": longitude,
+                    }
+                ),
+            )
+            .order_by(ArtifactRow.registered_at, ArtifactRow.id)
+        )
+        return tuple(_artifact_row_to_manifest(row) for row in rows)
+
 
 def _activity_row_to_manifest(row: ActivityRow) -> ActivityManifest:
     inputs = tuple(

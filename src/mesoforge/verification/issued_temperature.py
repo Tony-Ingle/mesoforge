@@ -29,6 +29,38 @@ def _temperature(value: dict[str, Any]) -> float | None:
     return float(temperature)
 
 
+def forecast_eligibility_reasons(
+    forecast: dict[str, Any], issued_at: Any, *, cutoff: datetime
+) -> list[str]:
+    """Existing forecast-only checks; observation-dependent eligibility is still pending."""
+    reasons: list[str] = []
+    valid_time = _instant(forecast.get("valid_time"))
+    issued_at = _instant(issued_at)
+    if valid_time is None or issued_at is None:
+        reasons.append("forecast_timestamps_missing_or_not_timezone_aware")
+    else:
+        if issued_at >= valid_time:
+            reasons.append("forecast_not_issued_before_valid_time")
+        if valid_time > cutoff:
+            reasons.append("forecast_valid_time_after_verification_cutoff")
+
+    if _temperature(forecast.get("temperature", {})) is None:
+        reasons.append("forecast_temperature_missing_nonfinite_or_not_kelvin")
+    if forecast.get("missing_reasons"):
+        reasons.append("forecast_has_explicit_missingness")
+    sources = forecast.get("sources", [])
+    if not sources:
+        reasons.append("forecast_source_cycles_unavailable")
+    for source in sources:
+        source_cycle = _instant(source.get("cycle"))
+        if source_cycle is None:
+            reasons.append("source_cycle_missing_or_not_timezone_aware")
+        elif issued_at is not None and source_cycle > issued_at:
+            reasons.append("source_cycle_after_forecast_issuance")
+
+    return reasons
+
+
 def evaluate_temperature_verification(
     match: dict[str, Any], *, verification_cutoff: datetime, evaluated_at: datetime
 ) -> dict[str, Any]:
@@ -89,28 +121,8 @@ def evaluate_temperature_verification(
     forecast = match["forecast"]
     valid_time = _instant(forecast.get("valid_time"))
     issued_at = _instant(match.get("issued_at"))
-    if valid_time is None or issued_at is None:
-        reasons.append("forecast_timestamps_missing_or_not_timezone_aware")
-    else:
-        if issued_at >= valid_time:
-            reasons.append("forecast_not_issued_before_valid_time")
-        if valid_time > cutoff:
-            reasons.append("forecast_valid_time_after_verification_cutoff")
-
     forecast_temperature = _temperature(forecast.get("temperature", {}))
-    if forecast_temperature is None:
-        reasons.append("forecast_temperature_missing_nonfinite_or_not_kelvin")
-    if forecast.get("missing_reasons"):
-        reasons.append("forecast_has_explicit_missingness")
-    sources = forecast.get("sources", [])
-    if not sources:
-        reasons.append("forecast_source_cycles_unavailable")
-    for source in sources:
-        source_cycle = _instant(source.get("cycle"))
-        if source_cycle is None:
-            reasons.append("source_cycle_missing_or_not_timezone_aware")
-        elif issued_at is not None and source_cycle > issued_at:
-            reasons.append("source_cycle_after_forecast_issuance")
+    reasons.extend(forecast_eligibility_reasons(forecast, issued_at, cutoff=cutoff))
 
     selected = match.get("selected")
     if match.get("status") != "matched" or selected is None:
