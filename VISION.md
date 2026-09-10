@@ -43,8 +43,9 @@ latitude/longitude. A configurable collection should look conceptually like:
 }
 ```
 
-This is a future configuration example, not a configuration file accepted today;
-the second coordinate is outside the current demonstration's supported area.
+The local batch command now accepts this configuration shape with one existing
+36-hour prepared dataset; the second coordinate is outside its supported area
+and produces a location error. The operating lifecycle below remains future work.
 Adding supported coordinates should require configuration changes, not code changes.
 Users should not maintain observation stations, bounding boxes, surrounding counties,
 model grid coordinates, or spatial zones. MesoForge should identify the location

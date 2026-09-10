@@ -34,8 +34,11 @@ QPF, PoP, METAR verification, provenance, and retained-input replay. Its default
 are unchanged. Standalone Phase 1 hours 0–6 generation is retired; shared science,
 its required configuration overlay, and historical readers remain.
 
-The 36-hour temperature extension is complete. The next
-milestone has not been selected; scheduling and additional models remain future work.
+The local batch command now reads a latitude/longitude collection and returns the
+same 36-hour temperature forecasts from one shared prepared dataset. A location
+error does not stop later coordinates. See [the batch command](#local-coordinate-batch).
+Proposed next milestone: save immutable issued-forecast versions from explicit
+batch runs, while keeping one-off API requests free of history side effects.
 
 Future direction: configure locations using latitude/longitude only, with geographic
 context and suitable observation sources derived internally. The intended VPS workflow
@@ -234,6 +237,86 @@ for hours 1–18. Phase 2's `scalar-vector.hg.h19-h36` row remains **60/40**;
 the endpoint's approved demonstration weights are separate from that policy.
 If either required model or hour is missing, that hour is null; weights
 are never redistributed. Invalid prepared-file units or time metadata prevent startup.
+
+### Local coordinate batch
+
+[The batch command](src/mesoforge/application/batch_forecast.py) reads one JSON config
+and one existing **36-hour** prepared snapshot. Save this as `locations.json`:
+
+```json
+{
+  "locations": [
+    {"lat": 45.8, "lon": -93.1},
+    {"lat": 45.9, "lon": -93.0}
+  ]
+}
+```
+
+Each location contains only numeric `lat` and `lon`; no station IDs, counties,
+bounding boxes, or other geographic configuration is needed. Run from the repository
+root with the locked dependencies installed:
+
+```text
+uv run --locked python -m mesoforge.application.batch_forecast --config locations.json --data-dir PATH_TO_PREPARED_SNAPSHOT
+```
+
+The Python module was exercised with the isolated Windows environment below;
+the portable `uv run` wrapper has not been executed. The command writes JSON to
+standard output: `results` preserves input order and each entry contains its
+zero-based `index`, input `location`, and `status`. An `ok` entry has the complete
+existing `forecast`, including all 36 hours, units, source cycles/leads, valid times,
+weights, missing reasons, source URLs, and checksums. An `error` entry instead has
+an error `code` and `message`. Missing hourly guidance remains null with reasons
+inside a successful forecast response; it does not silently change the blend.
+An unrepresentably large JSON number is retained as text in its location error.
+
+Exit code **0** means every location succeeded; **1** means at least one location
+failed, after all locations were processed. **2** reports an unusable config or
+dataset on standard error. The command rejects older three-hour snapshots. It loads
+and verifies guidance once, then reuses the same arrays for every coordinate without
+network calls or per-location preparation. It starts no HTTP server and stores no
+registered locations or issued history. Models, supported area, temperature scope,
+and fixed 70/30 demonstration weights are unchanged.
+
+Actual demonstration on September 10, using the retained HRRR 12Z / GFS 06Z snapshot:
+an unsupported coordinate was inserted between the two supported points above.
+These commands were executed; the example files are already present outside Git:
+
+```powershell
+$env:PYTHONPATH = Join-Path (Get-Location) 'src'
+$python = "$env:LOCALAPPDATA\MesoForge\baselines\20260909-8d0983f-d6c8ced2\environment\Scripts\python.exe"
+$batchDemo = "$env:LOCALAPPDATA\MesoForge\baselines\20260910-coordinate-batch"
+$snapshot = "$env:LOCALAPPDATA\MesoForge\prepared\20260910T12Z-hrrr12-gfs06-h36"
+& $python -B -m mesoforge.application.batch_forecast --config "$batchDemo\locations.json" --data-dir $snapshot | Set-Content -Encoding utf8 "$batchDemo\actual-batch.json"
+$LASTEXITCODE # 1: the deliberately unsupported location failed; both others completed.
+```
+
+| Input order | Latitude, longitude | Actual result | Hour 1 / hour 36, K (rounded) |
+| --- | --- | --- | --- |
+| 0 | 45.8, -93.1 | 36 hours; none missing | 283.705085 / 298.287692 |
+| 1 | 44.98, -93.27 | `unsupported_coordinate` | No forecast |
+| 2 | 45.9, -93.0 | 36 hours; none missing | 283.629142 / 298.173662 |
+
+The full output is `actual-batch.json` in the external directory above. A repeated
+run with network calls blocked produced identical results, loaded the dataset once
+(two prepared-file opens), and left the source snapshot unchanged. The first
+coordinate's full forecast exactly matches the earlier captured API response.
+These are fixed historical model inputs, not a current live forecast.
+
+Batch validation: **27 focused batch tests passed**, plus **262 existing API,
+preparation/acquisition, and retained Phase 2 tests**. The new tests independently
+calculate expected temperatures and check all 36 hours, provenance, continued
+processing after bad coordinates/calculation failures, shared loading without I/O,
+repeatable CLI output, and exit codes:
+
+```text
+python -B -m pytest tests/unit/application/test_batch_forecast.py -q -p no:cacheprovider
+```
+
+Ruff lint/format, mypy, nine import contracts, offline lock validation, documentation,
+hygiene, and whitespace checks passed. Full database/storage acceptance, the full
+coverage gate, and live-provider canaries were not run. Dependencies were unchanged;
+no model data was downloaded and no services were started for this batch milestone.
 
 ### Prepare real inputs before serving
 

@@ -218,6 +218,11 @@ class PreparedPointForecast:
     def notice(self) -> str:
         return _REAL_NOTICE if self.data_kind == _REAL_KIND else _NOTICE
 
+    @property
+    def horizon_hours(self) -> tuple[int, ...]:
+        """The prepared snapshot's declared forecast window, including missing hours."""
+        return self._horizons
+
     @classmethod
     def from_directory(cls, directory: Path) -> PreparedPointForecast:
         guidance: dict[str, xr.Dataset] = {}

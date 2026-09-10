@@ -1,0 +1,282 @@
+"""Offline batch checks using prepared, generated GRIB fixtures, never provider data."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import timedelta
+from pathlib import Path
+from typing import Any
+from unittest.mock import Mock
+
+import pytest
+
+from mesoforge.application import batch_forecast
+from mesoforge.application.point_forecast import PreparedPointForecast, prepare_demo_files
+from tests.unit.application.test_prepared_temperature import (
+    EXTENDED_HORIZONS,
+    TARGET,
+    prepare_fixture_guidance,
+)
+
+FIRST = {"lat": 45.8, "lon": -93.1}
+LAST = {"lat": 45.9, "lon": -93.0}
+OUTSIDE = {"lat": 44.98, "lon": -93.27}
+
+
+@pytest.fixture(scope="module")
+def prepared_batch_data(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    directory = tmp_path_factory.mktemp("batch-guidance")
+    prepare_fixture_guidance(directory, EXTENDED_HORIZONS)
+    return directory
+
+
+@pytest.fixture(autouse=True)
+def block_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    forbidden = Mock(side_effect=AssertionError("Batch attempted network access"))
+    monkeypatch.setattr("requests.Session", forbidden)
+    monkeypatch.setattr("socket.create_connection", forbidden)
+    monkeypatch.setattr("socket.socket.connect", forbidden)
+
+
+def write_config(tmp_path: Path, locations: list[Any]) -> Path:
+    path = tmp_path / "locations.json"
+    path.write_text(json.dumps({"locations": locations}), encoding="utf-8")
+    return path
+
+
+def test_batch_reuses_one_load_and_preserves_36_hour_values_times_and_provenance(
+    tmp_path: Path, prepared_batch_data: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = write_config(tmp_path, [FIRST, OUTSIDE, LAST])
+    manifest_bytes = (prepared_batch_data / "manifest.json").read_bytes()
+    manifest = json.loads(manifest_bytes)
+    loader = Mock(wraps=PreparedPointForecast.from_directory)
+    original_forecast = PreparedPointForecast.forecast
+    used_guidance: list[PreparedPointForecast] = []
+
+    def forecast_without_io(
+        self: PreparedPointForecast, *, latitude: float, longitude: float
+    ) -> dict[str, Any]:
+        used_guidance.append(self)
+        with monkeypatch.context() as during_forecast:
+            forbidden = Mock(side_effect=AssertionError("Forecast reloaded prepared guidance"))
+            during_forecast.setattr(Path, "open", forbidden)
+            during_forecast.setattr("xarray.open_dataset", forbidden)
+            return original_forecast(self, latitude=latitude, longitude=longitude)
+
+    monkeypatch.setattr(PreparedPointForecast, "from_directory", loader)
+    monkeypatch.setattr(PreparedPointForecast, "forecast", forecast_without_io)
+    result = batch_forecast.run_batch(config, prepared_batch_data)
+
+    loader.assert_called_once_with(prepared_batch_data)
+    assert len(used_guidance) == 3
+    assert all(item is used_guidance[0] for item in used_guidance)
+    rows = result["results"]
+    assert [row["index"] for row in rows] == [0, 1, 2]
+    assert [row["location"] for row in rows] == [FIRST, OUTSIDE, LAST]
+    assert [row["status"] for row in rows] == ["ok", "error", "ok"]
+    assert rows[1]["error"]["code"] == "unsupported_coordinate"
+    assert "45.5" in rows[1]["error"]["message"]
+    assert "forecast" not in rows[1]
+    for row, location in ((rows[0], FIRST), (rows[2], LAST)):
+        forecast = row["forecast"]
+        assert forecast["latitude"] == location["lat"]
+        assert forecast["longitude"] == location["lon"]
+        assert forecast["data_kind"] == manifest["data_kind"]
+        assert "fixed prepared inputs" in forecast["notice"]
+        assert forecast["target_reference_time"] == "2026-08-30T12:00:00Z"
+        assert forecast["manifest_sha256"] == hashlib.sha256(manifest_bytes).hexdigest()
+        assert [hour["horizon_hours"] for hour in forecast["hours"]] == list(EXTENDED_HORIZONS)
+        for horizon, hour in zip(EXTENDED_HORIZONS, forecast["hours"], strict=True):
+            # Constant fixture grids: .7*(279+h) + .3*(289+h) = 282+h K.
+            assert hour["temperature"]["value"] == pytest.approx(282 + horizon, abs=1e-6)
+            assert hour["temperature"]["unit"] == "K"
+            assert hour["valid_time"] == (TARGET + timedelta(hours=horizon)).isoformat().replace(
+                "+00:00", "Z"
+            )
+            assert hour["missing_reasons"] == []
+            assert len(hour["sources"]) == 2
+            for source, model, age, weight in zip(
+                hour["sources"], ("HRRR", "GFS"), (0, 6), (0.7, 0.3), strict=True
+            ):
+                evidence = next(
+                    item
+                    for item in manifest["inputs"]
+                    if item["model"] == model and item["valid_time"] == hour["valid_time"]
+                )
+                assert source == {
+                    "model": model,
+                    "cycle": "2026-08-30T12:00:00Z" if age == 0 else "2026-08-30T06:00:00Z",
+                    "source_lead_hours": horizon + age,
+                    "weight": weight,
+                    "raw_sha256": evidence["raw_sha256"],
+                    "source_url": evidence["source_grib_url"],
+                    "prepared_sha256": manifest["prepared_files"][model]["sha256"],
+                }
+
+
+def test_calculation_failure_does_not_prevent_the_next_location(
+    tmp_path: Path, prepared_batch_data: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_forecast = PreparedPointForecast.forecast
+
+    def fail_first(
+        self: PreparedPointForecast, *, latitude: float, longitude: float
+    ) -> dict[str, Any]:
+        if latitude == FIRST["lat"]:
+            raise RuntimeError("Deliberate calculation failure")
+        return original_forecast(self, latitude=latitude, longitude=longitude)
+
+    monkeypatch.setattr(PreparedPointForecast, "forecast", fail_first)
+    rows = batch_forecast.run_batch(write_config(tmp_path, [FIRST, LAST]), prepared_batch_data)[
+        "results"
+    ]
+    assert rows[0]["error"] == {
+        "code": "forecast_failed",
+        "message": "RuntimeError: Deliberate calculation failure",
+    }
+    assert rows[1]["status"] == "ok"
+    assert len(rows[1]["forecast"]["hours"]) == 36
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        None,
+        [45.8, -93.1],
+        {},
+        {"lat": 45.8},
+        {"lat": 45.8, "lon": -93.1, "station_id": "KMSP"},
+        {"lat": True, "lon": -93.1},
+        {"lat": 45.8, "lon": False},
+        {"lat": "45.8", "lon": -93.1},
+        {"lat": 45.8, "lon": None},
+    ],
+)
+def test_invalid_location_is_an_explicit_error_and_processing_continues(
+    tmp_path: Path, prepared_batch_data: Path, invalid: Any
+) -> None:
+    rows = batch_forecast.run_batch(write_config(tmp_path, [invalid, LAST]), prepared_batch_data)[
+        "results"
+    ]
+    assert rows[0]["location"] == invalid
+    assert rows[0]["status"] == "error"
+    assert rows[0]["error"]["code"] == "invalid_location"
+    assert rows[0]["error"]["message"]
+    assert rows[1]["index"] == 1
+    assert rows[1]["status"] == "ok"
+    assert len(rows[1]["forecast"]["hours"]) == 36
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        "{",
+        "[]",
+        "{}",
+        '{"locations": {"lat": 45.8, "lon": -93.1}}',
+        '{"locations": [], "stations": []}',
+        '{"locations": [{"lat": NaN, "lon": -93.1}]}',
+        '{"locations": [{"lat": 45.8, "lon": Infinity}]}',
+        '{"locations": [{"lat": 45.8, "lon": -Infinity}]}',
+    ],
+)
+def test_invalid_config_is_rejected_before_loading_guidance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, document: str
+) -> None:
+    config = tmp_path / "locations.json"
+    config.write_text(document, encoding="utf-8")
+    loader = Mock(side_effect=AssertionError("Invalid config should not load guidance"))
+    monkeypatch.setattr(PreparedPointForecast, "from_directory", loader)
+    with pytest.raises(ValueError):
+        batch_forecast.run_batch(config, tmp_path / "guidance")
+    loader.assert_not_called()
+
+
+def test_old_three_hour_dataset_is_rejected_instead_of_silently_shortening_batch(
+    tmp_path: Path,
+) -> None:
+    guidance = tmp_path / "old-guidance"
+    prepare_demo_files(guidance)
+    with pytest.raises(ValueError, match="36"):
+        batch_forecast.run_batch(write_config(tmp_path, [FIRST]), guidance)
+
+
+@pytest.mark.parametrize(
+    "locations,expected_exit", [([FIRST, LAST], 0), ([FIRST, OUTSIDE, LAST], 1)]
+)
+def test_cli_returns_complete_repeatable_json_and_a_meaningful_exit_code(
+    tmp_path: Path,
+    prepared_batch_data: Path,
+    capsys: pytest.CaptureFixture[str],
+    locations: list[dict[str, float]],
+    expected_exit: int,
+) -> None:
+    config = write_config(tmp_path, locations)
+    # Windows PowerShell-created UTF-8 files may begin with a BOM.
+    config.write_text(config.read_text(encoding="utf-8"), encoding="utf-8-sig")
+    arguments = ["--config", str(config), "--data-dir", str(prepared_batch_data)]
+    assert batch_forecast.main(arguments) == expected_exit
+    first = capsys.readouterr()
+    assert first.err == ""
+    rows = json.loads(first.out)["results"]
+    assert len(rows) == len(locations)
+    assert rows[-1]["location"] == LAST
+    assert rows[-1]["status"] == "ok"
+    assert len(rows[-1]["forecast"]["hours"]) == 36
+    assert batch_forecast.main(arguments) == expected_exit
+    repeated = capsys.readouterr()
+    assert repeated.err == ""
+    assert json.loads(repeated.out) == json.loads(first.out)
+
+
+@pytest.mark.parametrize("failure", ["missing_config", "invalid_config", "missing_guidance"])
+def test_cli_global_failures_are_json_errors_on_stderr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], failure: str
+) -> None:
+    config = tmp_path / "locations.json"
+    if failure == "invalid_config":
+        config.write_text("{}", encoding="utf-8")
+    elif failure == "missing_guidance":
+        config = write_config(tmp_path, [FIRST])
+    assert batch_forecast.main(["--config", str(config), "--data-dir", str(tmp_path)]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    error = json.loads(captured.err)["error"]
+    assert error["code"] == "batch_failed"
+    assert error["message"]
+
+
+def test_cli_isolates_numeric_overflow_and_still_emits_valid_json(
+    tmp_path: Path, prepared_batch_data: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = tmp_path / "locations.json"
+    config.write_text(
+        '{"locations": ['
+        '{"lat": 45.8, "lon": -93.1}, '
+        '{"lat": 1e400, "lon": -93.1}, '
+        '{"lat": 45.9, "lon": -93.0}]}',
+        encoding="utf-8",
+    )
+    assert (
+        batch_forecast.main(["--config", str(config), "--data-dir", str(prepared_batch_data)]) == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "Infinity" not in captured.out
+    rows = json.loads(captured.out)["results"]
+    assert [row["status"] for row in rows] == ["ok", "error", "ok"]
+    assert rows[1]["location"] == {"lat": "1e400", "lon": -93.1}
+    assert rows[1]["error"]["code"] == "invalid_location"
+    assert rows[1]["error"]["message"]
+    assert len(rows[0]["forecast"]["hours"]) == 36
+    assert len(rows[2]["forecast"]["hours"]) == 36
+
+
+def test_empty_location_list_has_no_forecast_results(
+    tmp_path: Path, prepared_batch_data: Path
+) -> None:
+    assert batch_forecast.run_batch(write_config(tmp_path, []), prepared_batch_data) == {
+        "results": []
+    }

@@ -113,8 +113,9 @@ accounts, long-term retention approval, or public SLOs.
 **Owner direction update, 2026-09-10:** the intended user-facing geographic input is
 only latitude/longitude. This operating direction is approved; its implementation
 details and the rest of this RFC remain proposed unless separately approved. The
-current implementation is still the localhost HRRR/GFS temperature demonstration
-for hours 1–36. It has no configured-location lifecycle or VPS deployment.
+current implementation provides the localhost HRRR/GFS temperature demonstration
+for hours 1–36 and a local batch command over one prepared dataset. It has no
+registered-location lifecycle or VPS deployment.
 
 A configurable collection should look conceptually like:
 
@@ -127,8 +128,9 @@ A configurable collection should look conceptually like:
 }
 ```
 
-This is not a currently accepted configuration format or a coverage expansion;
-the second example is outside today's demonstration area. New supported coordinates
+The local batch command accepts this format; it does not expand coverage or
+implement the lifecycle below. The second example is outside today's demonstration
+area and produces a location error. New supported coordinates
 should need configuration changes, not code changes. MesoForge derives location
 identity, nearby observation candidates, bounding boxes, surrounding counties,
 native-grid coordinates, and any spatial zone or surrounding context internally
