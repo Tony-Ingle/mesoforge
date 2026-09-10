@@ -8,22 +8,36 @@ is described below. Start with [VISION.md](VISION.md) for release boundaries and
 
 ## Current status
 
-The checked-out implementation is the Phase 2 deterministic, unpublished HRRR/NBM/GFS
-baseline: hours 1–36 for KCBG, KJMR, and KROS near Grasston, Minnesota. Grasston's center
-coordinate is not an output location. Variables include temperature, dew point, wind
-components, gust, one-hour QPF, and NBM one-hour PoP. The pipeline records source cycles,
-contributors, fallback states, and provenance; it matches METAR observations, calculates
-verification, and supports replay from retained inputs. This is not a forecast-skill claim.
+The working localhost endpoint, `GET /forecast?lat=45.8&lon=-93.1`, returns
+**synthetic** temperature guidance for hours 1–3 within latitude 45.5–46.0 and
+longitude -93.5–-93.0. It reuses prepared files and existing extraction/blending,
+keeps the approved 70% HRRR / 30% GFS weights, and reports Kelvin units, source
+cycles, valid times, and explicit missingness. Its fixed August 30, 2026 inputs
+are invented demonstration data, not a current weather forecast.
 
-The standalone Phase 1 HRRR-only hours 0–6 generation/verification workflow has
-been retired, including hour-zero output. Phase 2 HRRR support, shared science,
-the required Phase 1 configuration overlay, and retained-data support remain.
+Validation: on September 9, **39 API + 148 retained Phase 2 tests passed**, along
+with quality checks and a localhost HTTP demonstration; the server was stopped.
+The **39 API tests passed again on September 10** during focused review. Full
+database/storage acceptance, the full coverage gate, live-provider tests, and
+real-guidance use through this endpoint have not been verified. See the detailed
+commands and validation record below; passing this slice does not verify the whole app.
 
-There is a localhost-only **synthetic temperature HTTP demonstration**, described below.
-There is no operational forecast API, V2 shared-cache publication/job system, or
-registered-coordinate history service. RRFS, precipitation type, learned corrections/weights, AI adjustments,
-and publication are disabled or absent. Existing `_v2` modules and schema names refer
-to Phase 2 contracts, not completion of the proposed V2 platform.
+The separate Phase 2 pipeline remains an unpublished HRRR/NBM/GFS station baseline
+for hours 1–36 at KCBG, KJMR, and KROS, with temperature, dew point, wind, gust,
+QPF, PoP, METAR verification, provenance, and retained-input replay. Its defaults
+are unchanged. Standalone Phase 1 hours 0–6 generation is retired; shared science,
+its required configuration overlay, and historical readers remain.
+
+**Proposed next milestone:** feed one fixed real HRRR/GFS temperature snapshot
+through the same endpoint, area, hours, and weights. A separate preparation command
+would acquire/decode only the required messages, preserve native grids and source
+evidence, and write shared local inputs before serving. Real-data labels and
+per-model projection handling are required; real files cannot simply replace the
+synthetic files today. Implementation and acquisition require a separate approval.
+
+There is no operational forecast API, shared-cache job system, or registered-coordinate
+history service. RRFS, precipitation type, learned weights, AI adjustments, and
+publication remain disabled or absent. Existing `_v2` names describe Phase 2 contracts.
 
 Local Codex development has replaced the paused Hermes development pipeline. The
 [V2 architecture RFC](docs/rfcs/mesoforge-v2-architecture.md) is proposed design input,
