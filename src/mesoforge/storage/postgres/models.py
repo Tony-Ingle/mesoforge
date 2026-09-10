@@ -13,6 +13,7 @@ from typing import Any
 
 from sqlalchemy import (
     CheckConstraint,
+    DateTime,
     ForeignKey,
     Index,
     SmallInteger,
@@ -59,6 +60,34 @@ class StoredObjectRow(Base):
     byte_size: Mapped[int] = mapped_column(nullable=False)
     verified_at: Mapped[datetime] = mapped_column(
         nullable=False, server_default=func.transaction_timestamp()
+    )
+
+
+class IssuedForecastRow(Base):
+    __tablename__ = "issued_forecasts"
+    __table_args__ = (
+        CheckConstraint(
+            "schema_version = 'issued-forecast.v1'", name="ck_issued_forecasts_schema_version"
+        ),
+        CheckConstraint("location_index >= 0", name="ck_issued_forecasts_location_index"),
+        CheckConstraint("latitude BETWEEN -90 AND 90", name="ck_issued_forecasts_latitude"),
+        CheckConstraint("longitude BETWEEN -180 AND 180", name="ck_issued_forecasts_longitude"),
+        UniqueConstraint(
+            "batch_run_id", "location_index", name="uq_issued_forecasts_batch_location"
+        ),
+        Index("ix_issued_forecasts_coordinate_issue", "latitude", "longitude", "issued_at"),
+    )
+
+    issued_forecast_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    schema_version: Mapped[str] = mapped_column(nullable=False)
+    batch_run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    location_index: Mapped[int] = mapped_column(nullable=False)
+    latitude: Mapped[float] = mapped_column(nullable=False)
+    longitude: Mapped[float] = mapped_column(nullable=False)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    target_reference_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    content_digest: Mapped[str] = mapped_column(
+        ForeignKey("stored_objects.content_digest"), nullable=False
     )
 
 

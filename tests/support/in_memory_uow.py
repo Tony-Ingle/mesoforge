@@ -9,9 +9,11 @@ import hashlib
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
+from uuid import UUID
 
 from mesoforge.common.errors import Conflict, IntegrityError, NotFound
 from mesoforge.contracts.artifacts import ArtifactManifest
+from mesoforge.contracts.issued_forecasts import IssuedForecastRecord
 from mesoforge.contracts.provenance import ActivityManifest
 
 
@@ -279,6 +281,32 @@ class _InMemoryActivityRepository:
         )
 
 
+class _InMemoryIssuedForecastRepository:
+    def __init__(self, store: dict[UUID, IssuedForecastRecord]) -> None:
+        self._store = store
+
+    def add(self, record: IssuedForecastRecord) -> IssuedForecastRecord:
+        if record.issued_forecast_id in self._store:
+            raise Conflict("issued forecast already exists")
+        self._store[record.issued_forecast_id] = record
+        return record
+
+    def get(self, issued_forecast_id: UUID) -> IssuedForecastRecord:
+        if issued_forecast_id not in self._store:
+            raise NotFound(f"issued forecast {issued_forecast_id} not found")
+        return self._store[issued_forecast_id]
+
+    def list_for_coordinate(
+        self, latitude: float, longitude: float, *, limit: int = 100
+    ) -> tuple[IssuedForecastRecord, ...]:
+        records = (
+            row
+            for row in self._store.values()
+            if row.latitude == latitude and row.longitude == longitude
+        )
+        return tuple(sorted(records, key=lambda row: row.issued_at, reverse=True)[:limit])
+
+
 class InMemoryUnitOfWork:
     def __init__(self, factory: InMemoryUnitOfWorkFactory) -> None:
         self._factory = factory
@@ -288,6 +316,7 @@ class InMemoryUnitOfWork:
         self.activities = _InMemoryActivityRepository(factory.activities)
         self.configurations = _InMemoryConfigurationRepository(factory.configurations)
         self.runs = _InMemoryRunRepository(factory.runs)
+        self.issued_forecasts = _InMemoryIssuedForecastRepository(factory.issued_forecasts)
 
     def __enter__(self) -> InMemoryUnitOfWork:
         return self
@@ -313,6 +342,7 @@ class InMemoryUnitOfWorkFactory:
         self.activities: dict[str, ActivityManifest] = {}
         self.configurations: dict[str, _InMemoryConfigurationSnapshot] = {}
         self.runs: dict[str, object] = {}
+        self.issued_forecasts: dict[UUID, IssuedForecastRecord] = {}
         self._guard = threading.Lock()
 
     def __call__(self) -> InMemoryUnitOfWork:

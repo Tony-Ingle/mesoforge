@@ -1,15 +1,63 @@
-"""Forecast a JSON coordinate list from one existing 36-hour prepared dataset."""
+"""Issue and persist forecasts from one existing 36-hour prepared dataset."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
 import sys
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
+from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.point_forecast import PreparedPointForecast, UnsupportedCoordinateError
+from mesoforge.application.prepared_temperature import _code_identity
+from mesoforge.storage.postgres.database import resolve_database_dsn
+from mesoforge.storage.postgres.repositories import PostgresUnitOfWork
+from mesoforge.storage.s3 import S3ArtifactObjectStore
+
+
+def create_issuer() -> ForecastIssuanceService:
+    """Use the established PostgreSQL/S3 environment settings, with no local-file fallback."""
+    dsn = resolve_database_dsn("MESOFORGE_DATABASE_DSN")
+    names = (
+        "MESOFORGE_S3_BUCKET",
+        "MESOFORGE_S3_ENDPOINT",
+        "MESOFORGE_S3_ACCESS_KEY",
+        "MESOFORGE_S3_SECRET_KEY",
+    )
+    for name in names:
+        if not os.environ.get(name):
+            raise RuntimeError(f"{name} must be set for batch issuance")
+    identity = _code_identity()
+    package = Path(__file__).resolve().parents[1]
+    for path in (
+        "application/batch_forecast.py",
+        "application/issuance.py",
+        "contracts/issued_forecasts.py",
+        "storage/json.py",
+        "storage/s3.py",
+        "storage/postgres/models.py",
+        "storage/postgres/repositories.py",
+    ):
+        identity["source_sha256"][path] = hashlib.sha256((package / path).read_bytes()).hexdigest()
+    identity["dependency_versions"].update(
+        {name: version(name) for name in ("pydantic", "sqlalchemy", "psycopg", "boto3", "jcs")}
+    )
+    try:
+        objects = S3ArtifactObjectStore(
+            bucket=os.environ["MESOFORGE_S3_BUCKET"],
+            endpoint_url=os.environ["MESOFORGE_S3_ENDPOINT"],
+            access_key=os.environ["MESOFORGE_S3_ACCESS_KEY"],
+            secret_key=os.environ["MESOFORGE_S3_SECRET_KEY"],
+        )
+    except Exception as exc:
+        raise RuntimeError("Could not connect to configured issuance object storage") from exc
+    return ForecastIssuanceService(objects, lambda: PostgresUnitOfWork(dsn), code_identity=identity)
 
 
 def _reject_constant(value: str) -> None:
@@ -37,8 +85,10 @@ def _coordinates(location: object) -> tuple[float, float]:
     return latitude, longitude
 
 
-def run_batch(config_path: Path, data_dir: Path) -> dict[str, Any]:
-    """Load guidance once and preserve ordered successes/errors without writing data."""
+def run_batch(
+    config_path: Path, data_dir: Path, *, issuer: ForecastIssuanceService | None = None
+) -> dict[str, Any]:
+    """Load guidance once; independently calculate and persist each successful location."""
     config = json.loads(
         config_path.read_text(encoding="utf-8-sig"),
         parse_constant=_reject_constant,
@@ -55,6 +105,8 @@ def run_batch(config_path: Path, data_dir: Path) -> dict[str, Any]:
     if prepared.horizon_hours != tuple(range(1, 37)):
         raise ValueError("Batch forecasts require an existing dataset for hours 1..36.")
 
+    issuer = issuer if issuer is not None else create_issuer()
+    batch_run_id = uuid4()
     results: list[dict[str, Any]] = []
     for index, location in enumerate(config["locations"]):
         result: dict[str, Any] = {"index": index, "location": location}
@@ -76,9 +128,26 @@ def run_batch(config_path: Path, data_dir: Path) -> dict[str, Any]:
                     error={"code": "forecast_failed", "message": f"{type(exc).__name__}: {exc}"},
                 )
             else:
-                result.update(status="ok", forecast=forecast)
+                try:
+                    issued = issuer.issue(forecast, batch_run_id=batch_run_id, location_index=index)
+                except Exception:
+                    # Keep connection details out of the public per-location result.
+                    result.update(
+                        status="error",
+                        error={
+                            "code": "issuance_failed",
+                            "message": (
+                                "Could not persist this forecast; "
+                                "no successful issuance is reported."
+                            ),
+                        },
+                    )
+                else:
+                    result.update(
+                        status="ok", forecast=forecast, issued=issued.model_dump(mode="json")
+                    )
         results.append(result)
-    return {"results": results}
+    return {"batch_run_id": str(batch_run_id), "results": results}
 
 
 def main(argv: list[str] | None = None) -> int:

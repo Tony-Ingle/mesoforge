@@ -34,11 +34,15 @@ QPF, PoP, METAR verification, provenance, and retained-input replay. Its default
 are unchanged. Standalone Phase 1 hours 0–6 generation is retired; shared science,
 its required configuration overlay, and historical readers remain.
 
-The local batch command now reads a latitude/longitude collection and returns the
-same 36-hour temperature forecasts from one shared prepared dataset. A location
-error does not stop later coordinates. See [the batch command](#local-coordinate-batch).
-Proposed next milestone: save immutable issued-forecast versions from explicit
-batch runs, while keeping one-off API requests free of history side effects.
+The local batch command now saves immutable issued versions of its 36-hour forecasts
+using the existing PostgreSQL/S3 storage. Each explicit run has a new batch ID;
+location failures do not stop later coordinates. One-off `GET /forecast` remains
+read-only. **24 PostgreSQL/MinIO integration tests passed**, alongside 376 offline
+checks. Two actual batch runs retained two versions per supported coordinate; full
+payload readback matched, and HTTP requests created no history. Temporary services
+were stopped. Full database/storage acceptance and coverage remain unverified.
+See [the batch command](#local-coordinate-batch) for setup and evidence.
+Proposed next milestone: read-only API access to saved versions.
 
 Future direction: configure locations using latitude/longitude only, with geographic
 context and suitable observation sources derived internally. The intended VPS workflow
@@ -253,41 +257,77 @@ and one existing **36-hour** prepared snapshot. Save this as `locations.json`:
 ```
 
 Each location contains only numeric `lat` and `lon`; no station IDs, counties,
-bounding boxes, or other geographic configuration is needed. Run from the repository
-root with the locked dependencies installed:
+bounding boxes, or other geographic configuration is needed. **Batch runs now issue
+and persist forecasts**, so they require migrated PostgreSQL and an S3-compatible
+object store. One-off API requests still need only the prepared files.
+
+Use the existing storage environment variables, supplied outside Git:
+`MESOFORGE_DATABASE_DSN`, `MESOFORGE_S3_ENDPOINT`, `MESOFORGE_S3_BUCKET`,
+`MESOFORGE_S3_ACCESS_KEY`, and `MESOFORGE_S3_SECRET_KEY`. The DSN uses the
+`postgresql+psycopg://` dialect. See [local development](docs/operations/local-development.md)
+for existing service options; the command does not install or start them. Apply
+migration `0004_issued_forecasts` through the existing Alembic chain before running.
+From the repository root with the locked environment configured:
 
 ```text
+uv run --locked alembic upgrade head
 uv run --locked python -m mesoforge.application.batch_forecast --config locations.json --data-dir PATH_TO_PREPARED_SNAPSHOT
 ```
 
-The Python module was exercised with the isolated Windows environment below;
-the portable `uv run` wrapper has not been executed. The command writes JSON to
-standard output: `results` preserves input order and each entry contains its
+The portable `uv run` wrappers have not been executed on this Windows checkout.
+The command writes JSON to standard output: `batch_run_id` identifies this
+invocation; `results` preserves input order and each entry contains its
 zero-based `index`, input `location`, and `status`. An `ok` entry has the complete
 existing `forecast`, including all 36 hours, units, source cycles/leads, valid times,
-weights, missing reasons, source URLs, and checksums. An `error` entry instead has
-an error `code` and `message`. Missing hourly guidance remains null with reasons
-inside a successful forecast response; it does not silently change the blend.
+weights, missing reasons, source URLs, and checksums. It also has an `issued` header
+with a unique `issued_forecast_id`, batch ID, location index, coordinates, issuance
+UTC, target reference UTC, and the saved object's content digest. An `error` entry
+instead has an error `code` and `message`; no successful issuance is reported for
+that location. Missing hourly guidance remains null with reasons inside a saved
+forecast; it does not silently change the blend.
 An unrepresentably large JSON number is retained as text in its location error.
+
+Every invocation creates new issued versions, even when inputs and numerical values
+are identical. Issuance time is the current UTC time when the record is created;
+target/reference and source-cycle times retain their prepared-input meanings. This
+historical demonstration still makes no operational cutoff or live-forecast claim.
+The full forecast, issuance metadata, and current source/dependency identity are
+serialized with the existing canonical JSON serializer and saved through the
+existing S3 adapter. Verified bytes precede a single PostgreSQL transaction for
+stored-object metadata and the `issued_forecasts` header. Scientific payloads are
+not stored in PostgreSQL. A new run never updates the old header or overwrites its
+object; a database trigger also rejects header UPDATE/DELETE operations.
+
+An unsupported coordinate never reaches storage. Upload, integrity, or database
+errors return `issuance_failed` for that location and processing continues. A failed
+transaction may leave an unreferenced object; it does not publish partial metadata.
+No automatic retries or cleanup are added. Preserve the PostgreSQL data and S3
+objects together to retain issued history; saving a record does not copy the original
+GRIB guidance into that history or extend its existing retention guarantees.
 
 Exit code **0** means every location succeeded; **1** means at least one location
 failed, after all locations were processed. **2** reports an unusable config or
-dataset on standard error. The command rejects older three-hour snapshots. It loads
-and verifies guidance once, then reuses the same arrays for every coordinate without
-network calls or per-location preparation. It starts no HTTP server and stores no
-registered locations or issued history. Models, supported area, temperature scope,
-and fixed 70/30 demonstration weights are unchanged.
+dataset, or unavailable storage setup, on standard error. The command rejects older
+three-hour snapshots. It loads and verifies guidance once, then reuses the same arrays
+for every coordinate without provider calls or per-location preparation. Network I/O
+is limited to the configured persistence services. It starts no HTTP server or location
+registration/scheduling process. Models, area, temperature scope, and fixed 70/30
+demonstration weights are unchanged. `GET /forecast` imports no issuance service and
+does not create history, even for coordinates previously issued by a batch.
 
-Actual demonstration on September 10, using the retained HRRR 12Z / GFS 06Z snapshot:
+The earlier calculation-only demonstration on September 10 used HRRR 12Z / GFS 06Z:
 an unsupported coordinate was inserted between the two supported points above.
-These commands were executed; the example files are already present outside Git:
+Its example config and prepared snapshot remain available outside Git. With the
+storage environment variables configured and the database migrated, the equivalent
+PowerShell issuance command is:
 
 ```powershell
 $env:PYTHONPATH = Join-Path (Get-Location) 'src'
 $python = "$env:LOCALAPPDATA\MesoForge\baselines\20260909-8d0983f-d6c8ced2\environment\Scripts\python.exe"
 $batchDemo = "$env:LOCALAPPDATA\MesoForge\baselines\20260910-coordinate-batch"
 $snapshot = "$env:LOCALAPPDATA\MesoForge\prepared\20260910T12Z-hrrr12-gfs06-h36"
-& $python -B -m mesoforge.application.batch_forecast --config "$batchDemo\locations.json" --data-dir $snapshot | Set-Content -Encoding utf8 "$batchDemo\actual-batch.json"
+& $python -B -m alembic upgrade head
+& $python -B -m mesoforge.application.batch_forecast --config "$batchDemo\locations.json" --data-dir $snapshot
 $LASTEXITCODE # 1: the deliberately unsupported location failed; both others completed.
 ```
 
@@ -297,13 +337,13 @@ $LASTEXITCODE # 1: the deliberately unsupported location failed; both others com
 | 1 | 44.98, -93.27 | `unsupported_coordinate` | No forecast |
 | 2 | 45.9, -93.0 | 36 hours; none missing | 283.629142 / 298.173662 |
 
-The full output is `actual-batch.json` in the external directory above. A repeated
-run with network calls blocked produced identical results, loaded the dataset once
+The earlier calculation-only output is `actual-batch.json` in the external directory
+above. A repeated run with network calls blocked produced identical results, loaded the dataset once
 (two prepared-file opens), and left the source snapshot unchanged. The first
 coordinate's full forecast exactly matches the earlier captured API response.
 These are fixed historical model inputs, not a current live forecast.
 
-Batch validation: **27 focused batch tests passed**, plus **262 existing API,
+Prior calculation-only validation: **27 focused batch tests passed**, plus **262 existing API,
 preparation/acquisition, and retained Phase 2 tests**. The new tests independently
 calculate expected temperatures and check all 36 hours, provenance, continued
 processing after bad coordinates/calculation failures, shared loading without I/O,
@@ -316,7 +356,47 @@ python -B -m pytest tests/unit/application/test_batch_forecast.py -q -p no:cache
 Ruff lint/format, mypy, nine import contracts, offline lock validation, documentation,
 hygiene, and whitespace checks passed. Full database/storage acceptance, the full
 coverage gate, and live-provider canaries were not run. Dependencies were unchanged;
-no model data was downloaded and no services were started for this batch milestone.
+no model data was downloaded and no services were started for that earlier milestone.
+
+Issuance validation on September 10: **376 offline tests passed** (34 batch/issuance, 262
+retained API/preparation/Phase 2, 20 serializers, and 60 shared application tests).
+The storage unit tests use explicit in-memory doubles. **24 integration tests also
+passed against actual PostgreSQL 16.2 and MinIO RELEASE.2025-09-07T16-13-09Z**:
+issuance/readback, immutable UPDATE/DELETE rejection, explicit missingness,
+transaction rollback with continued processing, read-only GETs, migration roundtrips,
+and existing S3 integrity/concurrency checks. Mypy, nine import contracts, offline
+lock validation, formatting/lint, documentation, hygiene, and whitespace checks passed.
+
+```text
+python -B -m pytest tests/unit/application/test_batch_forecast.py tests/unit/application/test_forecast_issuance.py -q -p no:cacheprovider
+python -B -m pytest tests/integration/application/test_batch_issuance.py tests/integration/storage/test_migrations.py tests/integration/storage/test_s3_object_store.py -q -p no:cacheprovider
+```
+
+The actual batch CLI was run twice with the real 36-hour snapshot and the three-location
+config above, using the isolated Python environment and existing storage variables:
+
+```powershell
+$python = "$env:LOCALAPPDATA\MesoForge\baselines\20260909-8d0983f-d6c8ced2\environment\Scripts\python.exe"
+$env:PYTHONPATH = Join-Path (Get-Location) 'src'
+& $python -B -m mesoforge.application.batch_forecast --config "$env:LOCALAPPDATA\MesoForge\baselines\20260910-coordinate-batch\locations.json" --data-dir "$env:LOCALAPPDATA\MesoForge\prepared\20260910T12Z-hrrr12-gfs06-h36"
+```
+
+Both runs returned `ok, error, ok` and exit **1**, as expected for the unsupported
+middle coordinate. Both supported coordinates retained **two distinct versions**, each
+with all 36 hours and no missing values. PostgreSQL held **four issuance headers and
+four stored-object metadata rows**; MinIO held **four canonical JSON payloads totaling
+134,510 bytes**. Readback through a new issuance service reproduced each complete
+forecast and provenance exactly, with verified checksums. Two actual localhost GETs
+matched the earlier real API response and left both storage counts unchanged.
+The original prepared snapshot was unchanged; no guidance was downloaded.
+
+Evidence, batch output, and readback JSON are outside Git at
+`%LOCALAPPDATA%\MesoForge\baselines\20260910-issued-forecasts\demonstration-report.json`
+and its containing directory. PostgreSQL and MinIO used separate test/demo storage
+outside Git and loopback listeners; both services and the temporary API were stopped.
+Data files remain locally. No Docker/WSL or permanent service setup was installed.
+Full Phase 2 database/storage acceptance, the coverage gate, live-provider canaries,
+backup/restore, and production deployment were not validated by this focused check.
 
 ### Prepare real inputs before serving
 

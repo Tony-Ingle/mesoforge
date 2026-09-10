@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Protocol, runtime_checkable
+from uuid import UUID
 
 from mesoforge.common.identifiers import (
     ActivityId,
@@ -32,15 +33,20 @@ from mesoforge.common.identifiers import (
     RunId,
 )
 from mesoforge.contracts.artifacts import ArtifactManifest
+from mesoforge.contracts.issued_forecasts import IssuedForecastRecord
 from mesoforge.contracts.provenance import ActivityManifest
 from mesoforge.provenance.lineage import ActivityEdge, LineageGraph
 
 
 class StoredObject(Protocol):
-    content_digest: Digest
-    storage_uri: str
-    media_type: str
-    byte_size: int
+    @property
+    def content_digest(self) -> Digest: ...
+    @property
+    def storage_uri(self) -> str: ...
+    @property
+    def media_type(self) -> str: ...
+    @property
+    def byte_size(self) -> int: ...
 
 
 class ConfigurationSnapshotLike(Protocol):
@@ -141,6 +147,26 @@ class RunRepository(Protocol):
     def get(self, run_id: RunId) -> object: ...
 
 
+class IssuedForecastRepository(Protocol):
+    def add(self, record: IssuedForecastRecord) -> IssuedForecastRecord: ...
+    def get(self, issued_forecast_id: UUID) -> IssuedForecastRecord: ...
+    def list_for_coordinate(
+        self, latitude: float, longitude: float, *, limit: int = 100
+    ) -> tuple[IssuedForecastRecord, ...]: ...
+
+
+class IssuanceUnitOfWork(Protocol):
+    """Only the existing repositories needed to save one issued version."""
+
+    @property
+    def stored_objects(self) -> StoredObjectRepository: ...
+    @property
+    def issued_forecasts(self) -> IssuedForecastRepository: ...
+    def __enter__(self) -> IssuanceUnitOfWork: ...
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> object | None: ...
+    def commit(self) -> None: ...
+
+
 class LineageReader(Protocol):
     def ancestors(self, artifact_id: ArtifactId) -> LineageGraph: ...
     def descendants(self, artifact_id: ArtifactId) -> LineageGraph: ...
@@ -157,6 +183,7 @@ class UnitOfWork(Protocol):
     configurations: ConfigurationRepository
     grids: GridRepository
     runs: RunRepository
+    issued_forecasts: IssuedForecastRepository
 
     def __enter__(self) -> UnitOfWork: ...
     def __exit__(self, exc_type: object, exc: object, tb: object) -> object | None: ...
@@ -175,6 +202,8 @@ __all__ = [
     "GridDefinitionLike",
     "GridRepository",
     "IdempotencyLock",
+    "IssuanceUnitOfWork",
+    "IssuedForecastRepository",
     "LineageGraph",
     "LineageReader",
     "RunRepository",

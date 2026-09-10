@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
+from uuid import UUID
 
 import pytest
 
 from mesoforge.application import batch_forecast
+from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.point_forecast import PreparedPointForecast, prepare_demo_files
+from tests.support.in_memory_uow import InMemoryObjectStore, InMemoryUnitOfWorkFactory
 from tests.unit.application.test_prepared_temperature import (
     EXTENDED_HORIZONS,
     TARGET,
@@ -22,6 +25,21 @@ from tests.unit.application.test_prepared_temperature import (
 FIRST = {"lat": 45.8, "lon": -93.1}
 LAST = {"lat": 45.9, "lon": -93.0}
 OUTSIDE = {"lat": 44.98, "lon": -93.27}
+
+
+@pytest.fixture(autouse=True)
+def memory_issuance(monkeypatch: pytest.MonkeyPatch):
+    """Exercise issuance with explicit test doubles; these checks need no services."""
+    store = InMemoryObjectStore()
+    factory = InMemoryUnitOfWorkFactory()
+    service = ForecastIssuanceService(
+        store,
+        factory,
+        code_identity={"git_commit": "a" * 40, "working_tree_dirty": False},
+        clock=lambda: datetime(2026, 9, 10, 12, tzinfo=UTC),
+    )
+    monkeypatch.setattr(batch_forecast, "create_issuer", lambda: service)
+    return service, factory, store
 
 
 @pytest.fixture(scope="module")
@@ -46,7 +64,7 @@ def write_config(tmp_path: Path, locations: list[Any]) -> Path:
 
 
 def test_batch_reuses_one_load_and_preserves_36_hour_values_times_and_provenance(
-    tmp_path: Path, prepared_batch_data: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, prepared_batch_data: Path, monkeypatch: pytest.MonkeyPatch, memory_issuance
 ) -> None:
     config = write_config(tmp_path, [FIRST, OUTSIDE, LAST])
     manifest_bytes = (prepared_batch_data / "manifest.json").read_bytes()
@@ -79,8 +97,15 @@ def test_batch_reuses_one_load_and_preserves_36_hour_values_times_and_provenance
     assert rows[1]["error"]["code"] == "unsupported_coordinate"
     assert "45.5" in rows[1]["error"]["message"]
     assert "forecast" not in rows[1]
+    assert "issued" not in rows[1]
+    service, factory, _ = memory_issuance
+    assert len(factory.issued_forecasts) == 2
     for row, location in ((rows[0], FIRST), (rows[2], LAST)):
         forecast = row["forecast"]
+        issued = row["issued"]
+        assert issued["batch_run_id"] == result["batch_run_id"]
+        assert issued["location_index"] == row["index"]
+        assert service.read(UUID(issued["issued_forecast_id"]))["forecast"] == forecast
         assert forecast["latitude"] == location["lat"]
         assert forecast["longitude"] == location["lon"]
         assert forecast["data_kind"] == manifest["data_kind"]
@@ -228,7 +253,19 @@ def test_cli_returns_complete_repeatable_json_and_a_meaningful_exit_code(
     assert batch_forecast.main(arguments) == expected_exit
     repeated = capsys.readouterr()
     assert repeated.err == ""
-    assert json.loads(repeated.out) == json.loads(first.out)
+    first_payload, second_payload = json.loads(first.out), json.loads(repeated.out)
+    assert UUID(first_payload["batch_run_id"]) != UUID(second_payload["batch_run_id"])
+    for first_row, second_row in zip(
+        first_payload["results"], second_payload["results"], strict=True
+    ):
+        if first_row["status"] == "error":
+            assert second_row == first_row
+        else:
+            assert second_row["forecast"] == first_row["forecast"]
+            assert (
+                second_row["issued"]["issued_forecast_id"]
+                != first_row["issued"]["issued_forecast_id"]
+            )
 
 
 @pytest.mark.parametrize("failure", ["missing_config", "invalid_config", "missing_guidance"])
@@ -275,8 +312,28 @@ def test_cli_isolates_numeric_overflow_and_still_emits_valid_json(
 
 
 def test_empty_location_list_has_no_forecast_results(
-    tmp_path: Path, prepared_batch_data: Path
+    tmp_path: Path, prepared_batch_data: Path, memory_issuance
 ) -> None:
-    assert batch_forecast.run_batch(write_config(tmp_path, []), prepared_batch_data) == {
-        "results": []
-    }
+    payload = batch_forecast.run_batch(write_config(tmp_path, []), prepared_batch_data)
+    assert payload["results"] == []
+    assert UUID(payload["batch_run_id"])
+    assert memory_issuance[1].issued_forecasts == {}
+
+
+def test_upload_failure_has_no_successful_record_and_next_location_is_saved(
+    tmp_path: Path, prepared_batch_data: Path, memory_issuance
+) -> None:
+    _, factory, store = memory_issuance
+    store.fail_next_put = True
+    payload = batch_forecast.run_batch(write_config(tmp_path, [FIRST, LAST]), prepared_batch_data)
+    first, second = payload["results"]
+    assert first["status"] == "error"
+    assert first["error"]["code"] == "issuance_failed"
+    assert "forecast" not in first
+    assert "issued" not in first
+    assert second["status"] == "ok"
+    assert len(second["forecast"]["hours"]) == 36
+    assert len(factory.issued_forecasts) == 1
+    record = next(iter(factory.issued_forecasts.values()))
+    assert (record.latitude, record.longitude) == (LAST["lat"], LAST["lon"])
+    assert record.location_index == 1

@@ -17,6 +17,7 @@ than silently becoming a query miss).
 
 from __future__ import annotations
 
+import math
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -37,6 +38,7 @@ from mesoforge.common.identifiers import (
     validate_code_revision,
 )
 from mesoforge.contracts.artifacts import ArtifactManifest, Availability, SourceIdentity
+from mesoforge.contracts.issued_forecasts import IssuedForecastRecord
 from mesoforge.contracts.provenance import ActivityArtifactRef, ActivityError, ActivityManifest
 from mesoforge.contracts.runs import RunManifest
 from mesoforge.storage.postgres.database import create_database_engine, create_session_factory
@@ -47,6 +49,7 @@ from mesoforge.storage.postgres.models import (
     ArtifactRow,
     ConfigurationSnapshotRow,
     GridRow,
+    IssuedForecastRow,
     RunRow,
     RunSelectedInputRow,
     StoredObjectRow,
@@ -61,10 +64,14 @@ class _ConfigurationSnapshotInput(Protocol):
 
 
 class _StoredObjectInput(Protocol):
-    content_digest: Digest
-    storage_uri: str
-    media_type: str
-    byte_size: int
+    @property
+    def content_digest(self) -> Digest: ...
+    @property
+    def storage_uri(self) -> str: ...
+    @property
+    def media_type(self) -> str: ...
+    @property
+    def byte_size(self) -> int: ...
 
 
 @dataclass(frozen=True)
@@ -614,6 +621,69 @@ class PostgresRunRepository:
         return _run_row_to_manifest(row)
 
 
+def _issued_forecast_row_to_record(row: IssuedForecastRow) -> IssuedForecastRecord:
+    return IssuedForecastRecord.model_validate(
+        {
+            "schema_version": row.schema_version,
+            "issued_forecast_id": row.issued_forecast_id,
+            "batch_run_id": row.batch_run_id,
+            "location_index": row.location_index,
+            "latitude": row.latitude,
+            "longitude": row.longitude,
+            "issued_at": row.issued_at,
+            "target_reference_time": row.target_reference_time,
+            "content_digest": Digest(row.content_digest),
+        }
+    )
+
+
+class PostgresIssuedForecastRepository:
+    """Append and read issued versions; migration 0004 rejects update and delete."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, record: IssuedForecastRecord) -> IssuedForecastRecord:
+        record = IssuedForecastRecord.model_validate(record.model_dump())
+        row = IssuedForecastRow(**record.model_dump())
+        self._session.add(row)
+        self._session.flush()
+        return _issued_forecast_row_to_record(row)
+
+    def get(self, issued_forecast_id: uuid.UUID) -> IssuedForecastRecord:
+        if not isinstance(issued_forecast_id, uuid.UUID):
+            raise TypeError("issued_forecast_id must be a UUID")
+        row = self._session.get(IssuedForecastRow, issued_forecast_id)
+        if row is None:
+            raise NotFound(f"issued forecast {issued_forecast_id!r} not found")
+        return _issued_forecast_row_to_record(row)
+
+    def list_for_coordinate(
+        self, latitude: float, longitude: float, *, limit: int = 100
+    ) -> tuple[IssuedForecastRecord, ...]:
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be an integer between 1 and 1000")
+        for value, bound in ((latitude, 90), (longitude, 180)):
+            if (
+                type(value) not in (int, float)
+                or not math.isfinite(value)
+                or not -bound <= value <= bound
+            ):
+                raise ValueError("latitude and longitude must be finite geographic coordinates")
+        rows = self._session.scalars(
+            sa.select(IssuedForecastRow)
+            .where(
+                IssuedForecastRow.latitude == latitude,
+                IssuedForecastRow.longitude == longitude,
+            )
+            .order_by(
+                IssuedForecastRow.issued_at.desc(), IssuedForecastRow.issued_forecast_id.desc()
+            )
+            .limit(limit)
+        )
+        return tuple(_issued_forecast_row_to_record(row) for row in rows)
+
+
 class PostgresUnitOfWork:
     """Concrete storage.interfaces.UnitOfWork over one SQLAlchemy Session."""
 
@@ -630,6 +700,7 @@ class PostgresUnitOfWork:
         self.artifacts = PostgresArtifactRepository(self._session)
         self.activities = PostgresActivityRepository(self._session)
         self.runs = PostgresRunRepository(self._session)
+        self.issued_forecasts = PostgresIssuedForecastRepository(self._session)
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
