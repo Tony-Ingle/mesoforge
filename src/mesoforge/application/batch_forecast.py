@@ -8,15 +8,17 @@ import json
 import math
 import os
 import sys
+from datetime import datetime
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from mesoforge.application.issuance import ForecastIssuanceService
-from mesoforge.application.prepared_temperature import _code_identity
+from mesoforge.application.prepared_temperature import _code_identity, prepare_locations
 from mesoforge.application.spatial_coverage import CoverageRequiredError, UnsupportedCoordinateError
 from mesoforge.application.spatial_preparation import ensure_coverage
+from mesoforge.guidance.runtime import SystemClock
 from mesoforge.storage.postgres.database import resolve_database_dsn
 from mesoforge.storage.postgres.repositories import PostgresUnitOfWork
 from mesoforge.storage.s3 import S3ArtifactObjectStore
@@ -104,7 +106,11 @@ def load_locations(config_path: Path) -> list[Any]:
 
 
 def run_batch(
-    config_path: Path, data_dir: Path, *, issuer: ForecastIssuanceService | None = None
+    config_path: Path,
+    data_dir: Path,
+    *,
+    issuer: ForecastIssuanceService | None = None,
+    require_future_hours: bool = False,
 ) -> dict[str, Any]:
     """Load guidance once; independently calculate and persist each successful location."""
     locations = load_locations(config_path)
@@ -125,6 +131,14 @@ def run_batch(
         else:
             try:
                 forecast = prepared.forecast(latitude=latitude, longitude=longitude)
+                if (
+                    require_future_hours
+                    and datetime.fromisoformat(forecast["hours"][0]["valid_time"])
+                    <= SystemClock().now()
+                ):
+                    raise ValueError(
+                        "Automatic guidance expired before issuance; rerun cycle selection"
+                    )
             except UnsupportedCoordinateError as exc:
                 result.update(
                     status="error", error={"code": "unsupported_coordinate", "message": str(exc)}
@@ -165,10 +179,44 @@ def run_batch(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True, help="JSON locations list.")
-    parser.add_argument("--data-dir", type=Path, required=True, help="Existing 36-hour snapshot.")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--data-dir", type=Path, help="Reuse an existing 36-hour snapshot offline.")
+    mode.add_argument(
+        "--output-dir", type=Path, help="Prepare current guidance here before issuance."
+    )
+    parser.add_argument("--target-reference-time", type=datetime.fromisoformat)
+    parser.add_argument("--hrrr-cycle", type=datetime.fromisoformat)
+    parser.add_argument("--gfs-cycle", type=datetime.fromisoformat)
     args = parser.parse_args(argv)
+    times = (args.target_reference_time, args.hrrr_cycle, args.gfs_cycle)
+    if args.data_dir is not None and any(value is not None for value in times):
+        parser.error("Existing prepared guidance supplies its own cycles and reference time")
+    if any(value is not None for value in times) and any(value is None for value in times):
+        parser.error("Explicit override requires target reference time and both source cycles")
     try:
-        payload = run_batch(args.config, args.data_dir)
+        preparation = None
+        data_dir = args.data_dir
+        if data_dir is None:
+            # Validate storage configuration before acquiring provider data.
+            issuer = create_issuer()
+            preparation = prepare_locations(
+                load_locations(args.config),
+                args.output_dir,
+                target_reference_time=args.target_reference_time,
+                hrrr_cycle=args.hrrr_cycle,
+                gfs_cycle=args.gfs_cycle,
+            )
+            data_dir = Path(preparation["directory"])
+        else:
+            issuer = None
+        payload = run_batch(
+            args.config,
+            data_dir,
+            issuer=issuer,
+            require_future_hours=preparation is not None and all(value is None for value in times),
+        )
+        if preparation is not None:
+            payload["preparation"] = preparation
         output = json.dumps(payload, indent=2, allow_nan=False)
     except Exception as exc:
         print(

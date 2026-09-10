@@ -176,7 +176,9 @@ def test_two_batch_runs_keep_both_versions_and_one_off_api_does_not_issue(
         first_versions = uow.issued_forecasts.list_for_coordinate(FIRST["lat"], FIRST["lon"])
         last_versions = uow.issued_forecasts.list_for_coordinate(LAST["lat"], LAST["lon"])
         assert len(first_versions) == len(last_versions) == 2
-        assert uow.issued_forecasts.list_for_coordinate(OUTSIDE["lat"], OUTSIDE["lon"]) == ()
+        # OUTSIDE is now an invalid latitude, not a former prepared-region boundary.
+        with pytest.raises(ValueError, match="finite geographic coordinates"):
+            uow.issued_forecasts.list_for_coordinate(OUTSIDE["lat"], OUTSIDE["lon"])
         assert {row.issued_forecast_id for row in first_versions + last_versions} == expected_ids
 
     with TestClient(api.create_app(prepared_guidance)) as client:
@@ -199,11 +201,14 @@ def test_persisted_missing_model_is_still_explicit_with_no_weight_change(
     directory = tmp_path / "missing-model"
     shutil.copytree(prepared_guidance, directory)
     (directory / "GFS.nc").unlink()
-    batch = run_batch(write_config(tmp_path, [FIRST]), directory, issuer=service)
-    result = batch["results"][0]
-    assert result["status"] == "ok"
-    saved = service.read(UUID(result["issued"]["issued_forecast_id"]))["forecast"]
-    assert saved == result["forecast"]
+    # Batch coverage now restores prepared files from retained raw guidance.
+    # Exercise missingness persistence directly with the calculated missing-input payload.
+    forecast = PreparedPointForecast.from_directory(directory).forecast(
+        latitude=FIRST["lat"], longitude=FIRST["lon"]
+    )
+    issued = service.issue(forecast, batch_run_id=uuid4(), location_index=0)
+    saved = service.read(issued.issued_forecast_id)["forecast"]
+    assert saved == forecast
     assert len(saved["hours"]) == 36
     for hour in saved["hours"]:
         assert hour["temperature"] == {"value": None, "unit": "K"}
@@ -482,7 +487,7 @@ def test_api_selects_each_saved_hour_version_without_writes_or_calculation(
         # The first saved valid time is the excluded end of this adjacent window.
         for coordinate, start, end in (
             (FIRST, "2026-08-30T12:00:00Z", "2026-08-30T13:00:00Z"),
-            (OUTSIDE, "2026-08-30T13:00:00Z", "2026-08-30T16:00:00Z"),
+            ({"lat": 44.98, "lon": -93.27}, "2026-08-30T13:00:00Z", "2026-08-30T16:00:00Z"),
             (
                 {"lat": FIRST["lat"] + 0.000001, "lon": FIRST["lon"]},
                 "2026-08-30T13:00:00Z",

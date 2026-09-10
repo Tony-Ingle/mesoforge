@@ -15,8 +15,9 @@ coverage automatically; the former Grasston demonstration rectangle is retired.
 It retains the approved 70% HRRR / 30% GFS demonstration
 weights throughout the window; these are demonstration weights, not optimized
 weights. It reports Kelvin units, source cycles/leads, valid times, checksums,
-and explicit missingness. Preparation accepts explicit source cycles and a target
-reference time before serving. The demonstrated September 10, 2026 snapshots are
+and explicit missingness. Preparation now automatically selects complete current
+HRRR/GFS temperature guidance before serving; explicit source cycles and target
+reference time remain an override. See [automatic cycle selection](#automatic-current-guidance). The demonstrated September 10, 2026 snapshots are
 fixed historical guidance, not current live forecasts. Retained raw messages can
 now rebuild a dataset offline with the same preparation command's `--from-raw` mode.
 Starting without `--data-dir` still selects the clearly labeled synthetic example.
@@ -35,6 +36,17 @@ the source snapshot. Independent calculations from the raw messages matched all 
 API temperatures. The server was stopped. Full database/storage acceptance,
 the full coverage gate, and the live-provider canary suite were not run. This verifies
 the small slice, not the entire application or forecast skill.
+
+Automatic-cycle validation on September 10: **167 focused offline tests and 14
+PostgreSQL/MinIO integration tests passed**, along with Ruff, mypy, import contracts,
+documentation/hygiene checks and `git diff --check`. The real automatic batch and
+localhost HTTP demonstration returned all 36 future hours for Fresno, Wichita and
+Raleigh using provider-checked 18Z guidance. Independent calculations, immutable
+readback, unchanged previous versions and offline reuse/rebuilding passed. Three
+stale storage-test assumptions also failed against committed HEAD; their setup was
+corrected without changing scientific assertions or production storage behavior.
+Temporary PostgreSQL, MinIO and API processes were stopped. Full acceptance/coverage
+and live-provider canaries were not run. See [automatic mode](#automatic-current-guidance).
 
 The separate Phase 2 pipeline remains an unpublished HRRR/NBM/GFS station baseline
 for hours 1–36 at KCBG, KJMR, and KROS, with temperature, dew point, wind, gust,
@@ -88,8 +100,9 @@ processes coordinates sequentially, and continues after location errors. The rea
 demonstration verified both supported locations around an unsupported entry and reused
 all 12 results on repeat. **43 focused offline and 2 PostgreSQL/MinIO integration tests
 passed** for that increment. The new spatial preparation milestone is documented
-[below](#automatic-spatial-coverage). Proposed next milestone: combine previous-hour
-verification, coverage preparation, and new immutable forecast issuance in one explicit run.
+[below](#automatic-spatial-coverage). Proposed next milestone: discover suitable observation stations nationwide from
+coordinates, feeding the existing 50 km / ±15-minute verification path. The retained
+three-station catalog still limits observation matching outside Minnesota.
 
 Future direction: configure locations using latitude/longitude only, with geographic
 context and suitable observation sources derived internally. The intended VPS workflow
@@ -966,8 +979,8 @@ For a **new explicit cycle pair**, use the same preparation command with
 `--config locations.json`, `--target-reference-time`, `--hrrr-cycle`, and `--gfs-cycle`
 instead of `--from-raw`. It plans the collection first, acquires the selected temperature
 messages once, and prepares the needed regions before HTTP startup. Repeating the same
-command/output/cycles reuses retained data. Cycle selection is still explicit; there
-is no latest-cycle discovery or scheduling.
+command/output/cycles reuses retained data. Omitting all three time arguments now
+selects complete current guidance automatically, as described below. There is no scheduling.
 
 The spatial demonstration reused HRRR **2026-09-10 12Z**, GFS **06Z**, target **12Z**:
 HRRR leads 1–36 and GFS leads 7–42 share valid times 13Z September 10 through 00Z
@@ -1049,8 +1062,8 @@ with all selected model leads at most **48 hours**. Each source cycle must there
 be no more than **12 hours** older than the target for this 36-hour window.
 For each requested valid time,
 the model lead is `target reference + horizon - source cycle`; matching model lead
-numbers is not required. The command does not search for the latest available cycle.
-Provider availability still determines whether a chosen pair can be acquired.
+numbers is not required. These explicit overrides do not substitute different cycles
+when a requested pair is unavailable. Omit all three arguments for automatic selection.
 
 The command now downloads **72 selected temperature messages**, one per model per
 hour, so run it only when acquiring a new dataset. Choose
@@ -1091,6 +1104,89 @@ leads, valid times, hashes, configuration/code identity, and decoder versions.
 Provider availability and retrieval time are distinct; this manual historical
 demonstration does not apply an operational issuance cutoff. Raw messages remain
 intact outside Git even though the prepared views use only the small region.
+
+### Automatic current guidance
+
+Normal preparation needs only the coordinate collection and an external output
+folder. The batch command can perform the same preparation before immutable issuance,
+using the existing PostgreSQL/MinIO settings. Acquisition never runs inside HTTP GET.
+The output includes the actual prepared `directory` to pass to API startup:
+
+```text
+python -B -m mesoforge.application.prepared_temperature --config locations.json --output-dir EXTERNAL_PREPARED_ROOT
+python -B -m mesoforge.application.batch_forecast --config locations.json --output-dir EXTERNAL_PREPARED_ROOT
+python -B -m mesoforge.api --data-dir RETURNED_DIRECTORY
+```
+
+Choose either preparation alone or the batch command; the batch command already
+prepares once for the whole collection. With an existing snapshot, use
+`batch_forecast --config locations.json --data-dir RETURNED_DIRECTORY` to issue
+another version without discovery or downloads. A repeated automatic run checks
+providers again and creates a separate snapshot; `--data-dir` / `--from-raw` are
+explicit offline reuse modes. Distant locations get separate spatial views of the
+same retained full model messages, rather than separate model downloads.
+
+Automatic selection snapshots execution time and uses its UTC whole-hour floor as
+the target reference. Hours 1–36 therefore start at the next UTC hour. It considers
+00/06/12/18Z HRRR extended runs and GFS runs newest first, independently for each
+model, within the existing preparation limit of lead 48. Both selected cycles must
+cover every requested valid time. Nominal cycle time only enumerates candidates;
+it does **not** establish availability. Selection acquires the temperature message
+for the final required lead first, then every other required lead, using the existing
+provider URLs, inventories, byte-range checks and strict GRIB decoders. A missing
+middle hour also rejects a cycle. Provider mirrors are tried before falling back
+to an older cycle. Missing, corrupt or incomplete guidance is never filled or
+renormalized. No complete usable pair means an explicit failure and no issuance.
+If preparation reaches the first valid time, automatic issuance is refused and
+requires a new run; it does not silently issue an elapsed hour as a new forecast.
+
+The 128 MiB acquisition body budget still applies, including rejected candidates.
+All acquired complete temperature messages and inventories remain outside Git.
+`discovery/selection.json` records the candidates examined, failures and selection
+reasons; each prepared manifest carries this evidence, exact cycles/leads, source
+URLs/ranges, provider availability versus retrieval times, hashes and code identity.
+Issued payloads retain the selection summary, per-source acquisition metadata, and
+prepared-manifest checksum. Raw
+rebuilding preserves the original selection and acquisition evidence. Fixed 70/30
+weights remain demonstration weights, and the Phase 2 defaults are unchanged.
+
+For reproducibility, supply **all three** explicit timestamps with either preparation
+or `batch_forecast --output-dir`:
+
+```text
+python -B -m mesoforge.application.batch_forecast --config locations.json --output-dir EXTERNAL_FIXED_SNAPSHOT --target-reference-time 2026-09-10T12:00:00Z --hrrr-cycle 2026-09-10T12:00:00Z --gfs-cycle 2026-09-10T06:00:00Z
+```
+
+These are command forms; the fixed historical example is not a claim of current
+forecast availability. Use the isolated interpreter documented above, or the existing
+`uv run --locked python` wrapper (wrapper unverified on this Windows checkout).
+
+Automatic-mode demonstration on September 10, 2026: both discovered **18Z** cycles
+were complete, so HRRR and GFS selected **2026-09-10 18Z**, leads **5–40**, against
+reference **22Z**. Valid times were **September 10 23Z through September 12 10Z**.
+All three locations had **36/36 nonmissing hours**, still future at issuance around
+22:13Z. One acquisition downloaded **65,282,097 bytes** (63,420,870 raw temperature
+bytes plus 1,861,227 inventory bytes). Three separate regions totaled **12,440,910
+prepared NetCDF bytes**, reusing the same acquired model messages. No giant
+cross-country region was prepared.
+
+| Location | Coordinate | Immutable issued-forecast ID | First / last temperature (K) |
+| --- | --- | --- | --- |
+| Fresno | 36.7378, -119.7871 | `c347fa99-6200-4b5e-8960-8c0b9fcf380c` | 314.377960 / 294.946714 |
+| Wichita | 37.6872, -97.3301 | `89f85924-3764-4792-9155-6c8e7da414a9` | 302.619608 / 296.541069 |
+| Raleigh | 35.7796, -78.6382 | `e6456163-ba83-4a1a-b818-a1d56c50f811` | 304.502940 / 296.255264 |
+
+The automatic batch command and actual localhost HTTP requests were executed with
+the isolated interpreter. All **108** temperatures matched independent native-grid
+interpolation/blending calculations. Issued payloads and acquisition provenance read
+back exactly from PostgreSQL/MinIO; the seven older versions remained unchanged.
+HTTP calculation and saved-version retrieval created no rows or objects. Offline
+coverage reuse downloaded zero bytes; a raw-only rebuild reproduced the source
+region's values and selection provenance. An initial demonstration-runner check
+requested Fresno from a Raleigh-only rebuilt view and correctly failed for missing
+coverage; checking the matching region passed without changing application code.
+Evidence and full 36-hour responses remain outside Git under
+`%LOCALAPPDATA%/MesoForge/baselines/20260910-automatic-cycles`.
 
 ### Rebuild from retained raw messages without downloads
 

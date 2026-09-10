@@ -30,6 +30,10 @@ _DATA_KIND = "synthetic_demonstration"
 _NOTICE = "Synthetic demonstration data; not a current weather forecast."
 _REAL_KIND = "real_prepared_guidance"
 _REAL_NOTICE = "Real HRRR/GFS guidance from fixed prepared inputs; not a current live forecast."
+_SELECTED_NOTICE = (
+    "Real prepared HRRR/GFS temperature with 70/30 demonstration weights; "
+    "see source and valid times."
+)
 _VARIABLE = "air_temperature_2m"
 _WEIGHTS = {"HRRR": 0.7, "GFS": 0.3}
 # Owner-approved demonstration weights throughout hours 1..36, not optimized
@@ -221,6 +225,8 @@ class PreparedPointForecast:
 
     @property
     def notice(self) -> str:
+        if self._manifest is not None and "cycle_selection" in self._manifest:
+            return _SELECTED_NOTICE
         return _REAL_NOTICE if self.data_kind == _REAL_KIND else _NOTICE
 
     @property
@@ -359,6 +365,26 @@ class PreparedPointForecast:
                         source_url=evidence["source_grib_url"],
                         prepared_sha256=self._manifest["prepared_files"][model]["sha256"],
                     )
+                    if "cycle_selection" in self._manifest:
+                        source["acquisition"] = {
+                            key: evidence[key]
+                            for key in (
+                                "raw_bytes",
+                                "index_sha256",
+                                "index_bytes",
+                                "source_index_url",
+                                "byte_start",
+                                "byte_end",
+                                "endpoint",
+                                "grib_retrieved_at",
+                                "index_retrieved_at",
+                                "grib_available_at",
+                                "index_available_at",
+                                "grib_last_modified",
+                                "index_last_modified",
+                                "etag",
+                            )
+                        }
                 try:
                     aligned = align_station_to_model(
                         dataset,
@@ -390,7 +416,7 @@ class PreparedPointForecast:
                     "missing_reasons": reasons,
                 }
             )
-        result = {
+        result: dict[str, Any] = {
             "data_kind": self.data_kind,
             "notice": self.notice,
             "latitude": latitude,
@@ -400,4 +426,27 @@ class PreparedPointForecast:
         }
         if self._manifest_sha256 is not None:
             result["manifest_sha256"] = self._manifest_sha256
+        if self._manifest is not None and "cycle_selection" in self._manifest:
+            selection = self._manifest["cycle_selection"]
+            # Full acquisition/discovery evidence stays in the checksummed manifest.
+            # Carry the selection decision with the immutable issued payload as well.
+            result["cycle_selection"] = {
+                key: selection[key]
+                for key in (
+                    "execution_time",
+                    "target_reference_time",
+                    "first_valid_time",
+                    "last_valid_time",
+                    "selected_cycles",
+                    "status",
+                    "completed_at",
+                )
+            }
+            result["cycle_selection"]["candidates"] = {
+                model: [
+                    {key: row[key] for key in ("cycle", "status", "reason", "source_lead_hours")}
+                    for row in rows
+                ]
+                for model, rows in selection["candidates"].items()
+            }
         return result

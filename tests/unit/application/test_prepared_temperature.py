@@ -664,7 +664,7 @@ def test_cli_rebuild_rejects_reinterpreting_retained_times(
     network.assert_not_called()
 
 
-def test_cli_acquisition_requires_all_explicit_times_before_network(
+def test_cli_acquisition_requires_coordinates_before_network(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     network = Mock(side_effect=AssertionError("Invalid CLI options created HTTP transport"))

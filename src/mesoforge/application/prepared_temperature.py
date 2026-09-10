@@ -1,8 +1,8 @@
 """Prepare a fixed, bounded HRRR/GFS temperature slice before serving HTTP requests.
 
 The acquired inventory and complete temperature messages are retained alongside the
-small native-grid NetCDF views. This is a manual demonstration, not a cycle selector
-or an operational availability/cutoff policy.
+small native-grid NetCDF views. Automatic selection validates complete guidance;
+explicit cycles and offline rebuilding remain available for reproducibility.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 import pyproj
@@ -277,11 +278,13 @@ def _code_identity() -> dict[str, Any]:
     package = Path(__file__).resolve().parents[1]
     paths = (
         "application/prepared_temperature.py",
+        "application/cycle_selection.py",
         "application/point_forecast.py",
         "application/spatial_coverage.py",
         "application/spatial_preparation.py",
         "api.py",
         "guidance/acquisition_v2.py",
+        "guidance/cycle_selection.py",
         "guidance/http_fetch.py",
         "guidance/normalization.py",
         "guidance/sources/hrrr_phase2_decoding.py",
@@ -360,6 +363,8 @@ def prepare_temperature_guidance(
     target_horizon_hours: tuple[int, ...] = _HORIZONS,
     area: BoundingBox | None = None,
     fallback_areas: tuple[BoundingBox, ...] = (),
+    acquired_inputs: dict[str, list[Phase2LeadAcquisition]] | None = None,
+    cycle_selection: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Acquire both models for hours 1..36; retain raw evidence and prepare two files.
 
@@ -368,6 +373,25 @@ def prepare_temperature_guidance(
     """
     hrrr_leads = _leads(target_reference_time, hrrr_cycle, target_horizon_hours)
     gfs_leads = _leads(target_reference_time, gfs_cycle, target_horizon_hours)
+    if acquired_inputs is not None:
+        for model, cycle, leads in (
+            ("HRRR", hrrr_cycle, hrrr_leads),
+            ("GFS", gfs_cycle, gfs_leads),
+        ):
+            rows = acquired_inputs.get(model, [])
+            if (
+                len(rows) != len(leads)
+                or {row.forecast_hour for row in rows} != set(leads)
+                or any(
+                    row.model.upper() != model
+                    or row.cycle_date != cycle.date()
+                    or row.cycle_hour != cycle.hour
+                    for row in rows
+                )
+            ):
+                raise ValueError(
+                    f"{model}: selected acquisitions disagree with required cycles/leads"
+                )
     directory.mkdir(parents=True, exist_ok=True)
     if any(directory.iterdir()):
         raise ValueError(
@@ -389,7 +413,9 @@ def prepare_temperature_guidance(
                 "cycle_deadline": clock.now(),
                 "canonical_variables": (_VARIABLE,),
             }
-            if model == "HRRR":
+            if acquired_inputs is not None:
+                acquired = next(row for row in acquired_inputs[model] if row.forecast_hour == lead)
+            elif model == "HRRR":
                 acquired = acquire_hrrr_phase2_lead(configuration.hrrr, **kwargs)  # type: ignore[arg-type]
             else:
                 acquired = acquire_gfs_lead(configuration.gfs, **kwargs)  # type: ignore[arg-type]
@@ -435,6 +461,7 @@ def prepare_temperature_guidance(
             "Provider Last-Modified where available, else retrieval time; "
             "no operational cutoff applied."
         ),
+        **({"cycle_selection": cycle_selection} if cycle_selection is not None else {}),
     }
     _write_bytes(directory / "manifest.json", json.dumps(manifest, indent=2).encode())
     return manifest
@@ -603,6 +630,112 @@ class BoundedHttpTransport(RequestsHrrrHttpTransport):
         self._session.close()
 
 
+def prepare_locations(
+    locations: list[Any],
+    output_dir: Path,
+    *,
+    target_reference_time: datetime | None = None,
+    hrrr_cycle: datetime | None = None,
+    gfs_cycle: datetime | None = None,
+) -> dict[str, Any]:
+    """Prepare once for the entire collection, automatically unless all times are explicit."""
+    from mesoforge.application.batch_forecast import _coordinates
+    from mesoforge.application.cycle_selection import select_current_guidance
+    from mesoforge.application.spatial_coverage import plan_regions, validate_coordinate
+    from mesoforge.application.spatial_preparation import ensure_coverage
+
+    times = (target_reference_time, hrrr_cycle, gfs_cycle)
+    automatic = all(value is None for value in times)
+    if not automatic and any(value is None for value in times):
+        raise ValueError("Explicit override requires target reference time and both source cycles")
+    coordinates = []
+    for location in locations:
+        try:
+            lat, lon = _coordinates(location)
+            validate_coordinate(lat, lon)
+        except ValueError:
+            continue  # Batch reports malformed coordinates separately and continues.
+        coordinates.append((lat, lon))
+    areas = plan_regions(coordinates)
+    if not areas:
+        raise ValueError("At least one valid coordinate is required for spatial preparation")
+    configuration, _ = load_configuration_source(
+        base_path=Path("configs/base.yaml"),
+        additional_overlay_paths=(
+            Path("configs/phase1-grasston.yaml"),
+            Path("configs/phase2-grasston.yaml"),
+        ),
+    )
+    if configuration.phase2 is None:
+        raise ValueError("Phase 2 source settings are required")
+    clock = SystemClock()
+    if automatic:
+        # Never reinterpret or overwrite a previously prepared/issued snapshot.
+        output_dir = output_dir / (clock.now().strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:8])
+    output_dir = output_dir.resolve()
+    source = output_dir / "source"
+    retained_manifest = source / "manifest.json"
+    if retained_manifest.is_file():
+        assert (
+            target_reference_time is not None and hrrr_cycle is not None and gfs_cycle is not None
+        )
+        retained = json.loads(retained_manifest.read_text(encoding="utf-8"))
+        if retained["target_reference_time"] != _iso(target_reference_time) or any(
+            row["cycle"] != _iso(hrrr_cycle if row["model"] == "HRRR" else gfs_cycle)
+            for row in retained["inputs"]
+        ):
+            raise ValueError("Output already contains different source cycles or target time")
+        _, report = ensure_coverage(locations, source, cache_directory=output_dir)
+        return {**report, "directory": str(output_dir)}
+    transport = BoundedHttpTransport()
+    selection = None
+    acquired = None
+    try:
+        if automatic:
+            acquired, selection = select_current_guidance(
+                output_dir / "discovery",
+                configuration=configuration.phase2,
+                transport=transport,
+                clock=clock,
+                sleeper=SystemSleeper(),
+                areas=tuple(areas),
+            )
+            target_reference_time = datetime.fromisoformat(selection["target_reference_time"])
+            hrrr_cycle = datetime.fromisoformat(selection["selected_cycles"]["HRRR"])
+            gfs_cycle = datetime.fromisoformat(selection["selected_cycles"]["GFS"])
+        assert (
+            target_reference_time is not None and hrrr_cycle is not None and gfs_cycle is not None
+        )
+        manifest = prepare_temperature_guidance(
+            source,
+            area=areas[0],
+            fallback_areas=tuple(areas[1:]),
+            configuration=configuration.phase2,
+            target_reference_time=target_reference_time,
+            hrrr_cycle=hrrr_cycle,
+            gfs_cycle=gfs_cycle,
+            transport=transport,
+            clock=clock,
+            sleeper=SystemSleeper(),
+            acquired_inputs=acquired,
+            cycle_selection=selection,
+        )
+    finally:
+        transport.close()
+    _, report = ensure_coverage(locations, source, cache_directory=output_dir)
+    if automatic and clock.now() >= target_reference_time + timedelta(hours=1):
+        raise ValueError(
+            "Preparation crossed the first valid time; retained inputs are kept. "
+            "Rerun automatic selection before issuance."
+        )
+    return {
+        **report,
+        "directory": str(output_dir),
+        "downloaded_bytes": manifest["downloaded_bytes"],
+        **({"cycle_selection": selection} if selection is not None else {}),
+    }
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Prepare 36 hours of real HRRR/GFS temperature")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -638,8 +771,10 @@ def main(argv: list[str] | None = None) -> None:
     if args.from_raw is not None:
         if any(value is not None for value in times):
             parser.error("--from-raw uses retained times; do not also supply cycles or target time")
-    elif any(value is None for value in times):
-        parser.error("Acquisition requires --target-reference-time, --hrrr-cycle and --gfs-cycle")
+    elif any(value is not None for value in times) and any(value is None for value in times):
+        parser.error(
+            "Explicit override requires --target-reference-time, --hrrr-cycle and --gfs-cycle"
+        )
     configuration, _ = load_configuration_source(
         base_path=Path("configs/base.yaml"),
         additional_overlay_paths=(
@@ -668,51 +803,23 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.from_raw is None and not areas:
         parser.error("Acquisition requires --config locations.json or --lat and --lon")
-    if args.from_raw is not None:
-        manifest = rebuild_temperature_guidance(
-            args.from_raw,
-            args.output_dir,
-            configuration=configuration.phase2,
-            clock=SystemClock(),
-        )
-    else:
+    if args.from_raw is None:
         assert locations is not None
-        retained_manifest = args.output_dir / "source" / "manifest.json"
-        if retained_manifest.is_file():
-            retained = json.loads(retained_manifest.read_text())
-            if retained["target_reference_time"] != _iso(args.target_reference_time) or any(
-                row["cycle"] != _iso(args.hrrr_cycle if row["model"] == "HRRR" else args.gfs_cycle)
-                for row in retained["inputs"]
-            ):
-                raise ValueError("Output already contains different source cycles or target time")
-            _, report = ensure_coverage(
-                locations, args.output_dir / "source", cache_directory=args.output_dir
-            )
-            print(json.dumps(report, indent=2))
-            return
-        transport = BoundedHttpTransport()
-        try:
-            manifest = prepare_temperature_guidance(
-                args.output_dir / "source",
-                area=areas[0],
-                fallback_areas=tuple(areas[1:]),
-                configuration=configuration.phase2,
-                target_reference_time=args.target_reference_time,
-                hrrr_cycle=args.hrrr_cycle,
-                gfs_cycle=args.gfs_cycle,
-                transport=transport,
-                clock=SystemClock(),
-                sleeper=SystemSleeper(),
-            )
-        finally:
-            transport.close()
-    if locations is not None:
-        _, report = ensure_coverage(
-            locations, args.output_dir / "source", cache_directory=args.output_dir
+        report = prepare_locations(
+            locations,
+            args.output_dir,
+            target_reference_time=args.target_reference_time,
+            hrrr_cycle=args.hrrr_cycle,
+            gfs_cycle=args.gfs_cycle,
         )
-        report["downloaded_bytes"] = manifest["downloaded_bytes"]
         print(json.dumps(report, indent=2))
         return
+    manifest = rebuild_temperature_guidance(
+        args.from_raw,
+        args.output_dir,
+        configuration=configuration.phase2,
+        clock=SystemClock(),
+    )
     print(
         json.dumps(
             {"directory": str(args.output_dir), "downloaded_bytes": manifest["downloaded_bytes"]}
