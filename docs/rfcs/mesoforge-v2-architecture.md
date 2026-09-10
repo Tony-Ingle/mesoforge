@@ -60,8 +60,9 @@ delivery sequence is a non-binding estimate, not a required PR count.
 
 ### 2.1 First Usable Release
 
-1. Operators configure a supported region, model/product mix, fields, cadence, horizons,
-   deterministic baseline weights, and safety bounds.
+1. Operators configure service coverage, model/product mix, fields, cadence, horizons,
+   deterministic baseline weights, and safety bounds. Each user-facing location needs
+   only latitude/longitude; geographic metadata is derived internally (section 2.3).
 2. Production automation acquires each eligible cycle once, normalizes it, and publishes a
    shared cache only after required assets are complete and verified.
 3. The private API computes deterministic point forecasts from ready shared guidance.
@@ -106,6 +107,41 @@ fields, levels, leads, or models, nor settle indefinite-retention guarantees.
 Roadmap components may consume first-release facts but cannot reshape or delay first-release
 contracts. No first-release acceptance depends on simulated learning, AI, email, public
 accounts, long-term retention approval, or public SLOs.
+
+### 2.3 Coordinate-driven operating direction
+
+**Owner direction update, 2026-09-10:** the intended user-facing geographic input is
+only latitude/longitude. This operating direction is approved; its implementation
+details and the rest of this RFC remain proposed unless separately approved. The
+current implementation is still the localhost HRRR/GFS temperature demonstration
+for hours 1–36. It has no configured-location lifecycle or VPS deployment.
+
+A configurable collection should look conceptually like:
+
+```json
+{
+  "locations": [
+    {"lat": 45.8, "lon": -93.1},
+    {"lat": 44.98, "lon": -93.27}
+  ]
+}
+```
+
+This is not a currently accepted configuration format or a coverage expansion;
+the second example is outside today's demonstration area. New supported coordinates
+should need configuration changes, not code changes. MesoForge derives location
+identity, nearby observation candidates, bounding boxes, surrounding counties,
+native-grid coordinates, and any spatial zone or surrounding context internally
+when needed. Users do not maintain those derived geographic inputs. Service coverage,
+available guidance, and scientific suitability still bound what can be supported.
+
+The API and persistent forecast data belong on a VPS. A GitHub Actions workflow
+can read the configurable coordinate collection and invoke processing sequentially
+or in bounded batches. Acquisition/preparation stays outside forecast HTTP requests
+and produces shared guidance reusable across nearby coordinates, not per-location
+downloads. Section 6.6 describes the intended location lifecycle, including later
+AI and delivery stages. This direction does not implement or approve a combined
+Actions, registration, verification, AI, and delivery milestone.
 
 ## 3. Terminology
 
@@ -156,6 +192,8 @@ and delivery preferences are separate product metadata or later concerns and nev
   a full SHA-256 key.
 - **Coordinate/station separation:** a station never replaces the forecast coordinate.
   Distance, elevation, support decision, effective time, and station identity remain clear.
+  Observation sources/proxies are selected automatically using suitability rules;
+  users are not required to configure stations or context zones.
 - **Immutable issuance:** published assets, lineage headers, snapshots, forecast facts,
   observation revisions, and verification facts are append-only. Mutable state is limited
   to leases and versioned pointers.
@@ -216,7 +254,8 @@ architecture review.
 | Science worker | Scheduled guidance acquisition, bounded normalization, cache publication, registered issuance, repair/replay | Request-coupled acquisition or concurrent unbounded heavy work |
 | I/O worker | Observation acquisition, revision ingestion, matching, verification | Training or unbounded analytical scans |
 
-These may share an approximately 8 GB host. Worker concurrency and unit size are enforced
+The intended deployment places the API and persistent forecast data on a VPS. These
+roles may share an approximately 8 GB host. Worker concurrency and unit size are enforced
 safety bounds; one memory-heavy science unit runs at a time and I/O concurrency is bounded.
 A representative measurement must show a real margin using peak RSS and system
 `MemAvailable`. Per-process allocations are provisional until measured. If the margin
@@ -224,9 +263,12 @@ cannot be held under co-load, reduce units or move science work; do not consume 
 
 ### 5.3 Queue and governance
 
-Use a PostgreSQL jobs table with lease expiry, `FOR UPDATE SKIP LOCKED`, idempotent keys,
-and atomic publication. Do not add a second broker/workflow system without measured need
-and owner architecture review.
+The proposed internal queue is a PostgreSQL jobs table with lease expiry,
+`FOR UPDATE SKIP LOCKED`, idempotent keys, and atomic publication. The optional
+GitHub Actions workflow in section 2.3 is an external caller for configured location
+processing; persistent forecast data stays on the VPS. This does not settle the
+queue or scheduling implementation. Do not add a second broker/workflow system
+without measured need and owner architecture review.
 
 Human governance and production automation are separate:
 
@@ -289,6 +331,11 @@ emits an immutable verification fact: scoreable, missing, unsupported, quality r
 interval mismatch, cutoff excluded, or another stable reason. Late revisions create new
 identities and, if policy permits, superseding facts; earlier as-of results remain replayable.
 
+Support selection is automatic from the forecast coordinate and records the selected
+observation station/source as a proxy, with the suitability decision. Users do not
+supply a station list. No suitable observation means explicit unavailable verification,
+not a fabricated score or a reason to block generation of the next forecast.
+
 ### 6.5 Evaluation
 
 The API validates filters, groups, metrics, range, as-of cutoff, rows/work, and output before
@@ -300,6 +347,36 @@ Ordinary responses contain canonical query identity, aggregate lineage summary/w
 algorithm/version, eligible/scored/missing counts, and requested aggregates, with an
 optional audit handle. Per-source digests/fact references appear only in explicitly
 requested, separately bounded audit detail.
+
+### 6.6 Intended configured-location lifecycle
+
+This future lifecycle composes the responsibilities above; it is not implemented
+today. An explicitly configured collection may be processed by a GitHub Actions
+caller one coordinate at a time or in bounded batches. For each location:
+
+1. Validate and identify the location from latitude/longitude, deriving geographic
+   metadata and any needed spatial context internally.
+2. Verify eligible previous forecasts against suitable available observations,
+   using the version originally issued and the applicable time, quality, spatial
+   support, and cutoff rules. Record unavailable verification explicitly and
+   proceed with the new forecast when no suitable observation is available.
+3. Generate the new numerical forecast using ready shared guidance and the same
+   extraction/blending functions used for one-off forecasts. No provider acquisition
+   is triggered inside the forecast HTTP request.
+4. In a later milestone, allow an AI adjustment/discussion stage using the numerical
+   forecast, surrounding weather context, and prior verification. Keep the numerical
+   baseline intact; any accepted adjustment must satisfy approved deterministic
+   bounds and remain separately traceable. Missing verification is not invented history.
+5. Save the immutable issued forecast and its provenance under the issuance rules.
+6. Deliver the saved forecast once delivery is implemented, then continue to the
+   next coordinate.
+
+A location failure is recorded for that location and does not prevent the remaining
+coordinates from being processed. Missing required model guidance keeps its explicit
+forecast missingness; unavailable verification does not block a new forecast. One-off
+API requests remain outside registration/tracking and this recurring lifecycle unless
+the operator explicitly configures the location. AI and delivery are later roadmap
+stages, not prerequisites for numerical issuance or first-release acceptance.
 
 ## 7. Representative benchmark and admission
 
@@ -529,7 +606,9 @@ all-in-one proof-harness requirement.
 ## 17. Open owner decisions
 
 1. Supported region, model mix, fields, cadence, and desired horizon combinations.
-2. Baseline weights, fallback behavior, station support, providers, quality, and cutoffs.
+2. Baseline weights, fallback behavior, automatic observation-support suitability
+   rules, providers, quality, and cutoffs. Manual per-location station/zone configuration
+   is not an open alternative to the coordinate-only geographic input direction.
 3. Acceptable shared-host reserve and benchmark co-load.
 4. Packaging and measured input/work/output/concurrency/cancellation/timeout limits.
 5. Retention costs/durations and advertised capability levels.

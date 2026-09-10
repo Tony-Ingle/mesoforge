@@ -27,6 +27,55 @@ and fixed real prepared guidance, now extended to hours 1–36. That slice now w
 its observed results and validation gaps are recorded in README.
 That approval does not authorize the entire release or the model roadmap below.
 
+## Intended coordinate-driven operation
+
+The owner-approved operating direction below is **future functionality**, not a
+description of the current localhost demonstration or approval to implement every
+stage together. The user-facing geographic input should ultimately be only
+latitude/longitude. A configurable collection should look conceptually like:
+
+```json
+{
+  "locations": [
+    {"lat": 45.8, "lon": -93.1},
+    {"lat": 44.98, "lon": -93.27}
+  ]
+}
+```
+
+This is a future configuration example, not a configuration file accepted today;
+the second coordinate is outside the current demonstration's supported area.
+Adding supported coordinates should require configuration changes, not code changes.
+Users should not maintain observation stations, bounding boxes, surrounding counties,
+model grid coordinates, or spatial zones. MesoForge should identify the location
+and derive any needed geographic metadata and surrounding weather context internally.
+The service's supported coverage and scientific suitability rules remain explicit.
+
+The API and persistent forecast data should run on a VPS. Model acquisition and
+preparation remain separate from forecast HTTP requests; prepared guidance is shared
+across nearby coordinates rather than downloaded again for each location. A GitHub
+Actions workflow can read the coordinate collection and process it one location at
+a time or in bounded batches, using the VPS application and its persistent data.
+
+For each explicitly configured location, the intended sequence is:
+
+1. Identify the location from its coordinates.
+2. Verify eligible previously issued forecasts when suitable observations are available.
+3. Generate the new deterministic numerical forecast from prepared guidance.
+4. Later, allow a bounded AI adjustment/discussion stage using that numerical forecast,
+   internally derived surrounding weather context, and prior verification.
+5. Save the issued forecast and provenance, keeping any accepted adjustment separate
+   from its numerical baseline.
+6. Deliver the issued forecast, then continue to the next coordinate.
+
+Failure for one location must not prevent processing the remaining locations.
+Observation sources/proxies should be selected automatically under suitability rules
+and recorded with the verification. When none is suitable, verification remains
+explicitly unavailable and the next forecast can still proceed. A normal one-off API
+request must not silently register or track its coordinate. AI and delivery remain
+later stages; GitHub Actions, registration, and this lifecycle are not implemented
+by documenting this direction.
+
 ## Long-term model direction
 
 The owner-approved direction is an enterprise-style multi-model blend: HRRR, RAP,
@@ -58,27 +107,25 @@ full, together with their indexes and source metadata, outside Git.
 
 Acquire and cache required guidance in the background, and reuse it across locations.
 Retries and provider revisions must not create duplicate logical results.
-The diagram describes the proposed release, not services already running:
+The diagram describes the intended operating model, not services already running:
 
 ```mermaid
 flowchart TD
     Models[Weather model providers] --> Prepare[Background acquisition and normalization]
     Prepare --> Guidance[Ready shared guidance]
-    Request[Private forecast, history or performance request] --> API[Thin API]
-    Guidance --> Baseline[Shared point extraction and baseline calculation]
-    API -->|One-off forecast| Baseline
-    Issuance[Configured background issuance] --> Baseline
+    Locations[Configured latitude/longitude collection] --> Runner[Optional GitHub Actions runner]
+    Runner --> Workflow[Per-location workflow]
+    Request[One-off latitude/longitude request] --> API[Thin API]
+    subgraph VPS[Future VPS application and persistent data]
+        API --> Baseline[Shared point extraction and baseline calculation]
+        Guidance --> Baseline
+        Workflow -->|Generate| Baseline
+        Workflow <-->|Verify previous and save new issuance| History[Forecast versions, provenance and verification]
+        Baseline -->|Configured issuance| Workflow
+    end
     Baseline -->|One-off result| Response[Values, units, times, sources and missingness]
-    Baseline -->|Registered issuance only| History[Saved issued forecast versions]
-    History -->|Forecast history| API
-    Observations[Eligible observations] --> Verify[Matching and verification]
-    History --> Verify
-    Verify --> Facts[Saved verification facts]
-    Facts -->|Verification history| API
-    API -->|Performance request| Performance[Calculate requested summary]
-    History --> Performance
-    Facts --> Performance
-    Performance -->|Summary response| API
+    Observations[Automatically selected suitable observations] --> Workflow
+    Workflow --> Delivery[Later delivery]
 ```
 
 Boxes represent responsibilities within one application codebase, not mandatory

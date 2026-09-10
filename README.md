@@ -37,6 +37,11 @@ its required configuration overlay, and historical readers remain.
 The 36-hour temperature extension is complete. The next
 milestone has not been selected; scheduling and additional models remain future work.
 
+Future direction: configure locations using latitude/longitude only, with geographic
+context and suitable observation sources derived internally. The intended VPS workflow
+can process a coordinate collection through GitHub Actions while sharing prepared
+guidance; it is not implemented. See [VISION.md](VISION.md#intended-coordinate-driven-operation).
+
 There is no operational forecast API, shared-cache job system, or registered-coordinate
 history service. RRFS, precipitation type, learned weights, AI adjustments, and
 publication remain disabled or absent. Existing `_v2` names describe Phase 2 contracts.
