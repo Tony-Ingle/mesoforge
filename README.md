@@ -100,9 +100,17 @@ processes coordinates sequentially, and continues after location errors. The rea
 demonstration verified both supported locations around an unsupported entry and reused
 all 12 results on repeat. **43 focused offline and 2 PostgreSQL/MinIO integration tests
 passed** for that increment. The new spatial preparation milestone is documented
-[below](#automatic-spatial-coverage). Proposed next milestone: discover suitable observation stations nationwide from
-coordinates, feeding the existing 50 km / ±15-minute verification path. The retained
-three-station catalog still limits observation matching outside Minnesota.
+[below](#automatic-spatial-coverage). On-demand station discovery now queries and saves
+nearby METAR metadata from each
+coordinate, feeding the existing 50 km / ±15-minute verification path. See
+[station discovery](#discover-and-reuse-nearby-metar-stations). Its four-coordinate real
+demonstration saved 25 candidates and reused them with zero discovery calls on repeat.
+Nine eligible real-observation verification results were saved and safely reused;
+all 10 issued versions stayed unchanged. **109 focused offline and 16 PostgreSQL/MinIO
+integration tests passed**. Broader acceptance/coverage was not rerun.
+Proposed next milestone:
+combine previous-hour verification, automatic guidance preparation, and immutable
+forecast issuance in one explicit locations run, continuing past location failures.
 
 Future direction: configure locations using latitude/longitude only, with geographic
 context and suitable observation sources derived internally. The intended VPS workflow
@@ -715,15 +723,98 @@ and observation preview) passed, along with applicable quality checks. The integ
 window includes an unavailable hour between eligible hours. Broader suites were not
 rerun; operational validation gaps remain. The later real-observation demonstration follows.
 
+### Discover and reuse nearby METAR stations
+
+The geographic configuration still contains only latitude/longitude. With the existing
+PostgreSQL/MinIO environment, discover candidates independently of forecast eligibility:
+
+```text
+python -B -m mesoforge.application.station_discovery --config locations.json
+python -B -m mesoforge.application.station_discovery --lat 36.7378 --lon -119.7871
+```
+
+The [official Aviation Weather Center station-information API](https://aviationweather.gov/data/api/)
+supports bounded queries. MesoForge derives a small bounding box internally, queries
+`/api/data/stationinfo`, keeps METAR-capable candidates at a WGS84 distance of at most
+50 km, and orders them deterministically. It does not download a nationwide catalog.
+Dateline footprints use two bounded queries. Failed, oversized, malformed or possibly
+truncated provider responses are errors rather than cached empty results.
+
+Successful discovery, including a genuinely empty list, is saved with the existing
+artifact service. PostgreSQL retains manifests, coordinate/policy lookup metadata and
+lineage; MinIO retains exact raw responses and the immutable candidate snapshot.
+The snapshot includes station ID/network, coordinates, elevation when available,
+distance, metadata source, acquisition time, query bounds and raw checksums.
+A repeated coordinate loads the saved snapshot without a station-discovery request.
+A coordinate lock prevents concurrent first runs from rediscovering it independently.
+Discovery has a versioned policy and an internal explicit-refresh option, preserving
+older snapshots; there is no scheduled refresh or automatic expiry yet.
+
+The existing automatic verification command invokes this lookup only when saved hours
+are ready, then reuses the same METAR acquisition, normalization, QC, station ranking,
+and verification persistence. With no ready hours it downloads neither station metadata
+nor observations. The standalone discovery command can still prepare station candidates
+in advance. A new station snapshot cannot silently reuse observations normalized against
+an older snapshot. Normal forecast GET requests do not trigger discovery or verification.
+
+A discovered station is a candidate, not a promise of a usable observation. The unchanged
+QC requires metadata comparisons, including elevation: a missing elevation is saved as
+null and reported as unavailable for that QC, never filled with zero or an invented value.
+Station metadata acquired today can reject older reports if their metadata differs beyond
+the existing tolerance. Nearest eligible station, ±15-minute matching, QC, and deterministic
+ties are unchanged. The retained Phase 2 station catalog and historical readers remain;
+the new coordinate workflow no longer selects candidates from Minnesota's fixed list.
+
+Use the existing verification command; station IDs and padded observation windows are
+still derived internally:
+
+```text
+python -B -m mesoforge.application.automatic_verification --config locations.json --start-valid-time 2026-09-10T20:00:00Z --end-valid-time 2026-09-10T23:00:00Z
+```
+
+These command forms use the isolated interpreter documented above; the `uv run --locked`
+wrapper remains unverified here. Both discovery CLI forms and the automatic-verification
+command were executed on September 10; the discovery CLI reused the saved snapshots.
+
+The four-coordinate demonstration supplied only these coordinates. Candidate distances
+below are rounded to 0.1 km; saved metadata retains full precision.
+
+| Coordinate | Discovered METAR candidates and distance (km) |
+| --- | --- |
+| Fresno: 36.7378, -119.7871 | KFCH 3.0; KFAT 7.6; KO32 30.9; KMAE 39.8; KHJO 49.5 |
+| Wichita: 37.6872, -97.3301 | KIAB 9.1; KICT 9.9; KBEC 10.2; KAAO 12.0; K1K1 21.3; K3AU 22.2; KEGT 40.5; KEWK 41.9; KEQA 46.5 |
+| Raleigh: 35.7796, -78.6382 | KRDU 18.0; KJNX 34.9; KTQV 36.9; KLHZ 38.5; KHRJ 45.3; KTTA 47.8 |
+| Minnesota: 45.8, -93.1 | KROS 16.2; KJMR 16.4; K04W 29.4; KCBG 29.9; KPNM 48.0 |
+
+Four bounded metadata requests downloaded **7,180 bytes** and saved four immutable
+snapshots containing all metadata listed above. Repeat discovery made zero provider
+calls and created no PostgreSQL rows or MinIO objects. The real verification run used
+**30,486 bytes** of METAR observations and saved **9** results: one at each CONUS
+coordinate and six across two Minnesota issued versions. Six earlier CONUS hours were
+not issued before their valid times; explicit reasons were returned without scores.
+Repeat verification reused the observations and all nine results without network calls
+or storage changes. All **10** existing issued forecasts stayed unchanged.
+
+Focused checks passed: **109 offline tests** covering discovery, retention, preparation,
+automatic verification and existing AWC parsing/acquisition; **16 PostgreSQL/MinIO
+integration tests** in the existing verification and observation-preview modules.
+The final provenance assertion also passed on rerun. Ruff, mypy, all nine import
+contracts, documentation/hygiene and whitespace checks passed. Evidence and raw data
+remain outside Git under `%LOCALAPPDATA%\MesoForge\baselines\20260910-station-discovery`
+and existing artifact storage. Temporary PostgreSQL and MinIO were stopped.
+Full acceptance/coverage, scheduled refresh and provider
+reliability remain unverified; current metadata does not prove historical station validity.
+
 ### Prepare one real METAR dataset
 
 [Observation preparation](src/mesoforge/application/prepared_observations.py) reuses the
 retained AviationWeather.gov acquisition, strict parser, Phase 2 normalizer, and
-PostgreSQL/MinIO artifact path. It automatically selects **retained** METAR stations
-within 50 km; this does not discover a nationwide station catalog. Coordinates,
-elevations, and station identity come from a pinned copy of the existing configuration,
-not a newly acquired historical station catalog. Matching, QC, and verification math
-are unchanged. An opaque provider `qcField` is preserved alongside existing field QC;
+PostgreSQL/MinIO artifact path. It now uses coordinate-driven discovery and saves
+nearby METAR candidates within 50 km; station IDs come from the official metadata
+response, not the locations file. Older retained bundles still read their original
+configuration-pinned station snapshot. New discovery captures metadata at acquisition
+time; it does not assert historical station metadata validity. Matching, QC, and
+verification math are unchanged. An opaque provider `qcField` is preserved alongside existing field QC;
 its numeric value is not interpreted as a newly invented pass/fail rule.
 
 With the same configured PostgreSQL/MinIO environment as verification, the acquisition
@@ -901,7 +992,9 @@ The batch summary counts `completed`, `nothing_to_verify`, and `errors` location
 Exit 0 means no location errors, 1 means processing finished with location/hour errors,
 and 2 means unusable config or global arguments. The former middle-coordinate
 rectangle rejection is retired. With no saved eligible hours it now returns
-`nothing_to_verify`; observation suitability still depends on retained stations.
+`nothing_to_verify`; eligible hours use saved or newly discovered station candidates.
+If no candidates can pass the existing metadata QC, the result is explicitly
+`unavailable` with zero METAR observation downloads; the batch counts those separately.
 
 Historical result before automatic spatial coverage removed the fixed rectangle:
 
@@ -937,8 +1030,8 @@ footprint**, conservatively enclosed in geographic rectangles. It prepares the l
 footprint plus native interpolation cells, merges overlapping footprints, and handles
 distant groups separately. These defaults live in
 [spatial coverage](src/mesoforge/application/spatial_coverage.py), not in locations JSON.
-The observation search stays **50 km**, using retained stations and existing suitability
-rules. This change adds no station discovery, fields, or weather-dependent sizing.
+The observation search stays **50 km**, using discovered/saved stations and existing suitability
+rules. That spatial milestone added no station discovery, fields, or weather-dependent sizing.
 At a physical model edge, context is clipped to the available domain and the exact
 forecast point is checked separately. The 150 km footprint currently retains temperature
 only; it is not a new weather-context analysis product.

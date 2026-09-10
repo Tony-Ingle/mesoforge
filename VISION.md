@@ -51,6 +51,11 @@ forecast point. The retained observation-station search remains 50 km. Native mo
 boundaries bound the available context. Users supply no region, grid, or station
 metadata. Overlapping footprints share preparation before HTTP requests; raw guidance
 is retained for offline expansion and reuse. Current context data is temperature only.
+On-demand observation metadata discovery now queries nearby METAR stations from the
+coordinate and reuses immutable saved candidates through the existing PostgreSQL/MinIO
+path. Users supply no station IDs. Discovery and observation requests remain bounded;
+there is no nationwide catalog mirror or scheduled metadata refresh. Metadata acquisition
+time is recorded, and a candidate still must satisfy the existing time and QC rules.
 Weather-dependent sizing remains future work. The combined operating lifecycle below
 also remains future work.
 Adding supported coordinates should require configuration changes, not code changes.

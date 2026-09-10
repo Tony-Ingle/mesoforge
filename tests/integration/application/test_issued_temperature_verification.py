@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
@@ -24,9 +25,15 @@ from mesoforge.application.issued_temperature_verification import (
 )
 from mesoforge.application.observation_preview import preview_observation_match
 from mesoforge.application.point_forecast import PreparedPointForecast
-from mesoforge.application.prepared_observations import acquire_bundle, prepare_bundle
+from mesoforge.application.prepared_observations import (
+    acquire_bundle,
+    load_observation_configuration,
+    prepare_bundle,
+)
+from mesoforge.application.station_discovery import StationDiscoveryService
 from mesoforge.common.errors import IntegrityError, NotFound
 from mesoforge.common.identifiers import ArtifactId, Digest
+from mesoforge.observations.sources.stationinfo import discover_metar_stations
 from mesoforge.storage.json import CanonicalJsonSerializer
 from mesoforge.storage.postgres.idempotency_lock import PostgresIdempotencyLock
 from mesoforge.storage.postgres.repositories import PostgresUnitOfWork
@@ -43,7 +50,7 @@ from tests.support.phase1_fixture_transports import (
     RecordingSleeper,
 )
 from tests.unit.application.test_batch_forecast import FIRST, LAST, OUTSIDE, write_config
-from tests.unit.application.test_prepared_observations import _record
+from tests.unit.application.test_prepared_observations import _record, fixture_station_records
 
 pytestmark = pytest.mark.integration
 
@@ -85,6 +92,61 @@ def make_verifier(
         environment_digest=Digest.of_bytes(b"issued-temperature-verification-test-fixture"),
         clock=lambda: datetime.now(UTC),
     )
+
+
+def persisted_discovery(
+    dsn: str,
+    objects: S3ArtifactObjectStore,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    rename_station: bool = False,
+) -> tuple[StationDiscoveryService, Mock]:
+    """Generated stationinfo bytes traverse the real discovery and persistence path."""
+    from mesoforge.application import automatic_verification, prepared_observations
+
+    configuration = load_observation_configuration()
+    assert configuration.phase2 is not None
+    settings = configuration.phase2.aviationweather
+    station_records = fixture_station_records()
+    if rename_station:
+        for record in station_records:
+            if record["icaoId"] == "KROS":
+                record["icaoId"] = "KNEW"
+    payload = JSON.serialize(station_records)
+
+    def fetch(latitude: float, longitude: float) -> Any:
+        transport = FixtureAviationWeatherTransport()
+        transport.stationinfo_queue.append(FakeHttpResponse(200, {"ETag": "fixture"}, payload))
+        clock = FixedClock(datetime(2026, 8, 30, 17, tzinfo=UTC))
+        return discover_metar_stations(
+            settings,
+            latitude=latitude,
+            longitude=longitude,
+            transport=transport,
+            clock=clock,
+            sleeper=RecordingSleeper(clock),
+        )
+
+    provider = Mock(side_effect=fetch)
+    factory = lambda: PostgresUnitOfWork(dsn)  # noqa: E731
+    lock = PostgresIdempotencyLock(dsn)
+    service = StationDiscoveryService(
+        configuration=configuration,
+        artifacts=ArtifactService(
+            unit_of_work_factory=factory, object_store=objects, idempotency_lock=lock
+        ),
+        unit_of_work_factory=factory,
+        idempotency_lock=lock,
+        discover=provider,
+        code_identity=lambda: {**CODE_IDENTITY, "git_commit": "a" * 40},
+    )
+    monkeypatch.setattr(
+        automatic_verification, "get_station_candidates", service.get_station_candidates
+    )
+    monkeypatch.setattr(
+        prepared_observations, "get_station_candidates", service.get_station_candidates
+    )
+    return service, provider
 
 
 def verification_artifacts(inventory: dict[str, Any]) -> list[dict[str, Any]]:
@@ -435,6 +497,8 @@ def test_prepared_metar_bytes_feed_existing_window_and_rebuild_without_http(
     """The new preparation boundary uses invented provider bytes, then existing storage/logic."""
     from mesoforge.application import prepared_observations
 
+    _, metadata_provider = persisted_discovery(migrated_dsn, object_store, monkeypatch)
+
     end = datetime(2026, 8, 30, 16, tzinfo=UTC)
     acquired = datetime(2026, 8, 30, 17, tzinfo=UTC)
     payload = JSON.serialize(
@@ -451,6 +515,10 @@ def test_prepared_metar_bytes_feed_existing_window_and_rebuild_without_http(
     transport.metar_queue.append(FakeHttpResponse(200, {"ETag": "fixture"}, payload))
     clock = FixedClock(acquired)
     directory = tmp_path / "metar"
+    # Retained acquisition and later preparation can come from different code revisions.
+    monkeypatch.setattr(
+        prepared_observations, "_identity", lambda: {**CODE_IDENTITY, "git_commit": "b" * 40}
+    )
     acquire_bundle(
         directory,
         latitude=FIRST["lat"],
@@ -466,6 +534,9 @@ def test_prepared_metar_bytes_feed_existing_window_and_rebuild_without_http(
         pytest.fail("Preparation from retained bytes and verification must not construct HTTP")
 
     monkeypatch.setattr(prepared_observations, "RequestsAviationWeatherHttpTransport", no_http)
+    monkeypatch.setattr(
+        prepared_observations, "_identity", lambda: {**CODE_IDENTITY, "git_commit": "c" * 40}
+    )
     prepared = prepare_bundle(directory)
     monkeypatch.setenv("MESOFORGE_OBSERVATIONS_ARTIFACT_ID", prepared["observations_artifact_id"])
     issuer = make_issuer(migrated_dsn, object_store)
@@ -502,6 +573,13 @@ def test_prepared_metar_bytes_feed_existing_window_and_rebuild_without_http(
         assert selected["temperature"] == {"value": 293.15, "unit": "K"}
         assert selected["provenance"]["raw_artifact_id"] == prepared["raw_artifact_id"]
         assert selected["provenance"]["revision_digest"].startswith("sha256:")
+        with PostgresUnitOfWork(migrated_dsn) as uow:
+            raw_source = uow.artifacts.get(ArtifactId(prepared["raw_artifact_id"]))
+            station_snapshot = uow.artifacts.get(
+                ArtifactId(selected["provenance"]["station_snapshot_artifact_id"])
+            )
+        assert raw_source.code_revision == "b" * 40
+        assert station_snapshot.code_revision == "c" * 40
         assert saved["temperature_error"]["value"] == pytest.approx(
             saved["match"]["forecast"]["temperature"]["value"] - 293.15
         )
@@ -514,6 +592,7 @@ def test_prepared_metar_bytes_feed_existing_window_and_rebuild_without_http(
     assert repeat["summary"] == {**first["summary"], "verified": 0, "already_existing": 4}
     assert complete_storage_inventory(migrated_dsn, object_store) == after
     assert len(transport.get_calls) == 1
+    metadata_provider.assert_called_once_with(FIRST["lat"], FIRST["lon"])
 
 
 def test_automatic_window_acquires_once_reuses_real_snapshot_and_skips_empty_window(
@@ -526,6 +605,10 @@ def test_automatic_window_acquires_once_reuses_real_snapshot_and_skips_empty_win
 ) -> None:
     from mesoforge.application import automatic_verification, prepared_observations
 
+    discovery_service, metadata_provider = persisted_discovery(
+        migrated_dsn, object_store, monkeypatch, rename_station=True
+    )
+
     # Retained synthetic fixtures must never satisfy the automatic real-source lookup.
     synthetic = seed_observation_preview_inputs(migrated_dsn, object_store, VALID_TIME)
     monkeypatch.setenv("MESOFORGE_OBSERVATIONS_ARTIFACT_ID", str(synthetic.artifact_id))
@@ -534,6 +617,8 @@ def test_automatic_window_acquires_once_reuses_real_snapshot_and_skips_empty_win
     payload = JSON.serialize(
         [
             _record(
+                icaoId="KNEW",
+                rawOb=f"SYNTHETIC KNEW 30{hour:02d}10Z 18005KT 10SM CLR 20/10 A3000",
                 obsTime=int(datetime(2026, 8, 30, hour, 10, tzinfo=UTC).timestamp()),
                 reportTime=f"2026-08-30T{hour}:10:00Z",
                 receiptTime=f"2026-08-30T{hour}:12:00Z",
@@ -561,9 +646,15 @@ def test_automatic_window_acquires_once_reuses_real_snapshot_and_skips_empty_win
     first = automatic_verification.run_window(**query)
     assert first["preflight"]["query_window_start"] == "2026-08-30T12:45:00+00:00"
     assert first["preflight"]["query_window_end"] == "2026-08-30T15:15:00+00:00"
-    assert first["preflight"]["station_ids"] == ["KCBG", "KJMR", "KROS"]
+    assert first["preflight"]["station_ids"] == ["KCBG", "KJMR", "KNEW"]
     assert first["downloaded_bytes"] == len(payload)
     assert first["observations_reused"] is False
+    assert first["station_discovery"]["reused"] is False
+    assert first["station_discovery"]["discovery_calls"] == 1
+    assert (
+        first["observation_source"]["station_discovery_artifact_id"]
+        == (first["station_discovery"]["discovery_artifact_id"])
+    )
     assert first["verification"]["summary"] == {
         "verified": 4,
         "already_existing": 0,
@@ -574,6 +665,17 @@ def test_automatic_window_acquires_once_reuses_real_snapshot_and_skips_empty_win
     assert {row["issued_forecast_id"] for row in first["verification"]["results"]} == {
         str(row.issued_forecast_id) for row in issued
     }
+    verifier = make_verifier(migrated_dsn, object_store, issuer)
+    for row in first["verification"]["results"]:
+        if row["verification_id"] is None:
+            continue
+        saved = verifier.read(ArtifactId(row["verification_id"]))["result"]
+        selected = saved["match"]["selected"]
+        assert selected["station_id"] == "KNEW"
+        assert selected["temperature"] == {"value": 293.15, "unit": "K"}
+        assert saved["temperature_error"]["value"] == pytest.approx(
+            saved["match"]["forecast"]["temperature"]["value"] - 293.15
+        )
     assert os.environ["MESOFORGE_OBSERVATIONS_ARTIFACT_ID"] == str(synthetic.artifact_id)
     after = complete_storage_inventory(migrated_dsn, object_store)
     assert_forecasts_unchanged(before, after, object_store)
@@ -581,6 +683,12 @@ def test_automatic_window_acquires_once_reuses_real_snapshot_and_skips_empty_win
     assert repeated["observations_artifact_id"] == first["observations_artifact_id"]
     assert repeated["observations_reused"] is True
     assert repeated["downloaded_bytes"] == 0
+    assert repeated["station_discovery"]["reused"] is True
+    assert repeated["station_discovery"]["discovery_calls"] == 0
+    assert (
+        repeated["station_discovery"]["content_digest"]
+        == first["station_discovery"]["content_digest"]
+    )
     assert repeated["verification"]["summary"] == {
         **first["verification"]["summary"],
         "verified": 0,
@@ -598,6 +706,10 @@ def test_automatic_window_acquires_once_reuses_real_snapshot_and_skips_empty_win
     assert empty["status"] == "nothing_to_verify"
     assert empty["downloaded_bytes"] == 0
     assert len(transport.get_calls) == 1
+    assert complete_storage_inventory(migrated_dsn, object_store) == after
+    metadata_provider.assert_called_once_with(FIRST["lat"], FIRST["lon"])
+    cached = discovery_service.get_station_candidates(FIRST["lat"], FIRST["lon"])
+    assert cached == repeated["station_discovery"]
     assert complete_storage_inventory(migrated_dsn, object_store) == after
 
     # Broken retained evidence fails closed, without silently reacquiring different observations.
@@ -620,6 +732,8 @@ def test_automatic_batch_isolates_locations_and_reuses_results_without_changing_
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mesoforge.application import automatic_verification, prepared_observations
+
+    _, metadata_provider = persisted_discovery(migrated_dsn, object_store, monkeypatch)
 
     monkeypatch.setenv("MESOFORGE_OBSERVATIONS_DIR", str(tmp_path / "observations"))
     transport = FixtureAviationWeatherTransport()
@@ -669,6 +783,7 @@ def test_automatic_batch_isolates_locations_and_reuses_results_without_changing_
             issuance.issued_forecast_id
         )
     assert len(transport.get_calls) == 2
+    assert metadata_provider.call_count == 2
     after = complete_storage_inventory(migrated_dsn, object_store)
     assert_forecasts_unchanged(before, after, object_store)
     repeat = automatic_verification.run_batch(config, **window)
@@ -682,5 +797,6 @@ def test_automatic_batch_isolates_locations_and_reuses_results_without_changing_
             == first["results"][position]["result"]["verification"]["results"][0]["verification_id"]
         )
     assert len(transport.get_calls) == 2
+    assert metadata_provider.call_count == 2
     assert [issuer.read(row.issued_forecast_id) for row in issued] == originals
     assert complete_storage_inventory(migrated_dsn, object_store) == after

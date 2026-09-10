@@ -20,6 +20,7 @@ from tests.support.phase1_fixture_transports import (
     FixtureAviationWeatherTransport,
 )
 from tests.unit.application.test_batch_forecast import FIRST, LAST, OUTSIDE, write_config
+from tests.unit.application.test_prepared_observations import fixture_discovery
 from tests.unit.verification import test_issued_temperature as science_tests
 
 match = science_tests.match
@@ -117,6 +118,7 @@ def test_no_ready_hours_return_without_loading_configuration_or_acquiring(
         pytest.fail("No eligible saved hours must return before observation configuration or I/O")
 
     monkeypatch.setattr(automatic, "load_observation_configuration", unexpected)
+    monkeypatch.setattr(automatic, "get_station_candidates", unexpected)
     assert (
         automatic.main(
             [
@@ -147,6 +149,8 @@ def test_one_actual_valid_hour_acquires_exact_half_hour_with_automatic_stations(
     transport.metar_queue.append(FakeHttpResponse(200, {}, b"[]"))
     monkeypatch.setattr(preparation, "RequestsAviationWeatherHttpTransport", lambda: transport)
     monkeypatch.setattr(preparation, "SystemClock", lambda: FixedClock(NOW))
+    discovery = Mock(side_effect=fixture_discovery)
+    monkeypatch.setattr(preparation, "get_station_candidates", discovery)
     valid = datetime(2026, 9, 10, 13, tzinfo=UTC)
     metadata = preparation.acquire_for_valid_times(
         tmp_path / "single",
@@ -159,6 +163,7 @@ def test_one_actual_valid_hour_acquires_exact_half_hour_with_automatic_stations(
     assert float(query["hours"][0]) == 0.5
     assert query["ids"] == ["KCBG,KJMR,KROS"]
     assert metadata["query_window_start"] == "2026-09-10T12:45:00+00:00"
+    discovery.assert_called_once_with(45.8, -93.1)
 
 
 def test_batch_preserves_order_and_results_past_an_unsupported_coordinate(
@@ -299,3 +304,36 @@ def test_empty_batch_cli_succeeds_without_running_any_coordinate(
     )
     assert json.loads(capsys.readouterr().out)["results"] == []
     runner.assert_not_called()
+
+
+@pytest.mark.parametrize("missing_elevation", [False, True])
+def test_eligible_hours_without_usable_discovered_metadata_remain_unavailable(
+    match: dict[str, Any], monkeypatch: pytest.MonkeyPatch, missing_elevation: bool
+) -> None:
+    monkeypatch.setattr(
+        automatic, "select_issued_forecast_hours", lambda **kw: selection(match, (13,))
+    )
+    discovered = fixture_discovery()
+    if missing_elevation:
+        for candidate in discovered["candidates"]:
+            candidate["elevation_m"] = None
+    else:
+        discovered["candidates"] = []
+    monkeypatch.setattr(automatic, "get_station_candidates", lambda *args: discovered)
+    acquire = Mock(side_effect=AssertionError("Unusable metadata must not request METAR data"))
+    monkeypatch.setattr(automatic, "acquire_for_valid_times", acquire)
+    result = automatic.run_window(
+        latitude=45.8,
+        longitude=-93.1,
+        start_valid_time=datetime(2026, 9, 10, 13, tzinfo=UTC),
+        end_valid_time=datetime(2026, 9, 10, 14, tzinfo=UTC),
+    )
+    assert result["status"] == "unavailable"
+    assert result["reason"]
+    assert result["downloaded_bytes"] == 0
+    assert result["verification"] is None
+    assert result["preflight"]["station_ids"] == []
+    assert result["station_discovery"] == discovered
+    assert len(result["station_metadata_exclusions"]) == (3 if missing_elevation else 0)
+    assert all(row["reason"] for row in result["station_metadata_exclusions"])
+    acquire.assert_not_called()

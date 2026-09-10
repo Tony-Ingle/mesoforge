@@ -12,12 +12,15 @@ import pytest
 
 from mesoforge.application.prepared_observations import (
     acquire_bundle,
+    discovery_definitions,
     load_bundle,
+    load_observation_configuration,
     normalize_rows,
 )
 from mesoforge.catalog.configuration import load_configuration_source
 from mesoforge.common.errors import IntegrityError
-from mesoforge.common.identifiers import ArtifactId
+from mesoforge.common.identifiers import ArtifactId, Digest
+from mesoforge.observations.sources.stationinfo import parse_stationinfo_candidates
 from tests.support.phase1_fixture_transports import (
     FakeHttpResponse,
     FixedClock,
@@ -53,6 +56,47 @@ def _record(**overrides: Any) -> dict[str, Any]:
     return {**value, **overrides}
 
 
+def fixture_station_records() -> list[dict[str, Any]]:
+    """Synthetic provider metadata matching the existing scientific fixture definitions."""
+    configuration = load_observation_configuration()
+    assert configuration.phase2 is not None
+    return [
+        {
+            "icaoId": station.provider_icao_id,
+            "lat": station.expected_latitude,
+            "lon": station.expected_longitude,
+            "elev": station.expected_elevation_m,
+            "site": station.site_name,
+            "siteType": list(station.provider_site_types),
+        }
+        for station in configuration.phase2.stations
+    ]
+
+
+def fixture_discovery(latitude: float = 45.8, longitude: float = -93.1) -> dict[str, Any]:
+    """Offline discovery response; no real station discovery or persistence claim."""
+    candidates, excluded = parse_stationinfo_candidates(
+        json.dumps(fixture_station_records()).encode(), latitude=latitude, longitude=longitude
+    )
+    snapshot = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "radius_km": 50.0,
+        "candidates": candidates,
+        "excluded": excluded,
+        "acquired_at": ACQUIRED.isoformat(),
+        "metadata_source": "synthetic-provider-shaped-station-metadata-fixture",
+    }
+    return {
+        **snapshot,
+        "discovery_artifact_id": "art_00000000-0000-0000-0000-000000000003",
+        "content_digest": str(Digest.of_bytes(json.dumps(snapshot).encode())),
+        "reused": True,
+        "discovery_calls": 0,
+        "downloaded_bytes": 0,
+    }
+
+
 def _acquire(directory: Path, **overrides: Any) -> tuple[dict[str, Any], bytes, list[str]]:
     payload = json.dumps([_record()], indent=2).encode()
     transport = FixtureAviationWeatherTransport()
@@ -66,6 +110,7 @@ def _acquire(directory: Path, **overrides: Any) -> tuple[dict[str, Any], bytes, 
         "transport": transport,
         "clock": clock,
         "sleeper": RecordingSleeper(clock),
+        "station_discovery": fixture_discovery(),
         **overrides,
     }
     metadata = acquire_bundle(directory, **arguments)
@@ -89,6 +134,9 @@ def test_fixed_acquisition_pads_time_and_preserves_exact_bytes_for_offline_readb
     assert configuration.phase2 is not None
     assert configuration.phase2.aviationweather.metar_window_hours == 6.5
     assert len(calls) == 1
+    assert metadata["station_discovery"]["candidates"] == fixture_discovery()["candidates"]
+    assert metadata["station_discovery_artifact_id"] == fixture_discovery()["discovery_artifact_id"]
+    assert metadata["station_metadata_exclusions"] == []
 
 
 @pytest.mark.parametrize("filename", ["metar.json", "configuration.json"])
@@ -104,7 +152,7 @@ def test_offline_bundle_load_rejects_tampered_retained_bytes(tmp_path: Path, fil
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"latitude": 44.0},
+        {"latitude": 95.0},
         {"start_valid_time": START.replace(tzinfo=None)},
         {"end_valid_time": START},
         {"start_valid_time": START - timedelta(hours=4)},
@@ -182,3 +230,35 @@ def test_normalization_preserves_time_qc_revision_and_original_record_indices() 
     assert [excluded["raw_record_index"] for excluded in result["excluded"]] == [0, 1]
     assert all(excluded["reason"] for excluded in result["excluded"])
     assert normalize_rows(json.dumps(rows).encode(), **parameters) == result
+
+
+@pytest.mark.parametrize("missing_elevation", [False, True])
+def test_discovery_without_usable_metadata_stops_before_metar_io(
+    tmp_path: Path, missing_elevation: bool
+) -> None:
+    discovery = fixture_discovery()
+    if missing_elevation:
+        for candidate in discovery["candidates"]:
+            candidate["elevation_m"] = None
+    else:
+        discovery["candidates"] = []
+    transport = FixtureAviationWeatherTransport()
+    directory = tmp_path / "unavailable"
+    with pytest.raises(ValueError, match="No discovered METAR candidates"):
+        _acquire(directory, transport=transport, station_discovery=discovery)
+    assert transport.get_calls == []
+    assert not directory.exists()
+
+
+def test_missing_optional_station_name_preserves_usable_candidate_and_null_source() -> None:
+    discovery = fixture_discovery()
+    candidate = next(row for row in discovery["candidates"] if row["station_id"] == "KROS")
+    candidate["site_name"] = None
+    station = next(
+        row for row in discovery_definitions(discovery) if row.provider_icao_id == "KROS"
+    )
+    assert station.site_name == "KROS"
+    assert station.expected_latitude == candidate["lat"]
+    assert station.expected_longitude == candidate["lon"]
+    assert station.expected_elevation_m == candidate["elevation_m"]
+    assert candidate["site_name"] is None

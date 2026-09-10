@@ -17,14 +17,16 @@ from mesoforge.application.issuance import select_issued_forecast_hours
 from mesoforge.application.issued_temperature_verification import configured_service
 from mesoforge.application.prepared_observations import (
     acquire_for_valid_times,
+    discovery_definitions,
+    discovery_exclusions,
     load_observation_configuration,
     prepare_bundle,
-    retained_station_ids,
 )
 from mesoforge.application.spatial_coverage import (
     UnsupportedCoordinateError,
     validate_coordinate,
 )
+from mesoforge.application.station_discovery import get_station_candidates
 from mesoforge.catalog.configuration import compute_configuration_digest
 from mesoforge.common.errors import IntegrityError
 from mesoforge.common.identifiers import Digest
@@ -87,6 +89,7 @@ def _find_retained(
     configuration_digest: Digest,
     station_ids: tuple[str, ...],
     request: dict[str, Any],
+    station_discovery_artifact_id: str | None = None,
 ) -> tuple[ArtifactManifest, dict[str, Any]] | None:
     """Discover existing real inputs through their source manifests and transformation edges."""
     start = datetime.fromisoformat(request["query_window_start"])
@@ -101,6 +104,10 @@ def _find_retained(
             source: dict[str, Any] = raw.attributes or {}
             if (
                 raw.quality_state == "invalid"
+                or (
+                    station_discovery_artifact_id is not None
+                    and source.get("station_discovery_artifact_id") != station_discovery_artifact_id
+                )
                 or not set(station_ids) <= set(source["station_ids"])
                 or datetime.fromisoformat(source["query_window_start"]) > start
                 or datetime.fromisoformat(source["query_window_end"]) < end
@@ -176,6 +183,7 @@ def run_window(
         "downloaded_bytes": 0,
         "observation_source": None,
         "verification": None,
+        "station_discovery": None,
     }
     if not request["ready_valid_times"]:
         return {
@@ -184,8 +192,19 @@ def run_window(
             "reason": "No saved forecast hours are ready for observation matching.",
         }
     configuration = load_observation_configuration()
-    stations = retained_station_ids(configuration, latitude, longitude)
+    discovery = get_station_candidates(latitude, longitude)
+    result["station_discovery"] = discovery
+    result["station_metadata_exclusions"] = discovery_exclusions(discovery)
+    stations = tuple(s.provider_icao_id for s in discovery_definitions(discovery))
     request["station_ids"] = list(stations)
+    if not stations:
+        return {
+            **result,
+            "status": "unavailable",
+            "reason": (
+                "No discovered METAR stations within 50 km can satisfy the existing metadata QC."
+            ),
+        }
     digest = compute_configuration_digest(configuration)
     dsn = resolve_database_dsn("MESOFORGE_DATABASE_DSN")
     service = configured_service()
@@ -208,6 +227,7 @@ def run_window(
             configuration_digest=digest,
             station_ids=stations,
             request=request,
+            station_discovery_artifact_id=discovery["discovery_artifact_id"],
         )
         if retained is not None:
             manifest, source = retained
@@ -220,6 +240,7 @@ def run_window(
                 latitude=latitude,
                 longitude=longitude,
                 valid_times=tuple(datetime.fromisoformat(t) for t in request["ready_valid_times"]),
+                station_discovery=discovery,
             )
             prepared = prepare_bundle(raw_dir)
             identifier = prepared["observations_artifact_id"]
@@ -308,7 +329,8 @@ def run_batch(
                             "message": "Some saved hours failed; see per-hour results.",
                         },
                     )
-        summary["errors" if row["status"] == "error" else row["status"]] += 1
+        category = "errors" if row["status"] == "error" else row["status"]
+        summary[category] = summary.get(category, 0) + 1
         results.append(row)
     return {
         "start_valid_time": window.start.isoformat(),

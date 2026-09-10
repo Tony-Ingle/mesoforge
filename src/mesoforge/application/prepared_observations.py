@@ -12,8 +12,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
-from pyproj import Geod
-
 from mesoforge.application.artifacts import (
     ArtifactService,
     SourceRegistrationRequest,
@@ -22,10 +20,12 @@ from mesoforge.application.artifacts import (
 )
 from mesoforge.application.configuration import ConfigurationService
 from mesoforge.application.issuance import validate_hour_selection
+from mesoforge.application.phase2_replay import parse_station_snapshot
 from mesoforge.application.prepared_temperature import _code_identity
+from mesoforge.application.station_discovery import get_station_candidates
 from mesoforge.catalog.configuration import MesoForgeConfiguration, load_configuration_source
-from mesoforge.catalog.stations import StationRecord
-from mesoforge.common.identifiers import ArtifactId, Digest
+from mesoforge.catalog.stations import StationDefinition, StationRecord
+from mesoforge.common.identifiers import ArtifactId, Digest, StationId
 from mesoforge.contracts.artifacts import Availability
 from mesoforge.contracts.observations_v2 import NormalizedObservationV2, RawMetarRecordV2
 from mesoforge.guidance.runtime import SystemClock, SystemSleeper
@@ -50,6 +50,10 @@ def _identity() -> dict[str, Any]:
     identity = _code_identity()
     for name in (
         "application/prepared_observations.py",
+        "application/station_discovery.py",
+        "application/phase2_replay.py",
+        "catalog/stations.py",
+        "observations/sources/stationinfo.py",
         "observations/acquisition.py",
         "observations/sources/aviationweather.py",
         "observations/normalization_v2.py",
@@ -79,25 +83,54 @@ def load_observation_configuration() -> MesoForgeConfiguration:
     return configuration
 
 
-def retained_station_ids(
-    configuration: MesoForgeConfiguration, latitude: float, longitude: float
-) -> tuple[str, ...]:
-    phase2 = configuration.phase2
-    assert phase2 is not None
-    geod = Geod(ellps="WGS84")
-    station_ids = tuple(
-        sorted(
-            station.provider_icao_id
-            for station in phase2.stations
-            if geod.inv(longitude, latitude, station.expected_longitude, station.expected_latitude)[
-                2
-            ]
-            <= 50_000
+def discovery_definitions(discovery: dict[str, Any]) -> tuple[StationDefinition, ...]:
+    """Adapt discovered metadata to the existing QC contract without inventing elevation.
+
+    Candidates with unavailable elevation remain saved in discovery; they cannot
+    satisfy the existing metadata-tolerance QC and are explicitly excluded below.
+    """
+    definitions = []
+    for candidate in sorted(discovery["candidates"], key=lambda row: row["station_id"]):
+        if candidate["elevation_m"] is None:
+            continue
+        definitions.append(
+            StationDefinition(
+                station_id=StationId("station." + candidate["station_id"].lower()),
+                provider_icao_id=candidate["station_id"],
+                expected_latitude=float(candidate["lat"]),
+                expected_longitude=float(candidate["lon"]),
+                expected_elevation_m=float(candidate["elevation_m"]),
+                site_name=candidate["site_name"] or candidate["station_id"],
+                provider_site_types=tuple(candidate["site_types"]),
+                # This legacy field is unused by temperature matching (distance/time/ID).
+                provider_priority=0,
+            )
         )
+    return tuple(definitions)
+
+
+def discovery_exclusions(discovery: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "station_id": candidate["station_id"],
+            "reason": "Station elevation unavailable for existing metadata-tolerance QC.",
+        }
+        for candidate in discovery["candidates"]
+        if candidate["elevation_m"] is None
+    ]
+
+
+def _bundle_definitions(
+    metadata: dict[str, Any],
+    configuration: MesoForgeConfiguration,
+) -> tuple[StationDefinition, ...]:
+    if "station_discovery" in metadata:
+        return discovery_definitions(metadata["station_discovery"])
+    # Read retained pre-discovery bundles exactly as originally prepared.
+    assert configuration.phase2 is not None
+    return tuple(
+        s for s in configuration.phase2.stations if s.provider_icao_id in metadata["station_ids"]
     )
-    if not station_ids:
-        raise ValueError("No retained METAR stations lie within 50 km")
-    return station_ids
 
 
 def acquire_bundle(
@@ -110,6 +143,7 @@ def acquire_bundle(
     transport: HttpTransport | None = None,
     clock: Clock | None = None,
     sleeper: Sleeper | None = None,
+    station_discovery: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return _acquire_bundle(
         raw_dir,
@@ -120,11 +154,17 @@ def acquire_bundle(
         transport=transport,
         clock=clock,
         sleeper=sleeper,
+        station_discovery=station_discovery,
     )
 
 
 def acquire_for_valid_times(
-    raw_dir: Path, *, latitude: float, longitude: float, valid_times: tuple[datetime, ...]
+    raw_dir: Path,
+    *,
+    latitude: float,
+    longitude: float,
+    valid_times: tuple[datetime, ...],
+    station_discovery: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Pad the actual first/last eligible valid times, including a single valid hour."""
     if not valid_times:
@@ -136,6 +176,7 @@ def acquire_for_valid_times(
         start_valid_time=min(valid_times),
         end_valid_time=max(valid_times),
         single_hour=True,
+        station_discovery=station_discovery,
     )
 
 
@@ -150,6 +191,7 @@ def _acquire_bundle(
     clock: Clock | None = None,
     sleeper: Sleeper | None = None,
     single_hour: bool = False,
+    station_discovery: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fetch once through the retained adapter; save bytes before parsing any records."""
     if single_hour and start_valid_time == end_valid_time:
@@ -170,10 +212,20 @@ def _acquire_bundle(
         raise ValueError("The entire window, including the 15-minute margin, must be in the past")
     if raw_dir.resolve().is_relative_to(_ROOT):
         raise ValueError("Raw observation data must be retained outside the repository")
+    if raw_dir.exists():
+        raise FileExistsError(
+            "Raw observation directory already exists; retained files are preserved"
+        )
     configuration = load_observation_configuration()
     phase2 = configuration.phase2
     assert phase2 is not None
-    station_ids = retained_station_ids(configuration, latitude, longitude)
+    discovery = station_discovery or get_station_candidates(latitude, longitude)
+    if discovery["latitude"] != latitude or discovery["longitude"] != longitude:
+        raise ValueError("Saved station discovery belongs to a different forecast coordinate")
+    definitions = discovery_definitions(discovery)
+    station_ids = tuple(station.provider_icao_id for station in definitions)
+    if not station_ids:
+        raise ValueError("No discovered METAR candidates can satisfy the existing metadata QC")
     # Copy only the query duration; the retained Phase 2 defaults stay unchanged.
     settings = phase2.aviationweather.model_copy(
         update={"metar_window_hours": (end - start).total_seconds() / 3600}
@@ -200,7 +252,14 @@ def _acquire_bundle(
         "query_window_start": start.isoformat(),
         "query_window_end": end.isoformat(),
         "station_ids": list(station_ids),
-        "station_metadata_source": "retained_configuration",
+        "station_metadata_source": discovery["metadata_source"],
+        "station_discovery_artifact_id": discovery["discovery_artifact_id"],
+        "station_discovery": {
+            key: value
+            for key, value in discovery.items()
+            if key not in {"reused", "discovery_calls", "downloaded_bytes"}
+        },
+        "station_metadata_exclusions": discovery_exclusions(discovery),
         "url": fetched.url,
         "status_code": fetched.status_code,
         "headers": fetched.headers,
@@ -240,18 +299,21 @@ def normalize_rows(
     ingested_at: datetime,
     query_window_start: datetime,
     query_window_end: datetime,
+    station_definitions: tuple[StationDefinition, ...] | None = None,
 ) -> dict[str, Any]:
     """Use existing strict parsing/QC, retaining original provider indices after filtering."""
     phase2 = configuration.phase2
     assert phase2 is not None
     definitions = {
-        s.provider_icao_id: s for s in phase2.stations if s.provider_icao_id in station_ids
+        s.provider_icao_id: s
+        for s in (phase2.stations if station_definitions is None else station_definitions)
+        if s.provider_icao_id in station_ids
     }
     rows, excluded = [], []
     for index, raw in enumerate(parse_raw_metar_response(payload)):
         reason = None
         if raw.icao_id not in definitions:
-            reason = "Station was not requested from the retained catalog."
+            reason = "Station was not requested from the retained station snapshot."
         elif not query_window_start <= raw.obs_time <= query_window_end:
             reason = "Observation event time is outside the padded acquisition window."
         if reason:
@@ -340,24 +402,59 @@ def prepare_bundle(raw_dir: Path) -> dict[str, Any]:
         payload,
         metadata["url"],
     )
-    definitions = tuple(s for s in phase2.stations if s.provider_icao_id in metadata["station_ids"])
-    stations = register(
-        "station-catalog-snapshot",
-        "station-catalog-snapshot.v1",
-        _JSON.serialize(
-            {
-                "schema_version": "station-catalog-snapshot.v1",
-                "domain_id": str(phase2.domain.domain_id),
-                "station_ids": [str(s.station_id) for s in definitions],
-                "stations": [
-                    s.model_dump(mode="json", exclude={"schema_version"}) for s in definitions
-                ],
-                "point_extraction_policy": phase2.point_extraction_policy.model_dump(mode="json"),
-            }
-        ),
-        f"retained-configuration://{snapshot.configuration_digest}/metar-stations",
-    )
     identity = _identity()
+    definitions = _bundle_definitions(metadata, configuration)
+    station_payload = {
+        "schema_version": "station-catalog-snapshot.v1",
+        "domain_id": "coordinate-metar.v1"
+        if "station_discovery" in metadata
+        else str(phase2.domain.domain_id),
+        "station_ids": [str(s.station_id) for s in definitions],
+        "stations": [s.model_dump(mode="json", exclude={"schema_version"}) for s in definitions],
+        "point_extraction_policy": phase2.point_extraction_policy.model_dump(mode="json"),
+    }
+    if "station_discovery" in metadata:
+        discovery = metadata["station_discovery"]
+        discovery_id = ArtifactId(discovery["discovery_artifact_id"])
+
+        def station_transform(discovery_bytes: bytes) -> dict[str, Any]:
+            if str(Digest.of_bytes(discovery_bytes)) != discovery["content_digest"]:
+                raise ValueError("Station discovery checksum mismatch")
+            saved = _JSON.deserialize(discovery_bytes)
+            if saved["candidates"] != discovery["candidates"]:
+                raise ValueError("Retained discovery candidates disagree with immutable source")
+            return station_payload
+
+        def validate_station_snapshot(value: dict[str, Any]) -> None:
+            parse_station_snapshot(_JSON.serialize(value))
+
+        stations = artifacts.execute_raw_transformation(
+            TransformationRequest(
+                activity_type="prepare-discovered-station-snapshot",
+                activity_version="v1",
+                inputs=(TransformationInputRef(role="discovery", artifact_id=discovery_id),),
+                output_role="stations",
+                output_artifact_type="station-catalog-snapshot",
+                output_artifact_schema_version="station-catalog-snapshot.v1",
+                output_media_type="application/json",
+                parameters={"station_snapshot": station_payload},
+                configuration_snapshot_id=snapshot.configuration_snapshot_id,
+                configuration_digest=snapshot.configuration_digest,
+                code_revision=identity["git_commit"],
+                environment_digest=Digest.of_bytes(_JSON.serialize(identity)),
+            ),
+            station_transform,
+            _JSON,
+            input_loader=bytes,
+            output_validator=validate_station_snapshot,
+        ).output
+    else:
+        stations = register(
+            "station-catalog-snapshot",
+            "station-catalog-snapshot.v1",
+            _JSON.serialize(station_payload),
+            f"retained-configuration://{snapshot.configuration_digest}/metar-stations",
+        )
     request = TransformationRequest(
         activity_type="prepare-retained-metar",
         activity_version="v1",
@@ -388,6 +485,7 @@ def prepare_bundle(raw_dir: Path) -> dict[str, Any]:
             ingested_at=acquired,
             query_window_start=datetime.fromisoformat(metadata["query_window_start"]),
             query_window_end=datetime.fromisoformat(metadata["query_window_end"]),
+            station_definitions=definitions,
         )
         return {**result, "source_provenance": metadata}
 

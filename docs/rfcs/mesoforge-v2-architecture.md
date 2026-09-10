@@ -356,6 +356,18 @@ observation station/source as a proxy, with the suitability decision. Users do n
 supply a station list. No suitable observation means explicit unavailable verification,
 not a fabricated score or a reason to block generation of the next forecast.
 
+Implemented local increment: station discovery is lazy and coordinate-driven. It
+checks saved candidates by coordinate and versioned 50 km policy, otherwise queries
+bounded official AviationWeather stationinfo metadata and filters by WGS84 distance.
+Raw metadata, acquisition time, candidate metadata/distances and lineage use the existing
+PostgreSQL/MinIO artifact path. Repeated coordinates reuse that immutable snapshot.
+Refresh/revalidation can create a new version without changing locations.json; scheduled
+refresh, a nationwide catalog mirror and full effective-dated station history remain
+future work. The existing time/QC and nearest-station rules still govern observation
+suitability. A missing elevation remains explicit and cannot satisfy the current
+metadata-tolerance QC. Historical configuration-based snapshots remain readable.
+This increment does not implement the full worker, registration or lifecycle design.
+
 ### 6.5 Evaluation
 
 The API validates filters, groups, metrics, range, as-of cutoff, rows/work, and output before
