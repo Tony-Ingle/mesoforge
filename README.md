@@ -61,8 +61,12 @@ reuse the saved artifact; ineligible attempts return reasons without a score.
 saved 18:00 UTC forecast was compared with a synthetic KROS observation, read back,
 and retried without duplicates or changes to issued forecasts. See
 [single-hour verification](#verify-one-issued-temperature-hour).
-Proposed next milestone: verify eligible saved hours for one coordinate/time window,
-preserving overlapping issued versions and per-hour unavailable reasons.
+The `window` verification command now processes all saved versions for one coordinate
+and valid-time window, reporting new, reused, unavailable, and ineligible results.
+Its demonstration and repeat preserved issued forecasts; **56 focused offline and
+13 PostgreSQL/MinIO integration tests passed**. See [window verification](#verify-a-coordinate-and-time-window).
+Proposed next milestone: prepare one bounded real METAR observation dataset using
+existing acquisition/normalization, then run the same window command against it.
 
 Future direction: configure locations using latitude/longitude only, with geographic
 context and suitable observation sources derived internally. The intended VPS workflow
@@ -633,6 +637,44 @@ The new modules are `tests/unit/verification/test_issued_temperature.py`,
 `tests/integration/application/test_issued_temperature_verification.py`.
 Quality checks passed. Full acceptance/coverage, live observations, backup/restore,
 and deployment remain unvalidated.
+
+### Verify a coordinate and time window
+
+Use the same environment and retained observation artifact as single-hour verification:
+
+```text
+python -B -m mesoforge.application.issued_temperature_verification window --lat 45.8 --lon -93.1 --start-valid-time 2026-09-10T17:00:00Z --end-valid-time 2026-09-10T20:00:00Z
+```
+
+The window includes the start and excludes the end. Existing selection returns every
+issued version separately; each then uses unchanged matching, eligibility, and
+persistence logic. Results contain issued ID, valid time, verification ID, temperature
+error, and reasons. Read the complete saved provenance with the existing `read` command.
+Summary categories are exclusive: `verified` means newly saved, `already_existing`
+means reused with identical input/policy/code identity; `unavailable`, `ineligible`,
+and `errors` retain failures without stopping later hours. An empty selection returns
+zero counts. Exit 0 means processing completed (including expected unavailable/ineligible
+hours), 1 reports per-hour processing errors, and 2 indicates invalid input or failure
+to select/start. GET endpoints remain read-only; no observations are downloaded.
+
+The command above was demonstrated with two retained real-model forecast versions and
+one synthetic observation dataset. One eligible result was saved beforehand:
+
+| Run | Newly verified | Already existing | Ineligible | Unavailable | Errors |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| First window | 3 | 1 | 2 | 0 | 0 |
+| Repeated window | 0 | 4 | 2 | 0 | 0 |
+
+Both versions' 18:00 and 19:00 UTC hours were eligible; 17:00 UTC preceded issuance.
+Repeated execution/readback changed no PostgreSQL rows or MinIO objects. All four
+issued forecasts remained unchanged, and temporary services were stopped. Captured
+results are outside Git in `%LOCALAPPDATA%\MesoForge\baselines\20260910-verification-window`.
+Only focused coverage was added: six window/CLI unit cases and one integration case;
+the existing concurrency check also verifies reuse reporting. **56 offline tests**
+(verification application and hour selection) and **13 integration tests** (verification
+and observation preview) passed, along with applicable quality checks. The integration
+window includes an unavailable hour between eligible hours. Broader suites were not
+rerun; the previously documented live-observation and operational validation gaps remain.
 
 ### Prepare real inputs before serving
 

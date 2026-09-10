@@ -21,7 +21,11 @@ from mesoforge.application.artifacts import (
     TransformationInputRef,
     TransformationRequest,
 )
-from mesoforge.application.issuance import read_issued_forecast
+from mesoforge.application.issuance import (
+    read_issued_forecast,
+    select_issued_forecast_hours,
+    validate_hour_selection,
+)
 from mesoforge.application.observation_preview import preview_observation_match
 from mesoforge.application.prepared_temperature import _code_identity
 from mesoforge.common.errors import IntegrityError, NotFound
@@ -92,7 +96,9 @@ class IssuedTemperatureVerificationService:
             "result": result,
         }
 
-    def verify(self, issued_forecast_id: UUID, valid_time: datetime) -> dict[str, Any]:
+    def verify(
+        self, issued_forecast_id: UUID, valid_time: datetime, *, report_reuse: bool = False
+    ) -> dict[str, Any]:
         if valid_time.tzinfo is None or valid_time.utcoffset() is None:
             raise ValueError("valid_time must include a timezone")
         saved = self._read_forecast(issued_forecast_id)
@@ -168,7 +174,11 @@ class IssuedTemperatureVerificationService:
             environment_digest=self._environment_digest,
         )
 
+        transform_called = False
+
         def transform(*payloads: bytes) -> dict[str, Any]:
+            nonlocal transform_called
+            transform_called = True
             # Bind the already-validated match to the exact bytes reread by ArtifactService.
             for manifest, payload in zip(inputs, payloads, strict=True):
                 if Digest.of_bytes(payload) != manifest.content_digest:
@@ -183,7 +193,59 @@ class IssuedTemperatureVerificationService:
             output_validator=_validate_result,
         )
         # Verify readback for both a newly saved result and an existing idempotent winner.
-        return self.read(transformed.output.artifact_id)
+        response = self.read(transformed.output.artifact_id)
+        if report_reuse:
+            # Only the new winner executes the transform under the existing advisory lock.
+            response["already_existing"] = not transform_called
+        return response
+
+    def verify_window(
+        self,
+        *,
+        latitude: float,
+        longitude: float,
+        start_valid_time: datetime,
+        end_valid_time: datetime,
+    ) -> dict[str, Any]:
+        """Process each selected issued version independently through single-hour verification."""
+        selection = select_issued_forecast_hours(
+            latitude=latitude,
+            longitude=longitude,
+            start_valid_time=start_valid_time,
+            end_valid_time=end_valid_time,
+        )
+        summary = dict.fromkeys(
+            ("verified", "unavailable", "ineligible", "already_existing", "errors"), 0
+        )
+        results = []
+        for selected in selection["results"]:
+            identifier = selected["issued"]["issued_forecast_id"]
+            valid_time = selected["hour"]["valid_time"]
+            row: dict[str, Any] = {"issued_forecast_id": identifier, "valid_time": valid_time}
+            try:
+                outcome = self.verify(
+                    UUID(identifier), datetime.fromisoformat(valid_time), report_reuse=True
+                )
+                status = (
+                    "already_existing" if outcome.get("already_existing") else outcome["status"]
+                )
+                row.update(
+                    status=status,
+                    verification_id=outcome["verification_id"],
+                    reasons=outcome["result"]["reasons"],
+                    temperature_error=outcome["result"]["temperature_error"],
+                )
+                summary[status] += 1
+            except Exception:
+                summary["errors"] += 1
+                row.update(
+                    status="error",
+                    verification_id=None,
+                    reasons=["Could not verify this saved hour or read its existing result."],
+                    temperature_error=None,
+                )
+            results.append(row)
+        return {**selection, "results": results, "summary": summary}
 
 
 def configured_service() -> IssuedTemperatureVerificationService:
@@ -254,16 +316,34 @@ def main(argv: list[str] | None = None) -> int:
     verify.add_argument("--valid-time", type=datetime.fromisoformat, required=True)
     read = commands.add_parser("read", help="Read an exact saved verification artifact.")
     read.add_argument("--verification-id", type=ArtifactId, required=True)
+    window = commands.add_parser(
+        "window", help="Verify saved hours for one coordinate/time window."
+    )
+    window.add_argument("--lat", type=float, required=True)
+    window.add_argument("--lon", type=float, required=True)
+    window.add_argument("--start-valid-time", type=datetime.fromisoformat, required=True)
+    window.add_argument("--end-valid-time", type=datetime.fromisoformat, required=True)
     args = parser.parse_args(argv)
     if args.command == "verify" and args.valid_time.tzinfo is None:
         parser.error("--valid-time must include a timezone")
+    if args.command == "window":
+        try:
+            validate_hour_selection(args.lat, args.lon, args.start_valid_time, args.end_valid_time)
+        except ValueError as exc:
+            parser.error(str(exc))
     try:
         service = configured_service()
-        result = (
-            service.verify(args.issued_forecast_id, args.valid_time)
-            if args.command == "verify"
-            else service.read(args.verification_id)
-        )
+        if args.command == "window":
+            result = service.verify_window(
+                latitude=args.lat,
+                longitude=args.lon,
+                start_valid_time=args.start_valid_time,
+                end_valid_time=args.end_valid_time,
+            )
+        elif args.command == "verify":
+            result = service.verify(args.issued_forecast_id, args.valid_time)
+        else:
+            result = service.read(args.verification_id)
     except NotFound:
         print(
             json.dumps({"error": "Requested saved forecast hour or verification was not found."}),
@@ -277,6 +357,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     print(json.dumps(result, indent=2, allow_nan=False))
+    if args.command == "window":
+        return int(result["summary"]["errors"] > 0)
     return 0 if result["status"] == "verified" else 1
 
 

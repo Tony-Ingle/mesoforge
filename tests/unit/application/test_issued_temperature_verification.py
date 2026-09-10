@@ -395,3 +395,140 @@ def test_cli_reports_unavailable_without_claiming_a_saved_result(monkeypatch, ca
         == 1
     )
     assert json.loads(capsys.readouterr().out) == service.verify.return_value
+
+
+def test_window_continues_and_reports_each_outcome(verification_case, monkeypatch):
+    case = verification_case
+    monkeypatch.setattr(application, "select_issued_forecast_hours", case.issuer.select_hours)
+    verified = {
+        "status": "verified",
+        "verification_id": "art_saved",
+        "result": {"reasons": [], "temperature_error": {"value": 2.25, "unit": "K"}},
+    }
+    unavailable = {
+        "status": "unavailable",
+        "verification_id": None,
+        "result": {
+            "reasons": ["No observation"],
+            "temperature_error": {"value": None, "unit": "K"},
+        },
+    }
+    verify = Mock(
+        side_effect=[
+            verified,
+            unavailable,
+            {
+                **unavailable,
+                "status": "ineligible",
+                "result": {**unavailable["result"], "reasons": ["Issued too late"]},
+            },
+            {**verified, "already_existing": True},
+            RuntimeError("secret storage details"),
+            verified,
+        ]
+    )
+    monkeypatch.setattr(case.service, "verify", verify)
+    result = case.service.verify_window(
+        latitude=45.8,
+        longitude=-93.1,
+        start_valid_time=_VALID,
+        end_valid_time=_VALID + timedelta(hours=6),
+    )
+    assert result["summary"] == {
+        "verified": 2,
+        "unavailable": 1,
+        "ineligible": 1,
+        "already_existing": 1,
+        "errors": 1,
+    }
+    assert [row["status"] for row in result["results"]] == [
+        "verified",
+        "unavailable",
+        "ineligible",
+        "already_existing",
+        "error",
+        "verified",
+    ]
+    assert result["results"][1]["reasons"] == ["No observation"]
+    assert result["results"][2]["reasons"] == ["Issued too late"]
+    assert "secret" not in json.dumps(result)
+    assert verify.call_count == 6
+    for index, call in enumerate(verify.call_args_list):
+        assert call.args == (case.issued.issued_forecast_id, _VALID + timedelta(hours=index))
+        assert call.kwargs == {"report_reuse": True}
+
+
+def test_empty_window_does_not_attempt_verification(verification_case, monkeypatch):
+    case = verification_case
+    monkeypatch.setattr(application, "select_issued_forecast_hours", case.issuer.select_hours)
+    verify = Mock(side_effect=AssertionError("Empty window attempted verification"))
+    monkeypatch.setattr(case.service, "verify", verify)
+    result = case.service.verify_window(
+        latitude=0.0,
+        longitude=0.0,
+        start_valid_time=_VALID,
+        end_valid_time=_VALID + timedelta(hours=1),
+    )
+    assert result["results"] == []
+    assert result["summary"] == {
+        "verified": 0,
+        "unavailable": 0,
+        "ineligible": 0,
+        "already_existing": 0,
+        "errors": 0,
+    }
+    verify.assert_not_called()
+
+
+@pytest.mark.parametrize("errors", [0, 1])
+def test_window_cli_uses_one_service_and_reports_processing_errors(monkeypatch, capsys, errors):
+    service = Mock()
+    service.verify_window.return_value = {"summary": {"errors": errors, "unavailable": 1}}
+    factory = Mock(return_value=service)
+    monkeypatch.setattr(application, "configured_service", factory)
+    assert (
+        application.main(
+            [
+                "window",
+                "--lat",
+                "45.8",
+                "--lon",
+                "-93.1",
+                "--start-valid-time",
+                _iso(_VALID),
+                "--end-valid-time",
+                _iso(_CUTOFF),
+            ]
+        )
+        == errors
+    )
+    factory.assert_called_once_with()
+    service.verify_window.assert_called_once_with(
+        latitude=45.8,
+        longitude=-93.1,
+        start_valid_time=_VALID,
+        end_valid_time=_CUTOFF,
+    )
+    assert json.loads(capsys.readouterr().out) == service.verify_window.return_value
+
+
+@pytest.mark.parametrize("start", [_iso(_CUTOFF), "2026-01-01T13:00:00"])
+def test_window_cli_rejects_invalid_interval_before_storage(monkeypatch, start):
+    factory = Mock(side_effect=AssertionError("Invalid window opened storage"))
+    monkeypatch.setattr(application, "configured_service", factory)
+    with pytest.raises(SystemExit) as exc:
+        application.main(
+            [
+                "window",
+                "--lat",
+                "45.8",
+                "--lon",
+                "-93.1",
+                "--start-valid-time",
+                start,
+                "--end-valid-time",
+                _iso(_CUTOFF),
+            ]
+        )
+    assert exc.value.code == 2
+    factory.assert_not_called()

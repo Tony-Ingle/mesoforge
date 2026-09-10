@@ -8,6 +8,7 @@ are invented test data and are labeled accordingly in every artifact manifest.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from itertools import product
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,11 @@ NOTICE = "Synthetic observation fixtures; these are not measured weather observa
 
 
 def seed_observation_preview_inputs(
-    dsn: str, object_store: S3ArtifactObjectStore, valid_time: datetime
+    dsn: str,
+    object_store: S3ArtifactObjectStore,
+    valid_time: datetime,
+    *,
+    extra_valid_times: tuple[datetime, ...] = (),
 ) -> ArtifactManifest:
     """Register one normalized observation input and its raw/station provenance.
 
@@ -42,6 +47,8 @@ def seed_observation_preview_inputs(
     station distance priority over observation time proximity.
     """
     valid_time = valid_time.astimezone(UTC)
+    times = (valid_time, *(instant.astimezone(UTC) for instant in extra_valid_times))
+    locator_time = ",".join(instant.isoformat() for instant in times)
     configuration, _ = load_configuration_source(
         base_path=ROOT / "configs/base.yaml",
         environment_path=ROOT / "configs/phase1-grasston.yaml",
@@ -62,7 +69,7 @@ def seed_observation_preview_inputs(
         return artifacts.register_source(
             SourceRegistrationRequest(
                 source_authority="mesoforge.test-fixture",
-                source_locator=f"test-fixture://observation-preview/{valid_time.isoformat()}/{kind}",
+                source_locator=f"test-fixture://observation-preview/{locator_time}/{kind}",
                 source_revision="observation-preview-fixture.v1",
                 artifact_type=kind,
                 artifact_schema_version=schema,
@@ -99,8 +106,8 @@ def seed_observation_preview_inputs(
         },
     )
     raw_rows = []
-    for station in phase2.stations:
-        time = valid_time + timedelta(minutes=10 if station.provider_icao_id == "KROS" else 0)
+    for instant, station in product(times, phase2.stations):
+        time = instant + timedelta(minutes=10 if station.provider_icao_id == "KROS" else 0)
         temp = {"KCBG": 10.0, "KJMR": 400.0, "KROS": 20.0}[station.provider_icao_id]
         raw_rows.append(
             {
@@ -144,8 +151,8 @@ def seed_observation_preview_inputs(
             raw_record_index=index,
             station_snapshot_artifact_id=stations.artifact_id,
             ingested_at=now,
-            query_window_start=valid_time - timedelta(hours=1),
-            query_window_end=valid_time + timedelta(hours=1),
+            query_window_start=min(times) - timedelta(hours=1),
+            query_window_end=max(times) + timedelta(hours=1),
         )
         rows.append(normalized.model_dump(mode="json"))
     return register("normalized-metar-observations", "metar-observations.v2", {"rows": rows})

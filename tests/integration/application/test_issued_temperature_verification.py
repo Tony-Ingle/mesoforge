@@ -187,11 +187,16 @@ def test_concurrent_verifications_share_one_successful_activity_and_object(
 
     def verify(_: int) -> dict[str, Any]:
         return make_verifier(migrated_dsn, object_store, issuer).verify(
-            issued.issued_forecast_id, VALID_TIME
+            issued.issued_forecast_id, VALID_TIME, report_reuse=True
         )
 
     with ThreadPoolExecutor(max_workers=3) as executor:
         responses = list(executor.map(verify, range(3)))
+    assert sorted(response.pop("already_existing") for response in responses) == [
+        False,
+        True,
+        True,
+    ]
     assert responses[0]["status"] == "verified"
     assert responses == [responses[0]] * 3
     after = complete_storage_inventory(migrated_dsn, object_store)
@@ -199,6 +204,97 @@ def test_concurrent_verifications_share_one_successful_activity_and_object(
     assert len(after["tables"]["activities"]) == len(before["tables"]["activities"]) + 1
     assert len(after["objects"]) == len(before["objects"]) + 1
     assert_forecasts_unchanged(before, after, object_store)
+
+
+def test_window_keeps_versions_continues_after_unavailable_hours_and_reuses_saved_results(
+    prepared_guidance: Path,
+    migrated_dsn: str,
+    object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    later_time = datetime(2026, 8, 30, 15, tzinfo=UTC)
+    observations = seed_observation_preview_inputs(
+        migrated_dsn, object_store, VALID_TIME, extra_valid_times=(later_time,)
+    )
+    monkeypatch.setenv("MESOFORGE_OBSERVATIONS_ARTIFACT_ID", str(observations.artifact_id))
+    issuer = make_issuer(migrated_dsn, object_store)
+    forecast = PreparedPointForecast.from_directory(prepared_guidance).forecast(
+        latitude=FIRST["lat"], longitude=FIRST["lon"]
+    )
+    issued = [issuer.issue(forecast, batch_run_id=uuid4(), location_index=0) for _ in range(2)]
+    originals = {row.issued_forecast_id: issuer.read(row.issued_forecast_id) for row in issued}
+    verifier = make_verifier(migrated_dsn, object_store, issuer)
+    existing = verifier.verify(issued[0].issued_forecast_id, VALID_TIME)
+    before = complete_storage_inventory(migrated_dsn, object_store)
+    query = {
+        "latitude": FIRST["lat"],
+        "longitude": FIRST["lon"],
+        "start_valid_time": VALID_TIME,
+        "end_valid_time": datetime(2026, 8, 30, 16, tzinfo=UTC),
+    }
+
+    first = verifier.verify_window(**query)
+    assert first["summary"] == {
+        "verified": 3,
+        "unavailable": 2,
+        "ineligible": 0,
+        "already_existing": 1,
+        "errors": 0,
+    }
+    assert [row["valid_time"] for row in first["results"]] == [
+        f"2026-08-30T{hour}:00:00Z" for hour in (13, 13, 14, 14, 15, 15)
+    ]
+    identifiers = {str(row.issued_forecast_id) for row in issued}
+    for offset in (0, 2, 4):
+        pair = first["results"][offset : offset + 2]
+        assert {row["issued_forecast_id"] for row in pair} == identifiers
+    for row in first["results"][2:4]:
+        assert row["status"] == "unavailable"
+        assert row["verification_id"] is None
+        assert row["reasons"]
+        assert row["temperature_error"]["value"] is None
+    assert all(row["status"] == "verified" for row in first["results"][4:])
+    persisted = {
+        row["verification_id"]: verifier.read(ArtifactId(row["verification_id"]))
+        for row in first["results"]
+        if row["verification_id"] is not None
+    }
+    assert len(persisted) == 4
+    assert persisted[existing["verification_id"]] == existing
+    for row in first["results"]:
+        if row["verification_id"] is None:
+            continue
+        saved = persisted[row["verification_id"]]["result"]
+        assert saved["match"]["issued_forecast_id"] == row["issued_forecast_id"]
+        assert saved["match"]["forecast"]["valid_time"] == row["valid_time"]
+        assert saved["temperature_error"] == row["temperature_error"]
+        assert saved["match"]["selected"]["provenance"]["revision_digest"].startswith("sha256:")
+
+    after = complete_storage_inventory(migrated_dsn, object_store)
+    assert len(verification_artifacts(after)) == 4
+    assert len(after["tables"]["activities"]) == len(before["tables"]["activities"]) + 3
+    assert len(after["objects"]) == len(before["objects"]) + 3
+    assert_forecasts_unchanged(before, after, object_store)
+
+    repeated = make_verifier(migrated_dsn, object_store, issuer).verify_window(**query)
+    assert repeated["summary"] == {
+        "verified": 0,
+        "unavailable": 2,
+        "ineligible": 0,
+        "already_existing": 4,
+        "errors": 0,
+    }
+    assert repeated["results"] == [
+        {**row, "status": "already_existing"} if row["verification_id"] else row
+        for row in first["results"]
+    ]
+    for identifier, saved in persisted.items():
+        assert verifier.read(ArtifactId(identifier)) == saved
+    assert {row.issued_forecast_id: issuer.read(row.issued_forecast_id) for row in issued} == (
+        originals
+    )
+    assert complete_storage_inventory(migrated_dsn, object_store) == after
 
 
 def test_two_issued_versions_for_the_same_hour_are_independently_verified(
