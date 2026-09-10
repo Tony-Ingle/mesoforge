@@ -23,6 +23,7 @@ from mesoforge.application.issued_temperature_verification import (
 )
 from mesoforge.application.observation_preview import preview_observation_match
 from mesoforge.application.point_forecast import PreparedPointForecast
+from mesoforge.application.prepared_observations import acquire_bundle, prepare_bundle
 from mesoforge.common.errors import IntegrityError, NotFound
 from mesoforge.common.identifiers import ArtifactId, Digest
 from mesoforge.storage.json import CanonicalJsonSerializer
@@ -34,7 +35,14 @@ from tests.support.observation_preview import (
     complete_storage_inventory,
     seed_observation_preview_inputs,
 )
+from tests.support.phase1_fixture_transports import (
+    FakeHttpResponse,
+    FixedClock,
+    FixtureAviationWeatherTransport,
+    RecordingSleeper,
+)
 from tests.unit.application.test_batch_forecast import FIRST
+from tests.unit.application.test_prepared_observations import _record
 
 pytestmark = pytest.mark.integration
 
@@ -413,3 +421,95 @@ def test_saved_verification_payload_damage_fails_closed_without_rewriting_the_re
     with pytest.raises(IntegrityError):
         verifier.verify(issued.issued_forecast_id, VALID_TIME)
     assert complete_storage_inventory(migrated_dsn, object_store) == before
+
+
+def test_prepared_metar_bytes_feed_existing_window_and_rebuild_without_http(
+    tmp_path: Path,
+    prepared_guidance: Path,
+    migrated_dsn: str,
+    object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The new preparation boundary uses invented provider bytes, then existing storage/logic."""
+    from mesoforge.application import prepared_observations
+
+    end = datetime(2026, 8, 30, 16, tzinfo=UTC)
+    acquired = datetime(2026, 8, 30, 17, tzinfo=UTC)
+    payload = JSON.serialize(
+        [
+            _record(
+                obsTime=int(datetime(2026, 8, 30, hour, 10, tzinfo=UTC).timestamp()),
+                reportTime=f"2026-08-30T{hour}:10:00Z",
+                receiptTime=f"2026-08-30T{hour}:12:00Z",
+            )
+            for hour in (13, 15)
+        ]
+    )
+    transport = FixtureAviationWeatherTransport()
+    transport.metar_queue.append(FakeHttpResponse(200, {"ETag": "fixture"}, payload))
+    clock = FixedClock(acquired)
+    directory = tmp_path / "metar"
+    acquire_bundle(
+        directory,
+        latitude=FIRST["lat"],
+        longitude=FIRST["lon"],
+        start_valid_time=VALID_TIME,
+        end_valid_time=end,
+        transport=transport,
+        clock=clock,
+        sleeper=RecordingSleeper(clock),
+    )
+
+    def no_http() -> None:
+        pytest.fail("Preparation from retained bytes and verification must not construct HTTP")
+
+    monkeypatch.setattr(prepared_observations, "RequestsAviationWeatherHttpTransport", no_http)
+    prepared = prepare_bundle(directory)
+    monkeypatch.setenv("MESOFORGE_OBSERVATIONS_ARTIFACT_ID", prepared["observations_artifact_id"])
+    issuer = make_issuer(migrated_dsn, object_store)
+    forecast = PreparedPointForecast.from_directory(prepared_guidance).forecast(
+        latitude=FIRST["lat"],
+        longitude=FIRST["lon"],
+    )
+    issued = [issuer.issue(forecast, batch_run_id=uuid4(), location_index=0) for _ in range(2)]
+    before = complete_storage_inventory(migrated_dsn, object_store)
+    verifier = make_verifier(migrated_dsn, object_store, issuer)
+    query = dict(
+        latitude=FIRST["lat"],
+        longitude=FIRST["lon"],
+        start_valid_time=VALID_TIME,
+        end_valid_time=end,
+    )
+    first = verifier.verify_window(**query)
+    assert first["summary"] == {
+        "verified": 4,
+        "already_existing": 0,
+        "unavailable": 2,
+        "ineligible": 0,
+        "errors": 0,
+    }
+    assert {row["issued_forecast_id"] for row in first["results"]} == {
+        str(row.issued_forecast_id) for row in issued
+    }
+    for row in first["results"]:
+        if row["verification_id"] is None:
+            assert row["reasons"]
+            continue
+        saved = verifier.read(ArtifactId(row["verification_id"]))["result"]
+        selected = saved["match"]["selected"]
+        assert selected["temperature"] == {"value": 293.15, "unit": "K"}
+        assert selected["provenance"]["raw_artifact_id"] == prepared["raw_artifact_id"]
+        assert selected["provenance"]["revision_digest"].startswith("sha256:")
+        assert saved["temperature_error"]["value"] == pytest.approx(
+            saved["match"]["forecast"]["temperature"]["value"] - 293.15
+        )
+    _, raw = verifier._artifacts.load_verified_payload(ArtifactId(prepared["raw_artifact_id"]))
+    assert raw == payload
+    after = complete_storage_inventory(migrated_dsn, object_store)
+    assert_forecasts_unchanged(before, after, object_store)
+    assert prepare_bundle(directory) == prepared
+    repeat = verifier.verify_window(**query)
+    assert repeat["summary"] == {**first["summary"], "verified": 0, "already_existing": 4}
+    assert complete_storage_inventory(migrated_dsn, object_store) == after
+    assert len(transport.get_calls) == 1

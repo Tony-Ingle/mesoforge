@@ -65,8 +65,13 @@ The `window` verification command now processes all saved versions for one coord
 and valid-time window, reporting new, reused, unavailable, and ineligible results.
 Its demonstration and repeat preserved issued forecasts; **56 focused offline and
 13 PostgreSQL/MinIO integration tests passed**. See [window verification](#verify-a-coordinate-and-time-window).
-Proposed next milestone: prepare one bounded real METAR observation dataset using
-existing acquisition/normalization, then run the same window command against it.
+One bounded **real METAR dataset** now feeds that unchanged verification command.
+The September 10 demonstration acquired 27 reports from three retained stations,
+saved four verification results across two issued versions, and safely reused all
+four on repeat. Raw observations and provenance remain outside Git and in existing
+artifact storage. See [real observation preparation](#prepare-one-real-metar-dataset).
+Proposed next milestone: derive one bounded observation-acquisition window from
+eligible saved past hours, then reuse this preparation and verification path on demand.
 
 Future direction: configure locations using latitude/longitude only, with geographic
 context and suitable observation sources derived internally. The intended VPS workflow
@@ -635,8 +640,9 @@ independent issued versions, exact readback, explicit ineligibility, and damaged
 The new modules are `tests/unit/verification/test_issued_temperature.py`,
 `tests/unit/application/test_issued_temperature_verification.py`, and
 `tests/integration/application/test_issued_temperature_verification.py`.
-Quality checks passed. Full acceptance/coverage, live observations, backup/restore,
-and deployment remain unvalidated.
+Quality checks passed. That milestone used synthetic observations; the later bounded
+real-observation check is below. Full acceptance/coverage, backup/restore, and deployment
+remain unvalidated.
 
 ### Verify a coordinate and time window
 
@@ -674,7 +680,79 @@ the existing concurrency check also verifies reuse reporting. **56 offline tests
 (verification application and hour selection) and **13 integration tests** (verification
 and observation preview) passed, along with applicable quality checks. The integration
 window includes an unavailable hour between eligible hours. Broader suites were not
-rerun; the previously documented live-observation and operational validation gaps remain.
+rerun; operational validation gaps remain. The later real-observation demonstration follows.
+
+### Prepare one real METAR dataset
+
+[Observation preparation](src/mesoforge/application/prepared_observations.py) reuses the
+retained AviationWeather.gov acquisition, strict parser, Phase 2 normalizer, and
+PostgreSQL/MinIO artifact path. It automatically selects **retained** METAR stations
+within 50 km; this does not discover a nationwide station catalog. Coordinates,
+elevations, and station identity come from a pinned copy of the existing configuration,
+not a newly acquired historical station catalog. Matching, QC, and verification math
+are unchanged. An opaque provider `qcField` is preserved alongside existing field QC;
+its numeric value is not interpreted as a newly invented pass/fail rule.
+
+With the same configured PostgreSQL/MinIO environment as verification, the acquisition
+command is below. `$python` is the isolated interpreter and `PYTHONPATH` points to `src`
+as shown earlier. Use a **new directory outside the repository** for a new acquisition;
+this demonstrated directory already exists, so use `--from-raw` to reuse it.
+
+```powershell
+$observations = "$env:LOCALAPPDATA\MesoForge\observations\20260910T17-1930Z-grasston-metar"
+& $python -B -m mesoforge.application.prepared_observations --raw-dir $observations --lat 45.8 --lon -93.1 --start-valid-time 2026-09-10T17:00:00Z --end-valid-time 2026-09-10T19:30:00Z
+# Rebuild/register from retained bytes, without constructing an HTTP transport:
+& $python -B -m mesoforge.application.prepared_observations --raw-dir $observations --from-raw
+```
+
+The acquisition function was exercised with those exact inputs; the equivalent first
+CLI wrapper was not used for the real request. The `--from-raw` CLI was executed twice.
+Preparation prints `observations_artifact_id`; set it before running the **unchanged**
+window command. These commands were executed against the retained demonstration:
+
+```powershell
+$env:MESOFORGE_OBSERVATIONS_ARTIFACT_ID = 'art_0071726d-b60a-4df2-a215-35b341db342e'
+& $python -B -m mesoforge.application.issued_temperature_verification window --lat 45.8 --lon -93.1 --start-valid-time 2026-09-10T17:00:00Z --end-valid-time 2026-09-10T19:30:00Z
+```
+
+Preparation accepts up to six hours per explicit request and pads its bounds by
+15 minutes; the entire padded interval must be in the past. It uses the official
+[METAR API's date and hours query](https://aviationweather.gov/data/api/) through the
+existing retry/rate-limit adapter. This example requested **16:45–19:45 UTC** and
+received **27 reports (nine each from KCBG, KJMR, KROS), 11,146 response bytes**, at
+19:59:25 UTC on September 10. All normalized successfully. Exact response bytes,
+URL, headers, status, acquisition time, configuration/code identity, and checksums
+remain in `metar.json`, `manifest.json`, and `configuration.json` outside Git.
+The existing adapter represents HTTP 204 as canonical `[]`.
+Raw and normalized payloads live in MinIO; PostgreSQL holds their manifests,
+configuration, transformation lineage, and verification metadata. Observation event,
+report, provider-receipt, and ingestion times stay distinct. Original record indices,
+logical/revision digests, raw checksums, and station snapshot references are retained.
+
+At 18:00 UTC, the 17:55 and 18:15 reports at all three stations passed temperature QC.
+KROS won at **16.174 km**, ahead of KJMR (16.407 km) and KCBG (29.878 km); its 17:55
+report was closer in time than its 18:15 report. The other 21 reports were explicitly
+outside the time tolerance. The selected real temperature was **296.25 K**;
+the saved forecast was **296.510793354 K**, giving **+0.260793354 K** error.
+At 19:00 UTC the error was **+0.201772811 K**. Both issued versions were verified
+independently at each hour: **four new records**, then **four reused** on repeat.
+Both 17:00 hours remained ineligible because issuance followed the valid/observation
+time; no scores were fabricated. There were no unavailable hours or processing errors.
+
+Raw readback matched the downloaded bytes. Offline preparation returned the same
+artifact, and repeating preparation/verification changed no rows or objects. All four
+issued forecast records and payloads remained unchanged. Evidence is outside Git in
+`%LOCALAPPDATA%\MesoForge\baselines\20260910-real-metar`.
+Focused validation passed **70 offline tests** (new preparation plus existing provider
+parser/acquisition/normalization tests) and **10 PostgreSQL/MinIO integration tests**
+(existing verification module, including one new preparation-to-window case).
+The integration fixture covers a missing hour and blocks new observation HTTP transport
+construction after acquisition. No dependencies, policies, or forecast calculations changed.
+Ruff lint/format, mypy, all nine import contracts, documentation/hygiene checks, and
+`git diff --check` passed.
+Full acceptance/coverage, operational input-cutoff validation, long-term provider
+reliability, and station metadata history remain unverified; this is not a skill claim.
+Temporary services were stopped after validation. No polling or scheduling was added.
 
 ### Prepare real inputs before serving
 
