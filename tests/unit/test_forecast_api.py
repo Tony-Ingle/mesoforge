@@ -301,11 +301,12 @@ def test_valid_times_must_match_source_cycle_plus_leads(prepared_dir: Path) -> N
         api.create_app(prepared_dir)
 
 
-def test_cli_prepares_demo_and_binds_only_to_loopback(
+def test_cli_loads_prepared_demo_and_binds_only_to_loopback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     run = Mock()
     monkeypatch.setattr("uvicorn.run", run)
+    prepare_demo_files(tmp_path)
     api.main(["--data-dir", str(tmp_path), "--port", "8123"])
     run.assert_called_once()
     assert run.call_args.kwargs["host"] == "127.0.0.1"

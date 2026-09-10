@@ -8,19 +8,20 @@ is described below. Start with [VISION.md](VISION.md) for release boundaries and
 
 ## Current status
 
-The working localhost endpoint, `GET /forecast?lat=45.8&lon=-93.1`, returns
-**synthetic** temperature guidance for hours 1–3 within latitude 45.5–46.0 and
-longitude -93.5–-93.0. It reuses prepared files and existing extraction/blending,
-keeps the approved 70% HRRR / 30% GFS weights, and reports Kelvin units, source
-cycles, valid times, and explicit missingness. Its fixed August 30, 2026 inputs
-are invented demonstration data, not a current weather forecast.
+The localhost endpoint, `GET /forecast?lat=45.8&lon=-93.1`, now returns temperature
+from **real prepared HRRR/GFS guidance** for hours 1–3 within latitude 45.5–46.0
+and longitude -93.5–-93.0. It retains the approved 70% HRRR / 30% GFS demonstration
+weights and reports Kelvin units, source cycles/leads, valid times, checksums,
+and explicit missingness. Preparation happens before serving. The demonstrated
+September 10, 2026 snapshot is fixed historical guidance, not a current live forecast.
+Starting without `--data-dir` still selects the clearly labeled synthetic example.
 
-Validation: on September 9, **39 API + 148 retained Phase 2 tests passed**, along
-with quality checks and a localhost HTTP demonstration; the server was stopped.
-The **39 API tests passed again on September 10** during focused review. Full
-database/storage acceptance, the full coverage gate, live-provider tests, and
-real-guidance use through this endpoint have not been verified. See the detailed
-commands and validation record below; passing this slice does not verify the whole app.
+Validation on September 10: **229 tests passed** (78 API/preparation, 148 retained
+Phase 2, and 3 existing acquisition tests), along with quality checks. One bounded
+acquisition and real localhost responses succeeded; independent calculations from
+the raw messages agreed. The server was stopped. Full database/storage acceptance,
+the full coverage gate, and the live-provider canary suite were not run. This verifies
+the small slice, not the entire application or forecast skill.
 
 The separate Phase 2 pipeline remains an unpublished HRRR/NBM/GFS station baseline
 for hours 1–36 at KCBG, KJMR, and KROS, with temperature, dew point, wind, gust,
@@ -28,12 +29,10 @@ QPF, PoP, METAR verification, provenance, and retained-input replay. Its default
 are unchanged. Standalone Phase 1 hours 0–6 generation is retired; shared science,
 its required configuration overlay, and historical readers remain.
 
-**Proposed next milestone:** feed one fixed real HRRR/GFS temperature snapshot
-through the same endpoint, area, hours, and weights. A separate preparation command
-would acquire/decode only the required messages, preserve native grids and source
-evidence, and write shared local inputs before serving. Real-data labels and
-per-model projection handling are required; real files cannot simply replace the
-synthetic files today. Implementation and acquisition require a separate approval.
+**Proposed next milestone:** rebuild the same prepared temperature inputs from the
+retained raw messages without downloading them again, and demonstrate matching
+forecast values and source evidence. This would make local replay practical;
+it does not add fields, models, scheduling, or a broader cache platform.
 
 There is no operational forecast API, shared-cache job system, or registered-coordinate
 history service. RRFS, precipitation type, learned weights, AI adjustments, and
@@ -44,6 +43,15 @@ Local Codex development has replaced the paused Hermes development pipeline. The
 not approval to implement its entire release plan.
 
 ## Existing forecast path
+
+The long-term direction is a broader blend of HRRR, RAP, NAM 3 km, NAM, GFS,
+RRFS / REFS, NBM, and appropriate GEFS, ECMWF, Canadian, and other guidance.
+Only HRRR/NBM/GFS are implemented in Phase 2 today. NAM/NAM 3 km are legacy
+transition candidates: the September 9 NWS notices schedule retirement and the
+RRFS/REFS transition for October 14, 2026, subject to weather delay. See
+[VISION.md](VISION.md#long-term-model-direction) for the verified official notices
+and planned-versus-current support. Retain raw data actually acquired even when
+the API uses only a subset; this does not expand the authorized downloads.
 
 1. [The live runner](scripts/run_phase2_live.py), `main()`, builds `Phase2Request`
    from explicit UTC times. `_load_configuration()` merges
@@ -68,7 +76,7 @@ not approval to implement its entire release plan.
 
 Run commands from the repository root. **The general setup, service, and full-suite
 commands below remain unverified on this local Windows checkout.** The focused
-Python 3.12 checks and synthetic demonstration have separate execution results below.
+Python 3.12 checks and prepared-guidance demonstration have separate execution results below.
 
 The project requires Python **3.12** and `uv`; see [pyproject.toml](pyproject.toml)
 and [uv.lock](uv.lock). Dependencies include NumPy/xarray, Pint, pyproj,
@@ -138,25 +146,27 @@ or a POSIX shell is unavailable. The lockfile includes Windows pgserver wheels;
 that does not establish that the whole stack works on this machine. WSL/Linux offers
 an environment closer to CI.
 
-Checks passed during this consolidation: `python -B scripts/validate_docs.py`,
+During the September 9 documentation consolidation, checks passed:
+`python -B scripts/validate_docs.py`,
 `python -B scripts/check_repository_hygiene.py`, and `git diff --check`.
 The existing Python check scripts used the available Python 3.14.4 interpreter,
 not the project's Python 3.12 runtime; `uv` was not available on PATH. Product setup,
-provider access, services, and product tests were not exercised. Documentation checks
-do not establish runtime compatibility.
+provider access, services, and product tests were not exercised at that checkpoint.
+The later Python 3.12 and real-input results below supersede that limited runtime status.
 
 ## Approved localhost demonstration
 
 [The HTTP entry point](src/mesoforge/api.py) accepts a coordinate near Grasston and
-returns three hourly temperatures from [prepared synthetic guidance](src/mesoforge/application/point_forecast.py).
-Every response identifies itself as synthetic demonstration data, not a current
-weather forecast. The supported rectangle includes latitude **45.5–46.0** and
-longitude **-93.5–-93.0**; unsupported or invalid coordinates return HTTP 422.
+returns three hourly temperatures through [prepared point extraction](src/mesoforge/application/point_forecast.py).
+Every JSON response identifies its inputs as real prepared guidance or synthetic
+demonstration data. Neither mode claims to be a current live forecast. The supported
+rectangle includes latitude **45.5–46.0** and longitude **-93.5–-93.0**;
+unsupported or invalid coordinates return HTTP 422.
 
 With the locked dependencies installed, the portable start command is:
 
 ```text
-uv run --locked python -m mesoforge.api
+uv run --locked python -m mesoforge.api --data-dir PATH_TO_PREPARED_SNAPSHOT
 ```
 
 The module was exercised directly with the isolated Python 3.12 environment and
@@ -164,18 +174,34 @@ The module was exercised directly with the isolated Python 3.12 environment and
 Open <http://127.0.0.1:8765/forecast?lat=45.8&lon=-93.1>. Stop with Ctrl+C.
 The launcher binds only to `127.0.0.1`; `--port` changes the port, not the host.
 
-At startup, an empty directory receives tiny `HRRR.nc` and `GFS.nc` files; existing
-files are never overwritten. The default directory is
-`mesoforge-synthetic-temperature-demo` under the operating system's temporary
-directory; `--data-dir PATH` selects another directory. Both files are loaded and
-closed before requests begin, and reused across coordinates. Restart to load changed
-inputs. Their invented latitude/longitude grids are not real HRRR/GFS native grids.
+An explicit `--data-dir` requires existing prepared files; it never generates a
+synthetic substitute. Real snapshots contain `HRRR.nc`, `GFS.nc`, `manifest.json`,
+and retained source messages/indexes under `raw/`. Startup verifies their hashes,
+units, cycles, valid times, and projection metadata, then loads and closes the
+prepared datasets. Requests reuse these arrays across coordinates, with no file or
+provider I/O. Restart to load different inputs.
 
-The inputs fix the target reference at **2026-08-30 12:00 UTC**, HRRR's source cycle
-at 12:00, and GFS's at 06:00. Hours 1–3 are valid at 13:00, 14:00, and 15:00 UTC.
-Existing `align_station_to_model()` and `blend_scalar()` produce **286.14, 287.14,
-and 288.14 K** at the example coordinate. Responses include cycles, source leads,
-valid times, units, fixed weights, and explicit missing reasons.
+The snapshot exercised on Windows is outside Git at
+`%LOCALAPPDATA%\MesoForge\prepared\20260910T06Z-hrrr06-gfs00`.
+This exact PowerShell command starts it from the repository root using the existing
+isolated environment; it does not download anything:
+
+```powershell
+$env:PYTHONPATH = Join-Path (Get-Location) 'src'
+& "$env:LOCALAPPDATA\MesoForge\baselines\20260909-8d0983f-d6c8ced2\environment\Scripts\python.exe" -B -m mesoforge.api --data-dir "$env:LOCALAPPDATA\MesoForge\prepared\20260910T06Z-hrrr06-gfs00"
+```
+
+The real inputs use target reference **2026-09-10 06:00 UTC**, HRRR's **06Z** cycle
+at leads **1/2/3**, and GFS's **00Z** cycle at leads **7/8/9**. Both models are valid
+at **07Z/08Z/09Z**. Existing `align_station_to_model()` and `blend_scalar()` produced
+**285.29782837432555, 284.75571509307554, and 284.2734065226455 K** at the example
+coordinate. All three hours had empty missing-reason lists. Responses include source
+URLs and raw/prepared checksums, plus the manifest hash.
+
+Omitting `--data-dir` retains the earlier synthetic example. Its tiny invented grids
+live in `mesoforge-synthetic-temperature-demo` under the system temporary directory;
+existing files are not overwritten. Its August 30, 2026 inputs still produce
+**286.14, 287.14, and 288.14 K** at the example coordinate, labeled synthetic.
 
 Demo weights are **70% HRRR / 30% GFS**, matching
 `scalar-vector.hg.h01-h18` in [the existing configuration](configs/phase2-grasston.yaml).
@@ -183,29 +209,70 @@ That scalar/vector row applies to temperature and hours 1–3. Phase 2 defaults 
 unchanged. If either required model or hour is missing, that hour is null; weights
 are never redistributed. Invalid prepared-file units or time metadata prevent startup.
 
-This demonstration does not acquire real guidance or use databases. A real prepared
-guidance API remains later work requiring its own bounded approval; jobs, registration,
-history, verification, evaluation, and AI are outside this increment.
+### Prepare real inputs before serving
+
+[The preparation module](src/mesoforge/application/prepared_temperature.py) reuses
+the HRRR/GFS acquisition and strict GRIB decoders plus existing projection/subsetting
+functions. It selects only 2 m temperature, retains each complete acquired message
+and inventory, and writes small native-grid subsets with a one-cell halo. HRRR stays
+on its Lambert grid; GFS retains its geographic grid and north-to-south value order.
+The six-field Phase 2 normalizers and Phase 2 defaults are unchanged.
+
+The following module invocation was executed with the isolated Python interpreter
+and `PYTHONPATH=src`. It performs downloads and requires an empty output directory;
+do not rerun it to start the already prepared server. `OUTPUT_DIR` here represents
+the external snapshot path above; the `uv run` wrapper itself remains unverified.
+
+```text
+uv run --locked python -m mesoforge.application.prepared_temperature --output-dir OUTPUT_DIR --target-reference-time 2026-09-10T06:00:00Z --hrrr-cycle 2026-09-10T06:00:00Z --gfs-cycle 2026-09-10T00:00:00Z
+```
+
+The one authorized acquisition retrieved **5,342,777 HTTP body bytes**: **5,190,418**
+bytes in six raw temperature messages and **152,359** bytes in six inventories.
+HRRR came from NOAA's AWS archive; GFS from its Google Cloud archive. The streaming
+transport caps each inventory at 1 MiB, each selected message at 16 MiB, and the run
+at 64 MiB, rejecting responses that ignore byte ranges. No other fields were acquired.
+
+The manifest preserves URLs, byte ranges, retrieval and provider timestamps, cycles,
+leads, valid times, hashes, configuration/code identity, and decoder versions.
+Provider availability and retrieval time are distinct; this manual historical
+demonstration does not apply an operational issuance cutoff. Raw messages remain
+intact outside Git even though the prepared views use only the small region. This
+does not yet provide an offline raw-to-prepared replay command.
+
+No databases are needed. Jobs, registration, history, verification, evaluation, and
+AI remain outside this increment.
 
 ### Demonstration validation
 
-On 2026-09-09, the isolated locked Python 3.12 environment passed **39 focused API
-tests** in [test_forecast_api.py](tests/unit/test_forecast_api.py) and the **148-test
-recorded Phase 2 selection** in [CLEANUP.md](CLEANUP.md), run together: **187 passed**.
-Checks cover independent expected temperatures, boundaries, units/times/source cycles,
-missing files/hours, nonfinite extraction, labeled errors, repeated requests, and reuse
-of the same files for different coordinates. No existing scientific tests were changed.
+On 2026-09-10, the isolated locked Python 3.12 environment passed **229 tests** in
+one run: the **148-test recorded Phase 2 selection** in [CLEANUP.md](CLEANUP.md),
+**3 existing acquisition tests**, and **78 API/preparation tests**. The latter consist
+of the existing [synthetic API tests](tests/unit/test_forecast_api.py) and new
+[GRIB preparation](tests/unit/application/test_prepared_temperature.py) and
+[real-input API](tests/unit/test_real_forecast_api.py) tests. To select the four
+affected modules (append the recorded selection to reproduce the combined run):
+
+```text
+python -B -m pytest tests/unit/test_forecast_api.py tests/unit/application/test_prepared_temperature.py tests/unit/test_real_forecast_api.py tests/unit/guidance/test_acquisition_v2.py -q -s -p no:cacheprovider
+```
+
+These offline tests generate GRIB messages with known values and assert independent
+interpolation/blend results, native-grid gradients, actual valid-time alignment,
+units, provenance checksums, missing models/hours, unchanged weights, labeled errors,
+repeated requests without I/O, and acquisition limits. No retained scientific
+assertions were weakened. Additional read-only calculations from the downloaded raw
+messages matched all three endpoint results at two coordinates. The calculation
+accounted for the existing cfgrib decoder's float32 precision and agreed within 1e-8 K.
 
 Ruff lint/format, mypy, all nine import contracts, lock validation, documentation and
-repository hygiene checks, and `git diff --check` passed. A real localhost HTTP request
-returned the temperatures above; repeated requests matched, another coordinate worked,
-and unsupported coordinates returned 422. The demonstration server was stopped afterward.
-Full database/storage acceptance and live-provider tests were not run.
-
-The only dependency additions support HTTP serving/testing. Existing locked package
-versions are unchanged. Starlette's test client needs `httpx2` and an AnyIO version
-below 4.15 to avoid deprecated aliases under the repository's warnings-as-errors rule;
-the initial collection errors were resolved through those dependency choices.
+repository hygiene checks, and `git diff --check` passed. Actual localhost requests
+returned the real temperatures above; repeated responses matched, another coordinate
+worked, and unsupported coordinates returned 422. The listener was confirmed to be
+`127.0.0.1` only, then stopped. Full database/storage acceptance, the full coverage
+gate, and the live-provider canary suite were not run. The single acquisition is
+evidence for this fixed pair, not operational provider reliability or forecast skill.
+No dependencies or lockfile entries changed for the real-input milestone.
 
 ## References
 

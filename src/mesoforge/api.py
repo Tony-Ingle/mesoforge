@@ -1,4 +1,4 @@
-"""Localhost-only HTTP demonstration over synthetic prepared temperature guidance."""
+"""Localhost-only temperature endpoint over fixed, prepared model guidance."""
 
 from __future__ import annotations
 
@@ -20,12 +20,12 @@ from mesoforge.application.point_forecast import (
 )
 
 
-def _error(message: str, status_code: int) -> JSONResponse:
+def _error(message: str, status_code: int, prepared: PreparedPointForecast) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
         content={
-            "data_kind": "synthetic_demonstration",
-            "notice": "Synthetic demonstration data; not a current weather forecast.",
+            "data_kind": prepared.data_kind,
+            "notice": prepared.notice,
             "error": message,
         },
     )
@@ -35,7 +35,7 @@ def create_app(directory: Path) -> FastAPI:
     """Read and close prepared files once, before accepting any forecast request."""
     prepared = PreparedPointForecast.from_directory(directory)
     app = FastAPI(
-        title="MesoForge synthetic temperature demonstration",
+        title="MesoForge prepared temperature demonstration",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -44,22 +44,26 @@ def create_app(directory: Path) -> FastAPI:
 
     @app.exception_handler(RequestValidationError)
     async def invalid_parameters(request: Request, exc: RequestValidationError) -> JSONResponse:
-        return _error("Provide numeric lat and lon query parameters within the demo region.", 422)
+        return _error(
+            "Provide numeric lat and lon query parameters within the demo region.", 422, prepared
+        )
 
     @app.exception_handler(HTTPException)
     async def http_error(request: Request, exc: HTTPException) -> JSONResponse:
-        return _error(str(exc.detail), exc.status_code)
+        return _error(str(exc.detail), exc.status_code, prepared)
 
     @app.exception_handler(Exception)
     async def unexpected_error(request: Request, exc: Exception) -> JSONResponse:
-        return _error("Synthetic demonstration could not calculate this request.", 500)
+        return _error(
+            "Prepared temperature demonstration could not calculate this request.", 500, prepared
+        )
 
     @app.get("/forecast", response_model=None)
     def forecast(lat: float, lon: float) -> dict[str, Any] | JSONResponse:
         try:
             return prepared.forecast(latitude=lat, longitude=lon)
         except UnsupportedCoordinateError as exc:
-            return _error(str(exc), 422)
+            return _error(str(exc), 422, prepared)
 
     return app
 
@@ -69,12 +73,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--data-dir",
         type=Path,
-        default=Path(tempfile.gettempdir()) / "mesoforge-synthetic-temperature-demo",
-        help="Prepared-file directory; an empty directory gets two synthetic files at startup.",
+        help="Existing prepared-file directory; omitted selects the synthetic demonstration.",
     )
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args(argv)
-    prepare_demo_files(args.data_dir)
+    if args.data_dir is None:
+        args.data_dir = Path(tempfile.gettempdir()) / "mesoforge-synthetic-temperature-demo"
+        prepare_demo_files(args.data_dir)
     uvicorn.run(create_app(args.data_dir), host="127.0.0.1", port=args.port)
 
 

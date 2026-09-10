@@ -1,11 +1,9 @@
-"""Small prepared-input temperature demonstration, separate from operational guidance.
-
-The files contain invented fields on a latitude/longitude grid. Model labels identify
-demonstration contributors; they do not describe real HRRR or GFS native grids.
-"""
+"""Temperature from fixed prepared inputs; synthetic fixtures remain explicitly labeled."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,6 +19,8 @@ from mesoforge.forecasting.scalar_blend import Contribution, blend_scalar
 
 _DATA_KIND = "synthetic_demonstration"
 _NOTICE = "Synthetic demonstration data; not a current weather forecast."
+_REAL_KIND = "real_prepared_guidance"
+_REAL_NOTICE = "Real HRRR/GFS guidance from fixed prepared inputs; not a current live forecast."
 _VARIABLE = "air_temperature_2m"
 _WEIGHTS = {"HRRR": 0.7, "GFS": 0.3}
 _CRS = pyproj.CRS.from_epsg(4326)
@@ -90,8 +90,11 @@ def prepare_demo_files(directory: Path) -> None:
 
 
 def _validate_guidance(dataset: xr.Dataset, model: str) -> np.datetime64:
-    if dataset.attrs.get("model") != model or dataset.attrs.get("data_kind") != _DATA_KIND:
-        raise ValueError(f"{model}: file must identify the matching synthetic contributor")
+    if dataset.attrs.get("model") != model or dataset.attrs.get("data_kind") not in (
+        _DATA_KIND,
+        _REAL_KIND,
+    ):
+        raise ValueError(f"{model}: file must identify the matching contributor and data kind")
     target = _target_time(dataset.attrs.get("target_reference_time"))
     required = {
         _VARIABLE,
@@ -145,16 +148,78 @@ def _validate_guidance(dataset: xr.Dataset, model: str) -> np.datetime64:
     return target
 
 
+def _verify_file(directory: Path, filename: str, expected: str) -> None:
+    path = (directory / filename).resolve()
+    if not path.is_relative_to(directory.resolve()) or not path.is_file():
+        raise ValueError(f"Missing or invalid retained input path: {filename}")
+    with path.open("rb") as retained:
+        actual = hashlib.file_digest(retained, "sha256").hexdigest()
+    if actual != expected:
+        raise ValueError(f"Checksum mismatch for {filename}")
+
+
+def _load_source_manifest(
+    directory: Path, guidance: dict[str, xr.Dataset], target: np.datetime64
+) -> tuple[dict[str, Any], str]:
+    """Verify retained source and prepared file identities before serving real inputs."""
+    path = directory / "manifest.json"
+    if not path.is_file():
+        raise ValueError("Real prepared guidance requires manifest.json")
+    payload = path.read_bytes()
+    manifest = json.loads(payload)
+    try:
+        if (
+            manifest["data_kind"] != _REAL_KIND
+            or _target_time(manifest["target_reference_time"]) != target
+        ):
+            raise ValueError("Real guidance manifest data kind or target time disagrees")
+        entries = {(row["model"], row["valid_time"]): row for row in manifest["inputs"]}
+        if len(entries) != len(manifest["inputs"]):
+            raise ValueError("Real guidance manifest contains duplicate source times")
+        for row in entries.values():
+            for prefix in ("raw", "index"):
+                _verify_file(directory, row[f"{prefix}_file"], row[f"{prefix}_sha256"])
+        for model, dataset in guidance.items():
+            prepared = manifest["prepared_files"][model]
+            if prepared["file"] != f"{model}.nc":
+                raise ValueError(f"{model}: manifest names the wrong prepared file")
+            _verify_file(directory, prepared["file"], prepared["sha256"])
+            cycle = cast(np.datetime64, dataset["forecast_reference_time"].values[()])
+            for lead, valid in zip(
+                dataset["source_lead_time"].values, dataset["source_valid_time"].values, strict=True
+            ):
+                row = entries[(model, _iso(valid))]
+                if row["cycle"] != _iso(cycle) or row["source_lead_hours"] != int(
+                    lead / np.timedelta64(1, "h")
+                ):
+                    raise ValueError(f"{model}: source cycle/lead disagrees with retained evidence")
+                if not row["source_grib_url"].startswith("https://"):
+                    raise ValueError(f"{model}: missing source URL in retained evidence")
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise ValueError("Incomplete real guidance source manifest") from exc
+    return manifest, hashlib.sha256(payload).hexdigest()
+
+
 @dataclass(frozen=True)
 class PreparedPointForecast:
     """Eagerly loaded demonstration guidance; request-time calculation does no I/O."""
 
     _guidance: dict[str, xr.Dataset]
     _target_reference_time: np.datetime64
+    _projections: dict[str, pyproj.CRS]
+    data_kind: str
+    _manifest: dict[str, Any] | None
+    _manifest_sha256: str | None
+
+    @property
+    def notice(self) -> str:
+        return _REAL_NOTICE if self.data_kind == _REAL_KIND else _NOTICE
 
     @classmethod
     def from_directory(cls, directory: Path) -> PreparedPointForecast:
         guidance: dict[str, xr.Dataset] = {}
+        projections: dict[str, pyproj.CRS] = {}
+        kinds: set[str] = set()
         target: np.datetime64 | None = None
         for model in _WEIGHTS:
             path = directory / f"{model}.nc"
@@ -163,13 +228,35 @@ class PreparedPointForecast:
             with xr.open_dataset(path, engine="h5netcdf") as opened:
                 dataset = opened.load()
             model_target = _validate_guidance(dataset, model)
+            kind = str(dataset.attrs["data_kind"])
+            kinds.add(kind)
+            if len(kinds) != 1:
+                raise ValueError("Cannot mix real and synthetic guidance")
+            if kind == _REAL_KIND:
+                wkt = dataset.attrs.get("crs_wkt2")
+                if not isinstance(wkt, str) or not wkt:
+                    raise ValueError(f"{model}: real guidance requires crs_wkt2")
+                crs = pyproj.CRS.from_wkt(wkt)
+                if (model == "HRRR" and not crs.is_projected) or (
+                    model == "GFS" and not crs.is_geographic
+                ):
+                    raise ValueError(f"{model}: incorrect native projection")
+                projections[model] = crs
+            else:
+                projections[model] = _CRS
             if target is not None and model_target != target:
                 raise ValueError("Prepared model files disagree on target_reference_time")
             target = model_target
             guidance[model] = dataset
         if target is None:
             raise ValueError("No prepared demonstration guidance: HRRR.nc and GFS.nc are missing")
-        return cls(guidance, target)
+        data_kind = kinds.pop()
+        manifest, digest = (
+            _load_source_manifest(directory, guidance, target)
+            if data_kind == _REAL_KIND
+            else (None, None)
+        )
+        return cls(guidance, target, projections, data_kind, manifest, digest)
 
     def forecast(self, *, latitude: float, longitude: float) -> dict[str, Any]:
         if (
@@ -209,10 +296,21 @@ class PreparedPointForecast:
                     reasons.append(f"{model}: no guidance for this valid time")
                     continue
                 source["source_lead_hours"] = int((valid_time - cycle) / np.timedelta64(1, "h"))
+                if self._manifest is not None:
+                    evidence = next(
+                        row
+                        for row in self._manifest["inputs"]
+                        if row["model"] == model and row["valid_time"] == _iso(valid_time)
+                    )
+                    source.update(
+                        raw_sha256=evidence["raw_sha256"],
+                        source_url=evidence["source_grib_url"],
+                        prepared_sha256=self._manifest["prepared_files"][model]["sha256"],
+                    )
                 try:
                     aligned = align_station_to_model(
                         dataset,
-                        crs=_CRS,
+                        crs=self._projections[model],
                         station_latitude=latitude,
                         station_longitude=longitude,
                         canonical_variable_id=_VARIABLE,
@@ -240,11 +338,14 @@ class PreparedPointForecast:
                     "missing_reasons": reasons,
                 }
             )
-        return {
-            "data_kind": _DATA_KIND,
-            "notice": _NOTICE,
+        result = {
+            "data_kind": self.data_kind,
+            "notice": self.notice,
             "latitude": latitude,
             "longitude": longitude,
             "target_reference_time": _iso(self._target_reference_time),
             "hours": hours,
         }
+        if self._manifest_sha256 is not None:
+            result["manifest_sha256"] = self._manifest_sha256
+        return result

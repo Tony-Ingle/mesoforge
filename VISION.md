@@ -21,8 +21,38 @@ and [storage](docs/decisions/0004-postgresql-and-s3-storage.md) decisions. See
 The owner has moved development to local Codex and paused the Hermes development
 pipeline. The [revised V2 RFC](docs/rfcs/mesoforge-v2-architecture.md) is the proposed
 direction for a selective rebuild using suitable existing scientific functions.
-It remains **Proposed for owner architecture review**. This document does not approve
-its design choices, its full release scope, or the suggested first API milestone.
+Its full release architecture remains **Proposed for owner architecture review**.
+The owner separately approved the small localhost HRRR/GFS temperature endpoint
+and one fixed real prepared-guidance acquisition for hours 1–3. That slice now works;
+its observed results and validation gaps are recorded in README.
+That approval does not authorize the entire release or the model roadmap below.
+
+## Long-term model direction
+
+The owner-approved direction is an enterprise-style multi-model blend: HRRR, RAP,
+NAM 3 km (NAM CONUS nest), NAM, GFS, RRFS / REFS, and NBM, with additional useful
+deterministic and ensemble guidance such as GEFS, ECMWF, and Canadian models where
+appropriate. Product availability, access, and scientific suitability determine
+which integrations are useful. This is planned coverage, not implemented support
+or a requirement to acquire every model simultaneously. The current Phase 2 path
+supports HRRR/NBM/GFS; the small coordinate endpoint uses HRRR/GFS temperature only.
+The 70/30 demonstration weights are not a policy for the eventual model blend.
+
+NAM and NAM 3 km are transition/legacy candidates, not permanent dependencies.
+Verified on 2026-09-10: NWS [SCN 26-47, updated September 9](https://www.weather.gov/media/notification/pdf_2026/SCN26-47_Updated_Retire_NAM_SREF_HREF_HiresW_NAM_MOS.aab.pdf)
+announces retirement of NAM 12 km and its nests, along with SREF, HREF, HiresW,
+and NAM MOS, on **October 14, 2026 at 12:00 UTC**. The companion
+[SCN 26-48, updated September 9](https://www.weather.gov/media/notification/pdf_2026/scn26-048_Updated_RRFS_and_REFS_Implementation_aad.pdf)
+describes their RRFS/REFS replacement path. The coordinated date can be delayed
+by critical/significant weather. Earlier August 31 and October 6 dates are superseded;
+recheck official notices before implementing a NAM integration or transition.
+
+Retain the original raw model files/messages actually acquired, including fields
+not yet used by the API; prepared subsets do not replace that source evidence.
+Later trimming of fields/products is a separate decision. This does not authorize
+downloads of every field, level, lead, or model, or promise indefinite retention.
+The current test acquires only selected temperature messages and retains them in
+full, together with their indexes and source metadata, outside Git.
 
 ## Proposed architecture
 
@@ -69,10 +99,13 @@ One-off requests do not silently register a location or create durable forecast 
 - Observation acquisition, deterministic matching, and verification history.
 - Basic bounded performance queries over normalized facts.
 
-This is a release direction, not one implementation task. The immediate suggested
-increment is much smaller: a coordinate forecast from prepared guidance, exposing
-values, units, source cycles, valid times, and missingness. The exact support matrix,
-weights/fallbacks, preparation format, and private-access boundary are not yet approved.
+This is a release direction, not one implementation task. The completed first
+demonstration is much smaller: a coordinate temperature forecast from prepared
+guidance, exposing values, units, source cycles, valid times, and missingness.
+The exact support matrix,
+weights/fallbacks, preparation format, and private-access boundary for the full
+release remain open. The separately approved temperature slice keeps its existing
+area, hours 1–3, localhost binding, and demonstration weights.
 
 ## Future roadmap
 

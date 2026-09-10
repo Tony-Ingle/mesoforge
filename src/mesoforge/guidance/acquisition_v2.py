@@ -21,7 +21,12 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from email.utils import parsedate_to_datetime
 
-from mesoforge.catalog.sources import GfsSourceSettings, HrrrPhase2SourceSettings, NbmSourceSettings
+from mesoforge.catalog.sources import (
+    GfsSourceSettings,
+    HrrrPhase2SourceSettings,
+    NbmSourceSettings,
+    Phase2FieldContract,
+)
 from mesoforge.guidance.http_fetch import FetchedObject as FetchedObject
 from mesoforge.guidance.http_fetch import FetchError, RequestAttempt
 from mesoforge.guidance.http_fetch import fetch_with_range as _fetch_with_range
@@ -40,6 +45,21 @@ from mesoforge.guidance.sources import hrrr_phase2 as hrrr_phase2_source
 from mesoforge.guidance.sources import nbm as nbm_source
 
 Phase2AcquisitionError = FetchError
+
+
+def _selected_contracts(
+    contracts: tuple[Phase2FieldContract, ...], canonical_variables: tuple[str, ...] | None
+) -> tuple[Phase2FieldContract, ...]:
+    if canonical_variables is None:
+        return contracts
+    available = {contract.canonical_variable_id for contract in contracts}
+    if (
+        not canonical_variables
+        or len(set(canonical_variables)) != len(canonical_variables)
+        or not set(canonical_variables).issubset(available)
+    ):
+        raise ValueError("canonical_variables must be a nonempty, unique subset of field contracts")
+    return tuple(c for c in contracts if c.canonical_variable_id in canonical_variables)
 
 
 def parse_provider_availability(last_modified: str | None) -> datetime | None:
@@ -372,9 +392,11 @@ def acquire_hrrr_phase2_lead(
     cycle_hour: int,
     forecast_hour: int,
     cycle_deadline: datetime,
+    canonical_variables: tuple[str, ...] | None = None,
 ) -> Phase2LeadAcquisition:
     """Acquire one HRRR Phase 2 lead's pinned index and every field
-    contract's selected message."""
+    contract's selected message, or an explicit subset of those fields."""
+    contracts = _selected_contracts(settings.field_contracts, canonical_variables)
     index_urls = [
         (
             endpoint,
@@ -400,7 +422,7 @@ def acquire_hrrr_phase2_lead(
     rows = parse_index_rows(index_fetch.payload.decode("utf-8"))
 
     selected_rows: list[tuple[str, IndexRow]] = []
-    for contract in settings.field_contracts:
+    for contract in contracts:
         selector = hrrr_phase2_source.build_field_selector(
             contract.canonical_variable_id, forecast_hour=forecast_hour
         )
@@ -483,6 +505,7 @@ def acquire_gfs_lead(
     cycle_hour: int,
     forecast_hour: int,
     cycle_deadline: datetime,
+    canonical_variables: tuple[str, ...] | None = None,
 ) -> Phase2LeadAcquisition:
     """Acquire one GFS lead's pinned index and every field contract's
     selected message(s). For the APCP field at ``forecast_hour <= 6``
@@ -490,7 +513,9 @@ def acquire_gfs_lead(
     rows are retained (Section 2.4: caller responsibility, via
     ``select_field_rows`` plural) -- both are kept as distinct
     ``SelectedMessage`` entries so ``normalize_gfs_cycle`` can validate
-    their dual-parent equivalence during decode."""
+    their dual-parent equivalence during decode. ``canonical_variables``
+    optionally selects a subset; the default still acquires every field."""
+    contracts = _selected_contracts(settings.field_contracts, canonical_variables)
     index_urls = [
         (
             endpoint,
@@ -516,7 +541,7 @@ def acquire_gfs_lead(
     rows = parse_index_rows(index_fetch.payload.decode("utf-8"))
 
     selected_rows: list[tuple[str, IndexRow]] = []
-    for contract in settings.field_contracts:
+    for contract in contracts:
         selector = gfs_source.build_field_selector(
             contract.canonical_variable_id, forecast_hour=forecast_hour
         )

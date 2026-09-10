@@ -77,6 +77,24 @@ credential boundary. It is not public SaaS identity or tenancy.
 
 ### 2.2 Future Roadmap
 
+**Owner direction update, 2026-09-10:** the long-term model mix includes HRRR,
+RAP, NAM 3 km, NAM, GFS, RRFS / REFS, and NBM, with useful deterministic and
+ensemble guidance including GEFS, ECMWF, and Canadian models where appropriate.
+These are planned integrations, not completed support or one implementation task.
+Current Phase 2 supports HRRR/NBM/GFS; the separately approved localhost slice
+uses only HRRR/GFS temperature at hours 1–3 with demonstration weights of 70/30.
+
+NAM/NAM 3 km are transition candidates. The September 9 NWS SCN 26-47/26-48
+updates schedule NAM and its nests' retirement and RRFS/REFS replacement for
+October 14, 2026 at 12:00 UTC, subject to weather-related delay. The source links
+and verification date are in [VISION.md](../../VISION.md#long-term-model-direction).
+Earlier donor descriptions and older NOAA target dates do not override those notices.
+
+Retain raw model files/messages actually acquired, including currently unused
+fields, separately from prepared subsets. Later field/product trimming requires
+a separate decision. This direction does not authorize unbounded acquisition of
+fields, levels, leads, or models, nor settle indefinite-retention guarantees.
+
 - learned bias correction and model weighting;
 - bounded structured AI proposals and deterministic approval policy;
 - email or other delivery;
