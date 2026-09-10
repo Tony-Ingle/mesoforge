@@ -20,6 +20,7 @@ from mesoforge.application.issuance import (
     select_issued_forecast_hours,
     validate_hour_selection,
 )
+from mesoforge.application.observation_preview import preview_observation_match
 from mesoforge.application.point_forecast import (
     PreparedPointForecast,
     UnsupportedCoordinateError,
@@ -124,6 +125,52 @@ def create_app(directory: Path) -> FastAPI:
                     "error": {
                         "code": "issued_forecast_read_failed",
                         "message": "Could not read and verify the saved issued forecast.",
+                    }
+                },
+            )
+
+    @app.get("/issued-forecasts/{issued_forecast_id}/observation-match", response_model=None)
+    def observation_match(
+        issued_forecast_id: str, valid_time: str | None = None
+    ) -> dict[str, Any] | JSONResponse:
+        try:
+            identifier = UUID(issued_forecast_id)
+            instant = datetime.fromisoformat(valid_time or "")
+            if instant.tzinfo is None or instant.utcoffset() is None:
+                raise ValueError("valid_time must include a timezone")
+        except ValueError:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": {
+                        "code": "invalid_observation_match_query",
+                        "message": (
+                            "Provide an issued-forecast UUID and timezone-aware ISO valid_time."
+                        ),
+                    }
+                },
+            )
+        try:
+            return preview_observation_match(identifier, instant)
+        except NotFound:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": {
+                        "code": "issued_forecast_hour_not_found",
+                        "message": "No saved forecast hour exists for this ID and valid time.",
+                    }
+                },
+            )
+        except Exception:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": {
+                        "code": "observation_match_failed",
+                        "message": (
+                            "Could not read and verify the retained observation-match inputs."
+                        ),
                     }
                 },
             )

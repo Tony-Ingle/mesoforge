@@ -45,8 +45,16 @@ valid-time window, keeping overlapping issued versions separate. **327 offline a
 HTTP selection returned three hours from each of two retained versions, with original
 payloads and unchanged storage. Temporary services were stopped. Full database/storage
 acceptance and coverage remain unverified. See [saved-hour selection](#select-saved-forecast-hours).
-Proposed next milestone: match one selected hour to an automatically chosen observation
-proxy from retained inputs, after agreeing the temperature-source suitability rules.
+`GET /issued-forecasts/{id}/observation-match?valid_time=...` now previews one saved
+hour against a retained temperature observation, choosing a station automatically
+within 50 km and ±15 minutes after QC. It explains candidate exclusions and preserves
+provenance without scoring or writes. **477 focused offline and 37 PostgreSQL/MinIO
+integration tests passed** for this milestone. The localhost demonstration used real
+saved model forecasts with explicitly **synthetic observation fixtures**; no live
+observations were acquired. All stored contents stayed unchanged during requests.
+See [observation preview](#preview-one-observation-match) for the rules and limitations.
+Proposed next milestone: calculate and persist one temperature verification result
+linked to the exact issued version, observation revision, and matching policy.
 
 Future direction: configure locations using latitude/longitude only, with geographic
 context and suitable observation sources derived internally. The intended VPS workflow
@@ -449,7 +457,8 @@ No new forecasts or guidance downloads were needed. The API, PostgreSQL, and Min
 were stopped afterward, preserving their data outside Git. Evidence and captured
 responses are in `%LOCALAPPDATA%\MesoForge\baselines\20260910-issued-retrieval`.
 Quality checks passed; the full acceptance, coverage, live-provider, backup/restore,
-and deployment gaps above remain. Observation matching and verification are future work.
+and deployment gaps above remain. The read-only observation preview is documented below;
+forecast-error calculation and verification persistence remain future work.
 
 ### Select saved forecast hours
 
@@ -501,6 +510,63 @@ unchanged storage, and missing/corrupt payloads. The new unit module is
 listed above. The same three integration modules above were rerun. Quality checks
 passed. Full acceptance, coverage, live-provider, backup/restore, and deployment remain
 unvalidated. No observations were fetched or verification performed.
+
+### Preview one observation match
+
+Use the existing API startup and PostgreSQL/S3 settings. The operator additionally
+sets `MESOFORGE_OBSERVATIONS_ARTIFACT_ID` to one already-retained
+`normalized-metar-observations` artifact with schema `metar-observations.v2` in that
+storage. The preview loads its referenced station snapshots and original QC
+configuration through existing checksum-verified readers. This selects an input
+dataset, not a manually chosen station; the saved forecast supplies latitude/longitude.
+There is no observation discovery or acquisition in this endpoint.
+
+```text
+GET http://127.0.0.1:8765/issued-forecasts/b80e231a-c6e6-4066-ab4c-1e5d38bc2592/observation-match?valid_time=2026-09-10T13:00:00Z
+```
+
+The response preserves the saved hour, forecast context and code identity, and returns
+the selected station's METAR identity, coordinates, elevation, WGS84 distance, observation
+timestamp, Kelvin temperature, QC and raw/revision provenance. `candidates` explains
+exclusions. Both **50 km** and **±15 minutes** are inclusive. Eligible candidates rank
+by distance, then absolute time difference, then station ID; remaining ties use earlier
+observation time and revision identity. The latest retained revision of each logical
+observation is chosen before QC. Temperature-specific failures exclude a candidate;
+unrelated missing wind does not. The provider's opaque `qcField` is reported as evidence,
+not interpreted as a temperature failure by itself.
+
+No acceptable observation, missing forecast temperature, or an unconfigured dataset
+returns HTTP 200 with `status: unavailable`, `selected: null`, and an explicit reason.
+An empty observation artifact has no referenced station inventory to list. Invalid
+IDs or missing/naive times return 422; an unknown saved ID/hour returns 404; damaged
+or unavailable configured storage returns 500, not a successful unavailable match.
+This is a proxy preview over the configured snapshot, not an issuance-cutoff eligibility
+decision, an observation at the forecast coordinate itself, or a forecast skill score.
+
+September 10 localhost demonstration used the existing real-model forecast at
+`(45.8, -93.1)` for 13:00 UTC (**283.70508538821554 K**) and clearly labeled synthetic
+observation fixtures registered before the requests:
+
+| Station | Distance | Outcome |
+| --- | --- | --- |
+| KROS | 16.174 km | Selected: 293.15 K at 13:10 UTC, QC eligible |
+| KJMR | 16.407 km | Excluded: temperature failed range QC |
+| KCBG | 29.878 km | Eligible at 13:00 UTC, but farther away |
+
+The 15:00 UTC hour returned unavailable because no retained observation met the rules.
+Repeated requests preserved every PostgreSQL table's contents and all **seven MinIO
+objects**, including **four issued forecasts** and three fixture input artifacts.
+No verification/error artifacts or activities were created. The API and temporary
+services were stopped. Captured responses and the input manifest are outside Git at
+`%LOCALAPPDATA%\MesoForge\baselines\20260910-observation-match-preview`.
+
+Executed in the isolated locked environment: the previously listed API/batch/issuance/
+preparation modules, `tests/unit/observations`, `tests/unit/test_observation_preview_api.py`,
+and the recorded 148-test Phase 2 selection (**477 offline tests** total). The same
+three PostgreSQL/MinIO modules plus `tests/integration/application/test_observation_preview.py`
+passed (**37 integration tests**). Ruff, formatting, mypy, import contracts, lockfile,
+documentation, hygiene, and whitespace checks passed. Live observation handling,
+full acceptance/coverage, backup/restore, and deployment remain unvalidated.
 
 ### Prepare real inputs before serving
 
