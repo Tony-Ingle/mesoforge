@@ -15,15 +15,15 @@ from mesoforge.application.artifacts import ArtifactService
 from mesoforge.application.batch_forecast import _coordinates, load_locations
 from mesoforge.application.issuance import select_issued_forecast_hours
 from mesoforge.application.issued_temperature_verification import configured_service
-from mesoforge.application.point_forecast import (
-    UnsupportedCoordinateError,
-    validate_supported_coordinate,
-)
 from mesoforge.application.prepared_observations import (
     acquire_for_valid_times,
     load_observation_configuration,
     prepare_bundle,
     retained_station_ids,
+)
+from mesoforge.application.spatial_coverage import (
+    UnsupportedCoordinateError,
+    validate_coordinate,
 )
 from mesoforge.catalog.configuration import compute_configuration_digest
 from mesoforge.common.errors import IntegrityError
@@ -269,7 +269,7 @@ def run_batch(
             row.update(status="error", error={"code": "invalid_location", "message": str(exc)})
         else:
             try:
-                validate_supported_coordinate(latitude, longitude)
+                validate_coordinate(latitude, longitude)
                 outcome = run_window(
                     latitude=latitude,
                     longitude=longitude,

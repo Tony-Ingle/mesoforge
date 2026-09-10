@@ -20,6 +20,7 @@ import numpy as np
 import pyproj
 import xarray as xr
 
+from mesoforge.application.spatial_coverage import UnsupportedCoordinateError, native_bbox_bounds
 from mesoforge.catalog.configuration import Phase2Configuration, load_configuration_source
 from mesoforge.catalog.domains import BoundingBox
 from mesoforge.catalog.sources import GfsSourceSettings, HrrrPhase2SourceSettings
@@ -31,7 +32,6 @@ from mesoforge.guidance.acquisition_v2 import (
 from mesoforge.guidance.interfaces import Clock, HttpResponse, HttpTransport, Sleeper
 from mesoforge.guidance.normalization import (
     build_lambert_conformal_crs,
-    compute_bbox_halo_subset_indices,
     compute_latlon_grid,
     compute_projected_coordinates,
 )
@@ -47,7 +47,6 @@ _VARIABLE = "air_temperature_2m"
 _DATA_KIND = "real_prepared_guidance"
 _HORIZONS = tuple(range(1, 37))
 _BODY_BUDGET = 128 * 1024 * 1024
-_AREA = BoundingBox(south=45.5, north=46.0, west=-93.5, east=-93.0)
 _EXTRA_READ_KEYS = (
     "iScansNegatively",
     "jPointsAreConsecutive",
@@ -145,11 +144,15 @@ def normalize_temperature_messages(
     source_cycle: datetime,
     payloads_by_lead: dict[int, bytes],
     target_horizon_hours: tuple[int, ...] = _HORIZONS,
+    area: BoundingBox | None = None,
 ) -> xr.Dataset:
-    """Decode temperature only and retain the supported area plus one native cell.
+    """Decode temperature and retain an internal footprint plus a native-cell halo.
 
     The six-field Phase 2 normalizers are deliberately not called: no missing
     wind/precipitation fields are invented to satisfy their different contract.
+    Without a footprint the complete source grid is retained. At a model-domain
+    edge the footprint and halo stop at that edge; the exact forecast point is
+    checked separately against the native model domain.
     """
     leads = _leads(target_reference_time, source_cycle, target_horizon_hours)
     if set(payloads_by_lead) != set(leads):
@@ -160,6 +163,7 @@ def normalize_temperature_messages(
     )
     frames: list[xr.DataArray] = []
     crs: pyproj.CRS | None = None
+    source_extents: dict[str, float] = {}
     for lead in leads:
         if model == "HRRR" and isinstance(settings, HrrrPhase2SourceSettings):
             field = decode_selected_message(
@@ -182,8 +186,31 @@ def normalize_temperature_messages(
         else:
             raise ValueError("Model and source settings must match HRRR or GFS")
         lead_crs, x, y, lat, lon, order = _native_grid(model, field)
-        subset = compute_bbox_halo_subset_indices(x=x, y=y, lat=lat, lon=lon, bbox=_AREA)
-        ys, xs = slice(subset.y_start, subset.y_end), slice(subset.x_start, subset.x_end)
+        lead_extents = {
+            "source_x_min": float(np.min(x)),
+            "source_x_max": float(np.max(x)),
+            "source_y_min": float(np.min(y)),
+            "source_y_max": float(np.max(y)),
+        }
+        ys, xs = slice(None), slice(None)
+        if area is not None:
+            xmin, xmax, ymin, ymax = native_bbox_bounds(area, lead_crs)
+
+            def axis_slice(axis: np.ndarray, lower: float, upper: float) -> slice:
+                ordered = np.sort(axis)
+                lower, upper = max(lower, ordered[0]), min(upper, ordered[-1])
+                if lower > upper:
+                    raise UnsupportedCoordinateError(
+                        f"Requested footprint does not intersect the {model} native model domain"
+                    )
+                # Enclose projected footprint bounds, then retain one extra native cell.
+                first = max(0, int(np.searchsorted(ordered, lower, side="right")) - 2)
+                last = min(len(axis), int(np.searchsorted(ordered, upper, side="left")) + 2)
+                if axis[0] > axis[-1]:
+                    return slice(len(axis) - last, len(axis) - first)
+                return slice(first, last)
+
+            xs, ys = axis_slice(x, xmin, xmax), axis_slice(y, ymin, ymax)
         frame = xr.DataArray(
             np.asarray(field.values[:, order][ys, xs], dtype=np.float64),
             dims=("y", "x"),
@@ -191,11 +218,13 @@ def normalize_temperature_messages(
         )
         if frames and (
             lead_crs != crs
+            or lead_extents != source_extents
             or not frame["x"].equals(frames[0]["x"])
             or not frame["y"].equals(frames[0]["y"])
         ):
             raise ValueError(f"{model}: source grid changes between leads")
         crs = lead_crs
+        source_extents = lead_extents
         frames.append(frame)
     assert crs is not None
     cycle = np.datetime64(source_cycle.replace(tzinfo=None), "ns")
@@ -220,7 +249,13 @@ def normalize_temperature_messages(
             "data_kind": _DATA_KIND,
             "target_reference_time": _iso(target_reference_time),
             "crs_wkt2": crs.to_wkt(),
-            "grid_description": "Native model grid subset, supported area plus one-cell halo",
+            "grid_description": (
+                "Native model grid subset, derived footprint plus one-cell halo clipped to domain"
+                if area is not None
+                else "Complete native model grid"
+            ),
+            **source_extents,
+            **({"prepared_area_json": area.model_dump_json()} if area is not None else {}),
         },
     )
 
@@ -243,6 +278,8 @@ def _code_identity() -> dict[str, Any]:
     paths = (
         "application/prepared_temperature.py",
         "application/point_forecast.py",
+        "application/spatial_coverage.py",
+        "application/spatial_preparation.py",
         "api.py",
         "guidance/acquisition_v2.py",
         "guidance/http_fetch.py",
@@ -321,6 +358,8 @@ def prepare_temperature_guidance(
     clock: Clock,
     sleeper: Sleeper,
     target_horizon_hours: tuple[int, ...] = _HORIZONS,
+    area: BoundingBox | None = None,
+    fallback_areas: tuple[BoundingBox, ...] = (),
 ) -> dict[str, Any]:
     """Acquire both models for hours 1..36; retain raw evidence and prepare two files.
 
@@ -356,14 +395,23 @@ def prepare_temperature_guidance(
                 acquired = acquire_gfs_lead(configuration.gfs, **kwargs)  # type: ignore[arg-type]
             inputs.append(_retain_input(directory, acquired))
             payloads[lead] = acquired.selected_messages[0].payload
-        dataset = normalize_temperature_messages(
-            model=model,
-            settings=configuration.hrrr if model == "HRRR" else configuration.gfs,
-            target_reference_time=target_reference_time,
-            source_cycle=cycle,
-            payloads_by_lead=payloads,
-            target_horizon_hours=target_horizon_hours,
-        )
+        for candidate in (area, *fallback_areas):
+            try:
+                dataset = normalize_temperature_messages(
+                    model=model,
+                    settings=configuration.hrrr if model == "HRRR" else configuration.gfs,
+                    target_reference_time=target_reference_time,
+                    source_cycle=cycle,
+                    payloads_by_lead=payloads,
+                    target_horizon_hours=target_horizon_hours,
+                    area=candidate,
+                )
+            except UnsupportedCoordinateError:
+                if candidate == (area, *fallback_areas)[-1]:
+                    raise
+                continue
+            area = candidate
+            break
         prepared_files[model] = _write_prepared_file(directory, model, dataset)
     manifest = {
         "data_kind": _DATA_KIND,
@@ -372,6 +420,7 @@ def prepare_temperature_guidance(
         "created_at": _iso(clock.now()),
         "inputs": inputs,
         "prepared_files": prepared_files,
+        "prepared_area": area.model_dump() if area is not None else None,
         "downloaded_bytes": getattr(
             transport,
             "downloaded_bytes",
@@ -397,6 +446,7 @@ def rebuild_temperature_guidance(
     *,
     configuration: Phase2Configuration,
     clock: Clock,
+    area: BoundingBox | None = None,
 ) -> dict[str, Any]:
     """Re-decode retained raw messages into a new snapshot, without provider access.
 
@@ -406,6 +456,8 @@ def rebuild_temperature_guidance(
     source_directory = source_directory.resolve()
     source_payload = (source_directory / "manifest.json").read_bytes()
     source = json.loads(source_payload)
+    if area is None and source.get("prepared_area") is not None:
+        area = BoundingBox.model_validate(source["prepared_area"])
     configuration_hash = hashlib.sha256(configuration.model_dump_json().encode()).hexdigest()
     if (
         source.get("data_kind") != _DATA_KIND
@@ -475,6 +527,7 @@ def rebuild_temperature_guidance(
             source_cycle=cycle,
             payloads_by_lead=payloads,
             target_horizon_hours=horizons,
+            area=area,
         )
         prepared_files[model] = _write_prepared_file(directory, model, dataset)
     manifest = {
@@ -482,6 +535,7 @@ def rebuild_temperature_guidance(
         "target_horizon_hours": list(horizons),
         "created_at": _iso(clock.now()),
         "prepared_files": prepared_files,
+        "prepared_area": area.model_dump() if area is not None else None,
         "downloaded_bytes": 0,
         "preparation_code_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "code_identity": _code_identity(),
@@ -558,7 +612,28 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--from-raw", type=Path, help="Rebuild offline from this snapshot's manifest and raw files."
     )
+    parser.add_argument(
+        "--config", type=Path, help="Locations JSON; all regions are planned before acquisition."
+    )
+    parser.add_argument("--lat", type=float)
+    parser.add_argument("--lon", type=float)
     args = parser.parse_args(argv)
+    from mesoforge.application.batch_forecast import _coordinates, load_locations
+    from mesoforge.application.spatial_coverage import plan_regions
+    from mesoforge.application.spatial_preparation import ensure_coverage
+
+    locations = None
+    if args.config is not None:
+        if args.lat is not None or args.lon is not None:
+            parser.error("Use --config or --lat/--lon, not both")
+        locations = load_locations(args.config)
+    elif args.lat is not None or args.lon is not None:
+        if args.lat is None or args.lon is None:
+            parser.error("Both --lat and --lon are required")
+        locations = [{"lat": args.lat, "lon": args.lon}]
+    areas = plan_regions([_coordinates(location) for location in locations]) if locations else []
+    if locations is not None and not areas:
+        parser.error("At least one coordinate is required for spatial preparation")
     times = (args.target_reference_time, args.hrrr_cycle, args.gfs_cycle)
     if args.from_raw is not None:
         if any(value is not None for value in times):
@@ -574,6 +649,25 @@ def main(argv: list[str] | None = None) -> None:
     )
     if configuration.phase2 is None:
         raise ValueError("Phase 2 source settings are required")
+    if args.from_raw is not None and locations is not None:
+        source = args.from_raw
+        if (source / "coverage.json").is_file():
+            source = Path(json.loads((source / "coverage.json").read_text())["source_directory"])
+        if not all((source / f"{model}.nc").is_file() for model in ("HRRR", "GFS")):
+            retained_source = source
+            source = args.output_dir / "source"
+            rebuild_temperature_guidance(
+                retained_source,
+                source,
+                configuration=configuration.phase2,
+                clock=SystemClock(),
+                area=areas[0],
+            )
+        _, report = ensure_coverage(locations, source, cache_directory=args.output_dir)
+        print(json.dumps(report, indent=2))
+        return
+    if args.from_raw is None and not areas:
+        parser.error("Acquisition requires --config locations.json or --lat and --lon")
     if args.from_raw is not None:
         manifest = rebuild_temperature_guidance(
             args.from_raw,
@@ -582,10 +676,26 @@ def main(argv: list[str] | None = None) -> None:
             clock=SystemClock(),
         )
     else:
+        assert locations is not None
+        retained_manifest = args.output_dir / "source" / "manifest.json"
+        if retained_manifest.is_file():
+            retained = json.loads(retained_manifest.read_text())
+            if retained["target_reference_time"] != _iso(args.target_reference_time) or any(
+                row["cycle"] != _iso(args.hrrr_cycle if row["model"] == "HRRR" else args.gfs_cycle)
+                for row in retained["inputs"]
+            ):
+                raise ValueError("Output already contains different source cycles or target time")
+            _, report = ensure_coverage(
+                locations, args.output_dir / "source", cache_directory=args.output_dir
+            )
+            print(json.dumps(report, indent=2))
+            return
         transport = BoundedHttpTransport()
         try:
             manifest = prepare_temperature_guidance(
-                args.output_dir,
+                args.output_dir / "source",
+                area=areas[0],
+                fallback_areas=tuple(areas[1:]),
                 configuration=configuration.phase2,
                 target_reference_time=args.target_reference_time,
                 hrrr_cycle=args.hrrr_cycle,
@@ -596,6 +706,13 @@ def main(argv: list[str] | None = None) -> None:
             )
         finally:
             transport.close()
+    if locations is not None:
+        _, report = ensure_coverage(
+            locations, args.output_dir / "source", cache_directory=args.output_dir
+        )
+        report["downloaded_bytes"] = manifest["downloaded_bytes"]
+        print(json.dumps(report, indent=2))
+        return
     print(
         json.dumps(
             {"directory": str(args.output_dir), "downloaded_bytes": manifest["downloaded_bytes"]}

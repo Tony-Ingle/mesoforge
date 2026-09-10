@@ -108,10 +108,10 @@ def test_demo_weights_match_existing_hrrr_gfs_early_horizon_row(client: TestClie
         {},
         {"lat": "45.8"},
         {"lon": "-93.1"},
-        {"lat": "45.4999", "lon": "-93.1"},
-        {"lat": "46.0001", "lon": "-93.1"},
-        {"lat": "45.8", "lon": "-93.5001"},
-        {"lat": "45.8", "lon": "-92.9999"},
+        {"lat": "-90.0001", "lon": "-93.1"},
+        {"lat": "90.0001", "lon": "-93.1"},
+        {"lat": "45.8", "lon": "-180.0001"},
+        {"lat": "45.8", "lon": "180.0001"},
         {"lat": "nan", "lon": "-93.1"},
         {"lat": "inf", "lon": "-93.1"},
         {"lat": "45.8", "lon": "-inf"},
@@ -313,3 +313,13 @@ def test_cli_loads_prepared_demo_and_binds_only_to_loopback(
     assert run.call_args.kwargs["port"] == 8123
     assert (tmp_path / "HRRR.nc").is_file()
     assert (tmp_path / "GFS.nc").is_file()
+
+
+@pytest.mark.parametrize(
+    "latitude,longitude", [(45.4999, -93.1), (46.0001, -93.1), (45.8, -93.5001), (45.8, -92.9999)]
+)
+def test_small_prepared_subset_requires_preparation_not_unsupported(client, latitude, longitude):
+    response = client.get("/forecast", params={"lat": latitude, "lon": longitude})
+    assert response.status_code == 409
+    assert response.json()["code"] == "coverage_required"
+    assert "preparation" in response.json()["error"]

@@ -1,4 +1,4 @@
-"""Issue and persist forecasts from one existing 36-hour prepared dataset."""
+"""Ensure shared spatial coverage and issue immutable 36-hour temperature forecasts."""
 
 from __future__ import annotations
 
@@ -14,8 +14,9 @@ from typing import Any
 from uuid import uuid4
 
 from mesoforge.application.issuance import ForecastIssuanceService
-from mesoforge.application.point_forecast import PreparedPointForecast, UnsupportedCoordinateError
 from mesoforge.application.prepared_temperature import _code_identity
+from mesoforge.application.spatial_coverage import CoverageRequiredError, UnsupportedCoordinateError
+from mesoforge.application.spatial_preparation import ensure_coverage
 from mesoforge.storage.postgres.database import resolve_database_dsn
 from mesoforge.storage.postgres.repositories import PostgresUnitOfWork
 from mesoforge.storage.s3 import S3ArtifactObjectStore
@@ -108,7 +109,7 @@ def run_batch(
     """Load guidance once; independently calculate and persist each successful location."""
     locations = load_locations(config_path)
 
-    prepared = PreparedPointForecast.from_directory(data_dir)
+    prepared, coverage = ensure_coverage(locations, data_dir)
     if prepared.horizon_hours != tuple(range(1, 37)):
         raise ValueError("Batch forecasts require an existing dataset for hours 1..36.")
 
@@ -127,6 +128,10 @@ def run_batch(
             except UnsupportedCoordinateError as exc:
                 result.update(
                     status="error", error={"code": "unsupported_coordinate", "message": str(exc)}
+                )
+            except CoverageRequiredError as exc:
+                result.update(
+                    status="error", error={"code": "coverage_required", "message": str(exc)}
                 )
             except Exception as exc:
                 # Isolate a calculation failure to this location; interrupts still propagate.
@@ -154,7 +159,7 @@ def run_batch(
                         status="ok", forecast=forecast, issued=issued.model_dump(mode="json")
                     )
         results.append(result)
-    return {"batch_run_id": str(batch_run_id), "results": results}
+    return {"batch_run_id": str(batch_run_id), "coverage": coverage, "results": results}
 
 
 def main(argv: list[str] | None = None) -> int:

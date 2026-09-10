@@ -24,7 +24,7 @@ from tests.unit.application.test_prepared_temperature import (
 
 FIRST = {"lat": 45.8, "lon": -93.1}
 LAST = {"lat": 45.9, "lon": -93.0}
-OUTSIDE = {"lat": 44.98, "lon": -93.27}
+OUTSIDE = {"lat": 95.0, "lon": -93.27}  # Invalid latitude, not a prepared-region limit.
 
 
 @pytest.fixture(autouse=True)
@@ -88,14 +88,14 @@ def test_batch_reuses_one_load_and_preserves_36_hour_values_times_and_provenance
     result = batch_forecast.run_batch(config, prepared_batch_data)
 
     loader.assert_called_once_with(prepared_batch_data)
-    assert len(used_guidance) == 3
+    assert len(used_guidance) == 2
     assert all(item is used_guidance[0] for item in used_guidance)
     rows = result["results"]
     assert [row["index"] for row in rows] == [0, 1, 2]
     assert [row["location"] for row in rows] == [FIRST, OUTSIDE, LAST]
     assert [row["status"] for row in rows] == ["ok", "error", "ok"]
     assert rows[1]["error"]["code"] == "unsupported_coordinate"
-    assert "45.5" in rows[1]["error"]["message"]
+    assert "[-90, 90]" in rows[1]["error"]["message"]
     assert "forecast" not in rows[1]
     assert "issued" not in rows[1]
     service, factory, _ = memory_issuance

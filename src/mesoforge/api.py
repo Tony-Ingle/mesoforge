@@ -23,13 +23,16 @@ from mesoforge.application.issuance import (
 from mesoforge.application.observation_preview import preview_observation_match
 from mesoforge.application.point_forecast import (
     PreparedPointForecast,
-    UnsupportedCoordinateError,
     prepare_demo_files,
 )
+from mesoforge.application.spatial_coverage import CoverageRequiredError, UnsupportedCoordinateError
+from mesoforge.application.spatial_preparation import PreparedRegions, load_prepared
 from mesoforge.common.errors import NotFound
 
 
-def _error(message: str, status_code: int, prepared: PreparedPointForecast) -> JSONResponse:
+def _error(
+    message: str, status_code: int, prepared: PreparedPointForecast | PreparedRegions
+) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
         content={
@@ -57,7 +60,7 @@ def _hour_query_error() -> JSONResponse:
 
 def create_app(directory: Path) -> FastAPI:
     """Read and close prepared files once, before accepting any forecast request."""
-    prepared = PreparedPointForecast.from_directory(directory)
+    prepared = load_prepared(directory)
     app = FastAPI(
         title="MesoForge prepared temperature demonstration",
         docs_url=None,
@@ -71,7 +74,9 @@ def create_app(directory: Path) -> FastAPI:
         if request.url.path == "/issued-forecast-hours":
             return _hour_query_error()
         return _error(
-            "Provide numeric lat and lon query parameters within the demo region.", 422, prepared
+            "Provide numeric lat and lon query parameters with valid geographic ranges.",
+            422,
+            prepared,
         )
 
     @app.exception_handler(HTTPException)
@@ -89,7 +94,25 @@ def create_app(directory: Path) -> FastAPI:
         try:
             return prepared.forecast(latitude=lat, longitude=lon)
         except UnsupportedCoordinateError as exc:
-            return _error(str(exc), 422, prepared)
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "data_kind": prepared.data_kind,
+                    "notice": prepared.notice,
+                    "error": str(exc),
+                    "code": "unsupported_coordinate",
+                },
+            )
+        except CoverageRequiredError as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "data_kind": prepared.data_kind,
+                    "notice": prepared.notice,
+                    "error": str(exc),
+                    "code": "coverage_required",
+                },
+            )
 
     @app.get("/issued-forecasts/{issued_forecast_id}", response_model=None)
     def issued_forecast(issued_forecast_id: str) -> dict[str, Any] | JSONResponse:

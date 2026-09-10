@@ -43,9 +43,16 @@ latitude/longitude. A configurable collection should look conceptually like:
 }
 ```
 
-The local batch command now accepts this configuration shape with one existing
-36-hour prepared dataset; the second coordinate is outside its supported area
-and produces a location error. The operating lifecycle below remains future work.
+Local preparation and batch issuance now derive spatial coverage from this
+configuration shape. Both example coordinates are supported by HRRR/GFS; nearby
+points share prepared guidance. Internal defaults are a 50 km minimum model-data
+buffer and 150 km surrounding context footprint; the exact coordinate remains the
+forecast point. The retained observation-station search remains 50 km. Native model
+boundaries bound the available context. Users supply no region, grid, or station
+metadata. Overlapping footprints share preparation before HTTP requests; raw guidance
+is retained for offline expansion and reuse. Current context data is temperature only.
+Weather-dependent sizing remains future work. The combined operating lifecycle below
+also remains future work.
 Adding supported coordinates should require configuration changes, not code changes.
 Users should not maintain observation stations, bounding boxes, surrounding counties,
 model grid coordinates, or spatial zones. MesoForge should identify the location
@@ -153,7 +160,7 @@ guidance, exposing values, units, source cycles, valid times, and missingness.
 The exact support matrix,
 weights/fallbacks, preparation format, and private-access boundary for the full
 release remain open. The separately approved temperature slice keeps its existing
-area, hours 1–36, localhost binding, and fixed 70/30 demonstration weights.
+native HRRR/GFS domain, hours 1–36, localhost binding, and fixed 70/30 demonstration weights.
 
 ## Future roadmap
 

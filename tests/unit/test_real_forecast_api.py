@@ -149,7 +149,7 @@ def test_extended_api_returns_all_36_hours_with_fixed_demo_weights_and_no_reques
     with TestClient(app) as client:
         response = client.get("/forecast", params={"lat": latitude, "lon": longitude})
         repeated = client.get("/forecast", params={"lat": latitude, "lon": longitude})
-        unsupported = client.get("/forecast", params={"lat": 46.001, "lon": longitude})
+        unsupported = client.get("/forecast", params={"lat": 80.0, "lon": longitude})
     assert response.status_code == repeated.status_code == 200
     assert response.content == repeated.content
     assert unsupported.status_code == 422
@@ -323,8 +323,8 @@ def test_missing_lead_nulls_only_matching_valid_hour(
 @pytest.mark.parametrize(
     "path,params,status",
     [
-        ("/forecast", {"lat": 45.499, "lon": -93.1}, 422),
-        ("/forecast", {"lat": 45.8, "lon": -92.999}, 422),
+        ("/forecast", {"lat": 80.0, "lon": -93.1}, 422),
+        ("/forecast", {"lat": 45.8, "lon": 0.0}, 422),
         ("/forecast", {"lat": "nan", "lon": -93.1}, 422),
         ("/forecast", {}, 422),
         ("/not-a-route", {}, 404),

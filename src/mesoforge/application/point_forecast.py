@@ -15,6 +15,15 @@ import pyproj
 import xarray as xr
 
 from mesoforge.alignment.station_frame import StationAlignmentError, align_station_to_model
+from mesoforge.application.spatial_coverage import (
+    CoverageRequiredError,
+    UnsupportedCoordinateError,
+    bbox_in_grid,
+    bbox_within_prepared_domain,
+    point_in_grid,
+    validate_coordinate,
+)
+from mesoforge.catalog.domains import BoundingBox
 from mesoforge.forecasting.scalar_blend import Contribution, blend_scalar
 
 _DATA_KIND = "synthetic_demonstration"
@@ -26,23 +35,6 @@ _WEIGHTS = {"HRRR": 0.7, "GFS": 0.3}
 # Owner-approved demonstration weights throughout hours 1..36, not optimized
 # weights or the Phase 2 table's 60/40 HRRR/GFS row for hours 19..36.
 _CRS = pyproj.CRS.from_epsg(4326)
-
-
-class UnsupportedCoordinateError(ValueError):
-    """The requested coordinate is outside the demonstration's supported rectangle."""
-
-
-def validate_supported_coordinate(latitude: float, longitude: float) -> None:
-    """Apply the existing demonstration coverage boundary without loading guidance."""
-    if (
-        not math.isfinite(latitude)
-        or not math.isfinite(longitude)
-        or not 45.5 <= latitude <= 46.0
-        or not -93.5 <= longitude <= -93.0
-    ):
-        raise UnsupportedCoordinateError(
-            "Demonstration coordinates must be within latitude 45.5..46.0, longitude -93.5..-93.0"
-        )
 
 
 def _iso(value: np.datetime64) -> str:
@@ -286,8 +278,49 @@ class PreparedPointForecast:
             )
         return cls(guidance, target, projections, data_kind, manifest, digest, horizons)
 
+    def check_coordinate(self, latitude: float, longitude: float) -> None:
+        validate_coordinate(latitude, longitude)
+        for model, dataset in self._guidance.items():
+            crs = self._projections[model]
+            attrs = dataset.attrs
+            if "source_x_min" in attrs and not point_in_grid(
+                latitude,
+                longitude,
+                crs,
+                np.array([attrs["source_x_min"], attrs["source_x_max"]]),
+                np.array([attrs["source_y_min"], attrs["source_y_max"]]),
+            ):
+                raise UnsupportedCoordinateError(
+                    f"{model}: coordinate is outside the native model domain"
+                )
+            if not point_in_grid(latitude, longitude, crs, dataset.x.values, dataset.y.values):
+                raise CoverageRequiredError(
+                    f"{model}: prepared coverage is insufficient; "
+                    "run coordinate preparation before HTTP"
+                )
+
+    def covers_area(self, area: BoundingBox) -> bool:
+        """Geometry only: missing values/times remain forecast missingness, not coverage."""
+        if set(self._guidance) != set(_WEIGHTS):
+            return False
+        for model, dataset in self._guidance.items():
+            if bbox_in_grid(area, self._projections[model], dataset.x.values, dataset.y.values):
+                continue
+            attrs = dataset.attrs
+            if "source_x_min" in attrs and bbox_within_prepared_domain(
+                area,
+                self._projections[model],
+                dataset.x.values,
+                dataset.y.values,
+                np.array([attrs["source_x_min"], attrs["source_x_max"]]),
+                np.array([attrs["source_y_min"], attrs["source_y_max"]]),
+            ):
+                continue
+            return False
+        return True
+
     def forecast(self, *, latitude: float, longitude: float) -> dict[str, Any]:
-        validate_supported_coordinate(latitude, longitude)
+        self.check_coordinate(latitude, longitude)
         hours: list[dict[str, Any]] = []
         for horizon in self._horizons:
             valid_time = self._target_reference_time + np.timedelta64(horizon, "h")

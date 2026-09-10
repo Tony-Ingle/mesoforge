@@ -161,8 +161,6 @@ def _acquire_bundle(
         )
     else:
         validate_hour_selection(latitude, longitude, start_valid_time, end_valid_time)
-    if not (45.5 <= latitude <= 46.0 and -93.5 <= longitude <= -93.0):
-        raise ValueError("Coordinate is outside the supported Grasston demonstration area")
     if end_valid_time - start_valid_time > timedelta(hours=6):
         raise ValueError("This bounded preparation command accepts at most six hours per dataset")
     clock = clock or SystemClock()

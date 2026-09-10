@@ -9,8 +9,10 @@ is described below. Start with [VISION.md](VISION.md) for release boundaries and
 ## Current status
 
 The localhost endpoint, `GET /forecast?lat=45.8&lon=-93.1`, now returns temperature
-from **real prepared HRRR/GFS guidance** for hours 1–36 within latitude 45.5–46.0
-and longitude -93.5–-93.0. It retains the approved 70% HRRR / 30% GFS demonstration
+from **real prepared HRRR/GFS guidance** for hours 1-36 at exact coordinates within
+the native model domains. Coordinate preparation now derives and shares spatial
+coverage automatically; the former Grasston demonstration rectangle is retired.
+It retains the approved 70% HRRR / 30% GFS demonstration
 weights throughout the window; these are demonstration weights, not optimized
 weights. It reports Kelvin units, source cycles/leads, valid times, checksums,
 and explicit missingness. Preparation accepts explicit source cycles and a target
@@ -18,6 +20,12 @@ reference time before serving. The demonstrated September 10, 2026 snapshots are
 fixed historical guidance, not current live forecasts. Retained raw messages can
 now rebuild a dataset offline with the same preparation command's `--from-raw` mode.
 Starting without `--data-dir` still selects the clearly labeled synthetic example.
+The spatial milestone returned all 36 hours for each of the three requested coordinates,
+including 44.98, -93.27, with zero new downloads. **229 focused tests passed**, as did
+Ruff, mypy, import contracts, documentation/hygiene checks, and `git diff --check`.
+The localhost demonstration and offline repeat passed; PostgreSQL/MinIO integration
+and full acceptance/coverage were not rerun for this change. See
+[automatic spatial coverage](#automatic-spatial-coverage) for commands and evidence.
 
 Validation on September 10: **262 tests passed** (111 API/preparation, 148 retained
 Phase 2, and 3 existing acquisition tests), along with quality checks. One bounded
@@ -79,8 +87,9 @@ The command now also accepts the [existing locations JSON](#verify-configured-lo
 processes coordinates sequentially, and continues after location errors. The real batch
 demonstration verified both supported locations around an unsupported entry and reused
 all 12 results on repeat. **43 focused offline and 2 PostgreSQL/MinIO integration tests
-passed** for this increment. Proposed next milestone: combine verification and new forecast
-issuance from shared prepared guidance in one explicit per-coordinate run.
+passed** for that increment. The new spatial preparation milestone is documented
+[below](#automatic-spatial-coverage). Proposed next milestone: combine previous-hour
+verification, coverage preparation, and new immutable forecast issuance in one explicit run.
 
 Future direction: configure locations using latitude/longitude only, with geographic
 context and suitable observation sources derived internally. The intended VPS workflow
@@ -209,12 +218,13 @@ The later Python 3.12 and real-input results below supersede that limited runtim
 
 ## Approved localhost demonstration
 
-[The HTTP entry point](src/mesoforge/api.py) accepts a coordinate near Grasston and
+[The HTTP entry point](src/mesoforge/api.py) accepts an exact coordinate and
 returns 36 hourly temperatures through [prepared point extraction](src/mesoforge/application/point_forecast.py).
 Every JSON response identifies its inputs as real prepared guidance or synthetic
-demonstration data. Neither mode claims to be a current live forecast. The supported
-rectangle includes latitude **45.5–46.0** and longitude **-93.5–-93.0**;
-unsupported or invalid coordinates return HTTP 422.
+demonstration data. Neither mode claims to be a current live forecast. Invalid
+coordinates or points outside the native model domain return HTTP 422. A valid point
+outside prepared coverage returns HTTP 409 (`coverage_required`), with instructions
+to prepare coverage first. GET never downloads or prepares data.
 
 With the locked dependencies installed, the portable start command is:
 
@@ -283,7 +293,8 @@ are never redistributed. Invalid prepared-file units or time metadata prevent st
 ### Local coordinate batch
 
 [The batch command](src/mesoforge/application/batch_forecast.py) reads one JSON config
-and one existing **36-hour** prepared snapshot. Save this as `locations.json`:
+and ensures shared coverage from one **36-hour** source snapshot before issuing
+forecasts. Save this as `locations.json`:
 
 ```json
 {
@@ -366,13 +377,13 @@ $batchDemo = "$env:LOCALAPPDATA\MesoForge\baselines\20260910-coordinate-batch"
 $snapshot = "$env:LOCALAPPDATA\MesoForge\prepared\20260910T12Z-hrrr12-gfs06-h36"
 & $python -B -m alembic upgrade head
 & $python -B -m mesoforge.application.batch_forecast --config "$batchDemo\locations.json" --data-dir $snapshot
-$LASTEXITCODE # 1: the deliberately unsupported location failed; both others completed.
+$LASTEXITCODE # Historical result was 1; automatic coverage now supports all three points.
 ```
 
 | Input order | Latitude, longitude | Actual result | Hour 1 / hour 36, K (rounded) |
 | --- | --- | --- | --- |
 | 0 | 45.8, -93.1 | 36 hours; none missing | 283.705085 / 298.287692 |
-| 1 | 44.98, -93.27 | `unsupported_coordinate` | No forecast |
+| 1 | 44.98, -93.27 | Historical rectangle rejection | Now supported after automatic preparation |
 | 2 | 45.9, -93.0 | 36 hours; none missing | 283.629142 / 298.173662 |
 
 The earlier calculation-only output is `actual-batch.json` in the external directory
@@ -875,15 +886,16 @@ successful and failed hour results. No-ready locations return `nothing_to_verify
 perform zero observation downloads. Existing snapshot/reuse rules remain unchanged.
 The batch summary counts `completed`, `nothing_to_verify`, and `errors` locations.
 Exit 0 means no location errors, 1 means processing finished with location/hour errors,
-and 2 means unusable config or global arguments. The example intentionally exits **1**
-because its middle coordinate is outside supported coverage.
+and 2 means unusable config or global arguments. The former middle-coordinate
+rectangle rejection is retired. With no saved eligible hours it now returns
+`nothing_to_verify`; observation suitability still depends on retained stations.
 
-The real September 10 run produced:
+Historical result before automatic spatial coverage removed the fixed rectangle:
 
 | Coordinate | First run | Repeat | Observation bytes: first / repeat |
 | --- | --- | --- | ---: |
 | 45.8, -93.1 | 6 verified | 6 reused | 0 / 0 |
-| 44.98, -93.27 | Unsupported; continued | Unsupported; continued | No acquisition |
+| 44.98, -93.27 | Historical rectangle rejection | Historical rectangle rejection | No acquisition |
 | 45.9, -93.0 | 6 verified | 6 reused | 9,934 / 0 |
 
 The supported coordinates each had two issued versions at 18:00–20:00 UTC; their
@@ -903,6 +915,123 @@ integration case focused on sequential processing, failure isolation, no-work re
 reuse, and immutable forecasts. Ruff, mypy, import contracts, documentation/hygiene
 checks, and `git diff --check` passed. Temporary services were stopped. Broader acceptance,
 coverage, and operational reliability were not tested in this increment.
+
+### Automatic spatial coverage
+
+The locations file contains **only lat/lon**. Each point remains exact; MesoForge
+internally derives a minimum **50 km preparation buffer** and **150 km context
+footprint**, conservatively enclosed in geographic rectangles. It prepares the larger
+footprint plus native interpolation cells, merges overlapping footprints, and handles
+distant groups separately. These defaults live in
+[spatial coverage](src/mesoforge/application/spatial_coverage.py), not in locations JSON.
+The observation search stays **50 km**, using retained stations and existing suitability
+rules. This change adds no station discovery, fields, or weather-dependent sizing.
+At a physical model edge, context is clipped to the available domain and the exact
+forecast point is checked separately. The 150 km footprint currently retains temperature
+only; it is not a new weather-context analysis product.
+
+```json
+{"locations": [
+  {"lat": 45.8, "lon": -93.1},
+  {"lat": 44.98, "lon": -93.27},
+  {"lat": 45.9, "lon": -93.0}
+]}
+```
+
+From the repository root, with the existing locked interpreter and `PYTHONPATH=src`:
+
+```text
+python -B -m mesoforge.application.prepared_temperature --config locations.json --from-raw RETAINED_SNAPSHOT --output-dir COVERAGE_DIR
+python -B -m mesoforge.api --data-dir COVERAGE_DIR
+```
+
+A single point can use `--lat 44.98 --lon -93.27` instead of `--config`.
+Open `http://127.0.0.1:8765/forecast?lat=44.98&lon=-93.27`. The coverage directory
+contains a small local index of shared prepared snapshots. The API loads those
+snapshots before accepting requests. Normal GET requests still create no history.
+Existing batch issuance also ensures the entire collection's coverage automatically:
+
+```text
+python -B -m mesoforge.application.batch_forecast --config locations.json --data-dir COVERAGE_DIR
+```
+
+Batch issuance needs the existing PostgreSQL/MinIO settings and services. Geographic
+expansion reuses checksum-verified full raw messages from the selected source cycles;
+it does not redownload a model for each coordinate. Original snapshots remain intact.
+A repeat reuses sufficient prepared regions; corrupt/incomplete evidence is reported,
+not silently replaced with different inputs. Missing hourly temperatures remain explicit
+and the fixed 70/30 demonstration weights never change.
+
+For a **new explicit cycle pair**, use the same preparation command with
+`--config locations.json`, `--target-reference-time`, `--hrrr-cycle`, and `--gfs-cycle`
+instead of `--from-raw`. It plans the collection first, acquires the selected temperature
+messages once, and prepares the needed regions before HTTP startup. Repeating the same
+command/output/cycles reuses retained data. Cycle selection is still explicit; there
+is no latest-cycle discovery or scheduling.
+
+The spatial demonstration reused HRRR **2026-09-10 12Z**, GFS **06Z**, target **12Z**:
+HRRR leads 1–36 and GFS leads 7–42 share valid times 13Z September 10 through 00Z
+September 12. All three points share one derived context region, approximately
+**43.62345–47.25655 N, -95.18797–-91.05049 E**. Downloaded for this expansion: **0 bytes**.
+Retained raw temperature messages: **63,399,300 bytes**; inventories: **1,861,814 bytes**.
+Original acquisition: **65,261,114 bytes**. Raw hashes, source URLs/ranges, retrieval
+metadata, cycles/leads, prepared hashes, and preparation code identity are preserved.
+The shared HRRR/GFS prepared files total **5,029,082 bytes**. The localhost API
+returned **36/36 hours for each point, with zero missing hours**:
+
+| Exact coordinate | First temperature (K) | Last temperature (K) |
+| --- | ---: | ---: |
+| 45.8, -93.1 | 283.705085 | 298.287692 |
+| 44.98, -93.27 | 287.999758 | 300.493731 |
+| 45.9, -93.0 | 283.629142 | 298.173662 |
+
+Independent native-grid interpolation and 70/30 arithmetic matched all 108 values.
+A repeat/offline run, with network access blocked during preparation, reused the
+shared region and reproduced exact forecasts. HTTP repeats also matched. The original
+raw/source files remained unchanged, and the localhost server was stopped.
+Evidence and complete hourly responses are outside Git under
+`%LOCALAPPDATA%\MesoForge\baselines\20260910-spatial-coverage`.
+
+Preparation and API commands were exercised using the isolated Windows interpreter
+(substitute actual paths); portable `uv run --locked` wrappers remain unexecuted.
+Batch issuance was checked with existing in-memory storage fixtures in this milestone.
+No new provider acquisition, database service, observation acquisition, or full acceptance suite was
+needed for this spatial demonstration. The focused checks cover footprints, curved
+native-grid bounds, shared/offline preparation, actual-point extraction, missingness,
+HTTP read-only behavior, issuance/readback, and the retired rectangle's consumers.
+**229 focused tests passed** across the spatial geometry/preparation, temperature
+preparation/API, batch forecast, automatic verification, observation preparation,
+issuance, and saved-version API modules. Ruff check/format, mypy (`src scripts`), all
+nine import contracts, documentation/hygiene checks, and `git diff --check` passed.
+PostgreSQL/MinIO integration and the full acceptance/coverage gates were not rerun.
+The new spatial checks alone can be run with:
+
+```text
+python -B -m pytest tests/unit/application/test_spatial_coverage.py tests/unit/application/test_spatial_preparation.py -q -p no:cacheprovider
+```
+
+The final shared index is at
+`%LOCALAPPDATA%\MesoForge\prepared\20260910-spatial-coverage-final`.
+The preparation command and equivalent default-port startup command are:
+
+```powershell
+$python = "$env:LOCALAPPDATA\MesoForge\baselines\20260909-8d0983f-d6c8ced2\environment\Scripts\python.exe"
+$env:PYTHONPATH = Join-Path (Get-Location) 'src'
+$locations = "$env:LOCALAPPDATA\MesoForge\baselines\20260910-spatial-coverage\locations.json"
+$raw = "$env:LOCALAPPDATA\MesoForge\prepared\20260910T12Z-hrrr12-gfs06-h36"
+$coverage = "$env:LOCALAPPDATA\MesoForge\prepared\20260910-spatial-coverage-final"
+& $python -B -m mesoforge.application.prepared_temperature --config $locations --from-raw $raw --output-dir $coverage
+& $python -B -m mesoforge.api --data-dir $coverage
+```
+
+The demonstration used an ephemeral localhost port; the startup command's default is
+8765. Stop the API with Ctrl+C.
+
+Only fixed demonstration-region restrictions were retired: the hardcoded temperature
+crop, the rectangle validator and its consumers, and the redundant observation-prep
+rectangle gate. Boundary tests now distinguish native support from insufficient
+prepared coverage. Shared scientific functions, synthetic fixtures, Phase 2 defaults,
+observation matching policy, historical readers, and storage remain in place.
 
 ### Prepare real inputs before serving
 
@@ -931,7 +1060,7 @@ to serve it again. The equivalent portable command is below; its `uv run` wrappe
 has not been executed.
 
 ```text
-uv run --locked python -m mesoforge.application.prepared_temperature --output-dir OUTPUT_DIR --target-reference-time 2026-09-10T12:00:00Z --hrrr-cycle 2026-09-10T12:00:00Z --gfs-cycle 2026-09-10T06:00:00Z
+uv run --locked python -m mesoforge.application.prepared_temperature --config locations.json --output-dir OUTPUT_DIR --target-reference-time 2026-09-10T12:00:00Z --hrrr-cycle 2026-09-10T12:00:00Z --gfs-cycle 2026-09-10T06:00:00Z
 ```
 
 Equivalent PowerShell preparation and startup with the installed isolated environment:
@@ -940,7 +1069,7 @@ Equivalent PowerShell preparation and startup with the installed isolated enviro
 $python = "$env:LOCALAPPDATA\MesoForge\baselines\20260909-8d0983f-d6c8ced2\environment\Scripts\python.exe"
 $env:PYTHONPATH = Join-Path (Get-Location) 'src'
 $snapshot = "$env:LOCALAPPDATA\MesoForge\prepared\20260910T12Z-hrrr12-gfs06-h36"
-& $python -B -m mesoforge.application.prepared_temperature --output-dir $snapshot --target-reference-time 2026-09-10T12:00:00Z --hrrr-cycle 2026-09-10T12:00:00Z --gfs-cycle 2026-09-10T06:00:00Z
+& $python -B -m mesoforge.application.prepared_temperature --config locations.json --output-dir $snapshot --target-reference-time 2026-09-10T12:00:00Z --hrrr-cycle 2026-09-10T12:00:00Z --gfs-cycle 2026-09-10T06:00:00Z
 # Run startup only after preparation succeeds; stop the server with Ctrl+C.
 & $python -B -m mesoforge.api --data-dir $snapshot
 ```

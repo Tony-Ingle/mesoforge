@@ -114,7 +114,7 @@ accounts, long-term retention approval, or public SLOs.
 only latitude/longitude. This operating direction is approved; its implementation
 details and the rest of this RFC remain proposed unless separately approved. The
 current implementation provides the localhost HRRR/GFS temperature demonstration
-for hours 1–36 and a local batch command over one prepared dataset. It has no
+for hours 1–36 and local batch issuance with coordinate-derived shared preparation. It has no
 registered-location lifecycle or VPS deployment.
 
 A configurable collection should look conceptually like:
@@ -128,10 +128,28 @@ A configurable collection should look conceptually like:
 }
 ```
 
-The local batch command accepts this format; it does not expand coverage or
-implement the lifecycle below. The second example is outside today's demonstration
-area and produces a location error. New supported coordinates
-should need configuration changes, not code changes. MesoForge derives location
+The local preparation and batch commands now accept this format and automatically
+expand spatial coverage using retained HRRR/GFS temperature messages. Both example
+coordinates forecast successfully; the former fixed demonstration rectangle is retired.
+New coordinates require no code changes. Owner-approved internal defaults are:
+
+- Exact latitude/longitude is the forecast point.
+- 50 km minimum model-data preparation buffer.
+- 150 km surrounding weather-context footprint, currently temperature only.
+- Existing 50 km observation-station search, with suitability and time/QC rules unchanged.
+
+Preparation inspects the whole collection, derives conservative geographic envelopes,
+merges overlapping footprints, reuses sufficient prepared guidance, and otherwise
+prepares shared native-grid views from retained full messages. New source cycles use
+existing bounded acquisition once before serving. Distant footprints can use separate
+views of the same acquisition. Native-cell interpolation and raw/prepared checksums
+remain intact. Context stops at physical model boundaries; unsupported coordinates
+are invalid geographic input or points outside the native model domain. Insufficient
+prepared coverage instead requires preparation outside HTTP (HTTP 409).
+
+These defaults are internal and do not change the locations file. Dynamic
+weather-dependent mesoscale/synoptic sizing is deferred. This implements coverage
+preparation, not the combined operating lifecycle below. MesoForge derives location
 identity, nearby observation candidates, bounding boxes, surrounding counties,
 native-grid coordinates, and any spatial zone or surrounding context internally
 when needed. Users do not maintain those derived geographic inputs. Service coverage,

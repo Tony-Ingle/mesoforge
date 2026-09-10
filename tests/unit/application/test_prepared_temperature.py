@@ -763,3 +763,70 @@ def test_bounded_transport_retains_complete_selected_response_and_counts_body_by
     assert result.status_code == 206
     assert transport.downloaded_bytes == 4
     session.get.return_value.__exit__.assert_called_once()
+
+
+@pytest.mark.parametrize("outside_first", [False, True])
+def test_coordinate_cli_acquires_once_and_reuses_same_cycles_on_repeat(
+    tmp_path, monkeypatch, capsys, outside_first
+):
+    transport = FixtureTransport(EXTENDED_HORIZONS)
+    transport.close = Mock()
+    factory = Mock(return_value=transport)
+    monkeypatch.setattr(prepared_temperature, "BoundedHttpTransport", factory)
+    config = tmp_path / "locations.json"
+    config.write_text(
+        json.dumps(
+            {
+                "locations": [
+                    {"lat": 45.8, "lon": -93.1},
+                    {"lat": 44.98, "lon": -93.27},
+                    {"lat": 45.9, "lon": -93.0},
+                ]
+            }
+        )
+    )
+    if outside_first:
+        data = json.loads(config.read_text())
+        data["locations"].insert(0, {"lat": 0.0, "lon": 0.0})
+        config.write_text(json.dumps(data))
+    output = tmp_path / "prepared"
+    args = [
+        "--config",
+        str(config),
+        "--output-dir",
+        str(output),
+        "--target-reference-time",
+        TARGET.isoformat(),
+        "--hrrr-cycle",
+        TARGET.isoformat(),
+        "--gfs-cycle",
+        GFS_CYCLE.isoformat(),
+    ]
+    prepared_temperature.main(args)
+    first = json.loads(capsys.readouterr().out)
+    assert first["downloaded_bytes"] > 0
+    assert len(first["footprints"]) == 3 + int(outside_first)
+    assert len({row["directory"] for row in first["regions"]}) == 1
+    calls = list(transport.calls)
+    factory.assert_called_once()
+    prepared_temperature.main(args)
+    repeated = json.loads(capsys.readouterr().out)
+    assert repeated["downloaded_bytes"] == 0
+    assert repeated["regions"][0]["status"] == "reused"
+    assert transport.calls == calls
+    factory.assert_called_once()
+    from mesoforge.application.spatial_preparation import load_prepared
+
+    loaded = load_prepared(output)
+    for point in json.loads(config.read_text())["locations"]:
+        if point["lat"] == 0.0:
+            from mesoforge.application.spatial_coverage import UnsupportedCoordinateError
+
+            with pytest.raises(UnsupportedCoordinateError, match="native model domain"):
+                loaded.forecast(latitude=point["lat"], longitude=point["lon"])
+            continue
+        forecast = loaded.forecast(latitude=point["lat"], longitude=point["lon"])
+        assert len(forecast["hours"]) == 36
+        for hour in forecast["hours"]:
+            assert hour["temperature"]["value"] == pytest.approx(282 + hour["horizon_hours"])
+            assert hour["missing_reasons"] == []

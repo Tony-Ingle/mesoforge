@@ -1,0 +1,238 @@
+"""Ensure coordinate-derived prepared coverage before calculation or HTTP startup."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from mesoforge.application.point_forecast import PreparedPointForecast
+from mesoforge.application.prepared_temperature import rebuild_temperature_guidance
+from mesoforge.application.spatial_coverage import (
+    CONTEXT_KM,
+    MODEL_BUFFER_KM,
+    CoverageRequiredError,
+    UnsupportedCoordinateError,
+    footprint,
+    plan_regions,
+    validate_coordinate,
+)
+from mesoforge.catalog.configuration import load_configuration_source
+from mesoforge.guidance.runtime import SystemClock
+
+
+def source_identity(manifest: dict[str, Any]) -> str:
+    """A spatial view does not change the acquired guidance identity."""
+    value = {
+        key: manifest[key]
+        for key in ("data_kind", "target_reference_time", "configuration_sha256", "inputs")
+    }
+    value["target_horizon_hours"] = manifest.get("target_horizon_hours", [1, 2, 3])
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+@dataclass
+class PreparedRegions:
+    regions: list[PreparedPointForecast]
+    failures: dict[tuple[float, float], str]
+
+    @property
+    def data_kind(self) -> str:
+        return self.regions[0].data_kind
+
+    @property
+    def notice(self) -> str:
+        return self.regions[0].notice
+
+    @property
+    def horizon_hours(self) -> tuple[int, ...]:
+        return self.regions[0].horizon_hours
+
+    def forecast(self, *, latitude: float, longitude: float) -> dict[str, Any]:
+        validate_coordinate(latitude, longitude)
+        if (latitude, longitude) in self.failures:
+            raise UnsupportedCoordinateError(self.failures[latitude, longitude])
+        unsupported = []
+        for region in self.regions:
+            try:
+                region.check_coordinate(latitude, longitude)
+            except CoverageRequiredError:
+                continue
+            except UnsupportedCoordinateError as exc:
+                unsupported.append(exc)
+                continue
+            return region.forecast(latitude=latitude, longitude=longitude)
+        if len(unsupported) == len(self.regions):
+            raise unsupported[0]
+        raise CoverageRequiredError(
+            "Coverage is not prepared; run coordinate preparation before HTTP"
+        )
+
+
+def load_prepared(directory: Path) -> PreparedPointForecast | PreparedRegions:
+    """Load all shared regions once. This function never prepares or downloads."""
+    index = directory / "coverage.json"
+    if not index.is_file():
+        return PreparedPointForecast.from_directory(directory)
+    payload = json.loads(index.read_text())
+    regions = []
+    for row in {item["directory"]: item for item in payload["regions"]}.values():
+        region = PreparedPointForecast.from_directory(Path(row["directory"]))
+        if (
+            region._manifest is None
+            or source_identity(region._manifest) != payload["source_identity"]
+        ):
+            raise ValueError(
+                "Coverage regions must use the same source guidance and valid-time window"
+            )
+        regions.append(region)
+    if not regions:
+        raise ValueError("No prepared regions in coverage index")
+    failures = {(row["lat"], row["lon"]): row["message"] for row in payload.get("failures", [])}
+    return PreparedRegions(regions, failures)
+
+
+def ensure_coverage(
+    locations: list[Any],
+    source_directory: Path,
+    *,
+    cache_directory: Path | None = None,
+) -> tuple[PreparedPointForecast | PreparedRegions, dict[str, Any]]:
+    """Inspect the whole collection, reuse prepared views or rebuild shared views from raw.
+
+    Model acquisition retains complete native messages, so expanding a spatial view
+    never requires reacquiring the same cycle. Fresh cycles use the existing acquisition
+    command first. Missing/corrupt retained evidence is an explicit failure, not permission
+    to silently substitute another cycle.
+    """
+    from mesoforge.application.batch_forecast import _coordinates
+
+    index = source_directory / "coverage.json"
+    if index.is_file():
+        cache_directory = cache_directory or source_directory
+        source_directory = Path(json.loads(index.read_text())["source_directory"])
+    source_directory = source_directory.resolve()
+    prepared = PreparedPointForecast.from_directory(source_directory)
+    if prepared.data_kind != "real_prepared_guidance":
+        return prepared, {"regions": [], "downloaded_bytes": 0, "mode": "synthetic_fixture"}
+    assert prepared._manifest is not None
+    identity = source_identity(prepared._manifest)
+    cache = cache_directory or source_directory.with_name(source_directory.name + "-coverage")
+    coordinates = []
+    for location in locations:
+        try:
+            lat, lon = _coordinates(location)
+            validate_coordinate(lat, lon)
+        except ValueError:
+            continue  # Existing batch handling reports this location's input error.
+        coordinates.append((lat, lon))
+    areas = plan_regions(coordinates)
+    candidates = [(source_directory, prepared)]
+    if cache.exists():
+        for path in sorted(cache.glob("*/manifest.json")):
+            if path.parent.resolve() == source_directory:
+                continue
+            manifest = json.loads(path.read_text())
+            if source_identity(manifest) == identity:
+                candidates.append((path.parent, PreparedPointForecast.from_directory(path.parent)))
+    reports = []
+    selected: list[PreparedPointForecast] = []
+    failures: dict[tuple[float, float], str] = {}
+    for area in areas:
+        reused = next(((path, item) for path, item in candidates if item.covers_area(area)), None)
+        status = "reused"
+        if reused is None:
+            key = hashlib.sha256((identity + area.model_dump_json()).encode()).hexdigest()[:24]
+            destination = cache / key
+            failure_file = destination / "failure.json"
+            if failure_file.exists():
+                message = json.loads(failure_file.read_text())["message"]
+                for lat, lon in coordinates:
+                    if area.south <= lat <= area.north and area.west <= lon <= area.east:
+                        failures[lat, lon] = message
+                continue
+            if destination.exists():
+                raise ValueError(
+                    f"Incomplete or insufficient cached region is retained at {destination}"
+                )
+            configuration, _ = load_configuration_source(
+                base_path=Path("configs/base.yaml"),
+                additional_overlay_paths=(
+                    Path("configs/phase1-grasston.yaml"),
+                    Path("configs/phase2-grasston.yaml"),
+                ),
+            )
+            assert configuration.phase2 is not None
+            try:
+                rebuild_temperature_guidance(
+                    source_directory,
+                    destination,
+                    configuration=configuration.phase2,
+                    clock=SystemClock(),
+                    area=area,
+                )
+                item = PreparedPointForecast.from_directory(destination)
+            except UnsupportedCoordinateError as exc:
+                failure_file.write_text(json.dumps({"message": str(exc)}))
+                # Other geographic groups still get prepared. The native-domain failure
+                # is reported separately from insufficient prepared coverage.
+                for lat, lon in coordinates:
+                    if area.south <= lat <= area.north and area.west <= lon <= area.east:
+                        failures[lat, lon] = str(exc)
+                continue
+            if not item.covers_area(area):
+                raise CoverageRequiredError(
+                    "Rebuilt guidance does not cover the requested footprint"
+                )
+            reused = destination, item
+            candidates.append(reused)
+            status = "prepared_from_retained_raw"
+        path, item = reused
+        if not any(existing is item for existing in selected):
+            selected.append(item)
+        reports.append(
+            {
+                "area": area.model_dump(),
+                "directory": str(path),
+                "status": status,
+                "prepared_bytes": sum(
+                    (path / f"{model}.nc").stat().st_size for model in ("HRRR", "GFS")
+                ),
+                "manifest_sha256": item._manifest_sha256,
+            }
+        )
+    # Keep native metadata available for an invalid/out-of-domain-only collection.
+    if not selected:
+        selected = [prepared]
+        reports = [{"directory": str(source_directory), "status": "reused", "area": None}]
+    report = {
+        "source_directory": str(source_directory),
+        "source_identity": identity,
+        "model_buffer_km": MODEL_BUFFER_KM,
+        "context_km": CONTEXT_KM,
+        "observation_search_km": 50,
+        "downloaded_bytes": 0,
+        "retained_raw_bytes": sum(row["raw_bytes"] for row in prepared._manifest["inputs"]),
+        "retained_index_bytes": sum(row["index_bytes"] for row in prepared._manifest["inputs"]),
+        "footprints": [
+            {
+                "lat": lat,
+                "lon": lon,
+                "model_buffer": footprint(lat, lon, MODEL_BUFFER_KM).model_dump(),
+                "context": footprint(lat, lon, CONTEXT_KM).model_dump(),
+            }
+            for lat, lon in coordinates
+        ],
+        "regions": reports,
+        "failures": [
+            {"lat": lat, "lon": lon, "message": message} for (lat, lon), message in failures.items()
+        ],
+    }
+    cache.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(report, indent=2)
+    output = cache / "coverage.json"
+    if not output.exists() or output.read_text() != payload:
+        output.write_text(payload)
+    return PreparedRegions(selected, failures), report
