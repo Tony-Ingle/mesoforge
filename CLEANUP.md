@@ -1,8 +1,8 @@
 # MesoForge cleanup and selective-rebuild checklist
 
-**Status:** Batch 2 retires the standalone Phase 1 workflow; Batch 1 edits remain.
-Retained offline checks pass. Service-backed acceptance remains unrun; further
-cleanup is prospective, not authorized by this checklist alone.
+**Status:** Standalone cleanup is finished and saved. Batch 2 retires Phase 1;
+Batch 1 edits remain. Service-backed acceptance remains unrun. Do not search for
+further removals under this completed task.
 
 **Goal:** Make the current forecast path understandable, remove demonstrated obsolete
 code, and replace only the boundaries needed by the approved V2 work. Preserve
@@ -14,6 +14,25 @@ applicable `AGENTS.md`. Use `VISION.md` for direction, `README.md` for current
 capabilities, and the revised V2 RFC for design context. Proposed RFC choices do
 not become approved merely by appearing here. Escalate material conflicts; do not
 revive superseded Phase 3 requirements.
+
+## Saved checkpoint and focused review
+
+- On entry to the checkpoint task, `v2/first-forecast` was already clean at
+  `94792c3ad1c2c9d71b6a0f7cc7756b30a28bbb50`. That commit contains the documentation
+  consolidation, new documents, archived plans, and both cleanup batches. Its
+  history is preserved rather than rewritten to split already-saved work.
+- Review was limited to the accumulated changes from `8d0983f`: no accidental
+  deletion, unrelated edit, or broken active reference was identified. Archived
+  plans retain their original contents after the added notices. Documentation,
+  hygiene, and diff-whitespace checks passed again.
+- Previously reported results remain **148 retained Phase 2 tests, 197 affected
+  tests, and 90 scientific tests passed**, plus nine import contracts, mypy,
+  lint/format and the lock check. Those product checks were not rerun for this note.
+  The 19 Phase 2 acceptance tests were collected only. Full PostgreSQL/MinIO
+  acceptance and the full coverage gate were **not run**; saving these checkpoints
+  does not establish that the entire application is verified.
+- Earlier dated entries describe their then-uncommitted state. No further cleanup
+  or feature implementation is part of this checkpoint review.
 
 ## Batch 2: 2026-09-09 — approved standalone Phase 1 retirement
 
