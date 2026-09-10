@@ -32,6 +32,19 @@ class UnsupportedCoordinateError(ValueError):
     """The requested coordinate is outside the demonstration's supported rectangle."""
 
 
+def validate_supported_coordinate(latitude: float, longitude: float) -> None:
+    """Apply the existing demonstration coverage boundary without loading guidance."""
+    if (
+        not math.isfinite(latitude)
+        or not math.isfinite(longitude)
+        or not 45.5 <= latitude <= 46.0
+        or not -93.5 <= longitude <= -93.0
+    ):
+        raise UnsupportedCoordinateError(
+            "Demonstration coordinates must be within latitude 45.5..46.0, longitude -93.5..-93.0"
+        )
+
+
 def _iso(value: np.datetime64) -> str:
     return str(np.datetime_as_string(value, unit="s")) + "Z"
 
@@ -274,16 +287,7 @@ class PreparedPointForecast:
         return cls(guidance, target, projections, data_kind, manifest, digest, horizons)
 
     def forecast(self, *, latitude: float, longitude: float) -> dict[str, Any]:
-        if (
-            not math.isfinite(latitude)
-            or not math.isfinite(longitude)
-            or not 45.5 <= latitude <= 46.0
-            or not -93.5 <= longitude <= -93.0
-        ):
-            raise UnsupportedCoordinateError(
-                "Demonstration coordinates must be within latitude 45.5..46.0, "
-                "longitude -93.5..-93.0"
-            )
+        validate_supported_coordinate(latitude, longitude)
         hours: list[dict[str, Any]] = []
         for horizon in self._horizons:
             valid_time = self._target_reference_time + np.timedelta64(horizon, "h")

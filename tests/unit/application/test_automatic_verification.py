@@ -7,6 +7,7 @@ from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -18,6 +19,7 @@ from tests.support.phase1_fixture_transports import (
     FixedClock,
     FixtureAviationWeatherTransport,
 )
+from tests.unit.application.test_batch_forecast import FIRST, LAST, OUTSIDE, write_config
 from tests.unit.verification import test_issued_temperature as science_tests
 
 match = science_tests.match
@@ -157,3 +159,143 @@ def test_one_actual_valid_hour_acquires_exact_half_hour_with_automatic_stations(
     assert float(query["hours"][0]) == 0.5
     assert query["ids"] == ["KCBG,KJMR,KROS"]
     assert metadata["query_window_start"] == "2026-09-10T12:45:00+00:00"
+
+
+def test_batch_preserves_order_and_results_past_an_unsupported_coordinate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcomes = [
+        {
+            "status": "completed",
+            "downloaded_bytes": 0,
+            "observations_artifact_id": name,
+            "verification": {"summary": {"verified": 0, "already_existing": 2, "errors": 0}},
+        }
+        for name in ("first-observations", "last-observations")
+    ]
+    runner = Mock(side_effect=outcomes)
+    monkeypatch.setattr(automatic, "run_window", runner)
+    first = NOW - timedelta(hours=2)
+    result = automatic.run_batch(
+        write_config(tmp_path, [FIRST, OUTSIDE, LAST]), start_valid_time=first, end_valid_time=NOW
+    )
+    assert result["summary"] == {"completed": 2, "nothing_to_verify": 0, "errors": 1}
+    assert [r["location"] for r in result["results"]] == [FIRST, OUTSIDE, LAST]
+    assert [r["index"] for r in result["results"]] == [0, 1, 2]
+    assert result["results"][1]["error"]["code"] == "unsupported_coordinate"
+    assert result["results"][0]["result"] is outcomes[0]
+    assert result["results"][2]["result"] is outcomes[1]
+    assert [call.kwargs for call in runner.call_args_list] == [
+        {
+            "latitude": location["lat"],
+            "longitude": location["lon"],
+            "start_valid_time": first,
+            "end_valid_time": NOW,
+        }
+        for location in (FIRST, LAST)
+    ]
+
+
+def test_batch_cli_keeps_partial_failures_separate_and_continues_to_no_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    partial = {
+        "status": "completed",
+        "downloaded_bytes": 0,
+        "verification": {
+            "summary": {"verified": 1, "errors": 1},
+            "results": [{"issued_forecast_id": "original", "status": "verified"}],
+        },
+    }
+    nothing = {"status": "nothing_to_verify", "downloaded_bytes": 0, "verification": None}
+    runner = Mock(side_effect=[RuntimeError("private connection details"), partial, nothing])
+    monkeypatch.setattr(automatic, "run_window", runner)
+    code = automatic.main(
+        [
+            "--config",
+            str(write_config(tmp_path, [FIRST, LAST, FIRST])),
+            "--start-valid-time",
+            "2026-09-10T13:00:00Z",
+            "--end-valid-time",
+            "2026-09-10T16:00:00Z",
+        ]
+    )
+    output = capsys.readouterr().out
+    result = json.loads(output)
+    assert code == 1
+    assert "private connection details" not in output
+    assert result["summary"] == {"completed": 0, "nothing_to_verify": 1, "errors": 2}
+    assert result["results"][0]["error"]["code"] == "verification_failed"
+    assert result["results"][1]["error"]["code"] == "verification_incomplete"
+    assert result["results"][1]["result"] == partial
+    assert result["results"][2]["result"] == nothing
+    assert runner.call_count == 3
+
+
+@pytest.mark.parametrize("start", ["2026-09-10T16:00:00Z", "2026-09-10T13:00:00"])
+def test_batch_rejects_invalid_global_window_even_with_empty_locations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    start: str,
+) -> None:
+    runner = Mock()
+    monkeypatch.setattr(automatic, "run_window", runner)
+    assert (
+        automatic.main(
+            [
+                "--config",
+                str(write_config(tmp_path, [])),
+                "--start-valid-time",
+                start,
+                "--end-valid-time",
+                "2026-09-10T16:00:00Z",
+            ]
+        )
+        == 2
+    )
+    runner.assert_not_called()
+
+
+def test_batch_reuses_config_rules_and_continues_past_invalid_location(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nothing = {"status": "nothing_to_verify", "downloaded_bytes": 0, "verification": None}
+    runner = Mock(return_value=nothing)
+    monkeypatch.setattr(automatic, "run_window", runner)
+    config = write_config(tmp_path, [{**FIRST, "station_id": "KROS"}, LAST])
+    # Windows-authored BOM remains supported by the shared reader.
+    config.write_text(config.read_text(), encoding="utf-8-sig")
+    result = automatic.run_batch(
+        config, start_valid_time=NOW - timedelta(hours=1), end_valid_time=NOW
+    )
+    assert result["results"][0]["error"]["code"] == "invalid_location"
+    assert result["results"][1]["result"] == nothing
+    assert runner.call_count == 1
+
+
+def test_empty_batch_cli_succeeds_without_running_any_coordinate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runner = Mock()
+    monkeypatch.setattr(automatic, "run_window", runner)
+    assert (
+        automatic.main(
+            [
+                "--config",
+                str(write_config(tmp_path, [])),
+                "--start-valid-time",
+                "2026-09-10T13:00:00Z",
+                "--end-valid-time",
+                "2026-09-10T16:00:00Z",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["results"] == []
+    runner.assert_not_called()

@@ -12,8 +12,13 @@ from typing import Any
 from uuid import uuid4
 
 from mesoforge.application.artifacts import ArtifactService
+from mesoforge.application.batch_forecast import _coordinates, load_locations
 from mesoforge.application.issuance import select_issued_forecast_hours
 from mesoforge.application.issued_temperature_verification import configured_service
+from mesoforge.application.point_forecast import (
+    UnsupportedCoordinateError,
+    validate_supported_coordinate,
+)
 from mesoforge.application.prepared_observations import (
     acquire_for_valid_times,
     load_observation_configuration,
@@ -23,6 +28,7 @@ from mesoforge.application.prepared_observations import (
 from mesoforge.catalog.configuration import compute_configuration_digest
 from mesoforge.common.errors import IntegrityError
 from mesoforge.common.identifiers import Digest
+from mesoforge.common.time import IntervalClosure, IntervalDefinition
 from mesoforge.contracts.artifacts import ArtifactManifest
 from mesoforge.storage.json import CanonicalJsonSerializer
 from mesoforge.storage.postgres.database import resolve_database_dsn
@@ -242,24 +248,111 @@ def run_window(
     return {**result, "status": "completed"}
 
 
+def run_batch(
+    config_path: Path,
+    *,
+    start_valid_time: datetime,
+    end_valid_time: datetime,
+) -> dict[str, Any]:
+    """Process the shared locations list sequentially through the unchanged single-location path."""
+    window = IntervalDefinition(
+        start=start_valid_time, end=end_valid_time, closure=IntervalClosure.left_closed_right_open
+    )
+    locations = load_locations(config_path)
+    results = []
+    summary = {"completed": 0, "nothing_to_verify": 0, "errors": 0}
+    for index, location in enumerate(locations):
+        row: dict[str, Any] = {"index": index, "location": location}
+        try:
+            latitude, longitude = _coordinates(location)
+        except ValueError as exc:
+            row.update(status="error", error={"code": "invalid_location", "message": str(exc)})
+        else:
+            try:
+                validate_supported_coordinate(latitude, longitude)
+                outcome = run_window(
+                    latitude=latitude,
+                    longitude=longitude,
+                    start_valid_time=window.start,
+                    end_valid_time=window.end,
+                )
+            except UnsupportedCoordinateError as exc:
+                row.update(
+                    status="error", error={"code": "unsupported_coordinate", "message": str(exc)}
+                )
+            except ValueError as exc:
+                row.update(
+                    status="error",
+                    error={"code": "invalid_verification_request", "message": str(exc)},
+                )
+            except Exception:
+                row.update(
+                    status="error",
+                    error={
+                        "code": "verification_failed",
+                        "message": "Could not complete verification for this location.",
+                    },
+                )
+            else:
+                verification = outcome["verification"]
+                row.update(
+                    status=outcome["status"],
+                    result=outcome,
+                    summary=verification["summary"] if verification else None,
+                )
+                if verification and verification["summary"]["errors"]:
+                    row.update(
+                        status="error",
+                        error={
+                            "code": "verification_incomplete",
+                            "message": "Some saved hours failed; see per-hour results.",
+                        },
+                    )
+        summary["errors" if row["status"] == "error" else row["status"]] += 1
+        results.append(row)
+    return {
+        "start_valid_time": window.start.isoformat(),
+        "end_valid_time": window.end.isoformat(),
+        "summary": summary,
+        "results": results,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--lat", type=float, required=True)
-    parser.add_argument("--lon", type=float, required=True)
+    locations = parser.add_mutually_exclusive_group(required=True)
+    locations.add_argument("--lat", type=float)
+    locations.add_argument(
+        "--config", type=Path, help="Process a locations JSON file sequentially."
+    )
+    parser.add_argument("--lon", type=float)
     parser.add_argument("--start-valid-time", type=datetime.fromisoformat, required=True)
     parser.add_argument("--end-valid-time", type=datetime.fromisoformat, required=True)
     args = parser.parse_args(argv)
+    if (args.config is not None and args.lon is not None) or (
+        args.config is None and args.lon is None
+    ):
+        parser.error("Use --config alone, or provide both --lat and --lon")
     try:
-        result = run_window(
-            latitude=args.lat,
-            longitude=args.lon,
-            start_valid_time=args.start_valid_time,
-            end_valid_time=args.end_valid_time,
-        )
+        if args.config is not None:
+            result = run_batch(
+                args.config,
+                start_valid_time=args.start_valid_time,
+                end_valid_time=args.end_valid_time,
+            )
+        else:
+            result = run_window(
+                latitude=args.lat,
+                longitude=args.lon,
+                start_valid_time=args.start_valid_time,
+                end_valid_time=args.end_valid_time,
+            )
     except Exception as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
         return 2
     print(json.dumps(result, indent=2, allow_nan=False))
+    if args.config is not None:
+        return int(result["summary"]["errors"] > 0)
     return int(bool(result["verification"] and result["verification"]["summary"]["errors"]))
 
 

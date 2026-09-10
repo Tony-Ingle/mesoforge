@@ -42,7 +42,7 @@ from tests.support.phase1_fixture_transports import (
     FixtureAviationWeatherTransport,
     RecordingSleeper,
 )
-from tests.unit.application.test_batch_forecast import FIRST
+from tests.unit.application.test_batch_forecast import FIRST, LAST, OUTSIDE, write_config
 from tests.unit.application.test_prepared_observations import _record
 
 pytestmark = pytest.mark.integration
@@ -609,3 +609,78 @@ def test_automatic_window_acquires_once_reuses_real_snapshot_and_skips_empty_win
     with pytest.raises(IntegrityError):
         automatic_verification.run_window(**query)
     assert len(transport.get_calls) == 1
+
+
+def test_automatic_batch_isolates_locations_and_reuses_results_without_changing_issuances(
+    tmp_path: Path,
+    prepared_guidance: Path,
+    migrated_dsn: str,
+    object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mesoforge.application import automatic_verification, prepared_observations
+
+    monkeypatch.setenv("MESOFORGE_OBSERVATIONS_DIR", str(tmp_path / "observations"))
+    transport = FixtureAviationWeatherTransport()
+    payload = JSON.serialize(
+        [
+            _record(
+                obsTime=int(datetime(2026, 8, 30, 13, 10, tzinfo=UTC).timestamp()),
+                reportTime="2026-08-30T13:10:00Z",
+                receiptTime="2026-08-30T13:12:00Z",
+            )
+        ]
+    )
+    transport.metar_queue.extend(
+        [FakeHttpResponse(200, {}, payload), FakeHttpResponse(200, {}, payload)]
+    )
+    monkeypatch.setattr(
+        prepared_observations, "RequestsAviationWeatherHttpTransport", lambda: transport
+    )
+    issuer = make_issuer(migrated_dsn, object_store)
+    guidance = PreparedPointForecast.from_directory(prepared_guidance)
+    issued = [
+        issuer.issue(
+            guidance.forecast(latitude=location["lat"], longitude=location["lon"]),
+            batch_run_id=uuid4(),
+            location_index=i,
+        )
+        for i, location in enumerate((FIRST, LAST))
+    ]
+    originals = [issuer.read(row.issued_forecast_id) for row in issued]
+    before = complete_storage_inventory(migrated_dsn, object_store)
+    config = write_config(tmp_path, [FIRST, OUTSIDE, LAST, {"lat": 45.75, "lon": -93.2}])
+    window = dict(start_valid_time=VALID_TIME, end_valid_time=datetime(2026, 8, 30, 14, tzinfo=UTC))
+    first = automatic_verification.run_batch(config, **window)
+    assert first["summary"] == {"completed": 2, "errors": 1, "nothing_to_verify": 1}
+    assert [row["status"] for row in first["results"]] == [
+        "completed",
+        "error",
+        "completed",
+        "nothing_to_verify",
+    ]
+    assert first["results"][1]["error"]["code"] == "unsupported_coordinate"
+    assert first["results"][3]["result"]["downloaded_bytes"] == 0
+    for position, issuance in zip((0, 2), issued, strict=True):
+        row = first["results"][position]
+        assert row["summary"]["verified"] == 1
+        assert row["result"]["verification"]["results"][0]["issued_forecast_id"] == str(
+            issuance.issued_forecast_id
+        )
+    assert len(transport.get_calls) == 2
+    after = complete_storage_inventory(migrated_dsn, object_store)
+    assert_forecasts_unchanged(before, after, object_store)
+    repeat = automatic_verification.run_batch(config, **window)
+    for position in (0, 2):
+        row = repeat["results"][position]
+        assert row["summary"]["already_existing"] == 1
+        assert row["summary"]["verified"] == 0
+        assert row["result"]["downloaded_bytes"] == 0
+        assert (
+            row["result"]["verification"]["results"][0]["verification_id"]
+            == first["results"][position]["result"]["verification"]["results"][0]["verification_id"]
+        )
+    assert len(transport.get_calls) == 2
+    assert [issuer.read(row.issued_forecast_id) for row in issued] == originals
+    assert complete_storage_inventory(migrated_dsn, object_store) == after

@@ -75,8 +75,12 @@ now derives that observation request from saved past hours using only coordinate
 valid-time bounds. Its real demonstration saved six results, reused all six on repeat,
 and downloaded nothing for a window with no eligible hours. **75 focused offline and
 11 PostgreSQL/MinIO integration tests passed**; broader operational gaps remain below.
-Proposed next milestone: apply this command to the existing coordinate-list configuration,
-continuing when one location fails, before adding scheduling.
+The command now also accepts the [existing locations JSON](#verify-configured-locations-sequentially),
+processes coordinates sequentially, and continues after location errors. The real batch
+demonstration verified both supported locations around an unsupported entry and reused
+all 12 results on repeat. **43 focused offline and 2 PostgreSQL/MinIO integration tests
+passed** for this increment. Proposed next milestone: combine verification and new forecast
+issuance from shared prepared guidance in one explicit per-coordinate run.
 
 Future direction: configure locations using latitude/longitude only, with geographic
 context and suitable observation sources derived internally. The intended VPS workflow
@@ -832,8 +836,73 @@ command does not refresh delayed/corrected observations automatically. Verificat
 continues to require the same inputs, policies, and code identity (including Git HEAD).
 Changing code or choosing a different snapshot can create another auditable verification
 fact; older facts remain immutable. Full acceptance, coverage, operational cutoff validation,
-and provider reliability remain unverified. This is still an on-demand command, with no
-scheduler or coordinate-collection orchestration.
+and provider reliability remain unverified. This remains an on-demand command; the
+coordinate-list extension below adds sequential processing without scheduling.
+
+### Verify configured locations sequentially
+
+Use the same locations JSON as batch forecast issuance. For example, `locations.json`:
+
+```json
+{
+  "locations": [
+    {"lat": 45.8, "lon": -93.1},
+    {"lat": 44.98, "lon": -93.27},
+    {"lat": 45.9, "lon": -93.0}
+  ]
+}
+```
+
+With the existing storage settings/services and isolated interpreter, run:
+
+```text
+python -B -m mesoforge.application.automatic_verification --config locations.json --start-valid-time 2026-09-10T17:00:00Z --end-valid-time 2026-09-10T21:00:00Z
+```
+
+This command was executed with the example config saved outside Git in
+`%LOCALAPPDATA%\MesoForge\baselines\20260910-batch-verification\locations.json`.
+Use either `--config` or `--lat/--lon`. The shared time window is validated before
+processing. Each supported coordinate calls the existing automatic verification path
+in config order; it derives its own eligible hours, stations, and bounded observation
+request. No observation geography or model data path belongs in the locations JSON.
+No new forecast is generated or issued by this command.
+
+Each result has its original `index` and `location`, a status, the verification summary,
+and the complete single-location `result` with provenance. Unsupported/malformed
+coordinates and runtime failures have an explicit `error` and do not stop later entries.
+Per-hour processing failures also mark that location as an error while preserving its
+successful and failed hour results. No-ready locations return `nothing_to_verify` and
+perform zero observation downloads. Existing snapshot/reuse rules remain unchanged.
+The batch summary counts `completed`, `nothing_to_verify`, and `errors` locations.
+Exit 0 means no location errors, 1 means processing finished with location/hour errors,
+and 2 means unusable config or global arguments. The example intentionally exits **1**
+because its middle coordinate is outside supported coverage.
+
+The real September 10 run produced:
+
+| Coordinate | First run | Repeat | Observation bytes: first / repeat |
+| --- | --- | --- | ---: |
+| 45.8, -93.1 | 6 verified | 6 reused | 0 / 0 |
+| 44.98, -93.27 | Unsupported; continued | Unsupported; continued | No acquisition |
+| 45.9, -93.0 | 6 verified | 6 reused | 9,934 / 0 |
+
+The supported coordinates each had two issued versions at 18:00–20:00 UTC; their
+17:00 hours remained unscored with explicit late-issuance reasons. The first location
+reused its retained real snapshot. The second acquired 24 METAR reports from KCBG,
+KJMR, and KROS for **17:45–20:15 UTC**, through the same preparation path. Repeating
+preserved all 12 verification IDs and made no PostgreSQL/MinIO writes. A second batch
+ending at 18:00 returned `nothing_to_verify` for both supported locations, with zero
+downloads/writes, while still reporting the unsupported coordinate. All four issued
+forecast records and their complete payloads remained unchanged.
+
+Evidence is in `%LOCALAPPDATA%\MesoForge\baselines\20260910-batch-verification`.
+**43 offline tests passed** in the automatic-verification and batch-forecast unit modules;
+**2 integration tests passed** using `-k 'automatic_batch or automatic_window'` in the
+existing verification integration module. New coverage is six unit cases and one
+integration case focused on sequential processing, failure isolation, no-work results,
+reuse, and immutable forecasts. Ruff, mypy, import contracts, documentation/hygiene
+checks, and `git diff --check` passed. Temporary services were stopped. Broader acceptance,
+coverage, and operational reliability were not tested in this increment.
 
 ### Prepare real inputs before serving
 

@@ -85,10 +85,8 @@ def _coordinates(location: object) -> tuple[float, float]:
     return latitude, longitude
 
 
-def run_batch(
-    config_path: Path, data_dir: Path, *, issuer: ForecastIssuanceService | None = None
-) -> dict[str, Any]:
-    """Load guidance once; independently calculate and persist each successful location."""
+def load_locations(config_path: Path) -> list[Any]:
+    """Read the shared locations JSON format without accessing guidance or storage."""
     config = json.loads(
         config_path.read_text(encoding="utf-8-sig"),
         parse_constant=_reject_constant,
@@ -101,6 +99,15 @@ def run_batch(
     ):
         raise ValueError("Config must be a JSON object containing a locations list.")
 
+    return config["locations"]
+
+
+def run_batch(
+    config_path: Path, data_dir: Path, *, issuer: ForecastIssuanceService | None = None
+) -> dict[str, Any]:
+    """Load guidance once; independently calculate and persist each successful location."""
+    locations = load_locations(config_path)
+
     prepared = PreparedPointForecast.from_directory(data_dir)
     if prepared.horizon_hours != tuple(range(1, 37)):
         raise ValueError("Batch forecasts require an existing dataset for hours 1..36.")
@@ -108,7 +115,7 @@ def run_batch(
     issuer = issuer if issuer is not None else create_issuer()
     batch_run_id = uuid4()
     results: list[dict[str, Any]] = []
-    for index, location in enumerate(config["locations"]):
+    for index, location in enumerate(locations):
         result: dict[str, Any] = {"index": index, "location": location}
         try:
             latitude, longitude = _coordinates(location)
