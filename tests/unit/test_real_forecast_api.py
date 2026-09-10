@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
@@ -20,6 +22,7 @@ from mesoforge.application.prepared_temperature import prepare_temperature_guida
 from mesoforge.guidance.sources.hrrr_transport import RequestsHrrrHttpTransport
 from tests.fixtures import gfs_grib, hrrr_grib
 from tests.unit.application.test_prepared_temperature import (
+    EXTENDED_HORIZONS,
     GFS_CYCLE,
     TARGET,
     FixtureClock,
@@ -38,6 +41,21 @@ def prepared_dir(tmp_path: Path) -> Path:
     # demonstrated separately; a real-preparation label is not proof of origin alone.
     prepare_fixture_guidance(tmp_path)
     return tmp_path
+
+
+@pytest.fixture(scope="module")
+def extended_source(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    directory = tmp_path_factory.mktemp("extended-guidance")
+    prepare_fixture_guidance(directory, EXTENDED_HORIZONS)
+    return directory
+
+
+@pytest.fixture()
+def extended_dir(extended_source: Path, tmp_path: Path) -> Path:
+    # Decode the same 72 fixture messages once; copy only for deliberate mutations.
+    directory = tmp_path / "guidance"
+    shutil.copytree(extended_source, directory)
+    return directory
 
 
 def _manifest(directory: Path) -> dict[str, Any]:
@@ -116,6 +134,113 @@ def test_missing_real_model_returns_three_explicit_nulls_without_changing_weight
         assert [source["weight"] for source in hour["sources"]] == [0.7, 0.3]
 
 
+@pytest.mark.parametrize("latitude, longitude", [(45.8, -93.1), (45.625, -93.375)])
+def test_extended_api_returns_all_36_hours_with_fixed_demo_weights_and_no_request_io(
+    extended_source: Path, monkeypatch: pytest.MonkeyPatch, latitude: float, longitude: float
+) -> None:
+    app = api.create_app(extended_source)
+    manifest = _manifest(extended_source)
+    forbidden = Mock(side_effect=AssertionError("Request attempted guidance I/O"))
+    monkeypatch.setattr(xr, "open_dataset", forbidden)
+    monkeypatch.setattr(Path, "read_bytes", forbidden)
+    monkeypatch.setattr(Path, "read_text", forbidden)
+    monkeypatch.setattr(RequestsHrrrHttpTransport, "get", forbidden)
+    monkeypatch.setattr(RequestsHrrrHttpTransport, "head", forbidden)
+    with TestClient(app) as client:
+        response = client.get("/forecast", params={"lat": latitude, "lon": longitude})
+        repeated = client.get("/forecast", params={"lat": latitude, "lon": longitude})
+        unsupported = client.get("/forecast", params={"lat": 46.001, "lon": longitude})
+    assert response.status_code == repeated.status_code == 200
+    assert response.content == repeated.content
+    assert unsupported.status_code == 422
+    payload = response.json()
+    assert payload["data_kind"] == "real_prepared_guidance"
+    assert payload["notice"] == NOTICE
+    assert payload["latitude"] == latitude
+    assert payload["longitude"] == longitude
+    assert payload["target_reference_time"] == "2026-08-30T12:00:00Z"
+    assert len(payload["hours"]) == 36
+    # Independent arithmetic: .7*(279 + hour) + .3*(289 + hour) = 282 + hour.
+    # The late-hour fixture would instead be 283 + hour under Phase 2's 60/40 row.
+    assert [hour["temperature"]["value"] for hour in payload["hours"]] == pytest.approx(
+        list(range(283, 319)), abs=1e-6
+    )
+    for horizon, hour in zip(EXTENDED_HORIZONS, payload["hours"], strict=True):
+        assert hour["horizon_hours"] == horizon
+        assert hour["valid_time"] == (TARGET + timedelta(hours=horizon)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        assert hour["temperature"]["unit"] == "K"
+        assert hour["missing_reasons"] == []
+        assert [source["model"] for source in hour["sources"]] == ["HRRR", "GFS"]
+        assert [source["weight"] for source in hour["sources"]] == [0.7, 0.3]
+        for source in hour["sources"]:
+            age = 0 if source["model"] == "HRRR" else 6
+            assert source["cycle"] == f"2026-08-30T{12 - age:02}:00:00Z"
+            assert source["source_lead_hours"] == horizon + age
+            evidence = next(
+                item
+                for item in manifest["inputs"]
+                if item["model"] == source["model"] and item["source_lead_hours"] == horizon + age
+            )
+            assert source["raw_sha256"] == evidence["raw_sha256"]
+            assert source["source_url"] == evidence["source_grib_url"]
+    assert payload["hours"][-1]["valid_time"] == "2026-09-01T00:00:00Z"
+    forbidden.assert_not_called()
+
+
+def test_extended_demo_does_not_change_phase2_late_horizon_weights() -> None:
+    table = phase2_configuration().blend_configuration.scalar_vector_table
+    for horizon in range(19, 37):
+        row = table.row_for(available_models=("HRRR", "GFS"), horizon=horizon)
+        assert row.row_id == "scalar-vector.hg.h19-h36"
+        assert row.weights == (0.6, 0.0, 0.4)
+
+
+@pytest.mark.parametrize("missing_model", ["HRRR", "GFS"])
+def test_extended_api_keeps_late_missing_hours_null_without_renormalization(
+    extended_dir: Path, missing_model: str
+) -> None:
+    path = extended_dir / f"{missing_model}.nc"
+    with xr.open_dataset(path, engine="h5netcdf") as opened:
+        dataset = opened.load()
+    retained = [index for index in range(36) if index not in (18, 35)]
+    dataset.isel(source_lead_time=retained).to_netcdf(path, engine="h5netcdf")
+    _update_prepared_hash(extended_dir, missing_model)
+    with TestClient(api.create_app(extended_dir)) as client:
+        response = client.get("/forecast", params={"lat": 45.8, "lon": -93.1})
+    assert response.status_code == 200
+    assert len(response.json()["hours"]) == 36
+    for horizon, hour in enumerate(response.json()["hours"], start=1):
+        assert hour["valid_time"] == (TARGET + timedelta(hours=horizon)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        assert [source["weight"] for source in hour["sources"]] == [0.7, 0.3]
+        assert hour["temperature"]["unit"] == "K"
+        if horizon in (19, 36):
+            assert hour["temperature"]["value"] is None
+            assert hour["missing_reasons"] == [f"{missing_model}: no guidance for this valid time"]
+        else:
+            assert hour["temperature"]["value"] == pytest.approx(282 + horizon, abs=1e-6)
+            assert hour["missing_reasons"] == []
+
+
+@pytest.mark.parametrize("missing_model", ["HRRR", "GFS"])
+def test_extended_api_keeps_all_36_hours_when_a_required_model_is_missing(
+    extended_dir: Path, missing_model: str
+) -> None:
+    (extended_dir / f"{missing_model}.nc").unlink()
+    with TestClient(api.create_app(extended_dir)) as client:
+        response = client.get("/forecast", params={"lat": 45.8, "lon": -93.1})
+    assert response.status_code == 200
+    hours = response.json()["hours"]
+    assert [hour["horizon_hours"] for hour in hours] == list(EXTENDED_HORIZONS)
+    for hour in hours:
+        assert hour["temperature"] == {"value": None, "unit": "K"}
+        assert hour["missing_reasons"] == [f"{missing_model}: prepared guidance file is missing"]
+        assert [source["weight"] for source in hour["sources"]] == [0.7, 0.3]
+
+
 def test_native_grid_gradients_interpolate_at_the_requested_geographic_point(
     tmp_path: Path,
 ) -> None:
@@ -158,6 +283,7 @@ def test_native_grid_gradients_interpolate_at_the_requested_geographic_point(
         transport=transport,
         clock=FixtureClock(),
         sleeper=FixtureSleeper(),
+        target_horizon_hours=(1, 2, 3),
     )
     with TestClient(api.create_app(tmp_path)) as client:
         for lat, lon in ((45.8, -93.1), (45.625, -93.375)):

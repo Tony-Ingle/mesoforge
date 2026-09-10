@@ -23,6 +23,8 @@ _REAL_KIND = "real_prepared_guidance"
 _REAL_NOTICE = "Real HRRR/GFS guidance from fixed prepared inputs; not a current live forecast."
 _VARIABLE = "air_temperature_2m"
 _WEIGHTS = {"HRRR": 0.7, "GFS": 0.3}
+# Owner-approved demonstration weights throughout hours 1..36, not optimized
+# weights or the Phase 2 table's 60/40 HRRR/GFS row for hours 19..36.
 _CRS = pyproj.CRS.from_epsg(4326)
 
 
@@ -210,6 +212,7 @@ class PreparedPointForecast:
     data_kind: str
     _manifest: dict[str, Any] | None
     _manifest_sha256: str | None
+    _horizons: tuple[int, ...]
 
     @property
     def notice(self) -> str:
@@ -256,7 +259,14 @@ class PreparedPointForecast:
             if data_kind == _REAL_KIND
             else (None, None)
         )
-        return cls(guidance, target, projections, data_kind, manifest, digest)
+        horizons = tuple(manifest.get("target_horizon_hours", (1, 2, 3))) if manifest else (1, 2, 3)
+        if horizons not in ((1, 2, 3), tuple(range(1, 37))) or any(
+            type(hour) is not int for hour in horizons
+        ):
+            raise ValueError(
+                "Prepared temperature horizons must be 1..36 or the retained 1..3 slice"
+            )
+        return cls(guidance, target, projections, data_kind, manifest, digest, horizons)
 
     def forecast(self, *, latitude: float, longitude: float) -> dict[str, Any]:
         if (
@@ -270,7 +280,7 @@ class PreparedPointForecast:
                 "longitude -93.5..-93.0"
             )
         hours: list[dict[str, Any]] = []
-        for horizon in (1, 2, 3):
+        for horizon in self._horizons:
             valid_time = self._target_reference_time + np.timedelta64(horizon, "h")
             sources: list[dict[str, Any]] = []
             contributions: list[Contribution] = []

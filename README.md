@@ -9,20 +9,22 @@ is described below. Start with [VISION.md](VISION.md) for release boundaries and
 ## Current status
 
 The localhost endpoint, `GET /forecast?lat=45.8&lon=-93.1`, now returns temperature
-from **real prepared HRRR/GFS guidance** for hours 1–3 within latitude 45.5–46.0
+from **real prepared HRRR/GFS guidance** for hours 1–36 within latitude 45.5–46.0
 and longitude -93.5–-93.0. It retains the approved 70% HRRR / 30% GFS demonstration
-weights and reports Kelvin units, source cycles/leads, valid times, checksums,
+weights throughout the window; these are demonstration weights, not optimized
+weights. It reports Kelvin units, source cycles/leads, valid times, checksums,
 and explicit missingness. Preparation accepts explicit source cycles and a target
 reference time before serving. The demonstrated September 10, 2026 snapshots are
 fixed historical guidance, not current live forecasts. Retained raw messages can
 now rebuild a dataset offline with the same preparation command's `--from-raw` mode.
 Starting without `--data-dir` still selects the clearly labeled synthetic example.
 
-Validation on September 10: **247 tests passed** (96 API/preparation, 148 retained
-Phase 2, and 3 existing acquisition tests), along with quality checks. A second fixed
-pair worked through the existing acquisition command and API. An offline raw rebuild,
-with network calls blocked, reproduced exact forecast values and preserved the source
-snapshot. The server was stopped. Full database/storage acceptance,
+Validation on September 10: **262 tests passed** (111 API/preparation, 148 retained
+Phase 2, and 3 existing acquisition tests), along with quality checks. One bounded
+36-hour acquisition supplied all **36/36 hourly API results, with no missing hours**.
+An offline rebuild, with network calls blocked, reproduced exact values and preserved
+the source snapshot. Independent calculations from the raw messages matched all 36
+API temperatures. The server was stopped. Full database/storage acceptance,
 the full coverage gate, and the live-provider canary suite were not run. This verifies
 the small slice, not the entire application or forecast skill.
 
@@ -32,7 +34,7 @@ QPF, PoP, METAR verification, provenance, and retained-input replay. Its default
 are unchanged. Standalone Phase 1 hours 0–6 generation is retired; shared science,
 its required configuration overlay, and historical readers remain.
 
-The on-demand preparation and offline rebuild milestone is complete. The next
+The 36-hour temperature extension is complete. The next
 milestone has not been selected; scheduling and additional models remain future work.
 
 There is no operational forecast API, shared-cache job system, or registered-coordinate
@@ -158,7 +160,7 @@ The later Python 3.12 and real-input results below supersede that limited runtim
 ## Approved localhost demonstration
 
 [The HTTP entry point](src/mesoforge/api.py) accepts a coordinate near Grasston and
-returns three hourly temperatures through [prepared point extraction](src/mesoforge/application/point_forecast.py).
+returns 36 hourly temperatures through [prepared point extraction](src/mesoforge/application/point_forecast.py).
 Every JSON response identifies its inputs as real prepared guidance or synthetic
 demonstration data. Neither mode claims to be a current live forecast. The supported
 rectangle includes latitude **45.5–46.0** and longitude **-93.5–-93.0**;
@@ -182,32 +184,50 @@ units, cycles, valid times, and projection metadata, then loads and closes the
 prepared datasets. Requests reuse these arrays across coordinates, with no file or
 provider I/O. Restart to load different inputs.
 
+New real snapshots declare `target_horizon_hours` as hours 1–36. The API always
+returns every declared hour, including explicit nulls where either model is missing.
+Older three-hour snapshots without that declaration still serve and rebuild their
+original three hours. The default synthetic example also remains three hours.
+
 The latest snapshot exercised on Windows is outside Git at
-`%LOCALAPPDATA%\MesoForge\prepared\20260910T12Z-hrrr12-gfs06`.
+`%LOCALAPPDATA%\MesoForge\prepared\20260910T12Z-hrrr12-gfs06-h36`.
 This exact PowerShell command starts it from the repository root using the existing
 isolated environment; it does not download anything:
 
 ```powershell
 $env:PYTHONPATH = Join-Path (Get-Location) 'src'
-& "$env:LOCALAPPDATA\MesoForge\baselines\20260909-8d0983f-d6c8ced2\environment\Scripts\python.exe" -B -m mesoforge.api --data-dir "$env:LOCALAPPDATA\MesoForge\prepared\20260910T12Z-hrrr12-gfs06"
+& "$env:LOCALAPPDATA\MesoForge\baselines\20260909-8d0983f-d6c8ced2\environment\Scripts\python.exe" -B -m mesoforge.api --data-dir "$env:LOCALAPPDATA\MesoForge\prepared\20260910T12Z-hrrr12-gfs06-h36"
 ```
 
 These real inputs use target reference **2026-09-10 12:00 UTC**, HRRR's **12Z** cycle
-at leads **1/2/3**, and GFS's **06Z** cycle at leads **7/8/9**. Both models are valid
-at **13Z/14Z/15Z**. Existing `align_station_to_model()` and `blend_scalar()` produced
-**283.70508538821554, 286.79573061524354, and 290.41361203718293 K** at the example
-coordinate. All three hours had empty missing-reason lists. Responses include source
-URLs and raw/prepared checksums, plus the manifest hash.
+at leads **1–36**, and GFS's **06Z** cycle at leads **7–42**. The 36 matching valid
+times run hourly from **2026-09-10 13:00 UTC through 2026-09-12 00:00 UTC**.
+Existing `align_station_to_model()` and `blend_scalar()` produced all 36 values at
+the example coordinate, with empty missing-reason lists throughout. Example values
+from the actual HTTP response, rounded to six decimals:
+
+| Horizon | Valid time UTC | Temperature, K |
+| --- | --- | --- |
+| 1 | 2026-09-10 13:00 | 283.705085 |
+| 18 | 2026-09-11 06:00 | 289.244578 |
+| 19 | 2026-09-11 07:00 | 289.120690 |
+| 36 | 2026-09-12 00:00 | 298.287692 |
+
+Each response includes all 36 hourly rows, source URLs and raw/prepared checksums,
+plus the manifest hash. The full captured response is retained locally at
+`%LOCALAPPDATA%\MesoForge\baselines\20260910-temperature-36h\actual-response.json`.
 
 Omitting `--data-dir` retains the earlier synthetic example. Its tiny invented grids
 live in `mesoforge-synthetic-temperature-demo` under the system temporary directory;
 existing files are not overwritten. Its August 30, 2026 inputs still produce
 **286.14, 287.14, and 288.14 K** at the example coordinate, labeled synthetic.
 
-Demo weights are **70% HRRR / 30% GFS**, matching
-`scalar-vector.hg.h01-h18` in [the existing configuration](configs/phase2-grasston.yaml).
-That scalar/vector row applies to temperature and hours 1–3. Phase 2 defaults are
-unchanged. If either required model or hour is missing, that hour is null; weights
+Demo weights are **70% HRRR / 30% GFS throughout hours 1–36**, explicitly approved
+for this demonstration and **not optimized weights**. They match
+`scalar-vector.hg.h01-h18` in [the existing configuration](configs/phase2-grasston.yaml)
+for hours 1–18. Phase 2's `scalar-vector.hg.h19-h36` row remains **60/40**;
+the endpoint's approved demonstration weights are separate from that policy.
+If either required model or hour is missing, that hour is null; weights
 are never redistributed. Invalid prepared-file units or time metadata prevent startup.
 
 ### Prepare real inputs before serving
@@ -222,13 +242,15 @@ The six-field Phase 2 normalizers and Phase 2 defaults are unchanged.
 The existing acquisition command already supports different fixed cycles without
 code changes. Supply explicit UTC whole-hour timestamps ending in `Z`. The current
 source contract permits cycles at **00/06/12/18Z**, at or before the target reference,
-with all selected model leads at most **48 hours**. For each requested valid time,
+with all selected model leads at most **48 hours**. Each source cycle must therefore
+be no more than **12 hours** older than the target for this 36-hour window.
+For each requested valid time,
 the model lead is `target reference + horizon - source cycle`; matching model lead
 numbers is not required. The command does not search for the latest available cycle.
 Provider availability still determines whether a chosen pair can be acquired.
 
-This example was executed before changing the preparation code. It downloads six
-selected temperature messages, so run it only when acquiring a new dataset. Choose
+The command now downloads **72 selected temperature messages**, one per model per
+hour, so run it only when acquiring a new dataset. Choose
 a new, empty directory outside Git; occupied directories are refused. The example
 directory is already populated on this machine, so use the startup command above
 to serve it again. The equivalent portable command is below; its `uv run` wrapper
@@ -243,19 +265,23 @@ Equivalent PowerShell preparation and startup with the installed isolated enviro
 ```powershell
 $python = "$env:LOCALAPPDATA\MesoForge\baselines\20260909-8d0983f-d6c8ced2\environment\Scripts\python.exe"
 $env:PYTHONPATH = Join-Path (Get-Location) 'src'
-$snapshot = "$env:LOCALAPPDATA\MesoForge\prepared\20260910T12Z-hrrr12-gfs06"
+$snapshot = "$env:LOCALAPPDATA\MesoForge\prepared\20260910T12Z-hrrr12-gfs06-h36"
 & $python -B -m mesoforge.application.prepared_temperature --output-dir $snapshot --target-reference-time 2026-09-10T12:00:00Z --hrrr-cycle 2026-09-10T12:00:00Z --gfs-cycle 2026-09-10T06:00:00Z
 # Run startup only after preparation succeeds; stop the server with Ctrl+C.
 & $python -B -m mesoforge.api --data-dir $snapshot
 ```
 
-The second authorized acquisition retrieved **5,265,631 HTTP body bytes**: **5,113,253**
-bytes in six raw temperature messages and **152,378** bytes in six inventories.
-The earlier 06Z HRRR / 00Z GFS snapshot remains unchanged in
-`20260910T06Z-hrrr06-gfs00`; that acquisition downloaded **5,342,777** bytes.
+The one acquisition for this expansion retrieved **65,261,114 HTTP body bytes**
+(about **65.26 MB / 62.24 MiB**): **63,399,300** bytes in 72 raw temperature messages
+and **1,861,814** bytes in 72 inventories. No requested hours were missing.
+The earlier three-hour snapshots remain unchanged in `20260910T06Z-hrrr06-gfs00`
+and `20260910T12Z-hrrr12-gfs06` under the same external `prepared` directory.
 HRRR came from NOAA's AWS archive; GFS from its Google Cloud archive. The streaming
 transport caps each inventory at 1 MiB, each selected message at 16 MiB, and the run
-at 64 MiB, rejecting responses that ignore byte ranges. No other fields were acquired.
+at **128 MiB** for the expanded 72-message run, rejecting responses that ignore
+byte ranges. No other fields are selected. If acquisition or decoding fails, the
+command stops with an error and retains acquired raw files; it does not publish a
+completed manifest or invent replacements for unavailable inputs.
 
 The manifest preserves URLs, byte ranges, retrieval and provider timestamps, cycles,
 leads, valid times, hashes, configuration/code identity, and decoder versions.
@@ -267,7 +293,8 @@ intact outside Git even though the prepared views use only the small region.
 
 Use the same preparation module with `--from-raw SOURCE_DIR` and a different,
 empty `--output-dir`. This mode takes cycles and the target time from the retained
-manifest; it rejects additional cycle/time arguments. It checks the original source
+manifest, including its 36-hour declaration (or the earlier three-hour window);
+it rejects additional cycle/time arguments. It checks the original source
 configuration, raw/index byte counts and checksums, and source times, then reuses the
 same decoders, projection, subsetting, and prepared-file writer. It does not create
 an HTTP transport. The source `HRRR.nc` and `GFS.nc` files are not needed.
@@ -283,7 +310,7 @@ The equivalent rebuild was exercised through the module's CLI with network calls
 blocked, using these arguments and the isolated interpreter:
 
 ```powershell
-$rebuilt = "$env:LOCALAPPDATA\MesoForge\prepared\20260910T12Z-hrrr12-gfs06-rebuilt"
+$rebuilt = "$env:LOCALAPPDATA\MesoForge\prepared\20260910T12Z-hrrr12-gfs06-h36-rebuilt"
 & $python -B -m mesoforge.application.prepared_temperature --from-raw $snapshot --output-dir $rebuilt
 & $python -B -m mesoforge.api --data-dir $rebuilt
 ```
@@ -302,13 +329,13 @@ AI remain outside this increment.
 
 ### Demonstration validation
 
-On 2026-09-10, the isolated locked Python 3.12 environment passed **247 tests** in
-one run: the **148-test recorded Phase 2 selection** in [CLEANUP.md](CLEANUP.md),
-**3 existing acquisition tests**, and **96 API/preparation tests**. The latter consist
+On 2026-09-10, the isolated locked Python 3.12 environment passed **262 tests** in
+two focused runs: the **148-test recorded Phase 2 selection** in [CLEANUP.md](CLEANUP.md)
+plus **3 existing acquisition tests**, and **111 API/preparation tests**. The latter consist
 of the existing [synthetic API tests](tests/unit/test_forecast_api.py) and new
 [GRIB preparation](tests/unit/application/test_prepared_temperature.py) and
 [real-input API](tests/unit/test_real_forecast_api.py) tests. To select the four
-affected modules (append the recorded selection to reproduce the combined run):
+affected modules (append the recorded selection to run all 262 together):
 
 ```text
 python -B -m pytest tests/unit/test_forecast_api.py tests/unit/application/test_prepared_temperature.py tests/unit/test_real_forecast_api.py tests/unit/guidance/test_acquisition_v2.py -q -s -p no:cacheprovider
@@ -318,26 +345,27 @@ These offline tests generate GRIB messages with known values and assert independ
 interpolation/blend results, native-grid gradients, actual valid-time alignment,
 units, provenance checksums, missing models/hours, unchanged weights, labeled errors,
 repeated requests without I/O, and acquisition limits. No retained scientific
-assertions were weakened. At the earlier 06Z HRRR / 00Z GFS checkpoint, independent
-calculations from the raw messages matched all three results at two coordinates. That calculation
-accounted for the existing cfgrib decoder's float32 precision and agreed within 1e-8 K.
+assertions were weakened. Independent calculations directly from all 72 downloaded
+raw messages matched the 36 actual API temperatures at the example coordinate within
+1e-8 K, accounting for the existing cfgrib decoder's float32 precision.
 
-The 18 added rebuild cases check independent expected temperatures, exact forecast
-reproduction at two coordinates, absent source NetCDF files, preserved source bytes
-and provenance, zero network, corrupt/missing inputs, occupied destinations, and CLI
-argument restrictions. The actual second dataset was rebuilt with network calls
-blocked: both native datasets were identical and all three temperatures reproduced
-exactly at two coordinates. Actual HTTP responses from the acquired and rebuilt
-datasets also matched all three temperatures. The original snapshot remained unchanged.
+The 15 added extension cases check the default 72-message acquisition, source-age
+limits, all 36 independently expected values, UTC date rollover, unchanged Phase 2
+late-hour weights, missing models or hours 19/36, repeated requests without I/O,
+and exact offline rebuilding. The earlier three-hour tests remain, including old
+manifests without horizon metadata and rebuilding without the original NetCDF files.
+The actual expanded snapshot was rebuilt with network calls blocked: both native
+datasets were identical and every hourly temperature reproduced exactly at two
+coordinates. The original snapshot remained unchanged.
 
 Ruff lint/format, mypy, all nine import contracts, lock validation, documentation and
 repository hygiene checks, and `git diff --check` passed. Actual localhost requests
 returned the real temperatures above; repeated responses matched, another coordinate
 worked, and unsupported coordinates returned 422. The listener was confirmed to be
 `127.0.0.1` only, then stopped. Full database/storage acceptance, the full coverage
-gate, and the live-provider canary suite were not run. The two acquisitions are
-evidence for these fixed pairs, not operational provider reliability or forecast skill.
-No dependencies or lockfile entries changed for these real-input/rebuild milestones.
+gate, and the live-provider canary suite were not run. This fixed acquisition does
+not establish operational provider reliability or forecast skill. No dependencies
+or lockfile entries changed for the 36-hour extension.
 
 ## References
 

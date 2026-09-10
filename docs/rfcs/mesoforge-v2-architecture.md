@@ -82,7 +82,8 @@ RAP, NAM 3 km, NAM, GFS, RRFS / REFS, and NBM, with useful deterministic and
 ensemble guidance including GEFS, ECMWF, and Canadian models where appropriate.
 These are planned integrations, not completed support or one implementation task.
 Current Phase 2 supports HRRR/NBM/GFS; the separately approved localhost slice
-uses only HRRR/GFS temperature at hours 1–3 with demonstration weights of 70/30.
+uses only HRRR/GFS temperature, now approved through hours 1–36 with fixed
+demonstration weights of 70/30. Phase 2's late-horizon defaults remain unchanged.
 
 NAM/NAM 3 km are transition candidates. The September 9 NWS SCN 26-47/26-48
 updates schedule NAM and its nests' retirement and RRFS/REFS replacement for

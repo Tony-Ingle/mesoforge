@@ -45,6 +45,8 @@ from mesoforge.guidance.sources.hrrr_transport import (
 
 _VARIABLE = "air_temperature_2m"
 _DATA_KIND = "real_prepared_guidance"
+_HORIZONS = tuple(range(1, 37))
+_BODY_BUDGET = 128 * 1024 * 1024
 _AREA = BoundingBox(south=45.5, north=46.0, west=-93.5, east=-93.0)
 _EXTRA_READ_KEYS = (
     "iScansNegatively",
@@ -67,11 +69,17 @@ def _hour(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
-def _leads(target: datetime, cycle: datetime) -> tuple[int, ...]:
+def _leads(
+    target: datetime, cycle: datetime, target_horizon_hours: tuple[int, ...] = _HORIZONS
+) -> tuple[int, ...]:
+    if target_horizon_hours not in ((1, 2, 3), _HORIZONS) or any(
+        type(hour) is not int for hour in target_horizon_hours
+    ):
+        raise ValueError("Prepared temperature horizons must be 1..36 or the retained 1..3 slice")
     age = int((_hour(target) - _hour(cycle)).total_seconds() / 3600)
-    if age < 0 or age + 3 > 48 or cycle.hour not in (0, 6, 12, 18):
+    if age < 0 or age + target_horizon_hours[-1] > 48 or cycle.hour not in (0, 6, 12, 18):
         raise ValueError("Source cycles must be 00/06/12/18Z, at or before target, with leads <=48")
-    return tuple(age + hour for hour in (1, 2, 3))
+    return tuple(age + hour for hour in target_horizon_hours)
 
 
 def _native_grid(
@@ -136,15 +144,16 @@ def normalize_temperature_messages(
     target_reference_time: datetime,
     source_cycle: datetime,
     payloads_by_lead: dict[int, bytes],
+    target_horizon_hours: tuple[int, ...] = _HORIZONS,
 ) -> xr.Dataset:
     """Decode temperature only and retain the supported area plus one native cell.
 
     The six-field Phase 2 normalizers are deliberately not called: no missing
     wind/precipitation fields are invented to satisfy their different contract.
     """
-    leads = _leads(target_reference_time, source_cycle)
+    leads = _leads(target_reference_time, source_cycle, target_horizon_hours)
     if set(payloads_by_lead) != set(leads):
-        raise ValueError(f"{model}: expected exactly the three valid-time-aligned leads {leads}")
+        raise ValueError(f"{model}: expected exactly the valid-time-aligned leads {leads}")
     contract = next(c for c in settings.field_contracts if c.canonical_variable_id == _VARIABLE)
     settings = settings.model_copy(
         update={"read_keys": tuple(dict.fromkeys((*settings.read_keys, *_EXTRA_READ_KEYS)))}
@@ -311,10 +320,15 @@ def prepare_temperature_guidance(
     transport: HttpTransport,
     clock: Clock,
     sleeper: Sleeper,
+    target_horizon_hours: tuple[int, ...] = _HORIZONS,
 ) -> dict[str, Any]:
-    """Acquire exactly six temperature messages; retain evidence and prepare two files."""
-    hrrr_leads = _leads(target_reference_time, hrrr_cycle)
-    gfs_leads = _leads(target_reference_time, gfs_cycle)
+    """Acquire both models for hours 1..36; retain raw evidence and prepare two files.
+
+    The shorter horizon tuple remains available for retained three-hour fixtures.
+    The CLI always acquires the 36-hour window.
+    """
+    hrrr_leads = _leads(target_reference_time, hrrr_cycle, target_horizon_hours)
+    gfs_leads = _leads(target_reference_time, gfs_cycle, target_horizon_hours)
     directory.mkdir(parents=True, exist_ok=True)
     if any(directory.iterdir()):
         raise ValueError(
@@ -348,11 +362,13 @@ def prepare_temperature_guidance(
             target_reference_time=target_reference_time,
             source_cycle=cycle,
             payloads_by_lead=payloads,
+            target_horizon_hours=target_horizon_hours,
         )
         prepared_files[model] = _write_prepared_file(directory, model, dataset)
     manifest = {
         "data_kind": _DATA_KIND,
         "target_reference_time": _iso(target_reference_time),
+        "target_horizon_hours": list(target_horizon_hours),
         "created_at": _iso(clock.now()),
         "inputs": inputs,
         "prepared_files": prepared_files,
@@ -400,16 +416,19 @@ def rebuild_temperature_guidance(
     models: list[tuple[str, datetime, dict[int, bytes]]] = []
     try:
         target = _hour(datetime.fromisoformat(source["target_reference_time"]))
-        if len(source["inputs"]) != 6 or {r["model"] for r in source["inputs"]} != {
+        # Snapshots prepared before the 36-hour extension contain three hours
+        # and no horizon declaration. Do not reinterpret those retained inputs.
+        horizons = tuple(source.get("target_horizon_hours", (1, 2, 3)))
+        if len(source["inputs"]) != 2 * len(horizons) or {r["model"] for r in source["inputs"]} != {
             "HRRR",
             "GFS",
         }:
-            raise ValueError("Rebuild requires exactly six HRRR/GFS source messages")
+            raise ValueError("Rebuild requires both HRRR/GFS messages for every declared horizon")
         for model in ("HRRR", "GFS"):
             rows = [row for row in source["inputs"] if row["model"] == model]
             cycle = _hour(datetime.fromisoformat(rows[0]["cycle"]))
-            leads = _leads(target, cycle)
-            if len(rows) != 3 or {r["source_lead_hours"] for r in rows} != set(leads):
+            leads = _leads(target, cycle, horizons)
+            if len(rows) != len(horizons) or {r["source_lead_hours"] for r in rows} != set(leads):
                 raise ValueError(f"{model}: retained source leads are incomplete or duplicated")
             payloads: dict[int, bytes] = {}
             for row in rows:
@@ -455,10 +474,12 @@ def rebuild_temperature_guidance(
             target_reference_time=target,
             source_cycle=cycle,
             payloads_by_lead=payloads,
+            target_horizon_hours=horizons,
         )
         prepared_files[model] = _write_prepared_file(directory, model, dataset)
     manifest = {
         **source,
+        "target_horizon_hours": list(horizons),
         "created_at": _iso(clock.now()),
         "prepared_files": prepared_files,
         "downloaded_bytes": 0,
@@ -472,7 +493,7 @@ def rebuild_temperature_guidance(
 
 
 class BoundedHttpTransport(RequestsHrrrHttpTransport):
-    """Streaming adapter with a cumulative 64 MiB body budget for this manual slice."""
+    """Streaming adapter with a cumulative 128 MiB body budget for the 72 messages."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -493,8 +514,8 @@ class BoundedHttpTransport(RequestsHrrrHttpTransport):
             start, end = (int(v) for v in requested_range.removeprefix("bytes=").split("-"))
             if end < start or end - start + 1 > limit:
                 raise ValueError("Selected message exceeds the 16 MiB acquisition limit")
-        if self.downloaded_bytes >= 64 * 1024 * 1024:
-            raise ValueError("Acquisition exhausted the cumulative 64 MiB body budget")
+        if self.downloaded_bytes >= _BODY_BUDGET:
+            raise ValueError("Acquisition exhausted the cumulative 128 MiB body budget")
         with self._session.get(
             url, headers=request_headers, timeout=timeout, stream=True
         ) as response:
@@ -505,7 +526,7 @@ class BoundedHttpTransport(RequestsHrrrHttpTransport):
                 raise ValueError("Provider ignored the uncompressed response request")
             declared = response.headers.get("Content-Length")
             expected = None if declared is None else int(declared)
-            remaining = min(limit, 64 * 1024 * 1024 - self.downloaded_bytes)
+            remaining = min(limit, _BODY_BUDGET - self.downloaded_bytes)
             if expected is not None and (expected < 0 or expected > remaining):
                 raise ValueError("Response exceeds the remaining acquisition body budget")
             chunks: list[bytes] = []
@@ -529,7 +550,7 @@ class BoundedHttpTransport(RequestsHrrrHttpTransport):
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Prepare six real HRRR/GFS temperature messages")
+    parser = argparse.ArgumentParser(description="Prepare 36 hours of real HRRR/GFS temperature")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--target-reference-time", type=datetime.fromisoformat)
     parser.add_argument("--hrrr-cycle", type=datetime.fromisoformat)

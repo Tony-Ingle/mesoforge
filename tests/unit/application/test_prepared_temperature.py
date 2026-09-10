@@ -38,6 +38,7 @@ ROOT = Path(__file__).resolve().parents[3]
 TARGET = datetime(2026, 8, 30, 12, tzinfo=UTC)
 GFS_CYCLE = TARGET - timedelta(hours=6)
 VARIABLE = "air_temperature_2m"
+EXTENDED_HORIZONS = tuple(range(1, 37))
 
 
 def phase2_configuration() -> Phase2Configuration:
@@ -75,14 +76,14 @@ class _Response:
 
 
 class FixtureTransport:
-    """Serve six fixture products, each with an unrequested trailing message."""
+    """Serve fixture products, each with an unrequested trailing message."""
 
-    def __init__(self) -> None:
+    def __init__(self, horizons: tuple[int, ...] = (1, 2, 3)) -> None:
         self.calls: list[tuple[str, str, str | None]] = []
         self.payloads = {
             (model, horizon): temperature_payload(model, horizon)
             for model in ("HRRR", "GFS")
-            for horizon in (1, 2, 3)
+            for horizon in horizons
         }
 
     def _product(self, url: str) -> tuple[str, int, bytes, bytes, str]:
@@ -151,8 +152,10 @@ class FixtureSleeper:
         raise AssertionError(f"Unexpected retry: {seconds}")
 
 
-def prepare_fixture_guidance(directory: Path) -> tuple[dict[str, Any], FixtureTransport]:
-    transport = FixtureTransport()
+def prepare_fixture_guidance(
+    directory: Path, horizons: tuple[int, ...] = (1, 2, 3)
+) -> tuple[dict[str, Any], FixtureTransport]:
+    transport = FixtureTransport(horizons)
     manifest = prepare_temperature_guidance(
         directory,
         configuration=phase2_configuration(),
@@ -162,6 +165,7 @@ def prepare_fixture_guidance(directory: Path) -> tuple[dict[str, Any], FixtureTr
         transport=transport,
         clock=FixtureClock(),
         sleeper=FixtureSleeper(),
+        target_horizon_hours=horizons,
     )
     return manifest, transport
 
@@ -176,6 +180,7 @@ def test_normalization_retains_native_projection_kelvin_and_actual_valid_times(m
         target_reference_time=TARGET,
         source_cycle=TARGET - timedelta(hours=age),
         payloads_by_lead={hour + age: temperature_payload(model, hour) for hour in (1, 2, 3)},
+        target_horizon_hours=(1, 2, 3),
     )
     assert dataset.attrs["data_kind"] == "real_prepared_guidance"
     assert dataset.attrs["model"] == model
@@ -211,6 +216,7 @@ def test_normalization_rejects_messages_from_a_different_cycle(model: str) -> No
             payloads_by_lead={
                 hour + age + 6: temperature_payload(model, hour) for hour in (1, 2, 3)
             },
+            target_horizon_hours=(1, 2, 3),
         )
 
 
@@ -237,6 +243,7 @@ def test_gfs_north_to_south_values_stay_attached_to_their_native_coordinates() -
         target_reference_time=TARGET,
         source_cycle=GFS_CYCLE,
         payloads_by_lead=payloads,
+        target_horizon_hours=(1, 2, 3),
     )
     assert np.all(np.diff(dataset["y"].values) < 0)
     prepared_lon, prepared_lat = np.meshgrid(dataset["x"].values, dataset["y"].values)
@@ -302,6 +309,160 @@ def test_preparation_refuses_to_overwrite_an_existing_snapshot(tmp_path: Path) -
         )
     assert existing.read_text() == "Keep this input"
     assert transport.calls == []
+
+
+def test_default_preparation_covers_36_valid_hours_and_rebuilds_offline_exactly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    transport = FixtureTransport(EXTENDED_HORIZONS)
+    manifest = prepare_temperature_guidance(
+        source,
+        configuration=phase2_configuration(),
+        target_reference_time=TARGET,
+        hrrr_cycle=TARGET,
+        gfs_cycle=GFS_CYCLE,
+        transport=transport,
+        clock=FixtureClock(),
+        sleeper=FixtureSleeper(),
+    )
+    assert manifest["target_horizon_hours"] == list(EXTENDED_HORIZONS)
+    assert len(manifest["inputs"]) == 72
+    assert len(transport.calls) == 216
+    assert len([call for call in transport.calls if call[2] is not None]) == 72
+    assert manifest["downloaded_bytes"] == sum(
+        item["raw_bytes"] + item["index_bytes"] for item in manifest["inputs"]
+    )
+    valid_times = np.datetime64("2026-08-30T12", "h") + np.arange(1, 37).astype("timedelta64[h]")
+    assert str(valid_times[-1]) == "2026-09-01T00"
+    originals: dict[str, xr.Dataset] = {}
+    for model, age, base in (("HRRR", 0, 279), ("GFS", 6, 289)):
+        rows = [item for item in manifest["inputs"] if item["model"] == model]
+        assert [item["source_lead_hours"] for item in rows] == list(range(1 + age, 37 + age))
+        for horizon, item in zip(EXTENDED_HORIZONS, rows, strict=True):
+            assert (source / item["raw_file"]).read_bytes() == transport.payloads[model, horizon]
+            assert item["valid_time"] == (TARGET + timedelta(hours=horizon)).isoformat().replace(
+                "+00:00", "Z"
+            )
+        with xr.open_dataset(source / f"{model}.nc", engine="h5netcdf") as opened:
+            dataset = opened.load()
+        originals[model] = dataset
+        assert dataset[VARIABLE].attrs["units"] == "K"
+        assert dataset[VARIABLE].sizes["source_lead_time"] == 36
+        np.testing.assert_array_equal(dataset["source_valid_time"].values, valid_times)
+        np.testing.assert_array_equal(
+            dataset["source_lead_time"].values,
+            np.arange(1 + age, 37 + age).astype("timedelta64[h]"),
+        )
+        crs = pyproj.CRS.from_wkt(dataset.attrs["crs_wkt2"])
+        assert crs.is_projected if model == "HRRR" else crs.is_geographic
+        for horizon in EXTENDED_HORIZONS:
+            np.testing.assert_array_equal(dataset[VARIABLE].values[horizon - 1], base + horizon)
+    original_forecast = PreparedPointForecast.from_directory(source)
+    points = ((45.8, -93.1), (45.625, -93.375))
+    before = {
+        point: original_forecast.forecast(latitude=point[0], longitude=point[1])["hours"]
+        for point in points
+    }
+    source_bytes = {
+        path.relative_to(source): path.read_bytes() for path in source.rglob("*") if path.is_file()
+    }
+    forbidden = Mock(side_effect=AssertionError("Offline rebuild attempted a network session"))
+    monkeypatch.setattr("requests.Session", forbidden)
+    destination = tmp_path / "rebuilt"
+    rebuilt = prepared_temperature.rebuild_temperature_guidance(
+        source, destination, configuration=phase2_configuration(), clock=FixtureClock()
+    )
+    assert rebuilt["target_horizon_hours"] == list(EXTENDED_HORIZONS)
+    assert rebuilt["downloaded_bytes"] == 0
+    assert rebuilt["inputs"] == manifest["inputs"]
+    for model, dataset in originals.items():
+        with xr.open_dataset(destination / f"{model}.nc", engine="h5netcdf") as opened:
+            xr.testing.assert_identical(opened.load(), dataset)
+    after_forecast = PreparedPointForecast.from_directory(destination)
+    for point in points:
+        after = after_forecast.forecast(latitude=point[0], longitude=point[1])["hours"]
+        assert [hour["temperature"] for hour in after] == [
+            hour["temperature"] for hour in before[point]
+        ]
+        # .7 * (279 + hour) + .3 * (289 + hour) = 282 + hour.
+        assert [hour["temperature"]["value"] for hour in after] == pytest.approx(
+            list(range(283, 319)), abs=1e-6
+        )
+        assert [hour["valid_time"] for hour in after] == [
+            str(value) + ":00:00Z" for value in valid_times
+        ]
+        assert all(hour["missing_reasons"] == [] for hour in after)
+    assert {
+        path.relative_to(source): path.read_bytes() for path in source.rglob("*") if path.is_file()
+    } == source_bytes
+    forbidden.assert_not_called()
+
+
+@pytest.mark.parametrize("model", ["HRRR", "GFS"])
+def test_36_hour_preparation_rejects_cycle_too_old_before_io(tmp_path: Path, model: str) -> None:
+    transport = FixtureTransport()
+    cycles = {"HRRR": TARGET, "GFS": GFS_CYCLE}
+    cycles[model] = TARGET - timedelta(hours=18)
+    destination = tmp_path / "output"
+    with pytest.raises(ValueError, match="leads <=48"):
+        prepare_temperature_guidance(
+            destination,
+            configuration=phase2_configuration(),
+            target_reference_time=TARGET,
+            hrrr_cycle=cycles["HRRR"],
+            gfs_cycle=cycles["GFS"],
+            transport=transport,
+            clock=FixtureClock(),
+            sleeper=FixtureSleeper(),
+        )
+    assert transport.calls == []
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("horizons", [(), (1, 2), tuple(range(1, 36)), tuple(range(1, 38))])
+def test_preparation_rejects_unsupported_horizons_before_io(
+    tmp_path: Path, horizons: tuple[int, ...]
+) -> None:
+    transport = FixtureTransport()
+    destination = tmp_path / "output"
+    with pytest.raises(ValueError):
+        prepare_temperature_guidance(
+            destination,
+            configuration=phase2_configuration(),
+            target_reference_time=TARGET,
+            hrrr_cycle=TARGET,
+            gfs_cycle=GFS_CYCLE,
+            transport=transport,
+            clock=FixtureClock(),
+            sleeper=FixtureSleeper(),
+            target_horizon_hours=horizons,
+        )
+    assert transport.calls == []
+    assert not destination.exists()
+
+
+def test_legacy_snapshot_without_horizon_metadata_rebuilds_and_serves_three_hours(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    manifest, _ = prepare_fixture_guidance(source)
+    del manifest["target_horizon_hours"]
+    (source / "manifest.json").write_text(json.dumps(manifest))
+    original = PreparedPointForecast.from_directory(source).forecast(latitude=45.8, longitude=-93.1)
+    destination = tmp_path / "rebuilt"
+    prepared_temperature.rebuild_temperature_guidance(
+        source, destination, configuration=phase2_configuration(), clock=FixtureClock()
+    )
+    rebuilt = PreparedPointForecast.from_directory(destination).forecast(
+        latitude=45.8, longitude=-93.1
+    )
+    for forecast in (original, rebuilt):
+        assert [hour["horizon_hours"] for hour in forecast["hours"]] == [1, 2, 3]
+        assert [hour["temperature"]["value"] for hour in forecast["hours"]] == pytest.approx(
+            [283.0, 284.0, 285.0], abs=1e-6
+        )
+        assert all(hour["missing_reasons"] == [] for hour in forecast["hours"])
 
 
 @pytest.mark.parametrize("remove_prepared", [False, True])
@@ -580,11 +741,11 @@ def test_bounded_transport_stops_at_cumulative_budget_without_content_length(
     response.raw.read.side_effect = lambda amount, decode_content: b"x" * amount
     monkeypatch.setattr("requests.Session", lambda: session)
     transport = BoundedHttpTransport()
-    transport.downloaded_bytes = 64 * 1024 * 1024 - 10
+    transport.downloaded_bytes = 128 * 1024 * 1024 - 10
     with pytest.raises(ValueError, match="body limit"):
         transport.get("https://provider.example/fixture.idx")
     response.raw.read.assert_called_once_with(10, decode_content=True)
-    assert transport.downloaded_bytes == 64 * 1024 * 1024
+    assert transport.downloaded_bytes == 128 * 1024 * 1024
 
 
 def test_bounded_transport_retains_complete_selected_response_and_counts_body_bytes(

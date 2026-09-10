@@ -23,7 +23,7 @@ pipeline. The [revised V2 RFC](docs/rfcs/mesoforge-v2-architecture.md) is the pr
 direction for a selective rebuild using suitable existing scientific functions.
 Its full release architecture remains **Proposed for owner architecture review**.
 The owner separately approved the small localhost HRRR/GFS temperature endpoint
-and one fixed real prepared-guidance acquisition for hours 1–3. That slice now works;
+and fixed real prepared guidance, now extended to hours 1–36. That slice now works;
 its observed results and validation gaps are recorded in README.
 That approval does not authorize the entire release or the model roadmap below.
 
@@ -105,7 +105,7 @@ guidance, exposing values, units, source cycles, valid times, and missingness.
 The exact support matrix,
 weights/fallbacks, preparation format, and private-access boundary for the full
 release remain open. The separately approved temperature slice keeps its existing
-area, hours 1–3, localhost binding, and demonstration weights.
+area, hours 1–36, localhost binding, and fixed 70/30 demonstration weights.
 
 ## Future roadmap
 
@@ -139,6 +139,7 @@ and none expands an active task without a separate request.
 The RFC leaves owner decisions open on supported region/model/field/horizon combinations,
 weights and policies, private authentication, host reserve and measured work limits,
 cache packaging, and retention promises. FastAPI, PostgreSQL jobs, spatial partition
-packaging, and an envelope of up to 36 horizons are proposed choices, not completed
-features or blanket approvals. A small approved milestone need not settle unrelated
+packaging, and broader field/model coverage across 36 horizons are proposed choices,
+not completed features or blanket approvals. The small approved temperature slice
+does not settle unrelated
 later-release decisions.
