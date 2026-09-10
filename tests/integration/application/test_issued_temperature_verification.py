@@ -1,0 +1,319 @@
+"""Immutable one-hour verification facts through real PostgreSQL and MinIO.
+
+Both the model messages and observations used here are generated test fixtures.
+The test issuance clock models issuance before the selected hour; this is not an
+operational forecast-skill claim about the retrospective preparation fixtures.
+"""
+
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+import pytest
+
+from mesoforge.application.artifacts import ArtifactService
+from mesoforge.application.issuance import ForecastIssuanceService
+from mesoforge.application.issued_temperature_verification import (
+    IssuedTemperatureVerificationService,
+    configured_service,
+)
+from mesoforge.application.observation_preview import preview_observation_match
+from mesoforge.application.point_forecast import PreparedPointForecast
+from mesoforge.common.errors import IntegrityError, NotFound
+from mesoforge.common.identifiers import ArtifactId, Digest
+from mesoforge.storage.json import CanonicalJsonSerializer
+from mesoforge.storage.postgres.idempotency_lock import PostgresIdempotencyLock
+from mesoforge.storage.postgres.repositories import PostgresUnitOfWork
+from mesoforge.storage.s3 import S3ArtifactObjectStore, content_addressed_key
+from tests.integration.application import test_batch_issuance as issuance_tests
+from tests.support.observation_preview import (
+    complete_storage_inventory,
+    seed_observation_preview_inputs,
+)
+from tests.unit.application.test_batch_forecast import FIRST
+
+pytestmark = pytest.mark.integration
+
+migrated_dsn = issuance_tests.migrated_dsn
+object_store = issuance_tests.object_store
+prepared_guidance = issuance_tests.prepared_guidance
+configured_retrieval_storage = issuance_tests.configured_retrieval_storage
+
+VALID_TIME = datetime(2026, 8, 30, 13, tzinfo=UTC)
+ISSUED_AT = datetime(2026, 8, 30, 12, tzinfo=UTC)
+CODE_IDENTITY = {**issuance_tests.CODE_IDENTITY, "synthetic_test_fixture": True}
+JSON = CanonicalJsonSerializer()
+
+
+def make_issuer(
+    dsn: str, objects: S3ArtifactObjectStore, issued_at: datetime = ISSUED_AT
+) -> ForecastIssuanceService:
+    return ForecastIssuanceService(
+        objects,
+        lambda: PostgresUnitOfWork(dsn),
+        code_identity=CODE_IDENTITY,
+        clock=lambda: issued_at,
+    )
+
+
+def make_verifier(
+    dsn: str, objects: S3ArtifactObjectStore, issuer: ForecastIssuanceService
+) -> IssuedTemperatureVerificationService:
+    return IssuedTemperatureVerificationService(
+        ArtifactService(
+            unit_of_work_factory=lambda: PostgresUnitOfWork(dsn),
+            object_store=objects,
+            idempotency_lock=PostgresIdempotencyLock(dsn),
+        ),
+        read_forecast=issuer.read,
+        preview_match=preview_observation_match,
+        code_identity=CODE_IDENTITY,
+        code_revision="a" * 40,
+        environment_digest=Digest.of_bytes(b"issued-temperature-verification-test-fixture"),
+        clock=lambda: datetime.now(UTC),
+    )
+
+
+def verification_artifacts(inventory: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in inventory["tables"]["artifacts"]
+        if row["artifact_type"] == "issued-temperature-verification"
+    ]
+
+
+def assert_forecasts_unchanged(
+    before: dict[str, Any], after: dict[str, Any], objects: S3ArtifactObjectStore
+) -> None:
+    assert after["tables"]["issued_forecasts"] == before["tables"]["issued_forecasts"]
+    assert set(before["objects"]).issubset(after["objects"])
+    for row in before["tables"]["issued_forecasts"]:
+        # Read the actual bytes, not only counts or application-held envelopes.
+        digest = Digest(row["content_digest"])
+        payload = objects._client.get_object(
+            Bucket=objects._bucket, Key=content_addressed_key(digest)
+        )["Body"].read()
+        assert Digest.of_bytes(payload) == digest
+
+
+def test_verify_persists_exact_fact_and_repeated_operation_returns_the_same_record(
+    prepared_guidance: Path,
+    migrated_dsn: str,
+    object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observations = seed_observation_preview_inputs(migrated_dsn, object_store, VALID_TIME)
+    monkeypatch.setenv("MESOFORGE_OBSERVATIONS_ARTIFACT_ID", str(observations.artifact_id))
+    issuer = make_issuer(migrated_dsn, object_store)
+    forecast = PreparedPointForecast.from_directory(prepared_guidance).forecast(
+        latitude=FIRST["lat"], longitude=FIRST["lon"]
+    )
+    issued = issuer.issue(forecast, batch_run_id=uuid4(), location_index=0)
+    original = issuer.read(issued.issued_forecast_id)
+    preview = preview_observation_match(issued.issued_forecast_id, VALID_TIME)
+    before = complete_storage_inventory(migrated_dsn, object_store)
+
+    # Exercise the production environment/configuration factory as well as adapters.
+    response = configured_service().verify(issued.issued_forecast_id, VALID_TIME)
+    assert response["status"] == "verified"
+    identifier = ArtifactId(response["verification_id"])
+    result = response["result"]
+    assert result["schema_version"] == "issued-temperature-verification.v1"
+    assert result["status"] == "verified"
+    assert result["reasons"] == []
+    assert result["issued_forecast_digest"] == str(issued.content_digest)
+    assert result["match"] == preview
+    match = result["match"]
+    assert match["issued_forecast_id"] == str(issued.issued_forecast_id)
+    assert match["issued_at"] == "2026-08-30T12:00:00Z"
+    assert match["forecast"]["valid_time"] == "2026-08-30T13:00:00Z"
+    assert match["forecast"]["temperature"]["value"] == pytest.approx(283.0, abs=1e-6)
+    assert match["selected"]["station_id"] == "KROS"
+    assert match["selected"]["temperature"] == {"value": 293.15, "unit": "K"}
+    revision = match["selected"]["provenance"]["revision_digest"]
+    assert revision == preview["selected"]["provenance"]["revision_digest"]
+    assert revision.startswith("sha256:")
+    # Independent arithmetic: 70% of 280 K plus 30% of 290 K is 283 K;
+    # the observation is 20 C + 273.15 = 293.15 K, so the error is -10.15 K.
+    assert result["temperature_error"]["value"] == pytest.approx(-10.15, abs=1e-6)
+    assert result["temperature_error"]["unit"] == "K"
+    assert result["temperature_error"]["definition"] == "forecast_minus_observation"
+    assert result["verification_policy"]
+    assert (
+        result["verification_cutoff"]
+        == observations.model_dump(mode="json")["availability"]["available_at"]
+    )
+    assert "synthetic_observation_fixture" in JSON.serialize(result).decode()
+
+    after = complete_storage_inventory(migrated_dsn, object_store)
+    assert len(verification_artifacts(after)) == 1
+    assert len(after["tables"]["activities"]) == len(before["tables"]["activities"]) + 1
+    assert len(after["objects"]) == len(before["objects"]) + 1
+    assert_forecasts_unchanged(before, after, object_store)
+    assert issuer.read(issued.issued_forecast_id) == original
+
+    # Independent persisted-byte read proves PostgreSQL metadata and MinIO payload
+    # correspond to the returned result; new service instances share no local cache.
+    with PostgresUnitOfWork(migrated_dsn) as uow:
+        artifact = uow.artifacts.get(identifier)
+    payload = object_store.get_verified(artifact.storage_uri, artifact.content_digest)
+    assert JSON.deserialize(payload) == result
+    assert artifact.model_dump(mode="json") == response["artifact"]
+    assert configured_service().read(identifier) == response
+    assert configured_service().verify(issued.issued_forecast_id, VALID_TIME) == response
+    assert complete_storage_inventory(migrated_dsn, object_store) == after
+
+
+def test_concurrent_verifications_share_one_successful_activity_and_object(
+    prepared_guidance: Path,
+    migrated_dsn: str,
+    object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observations = seed_observation_preview_inputs(migrated_dsn, object_store, VALID_TIME)
+    monkeypatch.setenv("MESOFORGE_OBSERVATIONS_ARTIFACT_ID", str(observations.artifact_id))
+    issuer = make_issuer(migrated_dsn, object_store)
+    forecast = PreparedPointForecast.from_directory(prepared_guidance).forecast(
+        latitude=FIRST["lat"], longitude=FIRST["lon"]
+    )
+    issued = issuer.issue(forecast, batch_run_id=uuid4(), location_index=0)
+    before = complete_storage_inventory(migrated_dsn, object_store)
+
+    def verify(_: int) -> dict[str, Any]:
+        return make_verifier(migrated_dsn, object_store, issuer).verify(
+            issued.issued_forecast_id, VALID_TIME
+        )
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        responses = list(executor.map(verify, range(3)))
+    assert responses[0]["status"] == "verified"
+    assert responses == [responses[0]] * 3
+    after = complete_storage_inventory(migrated_dsn, object_store)
+    assert len(verification_artifacts(after)) == 1
+    assert len(after["tables"]["activities"]) == len(before["tables"]["activities"]) + 1
+    assert len(after["objects"]) == len(before["objects"]) + 1
+    assert_forecasts_unchanged(before, after, object_store)
+
+
+def test_two_issued_versions_for_the_same_hour_are_independently_verified(
+    prepared_guidance: Path,
+    migrated_dsn: str,
+    object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observations = seed_observation_preview_inputs(migrated_dsn, object_store, VALID_TIME)
+    monkeypatch.setenv("MESOFORGE_OBSERVATIONS_ARTIFACT_ID", str(observations.artifact_id))
+    issuer = make_issuer(migrated_dsn, object_store)
+    forecast = PreparedPointForecast.from_directory(prepared_guidance).forecast(
+        latitude=FIRST["lat"], longitude=FIRST["lon"]
+    )
+    issued = [issuer.issue(forecast, batch_run_id=uuid4(), location_index=0) for _ in range(2)]
+    before = complete_storage_inventory(migrated_dsn, object_store)
+    verifier = make_verifier(migrated_dsn, object_store, issuer)
+    results = [verifier.verify(row.issued_forecast_id, VALID_TIME) for row in issued]
+    assert all(row["status"] == "verified" for row in results)
+    assert len({row["verification_id"] for row in results}) == 2
+    assert {row["result"]["match"]["issued_forecast_id"] for row in results} == {
+        str(row.issued_forecast_id) for row in issued
+    }
+    assert len({row["result"]["issued_forecast_digest"] for row in results}) == 2
+    assert (
+        len(
+            {row["result"]["match"]["selected"]["provenance"]["revision_digest"] for row in results}
+        )
+        == 1
+    )
+    assert [row["result"]["temperature_error"]["value"] for row in results] == pytest.approx(
+        [-10.15, -10.15], abs=1e-6
+    )
+    after = complete_storage_inventory(migrated_dsn, object_store)
+    assert len(verification_artifacts(after)) == 2
+    assert_forecasts_unchanged(before, after, object_store)
+
+
+@pytest.mark.parametrize("case", ["issued_after_valid_time", "no_observation", "no_dataset"])
+def test_ineligible_or_unavailable_results_are_explicit_and_make_no_writes(
+    prepared_guidance: Path,
+    migrated_dsn: str,
+    object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    observations = seed_observation_preview_inputs(migrated_dsn, object_store, VALID_TIME)
+    monkeypatch.setenv("MESOFORGE_OBSERVATIONS_ARTIFACT_ID", str(observations.artifact_id))
+    issued_at = (
+        datetime(2026, 8, 30, 14, tzinfo=UTC) if case == "issued_after_valid_time" else ISSUED_AT
+    )
+    issuer = make_issuer(migrated_dsn, object_store, issued_at)
+    forecast = PreparedPointForecast.from_directory(prepared_guidance).forecast(
+        latitude=FIRST["lat"], longitude=FIRST["lon"]
+    )
+    issued = issuer.issue(forecast, batch_run_id=uuid4(), location_index=0)
+    if case == "no_dataset":
+        monkeypatch.delenv("MESOFORGE_OBSERVATIONS_ARTIFACT_ID")
+    valid_time = datetime(2026, 8, 30, 15, tzinfo=UTC) if case == "no_observation" else VALID_TIME
+    before = complete_storage_inventory(migrated_dsn, object_store)
+    response = make_verifier(migrated_dsn, object_store, issuer).verify(
+        issued.issued_forecast_id, valid_time
+    )
+    assert response["status"] == (
+        "ineligible" if case == "issued_after_valid_time" else "unavailable"
+    )
+    assert response["verification_id"] is None
+    assert response["result"]["reasons"]
+    assert response["result"]["temperature_error"]["value"] is None
+    assert complete_storage_inventory(migrated_dsn, object_store) == before
+
+
+def test_read_rejects_an_unknown_or_non_verification_artifact_without_writes(
+    migrated_dsn: str,
+    object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
+) -> None:
+    observations = seed_observation_preview_inputs(migrated_dsn, object_store, VALID_TIME)
+    verifier = make_verifier(migrated_dsn, object_store, make_issuer(migrated_dsn, object_store))
+    before = complete_storage_inventory(migrated_dsn, object_store)
+    with pytest.raises(NotFound):
+        verifier.read(ArtifactId.generate())
+    with pytest.raises(NotFound):
+        verifier.read(observations.artifact_id)
+    assert complete_storage_inventory(migrated_dsn, object_store) == before
+
+
+def test_saved_verification_payload_damage_fails_closed_without_rewriting_the_result(
+    prepared_guidance: Path,
+    migrated_dsn: str,
+    object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observations = seed_observation_preview_inputs(migrated_dsn, object_store, VALID_TIME)
+    monkeypatch.setenv("MESOFORGE_OBSERVATIONS_ARTIFACT_ID", str(observations.artifact_id))
+    issuer = make_issuer(migrated_dsn, object_store)
+    forecast = PreparedPointForecast.from_directory(prepared_guidance).forecast(
+        latitude=FIRST["lat"], longitude=FIRST["lon"]
+    )
+    issued = issuer.issue(forecast, batch_run_id=uuid4(), location_index=0)
+    verifier = make_verifier(migrated_dsn, object_store, issuer)
+    response = verifier.verify(issued.issued_forecast_id, VALID_TIME)
+    assert response["status"] == "verified"
+    identifier = ArtifactId(response["verification_id"])
+    digest = Digest(response["artifact"]["content_digest"])
+    # Deliberate corruption is confined to this fixture's dedicated random bucket.
+    object_store._client.put_object(
+        Bucket=object_store._bucket, Key=content_addressed_key(digest), Body=b"{}"
+    )
+    before = complete_storage_inventory(migrated_dsn, object_store)
+    with pytest.raises(IntegrityError):
+        verifier.read(identifier)
+    with pytest.raises(IntegrityError):
+        verifier.verify(issued.issued_forecast_id, VALID_TIME)
+    assert complete_storage_inventory(migrated_dsn, object_store) == before

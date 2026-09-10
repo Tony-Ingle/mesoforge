@@ -53,8 +53,16 @@ integration tests passed** for this milestone. The localhost demonstration used 
 saved model forecasts with explicitly **synthetic observation fixtures**; no live
 observations were acquired. All stored contents stayed unchanged during requests.
 See [observation preview](#preview-one-observation-match) for the rules and limitations.
-Proposed next milestone: calculate and persist one temperature verification result
-linked to the exact issued version, observation revision, and matching policy.
+The explicit local verification command now saves one immutable temperature error
+(`forecast - observation`) tied to the exact issued version, observation revision,
+matching rules, and retained-input cutoff. Retries with the same inputs and code
+reuse the saved artifact; ineligible attempts return reasons without a score.
+**680 focused offline and 45 PostgreSQL/MinIO integration tests passed**. The real
+saved 18:00 UTC forecast was compared with a synthetic KROS observation, read back,
+and retried without duplicates or changes to issued forecasts. See
+[single-hour verification](#verify-one-issued-temperature-hour).
+Proposed next milestone: verify eligible saved hours for one coordinate/time window,
+preserving overlapping issued versions and per-hour unavailable reasons.
 
 Future direction: configure locations using latitude/longitude only, with geographic
 context and suitable observation sources derived internally. The intended VPS workflow
@@ -458,7 +466,7 @@ were stopped afterward, preserving their data outside Git. Evidence and captured
 responses are in `%LOCALAPPDATA%\MesoForge\baselines\20260910-issued-retrieval`.
 Quality checks passed; the full acceptance, coverage, live-provider, backup/restore,
 and deployment gaps above remain. The read-only observation preview is documented below;
-forecast-error calculation and verification persistence remain future work.
+single-hour verification is also documented below.
 
 ### Select saved forecast hours
 
@@ -567,6 +575,64 @@ three PostgreSQL/MinIO modules plus `tests/integration/application/test_observat
 passed (**37 integration tests**). Ruff, formatting, mypy, import contracts, lockfile,
 documentation, hygiene, and whitespace checks passed. Live observation handling,
 full acceptance/coverage, backup/restore, and deployment remain unvalidated.
+
+### Verify one issued temperature hour
+
+This is an explicit write command; all existing API GET endpoints remain read-only.
+Use the same PostgreSQL/S3 settings and `MESOFORGE_OBSERVATIONS_ARTIFACT_ID` as the
+observation preview. With the project environment activated and `PYTHONPATH=src`:
+
+```text
+python -B -m mesoforge.application.issued_temperature_verification verify --issued-forecast-id b80e231a-c6e6-4066-ab4c-1e5d38bc2592 --valid-time 2026-09-10T18:00:00Z
+python -B -m mesoforge.application.issued_temperature_verification read --verification-id art_4a491043-aa94-49e2-b2b3-cb6b579cd902
+```
+
+These commands were demonstrated locally using the isolated locked Python 3.12
+environment. The IDs refer to retained local demonstration data. `verify` returns
+the saved artifact ID, manifest, and result; `read` returns that exact result without
+reselecting observations or recalculating. The existing `ArtifactService` stores the
+JSON fact in MinIO and its manifest, activity, and input links in PostgreSQL. No new
+tables or migrations were needed. The result retains the full match, issued-forecast
+ID and checksum, observation revision, source/QC/proxy metadata, rules, and code identity.
+
+The verification cutoff is fixed to the normalized observation artifact's availability
+time, making it a comparison against that retained snapshot. Forecast issuance must
+strictly precede both valid time and observation time; those times, observation
+availability/ingestion, and selected station metadata must be within the cutoff, which
+cannot be in the future. Temperatures must be finite Kelvin values and the match must
+pass the existing 50 km / ±15-minute / QC rules. Saved model cycles cannot follow
+issuance. **Acquisition timestamps are not embedded in saved forecasts**, so this is
+not a complete operational input-cutoff audit or a claim of forecast skill.
+
+Ineligible/unavailable attempts return explicit reasons, a null error and null
+verification ID, with no score artifact. Exit codes are 0 for a saved/read result,
+1 for an ineligible/unavailable attempt, and 2 for invalid input or storage failure.
+Identical forecast version/hour, observation snapshot/revision, cutoff, rules, and
+code/environment identity reuse the same result, including concurrent requests.
+Changed inputs, policy, or code identity produce a separate artifact; older results
+remain intact. Verification facts contain no aggregate performance statistics.
+
+The September 10 demonstration used forecast **296.5107933539454 K** at 18:00 UTC,
+issued at 17:09:48 UTC, and a **synthetic** KROS observation of **293.15 K** at 18:10 UTC.
+The saved error was **+3.3607933539454393 K**, tied to the issued ID above and observation
+revision `sha256:86ea1c81d54e31cce73da4a3d4dcda450dba6cf62fae49e1d491f93275a9e650`.
+Repeated execution and readback returned the same artifact. An older observation
+snapshot returned unavailable for 18:00 UTC; the 13:00 UTC forecast was ineligible
+because issuance followed valid/observation time. Neither attempt wrote a score.
+All four issued forecasts remained unchanged. One verification artifact/activity
+and one 16,525-byte MinIO object were added after fixture setup. Temporary services
+were stopped; evidence is outside Git in
+`%LOCALAPPDATA%\MesoForge\baselines\20260910-issued-temperature-verification`.
+
+Validation: **680 offline tests** passed across the API/batch/issuance/preparation,
+observation, verification, artifact-service, and recorded Phase 2 selections.
+**45 PostgreSQL/MinIO integration tests** passed, including concurrent retry safety,
+independent issued versions, exact readback, explicit ineligibility, and damaged inputs.
+The new modules are `tests/unit/verification/test_issued_temperature.py`,
+`tests/unit/application/test_issued_temperature_verification.py`, and
+`tests/integration/application/test_issued_temperature_verification.py`.
+Quality checks passed. Full acceptance/coverage, live observations, backup/restore,
+and deployment remain unvalidated.
 
 ### Prepare real inputs before serving
 
