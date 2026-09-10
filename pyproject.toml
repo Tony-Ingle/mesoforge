@@ -23,6 +23,8 @@ dependencies = [
     "cfgrib>=0.9.15.1",
     "herbie-data>=2026.3.0",
     "pyarrow>=25.0.1",
+    "fastapi>=0.141.1",
+    "uvicorn>=0.52.4",
 ]
 
 [dependency-groups]
@@ -37,6 +39,9 @@ dev = [
     "pgserver>=0.1.4,<1",
     "boto3-stubs[s3]>=1.35,<2",
     "types-PyYAML>=6,<7",
+    "httpx2>=2.12.0",
+    # Starlette 1.6 TestClient uses BlockingPortal aliases deprecated in AnyIO 4.15.
+    "anyio<4.15",
 ]
 
 [build-system]

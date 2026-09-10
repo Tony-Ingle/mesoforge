@@ -19,8 +19,9 @@ The standalone Phase 1 HRRR-only hours 0–6 generation/verification workflow ha
 been retired, including hour-zero output. Phase 2 HRRR support, shared science,
 the required Phase 1 configuration overlay, and retained-data support remain.
 
-There is no HTTP API, V2 shared-cache publication/job system, or registered-coordinate
-history service. RRFS, precipitation type, learned corrections/weights, AI adjustments,
+There is a localhost-only **synthetic temperature HTTP demonstration**, described below.
+There is no operational forecast API, V2 shared-cache publication/job system, or
+registered-coordinate history service. RRFS, precipitation type, learned corrections/weights, AI adjustments,
 and publication are disabled or absent. Existing `_v2` modules and schema names refer
 to Phase 2 contracts, not completion of the proposed V2 platform.
 
@@ -51,9 +52,9 @@ not approval to implement its entire release plan.
 
 ## Setup and commands
 
-Run commands from the repository root. **Except for documentation checks noted
-below, commands here were inspected but not executed during this consolidation;
-they remain unverified on this local Windows checkout.**
+Run commands from the repository root. **The general setup, service, and full-suite
+commands below remain unverified on this local Windows checkout.** The focused
+Python 3.12 checks and synthetic demonstration have separate execution results below.
 
 The project requires Python **3.12** and `uv`; see [pyproject.toml](pyproject.toml)
 and [uv.lock](uv.lock). Dependencies include NumPy/xarray, Pint, pyproj,
@@ -130,19 +131,67 @@ not the project's Python 3.12 runtime; `uv` was not available on PATH. Product s
 provider access, services, and product tests were not exercised. Documentation checks
 do not establish runtime compatibility.
 
-## Proposed next milestone
+## Approved localhost demonstration
 
-One small increment: a supported coordinate receives a deterministic baseline from
-prepared guidance through a private API, with values, units, source cycles, valid
-times, provenance, and explicit missingness. No provider downloads or regional GRIB
-decode occur inside the HTTP request.
+[The HTTP entry point](src/mesoforge/api.py) accepts a coordinate near Grasston and
+returns three hourly temperatures from [prepared synthetic guidance](src/mesoforge/application/point_forecast.py).
+Every response identifies itself as synthetic demonstration data, not a current
+weather forecast. The supported rectangle includes latitude **45.5–46.0** and
+longitude **-93.5–-93.0**; unsupported or invalid coordinates return HTTP 422.
 
-A suggested local demo is temperature at hours 1–3 near Grasston using prepared
-HRRR/GFS guidance, existing interpolation/scalar-blend functions, and an explicit
-fallback table. **The exact region, models, weights, horizons, prepared-file format,
-and private-access boundary remain proposals requiring owner approval.** Do not
-extend this milestone into jobs, shared-cache automation, registered history,
-verification, evaluation, or AI.
+With the locked dependencies installed, the portable start command is:
+
+```text
+uv run --locked python -m mesoforge.api
+```
+
+The module was exercised directly with the isolated Python 3.12 environment and
+`PYTHONPATH=src` on Windows; the `uv run` wrapper above has not been executed.
+Open <http://127.0.0.1:8765/forecast?lat=45.8&lon=-93.1>. Stop with Ctrl+C.
+The launcher binds only to `127.0.0.1`; `--port` changes the port, not the host.
+
+At startup, an empty directory receives tiny `HRRR.nc` and `GFS.nc` files; existing
+files are never overwritten. The default directory is
+`mesoforge-synthetic-temperature-demo` under the operating system's temporary
+directory; `--data-dir PATH` selects another directory. Both files are loaded and
+closed before requests begin, and reused across coordinates. Restart to load changed
+inputs. Their invented latitude/longitude grids are not real HRRR/GFS native grids.
+
+The inputs fix the target reference at **2026-08-30 12:00 UTC**, HRRR's source cycle
+at 12:00, and GFS's at 06:00. Hours 1–3 are valid at 13:00, 14:00, and 15:00 UTC.
+Existing `align_station_to_model()` and `blend_scalar()` produce **286.14, 287.14,
+and 288.14 K** at the example coordinate. Responses include cycles, source leads,
+valid times, units, fixed weights, and explicit missing reasons.
+
+Demo weights are **70% HRRR / 30% GFS**, matching
+`scalar-vector.hg.h01-h18` in [the existing configuration](configs/phase2-grasston.yaml).
+That scalar/vector row applies to temperature and hours 1–3. Phase 2 defaults are
+unchanged. If either required model or hour is missing, that hour is null; weights
+are never redistributed. Invalid prepared-file units or time metadata prevent startup.
+
+This demonstration does not acquire real guidance or use databases. A real prepared
+guidance API remains later work requiring its own bounded approval; jobs, registration,
+history, verification, evaluation, and AI are outside this increment.
+
+### Demonstration validation
+
+On 2026-09-09, the isolated locked Python 3.12 environment passed **39 focused API
+tests** in [test_forecast_api.py](tests/unit/test_forecast_api.py) and the **148-test
+recorded Phase 2 selection** in [CLEANUP.md](CLEANUP.md), run together: **187 passed**.
+Checks cover independent expected temperatures, boundaries, units/times/source cycles,
+missing files/hours, nonfinite extraction, labeled errors, repeated requests, and reuse
+of the same files for different coordinates. No existing scientific tests were changed.
+
+Ruff lint/format, mypy, all nine import contracts, lock validation, documentation and
+repository hygiene checks, and `git diff --check` passed. A real localhost HTTP request
+returned the temperatures above; repeated requests matched, another coordinate worked,
+and unsupported coordinates returned 422. The demonstration server was stopped afterward.
+Full database/storage acceptance and live-provider tests were not run.
+
+The only dependency additions support HTTP serving/testing. Existing locked package
+versions are unchanged. Starlette's test client needs `httpx2` and an AnyIO version
+below 4.15 to avoid deprecated aliases under the repository's warnings-as-errors rule;
+the initial collection errors were resolved through those dependency choices.
 
 ## References
 
