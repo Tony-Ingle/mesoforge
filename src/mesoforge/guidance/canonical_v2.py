@@ -293,7 +293,6 @@ _CONFIGURATION_SNAPSHOT_ID_RE = re.compile(r"^cfg_sha256_[0-9a-f]{64}$")
 _ARTIFACT_ID_RE = re.compile(r"^art_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _GRID_ID_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 _INTERVAL_WIDTH_NS = np.timedelta64(1, "h").astype("timedelta64[ns]")
-_INTERVAL_WIDTH_TOLERANCE_NS = np.timedelta64(0, "ns")
 
 # Codex re-review finding 3: a canonical artifact must carry the grid
 # profile its own model actually publishes. Identifier *syntax* alone

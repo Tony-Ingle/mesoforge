@@ -1,3 +1,5 @@
+> **Historical plan (archived 2026-09-09):** This completed Phase 0-2 development plan is retained for reference. Its agent instructions and delivery checklist are not current work orders. Follow the current owner request and root AGENTS.md; see the [archive index](../README.md). Original path: .hermes/plans/2026-08-28_032207-phase-1-operational-forecast-slice.md. The original contents follow unchanged.
+
 # MesoForge Phase 1 Operational Forecast Slice Implementation Plan
 
 > **For Hermes:** Implement this plan task-by-task with TDD and request Codex review after the implementation branch is pushed. Do not broaden the slice or merge it.

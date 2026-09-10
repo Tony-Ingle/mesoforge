@@ -1,3 +1,5 @@
+> **Historical plan (archived 2026-09-09):** This completed Phase 0-2 development plan is retained for reference. Its agent instructions and delivery checklist are not current work orders. Follow the current owner request and root AGENTS.md; see the [archive index](../README.md). Original path: .hermes/plans/2026-08-30_233217-phase-2-multimodel-baseline.md. The original contents follow unchanged.
+
 # MesoForge Phase 2 Multi-Model Baseline Implementation Plan
 
 > **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.

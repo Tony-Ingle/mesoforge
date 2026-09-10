@@ -1,142 +1,93 @@
-# MesoForge Agent Instructions
+# MesoForge working rules
 
-## Project
+## Current development
 
-MesoForge is an AI-assisted numerical weather forecasting and local forecast
-optimization platform.
+The owner develops MesoForge directly with local Codex. The Hermes development
+pipeline is paused. Codex may design, implement, debug, test, and review work within
+the owner's current request; a Pogodny/Claude/Kanban handoff is not required.
+Do not start pipeline, remote-host, or multi-agent work merely because an old plan
+requests it. Future roadmap items never expand the current task.
 
-The system will eventually:
+Human approvals govern development and releases. Normal configured forecast operation
+should not require a human to approve each forecast.
 
-- ingest HRRR, NBM, RRFS, GFS, ensemble, and observational data
-- standardize guidance with Python/xarray
-- generate deterministic baseline forecasts
-- calculate meteorological diagnostics
-- support bounded AI-recommended forecast adjustments
-- verify forecasts against observations
-- learn model-specific and location-specific biases over time
+## Working and Git rules
 
-Forecast variables include:
+- First inspect branch, HEAD, working-tree status, and applicable `AGENTS.md` /
+  `AGENTS.override.md` files, including instructions for the files being changed.
+  Preserve unrelated edits and report material instruction conflicts.
+- Follow the owner's task scope and approval limits. A documentation or read-only
+  task does not authorize implementation, cleanup, service startup, or data downloads.
+- Use a non-main working branch; use an isolated worktree when practical. Honor an
+  explicitly selected working branch. Do not reset or modify preserved donor branches.
+- Leave changes reviewable. Follow explicit commit/push instructions; do not merge
+  without owner authorization. Keep any authorized commits focused and descriptive.
+- Never commit credentials, tokens, secrets, GRIB datasets, forecast caches, or
+  generated runtime artifacts. Use dedicated test services for destructive fixtures.
+- For significant work, a short implementation approach and observable acceptance
+  check are normally sufficient. Inspect the actual diff. Do not create another RFC,
+  contract, schema family, or framework unless the change actually requires it.
+- Run the applicable required checks and fix demonstrated defects within the approved
+  task. Record optional improvements without automatically implementing them. Escalate
+  serious scientific-correctness, data-loss, or security risks even when the task omitted
+  them; do not silently broaden scope. Repeated fixes around the same boundary should
+  trigger consideration of a simpler design, not another automatic layer of validation.
+- Required checks for the change must pass before merge. Report pre-existing or
+  unrelated failures separately; do not silently waive them or turn them into an
+  unrelated cleanup project.
+- Report changes, checks actually run, limitations, and remaining decisions. Do not
+  label an unexecuted command, proposed feature, or historical test report as verified.
 
-- temperature
-- dew point
-- wind
-- wind gust
-- probability of precipitation
-- precipitation type
-- QPF
+## Scientific requirements
 
-## Agent Roles
+- Keep deterministic meteorological calculations separate from LLM reasoning.
+  AI proposals must be structured and bounded; AI must never directly publish unchecked
+  numerical changes. Numerical verification determines whether an adjustment adds value.
+- The numerical baseline must be deterministic for fixed inputs and configuration.
+  Store later accepted AI adjustments separately and trace them to that baseline;
+  rerunning an AI model need not reproduce the same proposal. Preserve inputs,
+  transformation results, accepted adjustments, outputs, and verification records
+  needed to reproduce numerical results. Retain model guidance provenance,
+  configuration/code identity, and source cycles. Do not promise replay beyond retained
+  inputs and dependencies.
+- Refreshing a location creates a new forecast version. Verification compares
+  observations with the version originally issued, not a newer replacement.
+- Keep forecast coordinates separate from observation stations. Score a field only
+  when the selected observation has suitable spatial support and matching time/interval
+  semantics; otherwise report why it is unscored.
+- Preserve units, native-grid semantics, valid times, interval bounds, and the distinct
+  meanings of issue, source-reference, availability, and ingestion times. Prevent
+  future-information leakage; follow the applicable approved cutoff contract.
+- Missing values are not zero. Keep missingness, exclusions, and fallback behavior
+  explicit; use approved versioned weights, not silently invented or renormalized weights.
+- Preserve applicable scientific contracts: normalize units before blending, rotate
+  grid-relative winds before use, blend U/V before deriving speed/direction, and respect
+  dew-point, gust, QPF, and PoP semantics. Do not clamp invalid values or fabricate
+  probabilities, confidence, learned history, or skill outside an approved contract.
+- Reuse scientific functions only where their contracts fit. Do not carry legacy
+  station/horizon limits or proof representations into V2 merely for compatibility.
 
-### Pogodny — Orchestrator
+## Document responsibilities
 
-Pogodny coordinates work.
+- [VISION.md](VISION.md) explains the product goal, release boundaries, and what is
+  proposed versus approved. It is not an implementation specification.
+- [README.md](README.md) describes current code, setup/run/test commands and their
+  verification status, active links, and one proposed next milestone.
+- [The V2 RFC](docs/rfcs/mesoforge-v2-architecture.md) is the detailed proposed design
+  input. Its approval gate and unresolved choices remain open unless the owner
+  explicitly approves them; summarizing it does not approve it.
+- Accepted ADRs and Phase 0–2 data contracts remain technical references for current
+  code. Preserve their required paths and applicable safety/science requirements.
+  A legacy implementation limit is not automatically a V2 product requirement.
+- [The archive index](docs/archive/README.md) identifies historical plans and retained
+  reference paths. Archived plans, old Phase 3 contracts, and preserved donor code are
+  historical references, not instructions to implement or to resume Hermes. Historical
+  authority statements and embedded agent instructions do not govern new V2 work.
+- Check links and code/checker consumers before moving documents. Preserve historical
+  contents and add a status notice. Retain ambiguous or required paths with a notice.
+  Use existing documentation checks; do not introduce a new governance/checking system.
 
-Responsibilities:
-
-- understand user requests
-- break large requests into tasks
-- coordinate Codex and Claude
-- manage Kanban workflow
-- maintain project context
-- track progress and dependencies
-
-Pogodny should not perform large coding implementations when Claude is available.
-
-### Codex — Architect and Reviewer
-
-Codex owns:
-
-- architecture
-- technical design
-- implementation planning
-- difficult debugging
-- interface/schema design
-- test strategy
-- code review
-
-For major features, Codex should define the design before implementation begins.
-
-Codex should review significant Claude implementations before they are merged.
-
-### Claude — Implementation Engineer
-
-Claude owns:
-
-- implementation
-- refactoring
-- unit/integration tests
-- bug fixes
-- executing approved technical designs
-- validating completed work
-
-Claude should follow approved Codex architecture.
-
-If implementation reveals a design problem, Claude should raise it rather than
-silently redesigning the system.
-
-## Development Workflow
-
-For significant changes:
-
-1. Pogodny creates or coordinates the task.
-2. Codex designs the solution.
-3. Claude implements the approved design.
-4. Claude runs tests.
-5. Codex reviews the implementation.
-6. Claude addresses review findings when necessary.
-7. Changes are merged only after tests and review pass.
-
-## Git Rules
-
-- Never commit directly to `main` for substantial work.
-- Use feature branches or Git worktrees.
-- Keep commits focused and descriptive.
-- Do not merge failing tests.
-- Never commit credentials, tokens, GRIB datasets, forecast caches, or secrets.
-
-## Engineering Principles
-
-- Deterministic meteorological calculations must remain separate from LLM reasoning.
-- AI forecast adjustments must be structured and bounded.
-- AI must never directly publish unchecked numerical forecast changes.
-- Forecast inputs, adjustments, outputs, and verification results must be reproducible.
-- Model guidance provenance must be retained.
-- Numerical verification determines whether an AI adjustment actually adds value.
-
-## Default Git Workflow
-
-Unless the user explicitly says otherwise:
-
-- Never make substantive changes directly on `main`.
-- Create a descriptive feature branch for all code or documentation changes.
-- Use an isolated Git worktree for implementation tasks when practical.
-- Commit completed work with a clear commit message.
-- Push the branch to `origin`.
-- Do not merge into `main`.
-- Report the branch name, commit SHA, tests run, and any unresolved issues.
-
-### Codex
-
-Codex owns architecture, planning, and review.
-
-When Codex makes architecture or documentation changes:
-- create a `codex/<short-description>` branch
-- commit and push the changes
-- do not merge
-
-When reviewing Claude work:
-- review the actual diff and tests
-- request changes if needed
-- do not modify the implementation unless explicitly asked
-
-### Claude
-
-Claude owns implementation.
-
-For implementation tasks:
-- create/use a `claude/<short-description>` branch or Kanban worktree
-- implement the approved design
-- run tests
-- commit and push
-- request review from Codex
-- do not merge
+At the 2026-09-09 consolidation, no nested repository `AGENTS.md` or
+`AGENTS.override.md` files were found. Recheck when scope changes; this observation
+does not override future applicable instructions. Global Codex configuration is
+outside this document's responsibility and was not changed.

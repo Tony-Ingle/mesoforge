@@ -13,7 +13,6 @@ import numpy as np
 import xarray as xr
 
 from mesoforge.catalog.grids import GridDefinition
-from mesoforge.catalog.units import VerticalDefinition
 from mesoforge.catalog.variables import VariableDefinition
 
 SYNTHETIC_GRID_ID = "synthetic-grid.v1"
@@ -44,15 +43,6 @@ def build_synthetic_grid() -> GridDefinition:
         longitude_convention="minus_180_to_180",
         orientation="x_east_y_north",
         spatial_support="cell_mean",
-    )
-
-
-def build_synthetic_vertical_definition() -> VerticalDefinition:
-    return VerticalDefinition(
-        vertical_definition_id=SYNTHETIC_VERTICAL_ID,
-        coordinate_type="height_above_ground",
-        value=2.0,
-        unit_id="m",
     )
 
 

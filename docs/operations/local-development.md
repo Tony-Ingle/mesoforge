@@ -1,5 +1,10 @@
 # MesoForge local development environment
 
+These are existing Phase 0–2 operational instructions. Service, installation, live,
+and product-test commands were not executed during the 2026-09-09 documentation
+consolidation and remain unverified on the local Windows checkout. Examples use a
+POSIX shell; see [README.md](../../README.md) for Windows notes and current status.
+
 MesoForge's integration and acceptance tests require two real backing services: PostgreSQL
 (metadata/provenance) and an S3-compatible object store (MinIO).
 
@@ -9,6 +14,7 @@ MesoForge's integration and acceptance tests require two real backing services: 
 cp .env.example .env   # edit values if needed
 docker compose -f deploy/local/compose.yaml up -d --wait
 export MESOFORGE_DATABASE_DSN=postgresql+psycopg://mesoforge:mesoforge_local@localhost:55432/mesoforge
+export MESOFORGE_TEST_DATABASE_DSN="$MESOFORGE_DATABASE_DSN"
 export MESOFORGE_TEST_S3_ENDPOINT=http://127.0.0.1:59000
 export MESOFORGE_TEST_S3_ACCESS_KEY=mesoforge_local
 export MESOFORGE_TEST_S3_SECRET_KEY=mesoforge_local_password
@@ -16,12 +22,12 @@ uv run alembic upgrade head
 uv run pytest -m integration -q
 ```
 
-## Option B: no Docker access (this development sandbox)
+## Option B: without Docker
 
 Integration tests do not require Docker to run. PostgreSQL is provided
 by the `pgserver` dev dependency (a real, pip-installable, non-root
 PostgreSQL 16+ binary distribution -- see
-`tests/integration/conftest.py`); a session-scoped fixture starts and
+[`tests/conftest.py`](../../tests/conftest.py)); a session-scoped fixture starts and
 tears it down automatically. Just running:
 
 ```bash
@@ -47,29 +53,16 @@ uv run pytest -m integration -q
 
 ## CI
 
-`.github/workflows/ci.yml`'s `integration` job uses real `postgres:16`
-and `minio` service containers; no pgserver/standalone-binary fallback
-is used there.
+[CI](../../.github/workflows/ci.yml)'s `integration` job uses a real `postgres:16`
+service container and starts MinIO with `docker run`; no pgserver/standalone-binary
+fallback is used there.
 
 ## Running the full quality/test suite
 
-See `Makefile` targets (`make quality`, `make test`, `make coverage`) or
-the exact command sequence in the Phase 0 implementation plan, Section
-"Task 12: Final quality and scope audit".
-
-## Phase 1 offline and live checks
-
-`make phase1-acceptance` runs the PostgreSQL/MinIO-backed offline acceptance proof.
-Provider access is never enabled in normal tests or CI. To validate current provider
-contracts manually, supply a recent explicit cycle and opt in:
-
-```bash
-MESOFORGE_LIVE_TESTS=1 MESOFORGE_LIVE_HRRR_CYCLE=YYYYMMDDTHH make smoke-live
-```
-
-The smoke tests use one HRRR lead and one bounded three-station METAR query, assert
-contract shape rather than weather values, and retain responses only in temporary test
-storage. Avoid repeated invocation and respect provider rate limits.
+See [Makefile](../../Makefile) targets (`make quality`, `make test`, `make coverage`)
+and the current [README command guide](../../README.md). The Phase 0 implementation
+plan is archived history, not the current command reference. Integration and
+acceptance fixtures reset database schemas; use a dedicated test database.
 
 ## Phase 2 checks
 

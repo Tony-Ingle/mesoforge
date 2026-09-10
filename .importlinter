@@ -116,18 +116,6 @@ forbidden_modules =
     mesoforge.storage
     mesoforge.application
 
-[importlinter:contract:phase1-application-no-scientific-logic]
-name = application.phase1 depends on domains only through their public modules, never a provider adapter directly
-type = forbidden
-source_modules =
-    mesoforge.application.phase1
-forbidden_modules =
-    mesoforge.guidance.sources.hrrr
-    mesoforge.observations.sources.aviationweather
-ignore_imports =
-    mesoforge.guidance.acquisition -> mesoforge.guidance.sources.hrrr
-    mesoforge.observations.acquisition -> mesoforge.observations.sources.aviationweather
-
 [importlinter:contract:phase2-coordinator-is-pure-composition]
 name = application.phase2 contains no provider, adapter, science implementation, or infrastructure imports
 type = forbidden

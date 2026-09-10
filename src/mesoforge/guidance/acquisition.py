@@ -5,8 +5,7 @@ Depends only on ``guidance.interfaces`` protocol shapes (transport,
 clock, sleeper) -- unit tests inject a scripted fake; production wiring
 injects ``RequestsHrrrHttpTransport``/real clock/``time.sleep``. No
 ``ArtifactService``/storage import here: this module returns plain,
-typed result objects that ``application/phase1.py`` registers as
-source artifacts.
+typed result objects for callers to register as source artifacts.
 
 Task 2 extracted the shared deterministic retry/failover/ranged-fetch
 engine to ``guidance.http_fetch`` so NBM/GFS acquisition (Tasks 3/4)

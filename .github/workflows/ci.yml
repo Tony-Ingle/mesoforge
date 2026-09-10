@@ -142,8 +142,6 @@ jobs:
         run: >-
           uv run pytest -m integration tests/integration
           tests/acceptance/test_phase0_artifact_lineage.py -q
-      - name: Phase 1 acceptance
-        run: make phase1-acceptance
       - name: Phase 2 acceptance
         run: make phase2-acceptance
       - name: Full coverage threshold

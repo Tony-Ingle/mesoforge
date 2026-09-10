@@ -6,6 +6,14 @@ Decision owner: MesoForge owner
 
 Architecture author: Codex
 
+> **Reference status (2026-09-09):** The source/donor descriptions below record the
+> inputs used when this RFC was written, not current branch or working-tree state.
+> The later preserved Phase 3 donor is
+> `43f56bc0c67ab782c94fb6349d65523793e1a836`; see the
+> [archive index](../archive/README.md). This RFC remains proposed: its decision log
+> records design choices under review, not blanket owner approval. The entry-point
+> summary is [VISION.md](../../VISION.md).
+
 Source baseline: `origin/main` at `ce0e0d77e645d31ca33caaac2d20f4f8748dc90e`
 
 Read-only implementation donor: `claude/phase3-coordinate-verification` at

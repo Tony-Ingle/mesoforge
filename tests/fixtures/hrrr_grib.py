@@ -94,44 +94,6 @@ def make_wind_message(
         eccodes.codes_release(gid)
 
 
-def make_lead_grib_bytes(
-    *,
-    forecast_hour: int,
-    temperature_k: np.ndarray,
-    eastward_wind_m_s: np.ndarray,
-    northward_wind_m_s: np.ndarray,
-    grid_relative_wind: bool = True,
-    cycle_date: str = "20260828",
-    cycle_hour: int = 18,
-) -> bytes:
-    """Concatenate T/U/V messages in that order, matching Phase 1's
-    field_assertions order (temperature, U, V)."""
-    return (
-        make_temperature_message(
-            forecast_hour=forecast_hour,
-            values_k=temperature_k,
-            cycle_date=cycle_date,
-            cycle_hour=cycle_hour,
-        )
-        + make_wind_message(
-            forecast_hour=forecast_hour,
-            component="u",
-            values_m_s=eastward_wind_m_s,
-            grid_relative=grid_relative_wind,
-            cycle_date=cycle_date,
-            cycle_hour=cycle_hour,
-        )
-        + make_wind_message(
-            forecast_hour=forecast_hour,
-            component="v",
-            values_m_s=northward_wind_m_s,
-            grid_relative=grid_relative_wind,
-            cycle_date=cycle_date,
-            cycle_hour=cycle_hour,
-        )
-    )
-
-
 def make_dew_point_message(
     *,
     forecast_hour: int,
@@ -196,63 +158,3 @@ def make_apcp_message(
         return bytes(eccodes.codes_get_message(gid))
     finally:
         eccodes.codes_release(gid)
-
-
-def make_phase2_lead_grib_bytes(
-    *,
-    forecast_hour: int,
-    temperature_k: np.ndarray,
-    dew_point_k: np.ndarray,
-    eastward_wind_m_s: np.ndarray,
-    northward_wind_m_s: np.ndarray,
-    gust_m_s: np.ndarray,
-    qpf_kg_m2: np.ndarray,
-    grid_relative_wind: bool = True,
-    cycle_date: str = "20260828",
-    cycle_hour: int = 18,
-) -> bytes:
-    """Concatenate all six Phase 2 HRRR field messages (temperature,
-    dew point, U, V, gust, one-hour QPF) for one forecast lead, in the
-    exact order HRRR Phase 2 field contracts declare them."""
-    return (
-        make_temperature_message(
-            forecast_hour=forecast_hour,
-            values_k=temperature_k,
-            cycle_date=cycle_date,
-            cycle_hour=cycle_hour,
-        )
-        + make_dew_point_message(
-            forecast_hour=forecast_hour,
-            values_k=dew_point_k,
-            cycle_date=cycle_date,
-            cycle_hour=cycle_hour,
-        )
-        + make_wind_message(
-            forecast_hour=forecast_hour,
-            component="u",
-            values_m_s=eastward_wind_m_s,
-            grid_relative=grid_relative_wind,
-            cycle_date=cycle_date,
-            cycle_hour=cycle_hour,
-        )
-        + make_wind_message(
-            forecast_hour=forecast_hour,
-            component="v",
-            values_m_s=northward_wind_m_s,
-            grid_relative=grid_relative_wind,
-            cycle_date=cycle_date,
-            cycle_hour=cycle_hour,
-        )
-        + make_gust_message(
-            forecast_hour=forecast_hour,
-            values_m_s=gust_m_s,
-            cycle_date=cycle_date,
-            cycle_hour=cycle_hour,
-        )
-        + make_apcp_message(
-            forecast_hour=forecast_hour,
-            values_kg_m2=qpf_kg_m2,
-            cycle_date=cycle_date,
-            cycle_hour=cycle_hour,
-        )
-    )

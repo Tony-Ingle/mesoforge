@@ -1,5 +1,14 @@
 # Phase 3 coordinate-keyed verification contract
 
+> **Historical reference (2026-09-09):** This is the preserved old Phase 3 contract,
+> not an instruction to implement V2. Its authority statements below apply to that
+> historical phase. The old implementation is a read-only donor; it is not the
+> checked-out Phase 2 baseline. This path remains for existing links and technical
+> comparison. See [VISION.md](../../VISION.md), the
+> [proposed V2 RFC](../rfcs/mesoforge-v2-architecture.md), and the
+> [archive index](../archive/README.md). Incompatible singleton, lattice, and proof
+> requirements do not silently govern new V2 work; V2 choices still need owner approval.
+
 This is the authoritative, implementation-enabling contract for Phase 3. The canonical
 architecture remains [`docs/architecture/v1.md`](../architecture/v1.md); where that
 future-state document is broader, this contract governs Phase 3. The implemented

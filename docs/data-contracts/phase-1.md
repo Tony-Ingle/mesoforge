@@ -1,5 +1,11 @@
 # Phase 1 operational forecast slice
 
+> **Status (2026-09-09):** The standalone hours 0–6 generation/verification workflow
+> is retired. Its lifecycle description below is historical. Shared scientific
+> contracts, schemas, configuration, and retained-data readers remain in use;
+> this path is retained for their references. See [README](../../README.md) and
+> [Phase 2](phase-2.md) for the supported workflow.
+
 Phase 1 is one deterministic, replayable HRRR forecast and METAR verification run for
 `grasston-minnesota.v1`. The authoritative configuration is
 `configs/phase1-grasston.yaml`; this document summarizes its durable contracts rather

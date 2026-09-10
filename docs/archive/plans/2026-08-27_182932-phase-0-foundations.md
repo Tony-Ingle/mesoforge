@@ -1,3 +1,5 @@
+> **Historical plan (archived 2026-09-09):** This completed Phase 0-2 development plan is retained for reference. Its agent instructions and delivery checklist are not current work orders. Follow the current owner request and root AGENTS.md; see the [archive index](../README.md). Original path: .hermes/plans/2026-08-27_182932-phase-0-foundations.md. The original contents follow unchanged.
+
 # MesoForge Phase 0 Foundations Implementation Plan
 
 > **For Hermes:** Implement this plan task-by-task with strict RED-GREEN-REFACTOR cycles. The pre-created Claude implementation task owns production changes; Codex reviews the resulting branch.

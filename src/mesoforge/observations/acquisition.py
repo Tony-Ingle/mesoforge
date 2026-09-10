@@ -3,8 +3,8 @@ Task 8).
 
 Depends only on ``observations.interfaces`` protocol shapes; unit
 tests inject a scripted fake transport/clock/sleeper. No storage
-import here -- returns plain typed result objects that
-``application/phase1.py`` registers as source artifacts.
+import here -- returns plain typed result objects for the application
+layer to register as source artifacts.
 """
 
 from __future__ import annotations

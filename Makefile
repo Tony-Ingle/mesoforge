@@ -1,7 +1,7 @@
 .PHONY: sync lock-check fmt fmt-check lint typecheck import-lint docs-check \
         hygiene-check unit contract property integration acceptance \
         test test-all coverage services-up services-down migrate quality ci \
-        scientific phase1-acceptance phase2-scientific phase2-offline \
+        scientific phase2-scientific phase2-offline \
         phase2-acceptance smoke-live
 
 sync:
@@ -50,9 +50,6 @@ acceptance:
 
 scientific:
 	uv run pytest -m scientific -q
-
-phase1-acceptance:
-	uv run pytest -m integration tests/acceptance/test_phase1_grasston_hrrr_metar_verification.py -q
 
 phase2-scientific:
 	uv run pytest -m scientific tests/unit tests/property -q

@@ -229,8 +229,6 @@ class ModelCycleSelectionPolicy(BaseModel):
 
 
 _MODEL_ORDER = ("HRRR", "NBM", "GFS")
-_H01_H18 = tuple(range(1, 19))
-_H19_H36 = tuple(range(19, 37))
 _WEIGHT_SUM_TOLERANCE = 1e-12
 
 
