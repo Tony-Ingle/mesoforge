@@ -25,15 +25,23 @@ Read-only design donor: `docs/rfcs/phase-3-debloat.md` at
 
 ## 1. Decision summary
 
-MesoForge V2 will be a selective rebuild from current `main`, not a merge-and-refactor of
-the old Phase 3 branch. It will reuse scientific kernels and infrastructure whose contracts
-remain valid, port cohesive donor algorithms with independent tests, and replace obsolete
-Phase 3 product architecture.
+MesoForge's long-term north star is an automated GFE-style local digital forecast
+system. A configured latitude/longitude centers a local forecast domain: shared
+model guidance becomes coherent MesoForge fields, learned deterministic corrections
+and bounded AI tool recipes may later adjust those fields, and interpolation at the
+exact coordinate produces the delivered spot forecast. A point-value blending API
+is an early capability, not the complete product architecture.
+
+The selective rebuild reuses scientific kernels and infrastructure whose contracts
+remain valid, ports cohesive donor algorithms with independent tests, and replaces
+obsolete Phase 3 product architecture. The `main` baseline and donor revisions above
+describe the original design inputs, not instructions to restart current development.
 
 The central data-flow decision is **ingest shared guidance once, derive forecasts for many
 locations**. Background work acquires and normalizes each supported model cycle once into a
-shared spatial cache. Forecast computation reads that cache for a coordinate; registration
-never creates a location-specific guidance download or copy.
+shared spatial cache. Nearby locations reuse source data. Local MesoForge forecast
+fields are derived products, distinct from complete native model datasets; registration
+does not require a separate source download or native-dataset copy for each location.
 
 The **First Usable Release** provides only:
 
@@ -53,8 +61,10 @@ observations; and exposes measured baseline performance. A new location reports 
 history and makes no learned-skill claim. The system never invents samples, confidence,
 bias, weights, or skill.
 
-This RFC is the architecture gate. Implementation begins only after owner approval. Its
-delivery sequence is a non-binding estimate, not a required PR count.
+The owner has clarified this long-term direction and separately approved implemented
+slices. The rest of this RFC remains proposed; documenting the direction does not
+approve new forecast behavior or every release stage. Its delivery sequence is a
+non-binding estimate, not a required PR count.
 
 ## 2. Release boundary
 
@@ -78,34 +88,47 @@ credential boundary. It is not public SaaS identity or tenancy.
 
 ### 2.2 Future Roadmap
 
-**Owner direction update, 2026-09-10:** the long-term model mix includes HRRR,
+The long-term field direction includes temperature, dew point/RH, wind/gust,
+clouds, QPF, PoP, precipitation type, snow, and other useful fields as their
+scientific contracts are implemented. Conditions derive from underlying forecast
+fields rather than an unexplained standalone prediction. The smallest proposed
+next milestone is a local MesoForge grid abstraction using the existing surface
+fields, before adding QPF, PoP, or precipitation type (section 13).
+
+**Owner model direction, 2026-09-10:** the long-term model mix includes HRRR,
 RAP, NAM 3 km, NAM, GFS, RRFS / REFS, and NBM, with useful deterministic and
 ensemble guidance including GEFS, ECMWF, and Canadian models where appropriate.
 These are planned integrations, not completed support or one implementation task.
-Current Phase 2 supports HRRR/NBM/GFS; the separately approved localhost slice
-uses only HRRR/GFS temperature, now approved through hours 1–36 with fixed
-demonstration weights of 70/30. Phase 2's late-horizon defaults remain unchanged.
+The retained Phase 2 HRRR/NBM/GFS station pipeline includes QPF/PoP; it remains a
+technical reference, not evidence of precipitation support in the V2 coordinate path.
 
-**Implemented contributor extension, 2026-09-10:** the local temperature path now
-uses shared model capability definitions and named/versioned scalar recipes, including
-the unchanged `temperature_control_v1` and comparison-only `temperature_equal_v1`.
-Capabilities identify provider, family/lineage, domain, fields, nominal cycles,
-adapter-supported leads and status; actual provider availability still requires discovery.
-Recipes contain arbitrary ordered contributor/weight lists and explicit `require_all`
-missingness. No silent redistribution or learned weighting is introduced.
-An issuance retains its configuration snapshot, active contributions/applied weights,
-and separate zero-active-weight shadow sources through the existing storage path.
-Comparison reads the saved snapshot, preserving the old HRRR/GFS interpretation for
-historical records without one. Shadow gaps never change the active blend or its
-verification eligibility; shadow scoring uses the existing eligibility rules.
+**Implemented local status, 2026-09-11:** the on-demand forward run provides real
+36-hour temperature, dew point, derived RH, vector wind and gust. HRRR/GFS are
+active: temperature retains the fixed 70/30 demonstration recipe throughout;
+added dew-point and U/V/gust fields use the retained Phase 2 70/30 row for hours
+1–18 and 60/40 row for hours 19–36, with approved fallbacks. RAP and IFS are real
+zero-active-weight shadows. IFS retains native three-hourly values and gaps, and
+its interval-maximum gust is unavailable under the instantaneous-gust contract.
+Automatic current-cycle discovery, coordinate-derived shared preparation, local
+batch/forward runs, immutable PostgreSQL/MinIO issuance, temperature verification,
+and model comparison exist. Cloud cover is explicitly unavailable. There is no
+local MesoForge grid, deterministic bias correction, AI editing, V2 precipitation,
+production deployment or scheduling yet. Detailed commands, evidence and limits
+belong in [README.md](../../README.md).
+
+Contributor capabilities and named/versioned recipes retain configuration snapshots,
+active contributions/applied weights, and separate shadows in immutable issuance.
+Historical records remain readable; shadow gaps do not change the active blend or
+its verification eligibility. No silent weight redistribution or learned weighting
+is introduced.
 
 The contributor lifecycle is **shadow → evaluated → active → deprecated → retired**.
 These are explicit configuration states, not automatic promotions. Evaluated evidence
 does not approve activation; changing active recipes requires owner authorization.
 Retirement disables new use while preserving historical identities and retained facts.
-The synthetic third-contributor check proves extension mechanics only. New real models
-still require suitable acquisition/normalization adapters and capability registration;
-lineage-aware weighting, RAP integration and automatic promotion are not implemented.
+New real models still require suitable acquisition/normalization adapters and
+capability registration; lineage-aware weighting and automatic promotion are not
+implemented.
 
 NAM/NAM 3 km are transition candidates. The September 9 NWS SCN 26-47/26-48
 updates schedule NAM and its nests' retirement and RRFS/REFS replacement for
@@ -118,25 +141,27 @@ fields, separately from prepared subsets. Later field/product trimming requires
 a separate decision. This direction does not authorize unbounded acquisition of
 fields, levels, leads, or models, nor settle indefinite-retention guarantees.
 
-- learned bias correction and model weighting;
-- bounded structured AI proposals and deterministic approval policy;
+- deterministic site/regime bias correction from verified history, inspectable site
+  knowledge, and evaluated model weighting;
+- bounded GFE-style spatial/temporal AI edit recipes executed by deterministic,
+  versioned tools, with adjustment performance measured against the bias-corrected baseline;
 - email or other delivery;
 - public/multi-user access, accounts, ownership, privacy controls, sharing, export,
   deletion, billing, and public SLOs;
 - broader geography, model mix, fields, horizons, retention guarantees, and analytics.
 
-Roadmap components may consume first-release facts but cannot reshape or delay first-release
-contracts. No first-release acceptance depends on simulated learning, AI, email, public
-accounts, long-term retention approval, or public SLOs.
+Learning, AI and delivery build on the numerical and verification foundation in separately
+approved stages. No first-release acceptance depends on simulated learning, AI, email,
+public accounts, long-term retention approval, or public SLOs.
 
 ### 2.3 Coordinate-driven operating direction
 
-**Owner direction update, 2026-09-10:** the intended user-facing geographic input is
-only latitude/longitude. This operating direction is approved; its implementation
-details and the rest of this RFC remain proposed unless separately approved. The
-current implementation provides the localhost HRRR/GFS temperature demonstration
-for hours 1–36 and local batch issuance with coordinate-derived shared preparation. It has no
-registered-location lifecycle or VPS deployment.
+**Owner direction clarified, 2026-09-11:** the user-facing geographic input is only
+latitude/longitude. Configured/registered locations are the persistent centers of
+local forecast domains, history, verification and eventual learning, AI forecast-desk
+work and delivery. Ordinary one-off requests may return numerical point forecasts
+without registration or tracking. This operating direction is approved; its
+implementation details and the remaining RFC remain proposed unless separately approved.
 
 A configurable collection should look conceptually like:
 
@@ -150,13 +175,14 @@ A configurable collection should look conceptually like:
 ```
 
 The local preparation and batch commands now accept this format and automatically
-expand spatial coverage using retained HRRR/GFS temperature messages. Both example
+expand spatial coverage using retained model messages, including the surface fields
+selected by the forward run. Both example
 coordinates forecast successfully; the former fixed demonstration rectangle is retired.
 New coordinates require no code changes. Owner-approved internal defaults are:
 
 - Exact latitude/longitude is the forecast point.
 - 50 km minimum model-data preparation buffer.
-- 150 km surrounding weather-context footprint, currently temperature only.
+- 150 km surrounding weather-context footprint for the selected available fields.
 - Existing 50 km observation-station search, with suitability and time/QC rules unchanged.
 
 Preparation inspects the whole collection, derives conservative geographic envelopes,
@@ -168,9 +194,12 @@ remain intact. Context stops at physical model boundaries; unsupported coordinat
 are invalid geographic input or points outside the native model domain. Insufficient
 prepared coverage instead requires preparation outside HTTP (HTTP 409).
 
-These defaults are internal and do not change the locations file. Dynamic
-weather-dependent mesoscale/synoptic sizing is deferred. This implements coverage
-preparation, not the combined operating lifecycle below. MesoForge derives location
+These are current internal preparation and observation defaults, not the radius,
+resolution, shape or extent policy for an editable MesoForge grid. They do not
+change the locations file. Grid spacing, context/editable geometry, taper distances,
+weather-dependent sizing and storage layout must be designed and measured during
+implementation. Coverage preparation and the current numerical forward run do not
+implement a local forecast grid or the full future lifecycle below. MesoForge derives location
 identity, nearby observation candidates, bounding boxes, surrounding counties,
 native-grid coordinates, and any spatial zone or surrounding context internally
 when needed. Users do not maintain those derived geographic inputs. Service coverage,
@@ -189,14 +218,27 @@ Actions, registration, verification, AI, and delivery milestone.
 - **Guidance cycle:** a model/product run identified by reference time and revision.
 - **Shared cached guidance:** guidance acquired and normalized once per cycle into spatial
   objects reused by many coordinates.
-- **Forecast:** deterministic MesoForge values with contributors, configuration, units,
-  quality, missingness, cutoffs, and lineage.
+- **Source guidance domain:** shared model coverage sufficient for interpolation and
+  surrounding meteorological context, reused across nearby locations.
+- **Context domain:** the larger area the automated forecaster may inspect for incoming
+  systems, gradients, fronts, precipitation structures, freezing lines, surrounding
+  observations and model disagreement, including evidence outside the editable area.
+- **Editable domain:** the smaller bounded area where approved tools may modify local
+  MesoForge forecast fields. Context access does not grant permission to edit it all.
+- **Forecast point:** the exact configured latitude/longitude used to interpolate the
+  delivered spot forecast from final local fields, never a replacement grid-cell center.
+- **Local MesoForge forecast field:** a derived field on MesoForge's forecast grid,
+  distinct from each source model's native-grid guidance. Grid design remains open.
+- **Forecast:** MesoForge values with contributors, configuration, units, quality,
+  missingness, cutoffs and lineage; the deterministic baseline remains identifiable
+  separately from later corrected and adjusted products.
 - **Issued forecast snapshot:** one immutable persisted forecast version. Refresh creates a
   new version and never edits an earlier one.
 - **Forecast state:** a small mutable pointer/status for the current issued snapshot; it
   contains no mutable forecast values.
 - **Registered location:** a normalized scientific coordinate selected by an operator for
-  recurring issuance, persistent history, observation matching, and verification.
+  recurring issuance, persistent history, observation matching and verification;
+  it is also the home for later site learning, bias correction, AI and delivery.
 - **One-off request:** a bounded coordinate forecast that does not silently register a
   location or create durable history.
 - **Observation revision:** a value with provider/station, event or interval time,
@@ -226,8 +268,18 @@ and delivery preferences are separate product metadata or later concerns and nev
 
 ## 4. Invariants
 
+These describe the proposed full-release architecture alongside applicable retained
+scientific contracts. In particular, the current model-set selection proves provider
+availability at decision time and records later acquisition/issuance separately; it
+does not implement the broader availability-and-ingestion cutoff design below.
+
 - **Shared acquisition:** cache identity includes model/product/cycle/revision, field,
   lead/interval, grid/partition, transform, and content identity; never a location.
+  Derived local fields reference shared source guidance rather than duplicating complete
+  native datasets per configured location.
+- **Spatial authority:** the system derives source/context/editable coverage from the
+  coordinate and approved policies. Tools enforce edit-domain limits even when relevant
+  meteorological evidence lies outside them. Users configure no boxes, cells or stations.
 - **Coordinate identity:** EPSG:4326 decimal input is range-validated; `180` becomes
   `-180`; values use five decimal places, round-half-to-even, positive zero, JCS bytes, and
   a full SHA-256 key.
@@ -237,11 +289,15 @@ and delivery preferences are separate product metadata or later concerns and nev
   users are not required to configure stations or context zones.
 - **Immutable issuance:** published assets, lineage headers, snapshots, forecast facts,
   observation revisions, and verification facts are append-only. Mutable state is limited
-  to leases and versioned pointers.
+  to leases and versioned pointers. Original baseline, bias-corrected fields, AI
+  proposal/edit recipe and final adjusted fields remain separately identifiable and
+  immutable when those stages exist; an adjustment never overwrites its baseline.
 - **Correct time:** issue, reference, provider availability, ingestion, event, valid,
   interval-bound, verification, and query/build times are distinct UTC fields.
 - **No leakage:** forecast inputs meet both availability and ingestion cutoffs. Observation
   selection meets verification and evaluation as-of cutoffs. Event time is insufficient.
+  Later correction history, site knowledge and AI context also retain eligibility evidence
+  and their applicable cutoffs; a later run must not inject future information.
 - **Explicit missingness:** every declared registered forecast and verification opportunity
   has a status. Null plus reason never becomes zero.
 - **Units:** temperature K; wind m/s; meteorological wind-from direction in degrees; QPF
@@ -259,6 +315,13 @@ and delivery preferences are separate product metadata or later concerns and nev
   synthesize PoP; missing accumulation is not zero.
 - **Baseline blend:** contributor set and lead band select a reviewed versioned weight row.
   Fallback is explicit/degraded; weights are not invented or silently renormalized.
+- **Deterministic editing:** AI proposes bounded tool recipes, never unrestricted grid
+  writes or unchecked numerical publication. Versioned deterministic execution and
+  validation enforce physical consistency, approved bounds, spatial/temporal continuity,
+  information cutoffs, edit-domain limits and applicable cross-field relationships.
+- **Deterministic replay:** fixed retained inputs and configuration reproduce the
+  numerical baseline, correction and execution of a saved edit recipe. Rerunning an AI
+  model need not reproduce its original proposal; preserve that proposal as evidence.
 - **Errors:** scalar error is forecast minus observation. Direction uses circular difference
   in `[-180,180]` with separate absolute circular metrics.
 - **No fake learning:** first-release responses state learning is unavailable; roadmap
@@ -276,10 +339,12 @@ workers     -> application services -> scientific/domain contracts
 application services -> storage interfaces
 storage adapters      -> storage interfaces + contracts
 
-Future:
+Future configured-location path:
+shared guidance -> local grid baseline -> deterministic bias correction
+bias-corrected fields + context/evidence -> AI tool recipe
+saved recipe + corrected fields -> deterministic tools/validation -> final fields
+final fields -> exact-coordinate interpolation -> immutable spot forecast/delivery
 learning    -> immutable forecast/verification query contracts
-adjustments -> immutable forecast/evidence contracts + deterministic policy
-delivery    -> immutable selected-forecast read model
 ```
 
 Current scientific and infrastructure packages remain donors after contract review. Package
@@ -321,13 +386,44 @@ Human governance and production automation are separate:
 
 ### 5.4 Shared cache
 
-Store native-grid spatial partitions with overlap sufficient for deterministic interpolation.
+Shared source guidance remains separate from the local MesoForge forecast grid.
+Store native-grid spatial partitions with overlap sufficient for deterministic interpolation
+and coverage for the surrounding context required by configured locations.
 Manifests pin grid, coordinates, field/level, lead/interval, units, transform, bounds, parent
 raw object, and digest. Publication is atomic after validation.
 
 Partition shape, field grouping, compression, packaging, cache size, and retention are
 **provisional hypotheses**. A `64 x 64` core plus one-cell overlap is a benchmark candidate,
-not acceptance. Section 7 chooses initial packaging and measured work limits.
+not acceptance or a local forecast-grid specification. Section 7 chooses initial packaging
+and measured work limits.
+
+For a configured location, the system derives context and editable domains around the
+coordinate and regrids/blends eligible numerical guidance into coherent local MesoForge
+fields. The context domain is larger than the smaller editable area: an approaching
+front or precipitation feature outside the edit boundary may justify a change inside it.
+The exact point is sampled from the final local fields. Source grids, local grid geometry
+and interpolation/regridding transforms retain their separate identities and semantics.
+Nearby local domains reuse shared guidance; this does not require duplicating complete
+native datasets or invent a new storage authority. Resolution, geometry, overlap and
+boundary handling remain implementation decisions subject to scientific checks and
+measurement, not values settled by the current preparation defaults.
+
+The later AI forecast desk inspects context, model disagreement, eligible observations,
+verification history and versioned site knowledge. It acts like a meteorologist using
+GFE tools by selecting structured, bounded operations with a field, region, time range
+and permitted parameters. Future examples include a regional/time-bounded delta, spatial
+or temporal taper, value anchor with surrounding blending, artifact smoothing, shifting
+or retiming a precipitation feature, adjusting a freezing-line/rain-snow transition,
+removing unsupported isolated trace QPF, and modifying a coherent region while preserving
+continuity at its boundary. These are examples for later design, not implemented tools
+or approved numerical algorithms.
+
+Deterministic versioned tools execute retained recipes against the identified corrected
+forecast. Validation checks physical and cross-field consistency, parameter/value bounds,
+continuity, cutoff eligibility and the editable domain before any result can be issued.
+Invalid proposals retain an explicit rejection reason; a permitted fallback to unchanged
+corrected fields must be recorded. Human approval governs tool/policy development and
+release, not each normal configured forecast. The AI cannot bypass that policy.
 
 ## 6. First-release flows
 
@@ -357,7 +453,8 @@ only measured subsets; the advertised matrix follows evidence.
 ### 6.3 Registered issuance
 
 Registration stores scientific coordinate separately from operator metadata. The science
-worker reuses the one-off cache/kernel in measured batches. A transaction inserts an
+worker reuses shared guidance and scientific kernels in measured batches; later local
+field generation feeds the same issuance boundary (section 6.6). A transaction inserts an
 immutable snapshot header, lineage reference, and all declared facts including missing
 rows; only completeness permits compare-and-swap of the current pointer. Failure leaves the
 prior snapshot immutable and visible with honest stale/failed state.
@@ -403,26 +500,39 @@ requested, separately bounded audit detail.
 
 ### 6.6 Intended configured-location lifecycle
 
-This future lifecycle composes the responsibilities above; it is not implemented
-today. An explicitly configured collection may be processed by a GitHub Actions
-caller one coordinate at a time or in bounded batches. For each location:
+The full future lifecycle composes the responsibilities above. Local coordinate
+batch/forward runs already combine verification and numerical issuance; persistent
+registration, local grids, learning, AI, delivery and production scheduling are not
+implemented. A configured collection may eventually be processed by a GitHub Actions
+caller one coordinate at a time or in bounded batches. Shared model acquisition and
+retention precede the per-location work. For each configured/registered location:
 
-1. Validate and identify the location from latitude/longitude, deriving geographic
-   metadata and any needed spatial context internally.
+1. Validate and identify the location from latitude/longitude; derive geographic
+   metadata, the larger context domain and the smaller editable domain internally.
 2. Verify eligible previous forecasts against suitable available observations,
    using the version originally issued and the applicable time, quality, spatial
    support, and cutoff rules. Record unavailable verification explicitly and
    proceed with the new forecast when no suitable observation is available.
-3. Generate the new numerical forecast using ready shared guidance and the same
-   extraction/blending functions used for one-off forecasts. No provider acquisition
-   is triggered inside the forecast HTTP request.
-4. In a later milestone, allow an AI adjustment/discussion stage using the numerical
-   forecast, surrounding weather context, and prior verification. Keep the numerical
-   baseline intact; any accepted adjustment must satisfy approved deterministic
-   bounds and remain separately traceable. Missing verification is not invented history.
-5. Save the immutable issued forecast and its provenance under the issuance rules.
-6. Deliver the saved forecast once delivery is implemented, then continue to the
-   next coordinate.
+3. Regrid and blend ready shared guidance into coherent local MesoForge fields using
+   deterministic scientific operators. Save the original numerical baseline and its
+   source/transform/configuration identity. No acquisition or regional grid preparation
+   occurs inside a forecast HTTP request.
+4. Apply approved deterministic site/regime bias correction learned from eligible
+   verified history, keeping the corrected fields separate from the original baseline.
+   With insufficient history or no approved correction, report that status explicitly.
+5. Let the later AI forecast desk inspect surrounding meteorology, disagreement,
+   eligible observations, verification history and structured site knowledge, then
+   propose a bounded spatial/temporal edit recipe against the corrected fields.
+6. Execute the saved recipe through versioned deterministic tools and validate physical
+   and cross-field consistency, bounds, continuity, cutoffs and edit-domain limits.
+   Retain the proposal, validation decision and final adjusted fields separately.
+7. Interpolate the final spot forecast at the exact configured coordinate. Persist the
+   complete immutable issuance and its stage lineage, then deliver the saved version
+   when delivery is implemented.
+8. When suitable observations become available, compare the issued baseline, corrected
+   and final forecasts on identical verified samples. Use measured results to assess
+   statistical corrections, site knowledge and which AI edit types help in each regime
+   (section 11), without rewriting the forecast originally issued.
 
 A location failure is recorded for that location and does not prevent the remaining
 coordinates from being processed. Missing required model guidance keeps its explicit
@@ -489,17 +599,41 @@ but do not repeat header metadata. Canonical serialization defines logical ident
 retained original source bytes remain authoritative. Zero-network replay promises logical
 values and identities, not identical Parquet bytes across encoder versions.
 
+For later local-grid issuance, provenance must distinguish the shared native guidance
+from the derived MesoForge grid, its coordinate/context/editable-domain definition,
+regridding/interpolation transforms, and each forecast stage. Preserve separate immutable
+original baseline, bias-corrected forecast, AI proposal/edit recipe and final adjusted
+forecast with parent links; retain the delivered point's exact coordinate and extraction
+method. This is a provenance requirement, not approval of a new table family, storage
+layout or duplicate copies of native guidance for every location.
+
+Correction identity includes the approved method/configuration and eligible training
+history. AI evidence includes the inspected inputs and site-knowledge version, proposal,
+model/configuration identity, tool versions/parameters, validation results and applied
+changes. Preserve accepted and rejected decisions so evaluations can distinguish a
+proposed edit from an applied one. None of these later records may replace the baseline
+or imply that an absent stage has run.
+
 ## 9. Retention capability levels
 
 | Retained material and execution dependencies | Available capability | Lost on expiry |
 |---|---|---|
 | Issued snapshots; forecast, observation, and verification facts; lineage headers; named error/evaluation algorithms and compatible code/configuration | Serve issued history and recompute errors/evaluations under the retained semantics | Expired facts cannot be served or rescored; aggregates lacking their selected facts cannot be recomputed |
 | Raw observation responses plus station metadata, lineage, exact normalizer/matcher code, configuration, and environment; rebuilding matches additionally requires the corresponding forecast facts, declared opportunities, pinned cutoffs, and support/matching policies | Renormalize observations; rebuild cutoff-correct matches only while the additional forecast/opportunity dependencies remain | Existing normalized facts remain usable, but source normalization and revision audit become impossible; matching also becomes impossible when either raw responses or its forecast/opportunity dependencies expire |
-| Normalized guidance plus grid/coordinate metadata, lineage, extraction/blend algorithms, baseline configuration, compatible code, and environment | Reproduce a forecast without acquiring or decoding regional source data | Issued facts remain, but forecast reproduction from the normalized cache and unissued point extraction become impossible |
-| Raw guidance/index bytes plus lineage, decoder/normalizer/extraction/blend code, configuration, dependencies, and environment | Full zero-network raw-to-cache-to-forecast replay | Shallower retained replay may remain, but full source replay becomes impossible |
+| Normalized guidance plus native/local grid and coordinate metadata, lineage, applicable regridding/extraction/blend algorithms, baseline configuration, compatible code, and environment | Reproduce the numerical baseline without acquiring or decoding regional source data | Issued facts remain, but baseline reproduction from the normalized cache and unissued extraction become impossible |
+| Raw guidance/index bytes plus lineage, applicable decoder/normalizer/regridding/extraction/blend code, configuration, dependencies, and environment | Full zero-network raw-to-cache-to-baseline replay | Shallower retained replay may remain, but full source replay becomes impossible |
 
 Classes expire independently. Raw-guidance expiry does not invalidate issued history; cache
 expiry does not erase it; raw-observation expiry does not rewrite normalized facts.
+
+Later correction and adjustment replay additionally requires the exact preceding fields,
+retained correction parameters, saved proposal/edit recipe, tool/validator versions,
+domain definitions, configuration and compatible execution dependencies. Rebuilding a
+learned correction or its evaluation further requires the eligible verified history and
+training/evaluation implementation. Replaying deterministic execution of a saved AI recipe
+does not mean an AI rerun will generate the same proposal. Serving an immutable final
+forecast may remain possible after deeper replay dependencies expire; advertise only the
+capability supported by what is actually retained.
 
 Durations are provisional pending storage cost, use, privacy, and owner approval. No
 provisional duration gates first release. The correctness minimum is transactional: retain
@@ -537,6 +671,26 @@ and approved variable-specific circular/probability scores. Responses name algor
 denominator semantics. Elaborate paired, reliability, regime, training, and report products
 are later unless separately approved. Availability, ingestion, verification, and evaluation
 as-of cutoffs prevent revisions from leaking into earlier results.
+
+Long-term learning has three explicit forms, all future work:
+
+- **Statistical learning:** deterministic site/regime bias correction derived from
+  verified history, with versioned training samples, cutoffs, parameters and promotion
+  evidence. A correction is not credited with skill merely because it fits its history.
+- **Site knowledge:** structured, versioned, inspectable records of recurring local
+  behavior and regimes with supporting evidence. Persistent knowledge does not depend
+  on an LLM permanently remembering earlier runs.
+- **AI performance learning:** compare proposed/applied edit types and their effects by
+  location and regime on identical verified samples, retaining rejected and unapplied
+  proposals as such. Evaluate AI against the bias-corrected baseline so ordinary
+  statistical corrections are not counted as AI value.
+
+Comparisons retain the original issued baseline, corrected and final forecasts and the
+same suitable observation revisions, valid intervals, cutoffs and scoring opportunities.
+Report sample counts, exclusions and uncertainty supported by evidence; distinguish
+training from independent evaluation. Point verification does not establish skill across
+the editable grid or for unscored fields. No suitable observations or too little history
+means unscored or insufficient evidence, not fabricated skill or automatic promotion.
 
 ## 12. Selective rebuild, donors, and retirement
 
@@ -603,6 +757,17 @@ These are sensible review units, not a mandatory seven-PR sequence. Adjacent sli
 combined/split for reviewability. The first slice has no dependency on learning, AI, email,
 accounts, long-term retention, or public SLOs.
 
+The next proposed implementation milestone is the smallest local MesoForge forecast-grid
+abstraction for the already implemented temperature, dew point/RH, vector wind and gust.
+Derive it from a coordinate, retain distinct shared-source and local-grid identities, and
+produce the exact-coordinate spot forecast through deterministic interpolation. Choose
+geometry and resolution by measurement during that work. Acceptance should demonstrate
+coherent surface fields, preserved scientific/missingness semantics, source reuse across
+nearby coordinates, and retained-input numerical replay with explicit provenance. Preserve
+the current point baseline as a reference; quantify and review differences caused by
+regridding, interpolation or diagnostic order. This is a recommendation for separate
+implementation approval, before QPF/PoP/precipitation type, bias correction or AI editing.
+
 File/module/table/code/test/change-size estimates are non-binding planning aids per slice.
 Material overrun triggers review when it reveals changed design, not because of a line
 counter. Owner architecture review is required before adding a durable authority, duplicated
@@ -663,10 +828,14 @@ all-in-one proof-harness requirement.
    rules, providers, quality, and cutoffs. Manual per-location station/zone configuration
    is not an open alternative to the coordinate-only geographic input direction.
 3. Acceptable shared-host reserve and benchmark co-load.
-4. Packaging and measured input/work/output/concurrency/cancellation/timeout limits.
+4. Local-grid spacing, context/editable-domain geometry and extents, boundary/taper
+   behavior, source/local packaging, and measured work/output/concurrency/timeout limits.
+   The approved preparation/station defaults in section 2.3 do not settle these choices.
 5. Retention costs/durations and advertised capability levels.
 6. Private authentication/operator authorization.
-7. Separately later: learning promotion, AI, delivery, public accounts/privacy/billing/SLOs.
+7. Separately later: correction methods/promotion, site-knowledge representation,
+   bounded AI tool algorithms/validation and evaluation policies, delivery, and public
+   accounts/privacy/billing/SLOs. The long-term direction does not approve these details.
 
 ## 18. First Usable Release exit criteria
 
@@ -702,9 +871,9 @@ all-in-one proof-harness requirement.
 |---|---|
 | Rebuild | Selective rebuild from `main`; cohesive tested ports |
 | First release | Private baseline, registered history, observations/verification, bounded evaluation |
-| Roadmap | Learning/bias/weights, AI, email, and public accounts later |
-| Guidance | Ingest once into shared cache; derive many |
-| Issuance | Immutable snapshots/facts; mutable pointer/status only |
+| Roadmap | Local forecast fields, site/regime bias correction, bounded GFE-style AI tools, delivery and public accounts in separately approved stages |
+| Guidance | Ingest once into shared source cache; derive local MesoForge fields using larger context and smaller editable domains, then interpolate the exact point |
+| Issuance | Immutable baseline, corrected fields, proposal/recipe and final fields when implemented; mutable pointer/status only |
 | Facts | Normalized facts and on-demand evaluation; no Cartesian lattice |
 | Errors | Derive on demand; no first-release `error_facts` |
 | Provenance | Compact shared lineage header plus fact identities/links/cutoffs/units/missingness |

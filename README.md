@@ -8,173 +8,75 @@ is described below. Start with [VISION.md](VISION.md) for release boundaries and
 
 ## Current status
 
-The [on-demand forward run](#run-verification-and-current-issuance-together) now
-prepares a **36-hour surface forecast**: temperature, dew point, derived relative
-humidity, vector wind speed/direction and gust. Temperature keeps its exact HRRR/GFS
-70/30 demonstration calculation. The added fields use applicable retained Phase 2
-rules, described below; RAP and IFS remain zero-weight shadows. Cloud cover is
-explicitly unavailable because no retained approved blend policy exists. Existing
-temperature-only inputs and historical issued versions remain readable. Verification
-and model-comparison metrics still cover temperature only.
+The [on-demand forward run](#run-verification-and-current-issuance-together) produces
+real **36-hour point surface forecasts**: temperature, dew point, derived RH, vector
+wind speed/direction and gust. It verifies eligible previous temperature forecasts,
+discovers current model cycles, prepares shared guidance for the configured coordinate
+collection, and saves new immutable issuances. Failed locations do not stop later ones;
+unavailable verification does not prevent a new forecast. Latitude/longitude are the
+only required geographic inputs; names are optional display metadata.
 
-The localhost endpoint, `GET /forecast?lat=45.8&lon=-93.1`, now returns temperature
-from **real prepared HRRR/GFS guidance** for hours 1-36 at exact coordinates within
-the native model domains. Coordinate preparation now derives and shares spatial
-coverage automatically; the former Grasston demonstration rectangle is retired.
-It retains the approved 70% HRRR / 30% GFS demonstration
-weights throughout the window; these are demonstration weights, not optimized
-weights. It reports Kelvin units, source cycles/leads, valid times, checksums,
-and explicit missingness. Preparation now automatically selects complete current
-HRRR/GFS temperature guidance before serving; explicit source cycles and target
-reference time remain an override. See [automatic cycle selection](#automatic-current-guidance). The demonstrated September 10, 2026 snapshots are
-fixed historical guidance, not current live forecasts. Retained raw messages can
-now rebuild a dataset offline with the same preparation command's `--from-raw` mode.
-Starting without `--data-dir` still selects the clearly labeled synthetic example.
-The spatial milestone returned all 36 hours for each of the three requested coordinates,
-including 44.98, -93.27, with zero new downloads. **229 focused tests passed**, as did
-Ruff, mypy, import contracts, documentation/hygiene checks, and `git diff --check`.
-The localhost demonstration and offline repeat passed; PostgreSQL/MinIO integration
-and full acceptance/coverage were not rerun for this change. See
-[automatic spatial coverage](#automatic-spatial-coverage) for commands and evidence.
+- **Science:** HRRR/GFS are active. Temperature retains 70/30 demonstration weights;
+  dew point and coupled wind/gust use the applicable retained Phase 2 70/30 rows for
+  hours 1–18 and 60/40 for hours 19–36, with explicit approved fallbacks. RH derives
+  from temperature/dew point. These are not optimized weights.
+- **Shadows:** real RAP and ECMWF IFS values/provenance accompany issuance with zero
+  active weight. IFS preserves native three-hourly gaps and has no compatible
+  instantaneous gust. Cloud cover is explicitly unavailable without an approved policy.
+- **Shared inputs:** [current four-model discovery](#discover-the-current-four-model-set)
+  and [selected preparation/issuance](#prepare-and-issue-the-exact-selected-model-set)
+  preserve actual provider availability, identities, cycles/leads and acquisition times.
+  [Coordinate-derived coverage](#automatic-spatial-coverage) reuses native-grid guidance
+  across locations; raw messages support offline rebuilding. This is not a local
+  MesoForge forecast grid.
+- **Storage and reads:** explicit [batch runs](#local-coordinate-batch) save immutable
+  PostgreSQL/MinIO versions. [Issued retrieval](#retrieve-one-issued-version) and
+  [saved-hour selection](#select-saved-forecast-hours) preserve exact versions.
+  `GET /forecast` calculates from prepared inputs without creating history or registration.
+  Starting the API without `--data-dir` still selects the labeled synthetic example.
+- **Verification:** [automatic METAR station discovery](#discover-and-reuse-nearby-metar-stations)
+  and [bounded verification](#automatically-prepare-observations-and-verify) use real
+  observations and idempotent facts. [Comparison metrics](#compare-temperature-models-and-blends)
+  retain separate issued versions and identical paired samples. Verification/scoring
+  currently covers temperature, not the new dew-point/wind fields.
 
-Validation on September 10: **262 tests passed** (111 API/preparation, 148 retained
-Phase 2, and 3 existing acquisition tests), along with quality checks. One bounded
-36-hour acquisition supplied all **36/36 hourly API results, with no missing hours**.
-An offline rebuild, with network calls blocked, reproduced exact values and preserved
-the source snapshot. Independent calculations from the raw messages matched all 36
-API temperatures. The server was stopped. Full database/storage acceptance,
-the full coverage gate, and the live-provider canary suite were not run. This verifies
-the small slice, not the entire application or forecast skill.
+The surface milestone recorded **560 focused offline tests and 19 PostgreSQL/MinIO
+integration tests passing**, plus quality checks, real Minneapolis issuance, exact
+readback and offline rebuilding. See the [forward-run evidence](#run-verification-and-current-issuance-together).
+Those product tests were not rerun for this documentation-only update. Full acceptance,
+coverage, forecast skill and production reliability are not established by that demonstration.
 
-Automatic-cycle validation on September 10: **167 focused offline tests and 14
-PostgreSQL/MinIO integration tests passed**, along with Ruff, mypy, import contracts,
-documentation/hygiene checks and `git diff --check`. The real automatic batch and
-localhost HTTP demonstration returned all 36 future hours for Fresno, Wichita and
-Raleigh using provider-checked 18Z guidance. Independent calculations, immutable
-readback, unchanged previous versions and offline reuse/rebuilding passed. Three
-stale storage-test assumptions also failed against committed HEAD; their setup was
-corrected without changing scientific assertions or production storage behavior.
-Temporary PostgreSQL, MinIO and API processes were stopped. Full acceptance/coverage
-and live-provider canaries were not run. See [automatic mode](#automatic-current-guidance).
+There is **no local MesoForge forecast grid, deterministic bias correction, site learning,
+AI editing, V2 precipitation fields, production deployment or scheduling yet**. Bias/AI
+report stages are explicitly unimplemented and final values currently equal the baseline.
+Registration services and delivery also remain future work. The retained Phase 2 station
+baseline has HRRR/NBM/GFS, QPF and PoP support; its defaults and technical references
+remain intact. Existing `_v2` names describe Phase 2 contracts.
 
-The separate Phase 2 pipeline remains an unpublished HRRR/NBM/GFS station baseline
-for hours 1–36 at KCBG, KJMR, and KROS, with temperature, dew point, wind, gust,
-QPF, PoP, METAR verification, provenance, and retained-input replay. Its defaults
-are unchanged. Standalone Phase 1 hours 0–6 generation is retired; shared science,
-its required configuration overlay, and historical readers remain.
+Future direction: configured coordinates will center local digital forecast domains,
+using shared source guidance, a larger inspection context and a smaller editable area.
+Versioned deterministic tools would validate bounded GFE-style AI edit recipes, keeping
+numerical, bias-corrected and final fields separate before exact-point interpolation.
+One-off requests stay untracked. See [VISION.md](VISION.md#intended-coordinate-driven-operation)
+and the [active RFC](docs/rfcs/mesoforge-v2-architecture.md); this direction is not implemented
+by this documentation change. The next increment is a small local surface-grid abstraction
+before precipitation, not deployment or scheduling.
 
-The local batch command now saves immutable issued versions of its 36-hour forecasts
-using the existing PostgreSQL/S3 storage. Each explicit run has a new batch ID;
-location failures do not stop later coordinates. One-off `GET /forecast` remains
-read-only. `GET /issued-forecasts/{issued_forecast_id}` now retrieves one exact saved
-version, including its complete forecast and provenance, without calculation or writes.
-`GET /issued-forecast-hours` also selects saved hours for one exact coordinate and a
-valid-time window, keeping overlapping issued versions separate. **327 offline and
-33 PostgreSQL/MinIO integration tests passed** for this selection milestone. Actual
-HTTP selection returned three hours from each of two retained versions, with original
-payloads and unchanged storage. Temporary services were stopped. Full database/storage
-acceptance and coverage remain unverified. See [saved-hour selection](#select-saved-forecast-hours).
-`GET /issued-forecasts/{id}/observation-match?valid_time=...` now previews one saved
-hour against a retained temperature observation, choosing a station automatically
-within 50 km and ±15 minutes after QC. It explains candidate exclusions and preserves
-provenance without scoring or writes. **477 focused offline and 37 PostgreSQL/MinIO
-integration tests passed** for this milestone. The localhost demonstration used real
-saved model forecasts with explicitly **synthetic observation fixtures**; no live
-observations were acquired. All stored contents stayed unchanged during requests.
-See [observation preview](#preview-one-observation-match) for the rules and limitations.
-The explicit local verification command now saves one immutable temperature error
-(`forecast - observation`) tied to the exact issued version, observation revision,
-matching rules, and retained-input cutoff. Retries with the same inputs and code
-reuse the saved artifact; ineligible attempts return reasons without a score.
-**680 focused offline and 45 PostgreSQL/MinIO integration tests passed**. The real
-saved 18:00 UTC forecast was compared with a synthetic KROS observation, read back,
-and retried without duplicates or changes to issued forecasts. See
-[single-hour verification](#verify-one-issued-temperature-hour).
-The `window` verification command now processes all saved versions for one coordinate
-and valid-time window, reporting new, reused, unavailable, and ineligible results.
-Its demonstration and repeat preserved issued forecasts; **56 focused offline and
-13 PostgreSQL/MinIO integration tests passed**. See [window verification](#verify-a-coordinate-and-time-window).
-One bounded **real METAR dataset** now feeds that unchanged verification command.
-The September 10 demonstration acquired 27 reports from three retained stations,
-saved four verification results across two issued versions, and safely reused all
-four on repeat. Raw observations and provenance remain outside Git and in existing
-artifact storage. See [real observation preparation](#prepare-one-real-metar-dataset).
-The new [automatic verification command](#automatically-prepare-observations-and-verify)
-now derives that observation request from saved past hours using only coordinate and
-valid-time bounds. Its real demonstration saved six results, reused all six on repeat,
-and downloaded nothing for a window with no eligible hours. **75 focused offline and
-11 PostgreSQL/MinIO integration tests passed**; broader operational gaps remain below.
-The command now also accepts the [existing locations JSON](#verify-configured-locations-sequentially),
-processes coordinates sequentially, and continues after location errors. The real batch
-demonstration verified both supported locations around an unsupported entry and reused
-all 12 results on repeat. **43 focused offline and 2 PostgreSQL/MinIO integration tests
-passed** for that increment. The new spatial preparation milestone is documented
-[below](#automatic-spatial-coverage). On-demand station discovery now queries and saves
-nearby METAR metadata from each
-coordinate, feeding the existing 50 km / ±15-minute verification path. See
-[station discovery](#discover-and-reuse-nearby-metar-stations). Its four-coordinate real
-demonstration saved 25 candidates and reused them with zero discovery calls on repeat.
-Nine eligible real-observation verification results were saved and safely reused;
-all 10 issued versions stayed unchanged. **109 focused offline and 16 PostgreSQL/MinIO
-integration tests passed**. Broader acceptance/coverage was not rerun.
-Newly issued hours now retain individual HRRR/GFS temperatures. The read-only
-[model comparison command](#compare-temperature-models-and-blends) reports both models,
-the unchanged 70/30 control, a comparison-only 50/50 blend, and saved observation errors
-with descriptive MAE/bias/RMSE. Its real demonstration used 19 existing verified hours;
-these small, overlapping samples do not establish a better recipe.
-Contributor capabilities and named/versioned recipes now share a generic scalar path.
-RAP is now an optional real temperature shadow contributor with **zero active weight**;
-the HRRR/GFS 70/30 control is unchanged. Its separate prepared inputs, provenance and
-values flow into new immutable issuances and the existing comparison command. See
-[RAP shadow preparation](#prepare-rap-temperature-in-shadow-mode) for scope and validation.
-The saved RAP versions have now been [verified against real METAR observations](#verify-saved-rap-shadow-guidance):
-three identical paired samples, unchanged control/history, and an offline repeat with
-no new observations or verification artifacts. This validates the comparison mechanics,
-not model rankings. [ECMWF IFS now also runs in shadow mode](#prepare-ecmwf-ifs-temperature-in-shadow-mode),
-using native three-hourly values with explicit missingness between them. Both shadows
-have zero active weight. The real three-location demonstration preserved every active
-forecast value; no eligible real IFS/observation pairs were available at validation.
-The first [bounded real historical backtest](#bounded-historical-temperature-backtest)
-now compares all four models and both recipes on 12 identical METAR pairs, without
-changing production or issued history. This is retrospective evaluation with explicit
-publication cutoffs, not a claim of historical local issuance. Forward accumulation
-is now the priority; the proposed 30-day historical backfill has not started.
-A separate [current four-model discovery command](#discover-the-current-four-model-set)
-now checks provider inventories and object metadata for a complete compatible
-HRRR/GFS/RAP/IFS set, retaining decision-time evidence outside Git. It does not
-prepare data or issue forecasts. The separate [selected-set batch command](#prepare-and-issue-the-exact-selected-model-set)
-now consumes that artifact, revalidates provider identities, shares preparation,
-and issues through existing PostgreSQL/MinIO storage. Every successful forecast
-retains the decision evidence and RAP/IFS shadows. The [on-demand forward command](#run-verification-and-current-issuance-together)
-now connects prior-hour automatic verification to current-set issuance in one local
-run. Its saved hourly report keeps the numerical baseline separate from explicit
-unimplemented bias/AI stages; final values currently equal the baseline. Names are
-optional display metadata. VPS operation, scheduling, bias correction, AI and delivery
-remain future work.
-
-Future direction: configure locations using latitude/longitude only, with geographic
-context and suitable observation sources derived internally. The intended VPS workflow
-can process a coordinate collection through GitHub Actions while sharing prepared
-guidance; it is not implemented. See [VISION.md](VISION.md#intended-coordinate-driven-operation).
-
-There is no operational forecast API, shared-cache job system, or registered-coordinate
-history service. RRFS, precipitation type, learned weights, AI adjustments, and
-publication remain disabled or absent. Existing `_v2` names describe Phase 2 contracts.
-
-Local Codex development has replaced the paused Hermes development pipeline. The
-[V2 architecture RFC](docs/rfcs/mesoforge-v2-architecture.md) is proposed design input,
-not approval to implement its entire release plan.
+Local Codex development continues; the Hermes development pipeline is paused. The RFC's
+unresolved implementation choices remain proposed, not blanket approval of the roadmap.
 
 ## Existing forecast path
 
-The long-term direction is a broader blend of HRRR, RAP, NAM 3 km, NAM, GFS,
-RRFS / REFS, NBM, and appropriate GEFS, ECMWF, Canadian, and other guidance.
-Only HRRR/NBM/GFS are implemented in Phase 2 today. NAM/NAM 3 km are legacy
-transition candidates: the September 9 NWS notices schedule retirement and the
-RRFS/REFS transition for October 14, 2026, subject to weather delay. See
-[VISION.md](VISION.md#long-term-model-direction) for the verified official notices
-and planned-versus-current support. Retain raw data actually acquired even when
-the API uses only a subset; this does not expand the authorized downloads.
+The current coordinate entry point is [forward_run.py](src/mesoforge/application/forward_run.py).
+It composes automatic previous-hour verification with selected-model preparation and
+immutable batch issuance. [point_forecast.py](src/mesoforge/application/point_forecast.py)
+and [surface_forecast.py](src/mesoforge/application/surface_forecast.py) extract native
+guidance at the exact coordinate and apply the retained scientific operators. They do
+not yet construct local MesoForge fields. Long-term model coverage is described in
+[VISION.md](VISION.md#long-term-model-direction).
+
+The following is the separate retained **Phase 2 station path**, which supplies
+reusable science and contracts; it is not the current coordinate lifecycle's entry point:
 
 1. [The live runner](scripts/run_phase2_live.py), `main()`, builds `Phase2Request`
    from explicit UTC times. `_load_configuration()` merges
@@ -246,7 +148,7 @@ shape, not forecast skill or operational availability.
 
 ### Run the existing baseline
 
-The operational entry point is `uv run python scripts/run_phase2_live.py` with
+The retained Phase 2 entry point is `uv run python scripts/run_phase2_live.py` with
 required arguments `--target-reference-time`, `--forecast-issue-time`,
 `--information-cutoff`, `--verification-cutoff`, and `--output-dir`.
 Supply explicit ISO UTC timestamps and a writable output directory; the runner's
@@ -2087,12 +1989,14 @@ python -B -m pytest tests/integration/application/test_forward_run.py tests/inte
 python -B -m pytest tests/integration/application/test_issued_temperature_verification.py::test_automatic_window_acquires_once_reuses_real_snapshot_and_skips_empty_window tests/integration/application/test_issued_temperature_verification.py::test_automatic_batch_isolates_locations_and_reuses_results_without_changing_issuances -q
 ```
 
-Next proposed: add interval-aware liquid precipitation amounts through the retained
-QPF normalization/blending path, preserving accumulation bounds and explicit gaps.
-Then establish compatible PoP threshold/interval support before adding probability,
-precipitation type and derived conditions. Do not infer PoP from deterministic QPF
-or precipitation type from surface temperature alone. VPS work and scheduling remain
-deferred.
+Next proposed: a small local MesoForge baseline-grid abstraction for the existing
+36-hour surface fields, using already prepared guidance and existing extraction/blend
+functions. Preserve grid coordinates/projection, units, native valid-time gaps,
+contributors, weights and provenance; extract the exact configured point from that
+local field representation. Measure grid choices during the implementation milestone.
+Keep the current point baseline as the regression reference and make any interpolation
+or diagnostic-order differences explicit. Bias/AI edits, precipitation and deployment
+remain outside that increment.
 
 ### Automatic current guidance
 

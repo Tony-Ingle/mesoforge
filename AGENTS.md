@@ -11,6 +11,22 @@ requests it. Future roadmap items never expand the current task.
 Human approvals govern development and releases. Normal configured forecast operation
 should not require a human to approve each forecast.
 
+## Architectural direction
+
+MesoForge's eventual product is a local gridded forecast system with a GFE-style
+automated forecast desk, not a point-only blending API. Latitude/longitude remain
+the only required geographic inputs. Reuse shared source guidance; derive context
+and smaller editable domains internally, then interpolate the final spot forecast
+at the exact coordinate. Do not duplicate complete native datasets per location.
+Future AI proposes bounded edit recipes applied by deterministic, versioned tools
+with physical, cross-field, continuity, cutoff and domain validation. Preserve the
+numerical baseline, bias-corrected fields, proposal and final forecast separately;
+measure AI's added value against the bias-corrected baseline on identical samples.
+Site knowledge must be versioned and inspectable, not assumed LLM memory.
+The local forecast grid, bias correction and AI editing are not implemented yet.
+This direction does not authorize future stages during unrelated tasks or settle
+unapproved domain dimensions, grid spacing, tapering or storage choices.
+
 ## Working and Git rules
 
 - First inspect branch, HEAD, working-tree status, and applicable `AGENTS.md` /

@@ -1,117 +1,146 @@
 # MesoForge vision
 
-MesoForge is intended to be an automatically updating, location-aware weather
-forecasting engine exposed through an API. It reuses numerical model guidance to
-produce forecasts for supported coordinates, preserves issued forecasts for registered
-locations, and measures their performance against suitable observations. Later learning
-and bounded AI adjustments must demonstrate value; improvement is not assumed or guaranteed.
+MesoForge should become an automated local digital forecast system. A configured
+latitude/longitude is the center of a local forecast domain, not just a point at
+which model values are averaged. The system should build coherent weather fields,
+learn from verification, and support bounded GFE-style forecast editing before
+interpolating the delivered spot forecast at the exact requested coordinate.
 
-Human approvals govern development and releases. Normal configured forecast operation
-should not require a human to approve each forecast.
+The intended AI forecast desk works like a meteorologist using forecast-editing
+tools: inspect a wider surrounding area, propose justified changes within a smaller
+editable area, and let deterministic tools validate and apply those changes. The
+original numerical baseline, statistical correction, AI proposal and final forecast
+remain separately inspectable. Improvement must be measured, never assumed.
+
+Human approvals govern development, policies and releases. Normal configured
+forecast operation should not require a human to approve each forecast.
 
 ## What is established, and what is proposed
 
-The existing Phase 0–2 implementation provides a Python modular monolith, versioned
-scientific contracts, immutable artifacts with provenance, PostgreSQL metadata,
-S3-compatible storage, and a deterministic HRRR/NBM/GFS station baseline with METAR
-verification. These foundations have accepted [architecture](docs/decisions/0001-python-modular-monolith.md)
-and [storage](docs/decisions/0004-postgresql-and-s3-storage.md) decisions. See
-[README.md](README.md) for the actual capability and execution limits.
+The implemented local V2 path produces a real **36-hour surface forecast** with
+temperature, dew point, derived RH, vector wind speed/direction and gust. It discovers
+current model cycles, prepares shared guidance, processes coordinate collections,
+verifies eligible previous temperature forecasts and saves new immutable issuances.
+HRRR/GFS remain active; temperature stays at 70/30 demonstration weights, while the
+added fields use applicable retained Phase 2 rules. RAP and IFS are real zero-weight
+shadows; IFS keeps native three-hourly gaps and has no compatible instantaneous gust.
+Cloud cover is explicitly unavailable without an approved blend policy.
 
-The owner has moved development to local Codex and paused the Hermes development
-pipeline. The [revised V2 RFC](docs/rfcs/mesoforge-v2-architecture.md) is the proposed
-direction for a selective rebuild using suitable existing scientific functions.
-Its full release architecture remains **Proposed for owner architecture review**.
-The owner separately approved the small localhost HRRR/GFS temperature endpoint
-and fixed real prepared guidance, now extended to hours 1–36. That slice now works;
-its observed results and validation gaps are recorded in README.
-That approval does not authorize the entire release or the model roadmap below.
+Prepared files hold native model grids; **there is no local MesoForge forecast grid
+yet**. Deterministic bias correction, site learning, AI editing, precipitation fields
+in the V2 path, delivery and production deployment/scheduling are not implemented.
+The existing on-demand forward run and explicit batch history are not a deployed
+registered-location service. [README.md](README.md) records commands, demonstrated
+results and validation gaps; temperature remains the verified/scored field today.
+
+The Python modular monolith, scientific contracts, provenance and PostgreSQL/S3
+storage reuse accepted [architecture](docs/decisions/0001-python-modular-monolith.md)
+and [storage](docs/decisions/0004-postgresql-and-s3-storage.md) decisions. The retained
+Phase 2 station baseline also has QPF/PoP support; that does not make precipitation
+implemented in the coordinate forward run.
+
+The owner-approved long-term direction below guides future design. The
+[V2 RFC](docs/rfcs/mesoforge-v2-architecture.md) remains proposed where implementation
+choices are unresolved. Completed, individually approved milestones do not approve
+its entire release architecture. This documentation change implements no new behavior.
+Local Codex development continues; the Hermes pipeline remains paused.
 
 ## Intended coordinate-driven operation
 
-The owner-approved operating direction below is **future functionality**, not a
-description of the current localhost demonstration or approval to implement every
-stage together. The user-facing geographic input should ultimately be only
-latitude/longitude. A configurable collection should look conceptually like:
+Latitude/longitude are the only required geographic inputs. For example:
 
 ```json
 {
   "locations": [
-    {"lat": 45.8, "lon": -93.1},
-    {"lat": 44.98, "lon": -93.27}
+    {"lat": 44.98859, "lon": -93.25557, "name": "Minneapolis"},
+    {"lat": 45.8, "lon": -93.1}
   ]
 }
 ```
 
-Local preparation and batch issuance now derive spatial coverage from this
-configuration shape. Both example coordinates are supported by HRRR/GFS; nearby
-points share prepared guidance. Internal defaults are a 50 km minimum model-data
-buffer and 150 km surrounding context footprint; the exact coordinate remains the
-forecast point. The retained observation-station search remains 50 km. Native model
-boundaries bound the available context. Users supply no region, grid, or station
-metadata. Overlapping footprints share preparation before HTTP requests; raw guidance
-is retained for offline expansion and reuse. Current context data is temperature only.
-On-demand observation metadata discovery now queries nearby METAR stations from the
-coordinate and reuses immutable saved candidates through the existing PostgreSQL/MinIO
-path. Users supply no station IDs. Discovery and observation requests remain bounded;
-there is no nationwide catalog mirror or scheduled metadata refresh. Metadata acquisition
-time is recorded, and a candidate still must satisfy the existing time and QC rules.
-Weather-dependent sizing remains future work. The combined operating lifecycle below
-also remains future work.
-Adding supported coordinates should require configuration changes, not code changes.
-Users should not maintain observation stations, bounding boxes, surrounding counties,
-model grid coordinates, or spatial zones. MesoForge should identify the location
-and derive any needed geographic metadata and surrounding weather context internally.
-The service's supported coverage and scientific suitability rules remain explicit.
+`name` is optional display metadata. New supported coordinates require no code
+changes. MesoForge derives geographic details internally when needed: users do not
+maintain bounding boxes, counties, model cells, domain corners, observation stations,
+or surrounding zones. Available guidance and physical model domains still constrain
+what can be forecast.
 
-The API and persistent forecast data should run on a VPS. Model acquisition and
-preparation remain separate from forecast HTTP requests; prepared guidance is shared
-across nearby coordinates rather than downloaded again for each location. A GitHub
-Actions workflow can read the coordinate collection and process it one location at
-a time or in bounded batches, using the VPS application and its persistent data.
+The intended spatial layers have different jobs:
 
-For each explicitly configured location, the intended sequence is:
+| Layer | Purpose |
+| --- | --- |
+| Source guidance domain | Shared numerical-model data sufficient for interpolation and surrounding context; nearby locations reuse it instead of downloading or duplicating complete native datasets per location. |
+| Context domain | The larger area the forecast desk may inspect for incoming systems, gradients, fronts, precipitation structures, freezing lines, surrounding observations and model disagreement. |
+| Editable domain | A smaller bounded local region where approved tools may modify MesoForge forecast fields. Evidence outside it may inform edits inside it. |
+| Forecast point | The exact configured latitude/longitude, where the final spot forecast is interpolated from the final local fields. |
 
-1. Identify the location from its coordinates.
-2. Verify eligible previously issued forecasts when suitable observations are available.
-3. Generate the new deterministic numerical forecast from prepared guidance.
-4. Later, allow a bounded AI adjustment/discussion stage using that numerical forecast,
-   internally derived surrounding weather context, and prior verification.
-5. Save the issued forecast and provenance, keeping any accepted adjustment separate
-   from its numerical baseline.
-6. Deliver the issued forecast, then continue to the next coordinate.
+Current preparation uses approved internal defaults of a **50 km minimum model-data
+buffer**, **150 km surrounding context footprint**, and **50 km station search**.
+These are preparation/search defaults, not an approved editable-domain radius or a
+local forecast-grid design. Native-grid views are already shared across overlapping
+locations and can be rebuilt from retained raw messages; distant locations may use
+separate views of the same acquired guidance. Context ends at available model coverage.
 
-Failure for one location must not prevent processing the remaining locations.
-Observation sources/proxies should be selected automatically under suitability rules
-and recorded with the verification. When none is suitable, verification remains
-explicitly unavailable and the next forecast can still proceed. A normal one-off API
-request must not silently register or track its coordinate. AI and delivery remain
-later stages; GitHub Actions, registration, and this lifecycle are not implemented
-by documenting this direction.
+Local-grid radii, resolution, projection, shape, taper distances and storage layout
+remain implementation decisions to measure and design. This update fixes none of
+those parameters and does not add dynamic weather-dependent sizing.
+
+For explicitly configured/registered locations, the eventual lifecycle is:
+
+1. Identify each coordinate, derive its domains and verify eligible prior issued
+   versions using automatically selected suitable observations.
+2. Acquire/retain required shared guidance outside forecast HTTP requests, inspecting
+   the collection first so nearby locations share preparation.
+3. Regrid/blend guidance into coherent local MesoForge baseline fields, retaining
+   contributor values, weights, units, times, missingness and provenance.
+4. Apply a deterministic site/regime bias correction derived from verified history,
+   preserving both the original and bias-corrected baseline.
+5. Let the AI desk inspect context, model disagreement, observations, prior verification
+   and versioned site knowledge, then propose bounded spatial/temporal edit recipes.
+6. Validate and apply accepted recipes through deterministic, versioned tools. Save
+   the proposal, validation decisions and final adjusted fields separately.
+7. Interpolate the final spot forecast at the exact coordinate; save the immutable
+   issuance and its provenance, then deliver it when delivery is implemented.
+8. As observations arrive, verify the original baseline, statistical correction and
+   final adjustments on comparable samples, learning which behavior helps at that
+   location and regime. Continue through every configured coordinate.
+
+A location failure must not stop later locations. Unsuitable or missing observations
+produce explicit unavailable verification and do not prevent a new forecast; no
+learned correction or score is fabricated when history is absent. Station candidates
+are already discovered/reused automatically, while time, distance and QC determine
+which observation is an acceptable proxy for a forecast coordinate.
+
+Ordinary one-off requests may receive a numerical point forecast without silently
+becoming tracked locations. Explicitly configured/registered locations are where
+persistent issuance, verification, site knowledge, bias correction, AI desk behavior
+and delivery can accumulate. Current explicit batch runs already preserve history;
+registration and the complete future lifecycle are not yet implemented.
+
+The intended deployment keeps the API and persistent forecast data on a VPS. A future
+GitHub Actions caller or scheduler may process the coordinate list sequentially or
+in bounded batches. That deployment and scheduling remain deferred; preparation must
+stay outside forecast HTTP requests regardless of how runs are started.
 
 ## Long-term model direction
 
 The owner-approved direction is an enterprise-style multi-model blend: HRRR, RAP,
-NAM 3 km (NAM CONUS nest), NAM, GFS, RRFS / REFS, and NBM, with additional useful
-deterministic and ensemble guidance such as GEFS, ECMWF, and Canadian models where
-appropriate. Product availability, access, and scientific suitability determine
-which integrations are useful. This is planned coverage, not implemented support
-or a requirement to acquire every model simultaneously. The current Phase 2 path
-supports HRRR/NBM/GFS; the small coordinate endpoint uses HRRR/GFS temperature only.
-The 70/30 demonstration weights are not a policy for the eventual model blend.
+NAM 3 km (NAM CONUS nest), NAM, GFS, RRFS / REFS, and NBM, with useful deterministic
+and ensemble guidance such as GEFS, ECMWF and Canadian models where appropriate.
+Availability, access and scientific suitability determine useful integrations; this
+is not a requirement to acquire every model simultaneously. HRRR/GFS active guidance
+and RAP/ECMWF IFS shadows are implemented in the V2 surface path. Retained Phase 2
+also supports NBM. Temperature's 70/30 demonstration is not an optimized or universal
+field-weight policy.
 
-The coordinate temperature path now has common contributor capability definitions
-and named/versioned recipes with arbitrary contributor lists. Active forecasting
-remains HRRR/GFS 70/30, temperature, hours 1–36. The additional contributor used to
-test the extension is synthetic shadow data; RAP and other real additions remain future work.
-Model integration follows **shadow → evaluated → active → deprecated → retired**.
-Shadow values and configuration are retained separately from the active blend in
-the same immutable issuance, so they can be compared without changing the control.
-Evaluated means evidence is available, not automatic approval. Promotion remains
-a human-controlled versioned configuration decision; lineage is metadata for future
-diversity-aware weighting, not a weighting algorithm. Retirement preserves historical
-identities and issued records. Adapters still own model-specific acquisition,
-normalization, availability and domain semantics; registration does not make those automatic.
+Common model capabilities and named/versioned scalar recipes support arbitrary
+contributor lists. Adapters own model-specific acquisition, normalization, native-grid,
+lead and availability semantics; registration alone cannot supply those capabilities.
+The lifecycle remains **shadow → evaluated → active → deprecated → retired**.
+Shadow values/provenance use the same immutable issuance and comparison infrastructure,
+without affecting the active control. Evaluation supplies evidence, not automatic
+approval. Promotion requires an approved versioned configuration; retirement preserves
+historical identities and issued records. Family/lineage metadata prepares for later
+diversity-aware evaluation, not an implemented weighting algorithm.
 
 NAM and NAM 3 km are transition/legacy candidates, not permanent dependencies.
 Verified on 2026-09-10: NWS [SCN 26-47, updated September 9](https://www.weather.gov/media/notification/pdf_2026/SCN26-47_Updated_Retire_NAM_SREF_HREF_HiresW_NAM_MOS.aab.pdf)
@@ -122,97 +151,114 @@ describes their RRFS/REFS replacement path. The coordinated date can be delayed
 by critical/significant weather. Earlier August 31 and October 6 dates are superseded;
 recheck official notices before implementing a NAM integration or transition.
 
-Retain the original raw model files/messages actually acquired, including fields
-not yet used by the API; prepared subsets do not replace that source evidence.
-Later trimming of fields/products is a separate decision. This does not authorize
-downloads of every field, level, lead, or model, or promise indefinite retention.
-The current test acquires only selected temperature messages and retains them in
-full, together with their indexes and source metadata, outside Git.
+Retain the raw model files/messages actually acquired, including fields not yet
+used in a product, with indexes and source metadata. Shared prepared subsets and
+local forecast fields do not replace that source evidence. Future trimming and
+retention periods are separate decisions; this does not authorize downloading every
+field, level, lead or model, or guarantee indefinite retention.
 
 ## Proposed architecture
 
-Acquire and cache required guidance in the background, and reuse it across locations.
-Retries and provider revisions must not create duplicate logical results.
-The diagram describes the intended operating model, not services already running:
+The diagram shows the intended forecast-domain workflow, not functionality already
+running. Shared source guidance and the local MesoForge forecast field are distinct:
 
 ```mermaid
 flowchart TD
-    Models[Weather model providers] --> Prepare[Background acquisition and normalization]
-    Prepare --> Guidance[Ready shared guidance]
-    Locations[Configured latitude/longitude collection] --> Runner[Optional GitHub Actions runner]
-    Runner --> Workflow[Per-location workflow]
-    Request[One-off latitude/longitude request] --> API[Thin API]
-    subgraph VPS[Future VPS application and persistent data]
-        API --> Baseline[Shared point extraction and baseline calculation]
-        Guidance --> Baseline
-        Workflow -->|Generate| Baseline
-        Workflow <-->|Verify previous and save new issuance| History[Forecast versions, provenance and verification]
-        Baseline -->|Configured issuance| Workflow
-    end
-    Baseline -->|One-off result| Response[Values, units, times, sources and missingness]
-    Observations[Automatically selected suitable observations] --> Workflow
-    Workflow --> Delivery[Later delivery]
+    Models[Model providers] --> Shared[Shared acquisition and prepared guidance]
+    Coordinates[Configured latitude/longitude] --> Domains[Internally derived domains]
+    Shared --> Baseline[Local numerical baseline fields]
+    Domains --> Baseline
+    Shared --> Context[Larger inspection context]
+    Domains --> Context
+    Baseline --> Corrected[Separate bias-corrected fields]
+    Context --> Desk[AI desk proposes bounded edit recipe]
+    Corrected --> Desk
+    Desk --> Tools[Deterministic validation and versioned editing tools]
+    Corrected --> Tools
+    Domains -->|Editable boundary| Tools
+    Tools --> Final[Separate final adjusted fields]
+    Final --> Spot[Exact-coordinate spot forecast]
+    Baseline --> History[Immutable stages, evidence and verification]
+    Corrected --> History
+    Desk --> History
+    Final --> History
+    History -->|Verified history and site knowledge| Corrected
+    History -->|Context and measured edit performance| Desk
 ```
 
-Boxes represent responsibilities within one application codebase, not mandatory
-microservices, classes, or separate frameworks. API requests and background issuance
-reuse the same forecast calculations.
-
-The proposed implementation keeps scientific logic separate from HTTP, workers, and
-storage. Acquisition and heavy preparation run outside the forecast request path,
-not as heavy work attached to an HTTP response. An HTTP request performs only bounded
-reads and calculation. This does not require a new broker or scheduling framework.
-One-off requests do not silently register a location or create durable forecast history.
+These are responsibilities in the existing application architecture, not mandated
+microservices or another persistence framework. Large immutable field artifacts and
+their lineage should reuse the PostgreSQL/S3 path; their packaging remains to be
+measured. Multiple local forecasts can reference one shared source snapshot without
+copying complete native datasets for each configured location. Regridding and
+editing occur during preparation/issuance, outside the normal HTTP request path.
 
 ## Proposed first usable release
 
-- A private, operator-controlled API for a bounded supported region.
-- Deterministic forecasts at supported coordinates from prepared shared guidance.
-- Immutable forecast history for registered locations.
-- Observation acquisition, deterministic matching, and verification history.
-- Basic bounded performance queries over normalized facts.
+The release direction remains a private operator-controlled forecast service with
+useful deterministic output, immutable configured-location history, suitable
+observation matching and bounded performance queries. An approved local-grid
+increment should establish the numerical field representation before precipitation
+or editing stages are added. Statistical correction, AI, delivery and long-term
+learning are not prerequisites for that increment.
 
-This is a release direction, not one implementation task. The completed first
-demonstration is much smaller: a coordinate temperature forecast from prepared
-guidance, exposing values, units, source cycles, valid times, and missingness.
-The exact support matrix,
-weights/fallbacks, preparation format, and private-access boundary for the full
-release remain open. The separately approved temperature slice keeps its existing
-native HRRR/GFS domain, hours 1–36, localhost binding, and fixed 70/30 demonstration weights.
+The exact wider release support matrix, authentication, measured resource limits,
+local-grid design and retention promises remain open. Existing approved field and
+model rules remain in force until explicitly changed; the long-term north star
+does not authorize implementing the roadmap as one task.
 
 ## Future roadmap
 
-Measured bias correction and learned model weights may later improve the baseline.
-Structured AI proposals may follow, with deterministic validation and bounds.
-Email/delivery, public accounts, broader geography/model coverage, and additional
-products are later work. None is needed to implement the first small baseline slice,
-and none expands an active task without a separate request.
+Fields should grow from today's temperature, dew point/RH and wind/gust to supported
+cloud, QPF, PoP, precipitation type, snow and other useful forecasts. Conditions must
+be derived from the underlying fields with explainable rules and explicit missingness,
+not emitted as an unexplained standalone prediction.
+
+Future AI tools may apply a regional/time-window delta, taper changes spatially or
+temporally, anchor a value and blend around it, smooth an artifact, shift or retime
+a precipitation feature, adjust a freezing line/rain-snow transition, or remove
+unsupported isolated trace-QPF noise. Coherent edits must preserve continuity at
+the boundary. These are examples to design and evaluate, not implemented operations
+or permission for arbitrary grid writes. Deterministic validation must enforce
+physical consistency, bounds, continuity, information cutoffs, editable-domain limits
+and applicable cross-field relationships before any proposed change is accepted.
+
+Learning has three distinct meanings, all future work:
+
+| Kind | Meaning and evidence |
+| --- | --- |
+| Statistical learning | Deterministic site/regime bias correction derived from verified history, with retained training inputs, code and versioned correction parameters. |
+| Site knowledge | Structured, versioned, inspectable knowledge of recurring local behavior and regimes, tied to supporting evidence; it does not assume an LLM permanently remembers previous runs. |
+| AI performance learning | Measure which edit types improve forecasts, and under which regimes, using identical eligible forecast/observation samples and explicit sample counts. |
+
+Evaluate the AI's added value against the **bias-corrected baseline**, while retaining
+the original numerical baseline as a separate comparison. AI must not receive credit
+for corrections that ordinary statistical methods can make. Missing evidence remains
+missing; neither tiny demonstrations nor unmatched samples establish forecast skill.
 
 ## Essential boundaries
 
-- The numerical baseline is deterministic for fixed inputs and configuration. Any
-  later accepted AI adjustment is stored separately and remains traceable to that
-  baseline. AI cannot publish unchecked numerical changes. Do not invent learned
-  skill or confidence.
-- Refreshing a location creates a new forecast version. Verification compares
-  observations with the version originally issued, not a newer replacement.
-- Keep forecast coordinates separate from observation stations. Score a field only
-  when the selected observation has suitable spatial support and matching time/interval
-  semantics; otherwise report why it is unscored.
-- Keep units, wind conventions, source/valid/interval times, and missingness explicit.
-  Preserve source provenance and configuration; missing is not zero.
-- Respect information cutoffs. The V2 proposal requires both provider availability
-  and local ingestion to meet the cutoff; an event timestamp alone is insufficient.
-- No provider downloads, regional decoding, or training inside a forecast HTTP request.
-- Retain original source evidence and advertise only replay capabilities supported
-  by retained data and compatible execution dependencies.
-- Reuse suitable science without importing obsolete Phase 3 singleton/lattice/proof
-  machinery as the product architecture. Preserve donors as historical references.
-
-The RFC leaves owner decisions open on supported region/model/field/horizon combinations,
-weights and policies, private authentication, host reserve and measured work limits,
-cache packaging, and retention promises. FastAPI, PostgreSQL jobs, spatial partition
-packaging, and broader field/model coverage across 36 horizons are proposed choices,
-not completed features or blanket approvals. The small approved temperature slice
-does not settle unrelated
-later-release decisions.
+- Numerical fields and deterministic edits must be reproducible for fixed retained
+  inputs, grid definition, code, parameters and configuration. AI proposals need not
+  regenerate identically: preserve the actual proposal/edit recipe, validation outcome,
+  accepted operations and stage identities to replay its deterministic application.
+- Preserve original baseline, bias-corrected fields, AI proposal/edit recipe and final
+  adjusted fields separately. A refresh creates a new immutable issuance; verification
+  compares exact issued versions/stages and observation revisions, never replacements.
+- Keep coordinates distinct from observation proxies. Score only suitable spatial and
+  temporal support and report why an observation or field is unscored.
+- Preserve units, source/native-grid semantics, wind vectors, valid/interval times,
+  explicit missingness, exclusions and approved field-specific weights. No silent
+  clamping, invented probabilities, confidence, samples or learned skill.
+- Enforce the applicable approved information cutoff at every stage. The existing
+  current-model-set evidence proves provider availability at decision time and records
+  later acquisition/issuance separately; the RFC's broader ingestion-cutoff design is
+  still proposed. Future corrections, site knowledge and AI context must retain their
+  own evidence cutoffs and cannot use future information.
+- No downloads, regional decoding/regridding, training or AI inside a normal forecast
+  HTTP request. A one-off request does not silently acquire persistent tracking/history.
+- Reuse scientific functions where contracts fit. Retain raw guidance, transformation
+  definitions/results, stage artifacts and lineage only with accurately stated replay
+  capabilities; no promise exceeds retained inputs and compatible dependencies.
+- Historical Phase 3 plans and donor branches remain references, not the product
+  architecture or instructions to resume Hermes. Future stages require scoped approval.
