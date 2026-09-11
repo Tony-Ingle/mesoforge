@@ -138,6 +138,11 @@ def test_ecmwf_native_inclusive_threshold_and_24h_window_are_preserved(monkeypat
     assert event["interval_end"] == "2026-09-13T00:00:00Z"
     assert event["licence"] == "CC-BY-4.0"
     assert event["version"]["model_version"] == "cy50r1"
+    assert event["spatial_support"]["kind"] == "grid_box_mean"
+    assert event["spatial_support"]["point_downscaling"] == "not_applied"
+    assert event["spatial_support"]["effective_event_footprint"] == (
+        "not_encoded_in_retained_message"
+    )
 
 
 @pytest.mark.parametrize("coordinate", ["latitude", "longitude"])

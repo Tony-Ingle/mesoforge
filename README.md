@@ -2414,7 +2414,7 @@ The September 11, 2026 source inspection found:
 | NBM native six-hour | Point/grid probability >0.254 kg/m² over six hours | Zero-weight native comparison reference, acquired directly—not aggregated hourly PoP. |
 | GEFS bias-corrected PQPF | Point/grid probability >0.254 kg/m² over six hours | Compatible with the matching native NBM six-hour event; incompatible with hourly control. |
 | REFS parallel | Neighborhood probability >12.7 kg/m² over one hour | Native shadow only; threshold/support differ, and the retained message does not encode neighborhood radius. |
-| ECMWF IFS ENS `tpg1` | Probability ≥1 kg/m² over 24 hours | Native shadow only; threshold, comparator and interval differ from hourly NBM. |
+| ECMWF IFS ENS `tpg1` | Grid-box-mean precipitation probability ≥1 kg/m² over 24 hours | Native shadow only; threshold, comparator, interval and unnormalized spatial support prevent direct hourly comparison. |
 
 NOAA documents the [GEFS PQPF products](https://www.nco.ncep.noaa.gov/pmb/products/gens/)
 and their [six-hour threshold inventory](https://www.nco.ncep.noaa.gov/pmb/products/gens/gepqpf.t00z.pgrb2a.0p50.bc_06hf024.shtml).
@@ -2504,12 +2504,88 @@ The grid artifact is **104,680,987 bytes**, **14,516,096 compressed**, built in 
 whitespace checks passed. PostgreSQL/MinIO integration and full application acceptance
 were not rerun in this increment; no service was started and no PoP skill was measured.
 
-Next recommended: one explicitly defined six-hour ECMWF ensemble event matching the
-NBM/GEFS threshold and period, using native guidance if available or a documented
-complete member population. This would add a third comparable source before p-type.
-The current daily and neighborhood events must not be coerced into that comparison.
-Precipitation type remains a separate categorical/thermodynamic-guidance milestone;
-surface temperature alone is insufficient.
+#### ECMWF six-hour normalization outcome
+
+The bounded follow-up checked the exact NBM/GEFS event: **strictly >0.254 kg/m²**
+over **2026-09-11 18Z–2026-09-12 00Z**. The outcome is **incompatible / no ECMWF
+six-hour probability calculated**. Delivered hourly NBM PoP, all active weights,
+deterministic QPF and historical issued forecasts remain unchanged.
+
+There is no matching native probability in the inspected official open-data
+catalog/inventory: its precipitation probabilities are 24-hour events starting
+at ≥1 mm. The daily probability is not split or converted. Member precipitation
+does provide the necessary temporal inputs, but temporal alignment alone does
+not establish the same spatial event:
+
+- Actual 12Z-cycle inventories list all **50 perturbed members (1–50)** at both
+  leads 6 and 12, without missing or duplicate entries. The complete operational
+  ensemble includes a separate control, obtained from `oper/fc` since IFS 50r1;
+  it must not be accidentally counted twice. See the
+  [official member/control conventions](https://confluence.ecmwf.int/spaces/DAC/pages/272310539/ECMWF+open+data+real-time+forecasts+from+IFS+and+AIFS).
+- Only **member 1's two messages** were acquired to check encoding. They contain
+  cumulative `tp` in metres over 0–6 and 0–12 hours, on the same published 0.25°
+  grid, IFS `cy50r1`. Their difference covers the requested six hours. Members
+  2–50 and the separate control were **not acquired**, not declared missing from
+  the provider. Control availability was not probed. No partial-population
+  denominator or exceedance fraction was invented.
+- ECMWF documents raw ENS rainfall as **grid-box-average precipitation**,
+  distinct from its calibrated ecPoint product. Published grid spacing is not a
+  complete description of the physical event footprint. Bilinear probability
+  interpolation onto MesoForge's local grid does not turn that event into a
+  point-scale event. The existing application has no established common-support
+  normalization for this comparison; adding spatial calibration to force it is
+  outside this increment. See the
+  [ECMWF spatial-support explanation](https://confluence.ecmwf.int/spaces/FUG/pages/673551197/Section+8.1.7+Point+rainfall).
+- The prior generic ECMWF `grid_point` label was too broad. Newly prepared ENS
+  metadata now records `grid_box_mean`, published spacing, unknown effective
+  footprint and no point downscaling. Even a hypothetical fraction with matching
+  threshold/window remains incompatible with the current point-support target.
+  Earlier saved artifacts are preserved; replay produces a separate corrected
+  metadata version without changing native probabilities. The existing NBM/GEFS
+  disagreement remains an exploratory comparison of matched threshold/time
+  metadata, not proof of identical physical support or point-verification skill.
+- Member subtraction was inspected without clipping: some global cells have
+  small negative increments, while inspected Minneapolis cells do not. These
+  signed values and packing metadata are retained. No new packing repair,
+  missing-value substitution or probability calculation was introduced.
+
+For the requested six-hour window at Minneapolis, NBM remains **1.000000%** and
+GEFS **3.246593%**; ECMWF's directly comparable value is **null**, with the
+spatial-support reason above. Its separate native daily probability remains
+**90.319568% for Sep 12 00Z–Sep 13 00Z**, never a six-hour value.
+
+The probe retained **1,258,844 bytes** of member GRIB messages and **4,000,266
+bytes** of provider indexes outside Git under
+`%LOCALAPPDATA%/MesoForge/baselines/20260911-ens-six-hour/`. Metadata include URLs,
+byte ranges, object identities, acquisition times, hashes, member identities,
+source cycle/leads, actual accumulation bounds, units and GRIB version/packing
+keys. `offline-member-audit.json` records the explicit unavailable result and
+hash-checked replay; `offline_member_audit.py` reproduces the bounded probe from
+retained inputs with network access blocked. No all-member download was needed.
+
+Native probability replay uses the existing command unchanged:
+
+```text
+python -B -m mesoforge.application.prepared_probability_sources --prepared-run EXISTING_SHADOW_RUN --from-raw --output-dir NEW_SHADOW_REPLAY
+```
+
+Validation for this follow-up: **111 focused tests passed** across native
+probability decoding/acquisition, contributor comparisons, retained preparation,
+local-grid and hourly-report behavior. Ruff, mypy, all nine import contracts,
+the offline lock check, documentation, hygiene and `git diff --check` passed.
+The member probe replayed with exact hashes/metadata and zero provider calls;
+the four existing native probability arrays and source acquisition provenance
+also survived raw replay unchanged. A rebuilt Minneapolis grid preserved all
+**49 × 36** NBM/surface/QPF cell-hours exactly; repeat grid builds and two API
+reads matched exactly with zero provider calls. PostgreSQL/MinIO integration,
+full application acceptance and PoP verification/calibration were not run for
+this follow-up.
+
+Next recommended: **precipitation type from appropriate native categorical and/or
+thermodynamic guidance**, retaining model/time availability and explicit missingness
+on this same grid. Surface temperature alone is insufficient. Common-support PoP
+normalization/calibration can remain a separate future task; no delivered PoP
+weight changes are authorized by this experiment.
 
 ### Automatic current guidance
 

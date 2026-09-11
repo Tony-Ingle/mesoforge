@@ -149,6 +149,48 @@ def test_missing_native_endpoints_are_not_filled_or_split():
     assert "no temporal filling" in row["missing_reasons"][0]
 
 
+def test_matching_six_hour_threshold_does_not_turn_grid_box_rainfall_into_point_probability():
+    # Hypothetical complete member fraction, not real ENS data. Even with matching
+    # event times and threshold, probability interpolation cannot change support.
+    support = {
+        "kind": "grid_box_mean",
+        "published_grid_spacing_degrees": 0.25,
+        "effective_event_footprint": "not_encoded_in_retained_message",
+        "point_downscaling": "not_applied",
+    }
+    active = _active()
+    saved_active = deepcopy(active)
+    box = _view("ENS_MEMBER_FRACTION_FIXTURE", fraction=0.2, events=[_event(support=support)])
+    box.dataset.probability.values[0] = [[0.0, 0.2], [0.4, 0.6]]
+    result = _run([_view("NBM_6H"), box], active=active)
+    assert result["contributors"][1]["value"] == pytest.approx(0.3)
+    assert result["contributors"][1]["active_weight"] == 0
+    assert result["contributors"][1]["spatial_support"] == support
+    pair = result["comparisons"][-1]
+    assert pair["status"] == "incompatible" and pair["delta"] is None
+    assert len(pair["reasons"]) == 1
+    assert "interpolating probabilities does not change support" in pair["reasons"][0]
+    assert active == saved_active
+
+
+def test_daily_ecmwf_cannot_supply_requested_six_hour_event():
+    daily = _event(hours=24, threshold=1.0, comparison="ge", support={"kind": "grid_box_mean"})
+    daily["source_cycle"] = "2026-09-10T18:00:00Z"
+    daily["source_lead_hours"] = 24
+    view = _view("ECMWF_ENS_24H", fraction=0.9, events=[daily])
+    result = _run([_view("NBM_6H"), view])
+    # Sharing an interval endpoint does not make the daily probability six-hourly.
+    assert result["contributors"][1]["value"] == 0.9
+    assert result["contributors"][1]["interval_start"] == daily["interval_start"]
+    pair = result["comparisons"][-1]
+    assert pair["delta"] is None and pair["status"] == "incompatible"
+    assert "Different precipitation threshold or comparator" in pair["reasons"]
+    assert "Different native accumulation interval or interval closure" in pair["reasons"]
+    earlier = _run([view], valid="2026-09-11T12:00:00Z")["contributors"][0]
+    assert earlier["value"] is None
+    assert "no temporal filling" in earlier["missing_reasons"][0]
+
+
 @pytest.mark.parametrize("value", [0.0, 1.0, np.nan, -0.1, 1.1])
 def test_zero_one_and_invalid_corners_are_explicit(value):
     view = _view(fraction=0.4)

@@ -150,7 +150,16 @@ PRODUCTS: dict[str, dict[str, Any]] = {
         "provider": "ECMWF",
         "duration_hours": 24,
         "threshold": {"value": 1.0, "unit": "kg/m^2", "comparison": "ge"},
-        "spatial_support": {"kind": "grid_point"},
+        "spatial_support": {
+            "kind": "grid_box_mean",
+            "published_grid_spacing_degrees": 0.25,
+            "effective_event_footprint": "not_encoded_in_retained_message",
+            "point_downscaling": "not_applied",
+            "documentation": (
+                "https://confluence.ecmwf.int/spaces/FUG/pages/673551197/"
+                "Section+8.1.7+Point+rainfall"
+            ),
+        },
         "probability_method": "native_published_ensemble_probability",
         "product": "IFS ENS native tpg1 24-hour probability",
         "status": "shadow",

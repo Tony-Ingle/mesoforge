@@ -230,7 +230,16 @@ def _comparison(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
         reasons.append("Different native accumulation interval or interval closure")
     left_support, right_support = left.get("spatial_support"), right.get("spatial_support")
     if not _support_known(left_support) or not _support_known(right_support):
-        reasons.append("Unknown event spatial support prevents comparison")
+        if any(
+            isinstance(support, dict) and support.get("kind") == "grid_box_mean"
+            for support in (left_support, right_support)
+        ):
+            reasons.append(
+                "Native grid-box-mean precipitation has no established common spatial support "
+                "with the comparison target; interpolating probabilities does not change support"
+            )
+        else:
+            reasons.append("Unknown event spatial support prevents comparison")
     elif left_support != right_support:
         reasons.append("Different event spatial support")
     compatible = not reasons
