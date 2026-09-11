@@ -200,3 +200,105 @@ def test_wrong_units_and_naive_times_are_not_mislabeled(forecast: dict[str, Any]
     forecast["hours"][0]["valid_time"] = "2026-11-01T05:00:00"
     with pytest.raises(ValueError, match="UTC offset"):
         build_hourly_report(forecast)
+
+
+@pytest.fixture
+def qpf_forecast(forecast: dict[str, Any]) -> dict[str, Any]:
+    for hour in forecast["hours"]:
+        end = datetime.fromisoformat(hour["valid_time"])
+        field = {
+            "value": 25.4,
+            "unit": "kg/m^2",
+            "interval_start": (end - timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+            "interval_end": end.isoformat().replace("+00:00", "Z"),
+            "missing_reasons": [],
+            "weights": {"HRRR": 0.7, "GFS": 0.3},
+            "provenance": {"parents": ["sha256:current", "sha256:previous"]},
+        }
+        hour["surface"] = {
+            "fields": {"liquid_equivalent_precipitation_amount_1h": deepcopy(field)},
+            "contributors": {
+                source["model"]: {
+                    "fields": {"liquid_equivalent_precipitation_amount_1h": deepcopy(field)},
+                    "cycle": source["cycle"],
+                    "source_lead_hours": source["source_lead_hours"],
+                    "role": "active",
+                }
+                for source in hour["sources"]
+            },
+        }
+    return forecast
+
+
+@pytest.mark.parametrize(
+    ("amount", "inches", "text"),
+    [
+        (25.4, 1.0, "1"),
+        (0.254, 0.01, "0.01"),
+        (0.0, 0.0, "0"),
+        (2.54e-11, 1e-12, "1e-12"),
+        (None, None, "unavailable"),
+    ],
+)
+def test_qpf_display_preserves_small_positive_zero_and_missing(
+    qpf_forecast: dict[str, Any], amount: float | None, inches: float | None, text: str
+) -> None:
+    variable = "liquid_equivalent_precipitation_amount_1h"
+    field = qpf_forecast["hours"][0]["surface"]["fields"][variable]
+    field["value"] = amount
+    if amount is None:
+        field["missing_reasons"] = ["No exact matching accumulation interval"]
+    report = build_hourly_report(qpf_forecast)
+    displayed = report["hours"][0]["display_qpf"]
+    assert displayed["value"] == (
+        None if inches is None else pytest.approx(inches, rel=1e-12, abs=0)
+    )
+    assert displayed["unit"] == "inch"
+    assert displayed["interval_start"] == "2026-11-01T04:00:00Z"
+    assert displayed["interval_end"] == "2026-11-01T05:00:00Z"
+    assert displayed["interval_closure"] == "left_open_right_closed"
+    rendered = render_hourly_report(report)
+    first = next(line for line in rendered.splitlines() if line.startswith("| 1 |"))
+    assert f"| {text} | 2026-11-01T04:00:00Z | 2026-11-01T05:00:00Z |" in first
+    if amount is None:
+        assert "No exact matching accumulation interval" in rendered
+
+
+def test_qpf_report_preserves_native_values_provenance_and_intervals(
+    qpf_forecast: dict[str, Any],
+) -> None:
+    variable = "liquid_equivalent_precipitation_amount_1h"
+    native = qpf_forecast["hours"][0]["surface"]["contributors"]["GFS"]["fields"][variable]
+    native["value"] = 0.254
+    original = deepcopy(qpf_forecast)
+    report = build_hourly_report(qpf_forecast)
+    rendered = render_hourly_report(report)
+    assert qpf_forecast == original
+    assert "liquid-equivalent accumulation over (start, end]" in rendered
+    assert "precipitation probability or precipitation type" in rendered
+    assert rendered.count("QPF in | Accumulation start UTC (exclusive) | End UTC (inclusive)") == 3
+    assert len([line for line in rendered.splitlines() if line.startswith("| 36 |")]) == 3
+    gfs_table = rendered.split("### GFS native contributor")[1].split("### HRRR")[0]
+    assert "| 0.01 | 2026-11-01T04:00:00Z | 2026-11-01T05:00:00Z |" in gfs_table
+    for saved, display in zip(qpf_forecast["hours"], report["hours"], strict=True):
+        assert display["surface"] == saved["surface"]
+        assert display["final_surface_fields"] == saved["surface"]["fields"]
+    report["hours"][0]["final_surface_fields"][variable]["provenance"]["parents"].append("edit")
+    report["hours"][0]["display_qpf"]["value"] = 999
+    assert qpf_forecast == original
+    assert report["hours"][0]["surface"] == original["hours"][0]["surface"]
+
+
+def test_qpf_wrong_units_are_not_silently_reinterpreted(qpf_forecast: dict[str, Any]) -> None:
+    field = qpf_forecast["hours"][0]["surface"]["fields"][
+        "liquid_equivalent_precipitation_amount_1h"
+    ]
+    field["unit"] = "inch"
+    with pytest.raises(ValueError, match="canonical QPF"):
+        build_hourly_report(qpf_forecast)
+
+
+def test_historical_report_does_not_invent_qpf(forecast: dict[str, Any]) -> None:
+    report = build_hourly_report(forecast)
+    assert all("display_qpf" not in hour for hour in report["hours"])
+    assert "QPF" not in render_hourly_report(report)

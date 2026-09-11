@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from copy import deepcopy
 
@@ -18,6 +19,7 @@ TARGET = np.datetime64("2026-09-11T12:00:00", "ns")
 T, DEW = "air_temperature_2m", "dew_point_temperature_2m"
 U, V, GUST = "eastward_wind_10m", "northward_wind_10m", "wind_gust_10m"
 RH, SPEED, DIRECTION = "relative_humidity_2m", "wind_speed_10m", "wind_from_direction_10m"
+QPF = "liquid_equivalent_precipitation_amount_1h"
 CRS = pyproj.CRS.from_epsg(4326)
 
 
@@ -64,6 +66,28 @@ def _case(horizon=1):
     }
     sources = [_temperature_source(model, row[0], horizon) for model, row in datasets.items()]
     return datasets, sources
+
+
+def _add_qpf(dataset, amounts):
+    """Add native-grid hourly depths and exact bounds to the existing surface fixture."""
+    values = np.asarray(amounts, dtype=np.float64)
+    if values.ndim == 0:
+        values = np.full(dataset.sizes["source_lead_time"], values)
+    shape = (dataset.sizes["source_lead_time"], dataset.sizes["y"], dataset.sizes["x"])
+    dataset[QPF] = (
+        ("source_lead_time", "y", "x"),
+        np.broadcast_to(values[:, None, None], shape).copy(),
+        {
+            "unit_id": "kg/m^2",
+            "temporal_semantics": "accumulation",
+            "interval_closure": "left_open_right_closed",
+        },
+    )
+    ends = dataset.source_valid_time.values.astype("datetime64[ns]")
+    dataset[f"{QPF}_interval_bounds"] = (
+        ("source_lead_time", "bounds"),
+        np.column_stack((ends - np.timedelta64(1, "h"), ends)),
+    )
 
 
 def _temperature_source(model, dataset, horizon):
@@ -272,3 +296,174 @@ def test_point_loader_rejects_invalid_surface_units_or_unrotated_winds(
     dataset.to_netcdf(path, engine="h5netcdf")
     with pytest.raises(ValueError, match=reason):
         PreparedPointForecast.from_directory(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "horizon,expected,weights",
+    [
+        (1, 2.9, {"HRRR": 0.7, "GFS": 0.3}),
+        (19, 3.2, {"HRRR": 0.6, "GFS": 0.4}),
+    ],
+)
+def test_qpf_aligns_actual_intervals_across_cycles_and_uses_approved_rows(
+    configuration, horizon, expected, weights
+):
+    datasets, sources = _case(horizon)
+    before = _extract(configuration, datasets, sources, horizon=horizon)
+    for model, amount in (("HRRR", 2.0), ("GFS", 5.0)):
+        _add_qpf(datasets[model][0], amount)
+    result = _extract(configuration, datasets, sources, horizon=horizon)
+    qpf = result["fields"][QPF]
+    assert qpf["value"] == pytest.approx(expected)
+    assert qpf["unit"] == "kg/m^2" and qpf["weights"] == weights
+    assert qpf["policy"] == "phase2-qpf-fallback.v1"
+    assert qpf["row_id"] == f"qpf.hg.{'h01-h18' if horizon <= 18 else 'h19-h36'}"
+    assert qpf["row_sha256"]
+    expected_end = TARGET + np.timedelta64(horizon, "h")
+    expected_start = expected_end - np.timedelta64(1, "h")
+    for field in (qpf, *(v["fields"][QPF] for v in result["contributors"].values())):
+        assert field["interval_start"] == str(np.datetime_as_string(expected_start, unit="s")) + "Z"
+        assert field["interval_end"] == str(np.datetime_as_string(expected_end, unit="s")) + "Z"
+        assert field["interval_closure"] == "left_open_right_closed"
+        assert field["temporal_semantics"] == "accumulation"
+    native = result["contributors"]
+    assert native["HRRR"]["fields"][QPF]["source_lead_hours"] == horizon
+    assert native["GFS"]["fields"][QPF]["source_lead_hours"] == horizon + 6
+    assert native["GFS"]["fields"][QPF]["source_cycle"] == "2026-09-11T06:00:00Z"
+    assert {v: field for v, field in result["fields"].items() if v != QPF} == {
+        v: field for v, field in before["fields"].items() if v != QPF
+    }
+
+
+def test_qpf_mismatched_and_missing_intervals_remain_explicit(configuration):
+    datasets, sources = _case()
+    for model in datasets:
+        _add_qpf(datasets[model][0], 3.0)
+    # Equal valid times do not make a three-hour total compatible with a one-hour depth.
+    datasets["HRRR"][0][f"{QPF}_interval_bounds"].values[0, 0] -= np.timedelta64(2, "h")
+    result = _extract(configuration, datasets, sources)
+    assert result["fields"][QPF]["value"] == pytest.approx(3.0)
+    assert result["fields"][QPF]["weights"] == {"GFS": 1.0}
+    assert result["fields"][QPF]["status"] == "fallback"
+    hrrr = result["contributors"]["HRRR"]["fields"][QPF]
+    assert hrrr["value"] is None
+    assert any("exact one-hour" in reason for reason in hrrr["missing_reasons"])
+    datasets["GFS"][0][f"{QPF}_interval_bounds"].values[0, 1] += np.timedelta64(1, "h")
+    missing = _extract(configuration, datasets, sources)["fields"][QPF]
+    assert missing["value"] is None and missing["weights"] == {}
+    assert missing["status"] == "unavailable" and missing["missing_reasons"]
+
+
+@pytest.mark.parametrize("amount", [0.0, 0.254, 1e-12])
+def test_qpf_zero_and_tiny_positive_amounts_are_not_missing_or_thresholded(configuration, amount):
+    datasets, sources = _case()
+    for model in datasets:
+        _add_qpf(datasets[model][0], amount)
+    result = _extract(configuration, datasets, sources)
+    assert result["fields"][QPF]["value"] == pytest.approx(amount, rel=1e-12, abs=0)
+    assert result["fields"][QPF]["missing_reasons"] == []
+    for model in datasets:
+        datasets[model][0][QPF].values[0, 0, 0] = np.nan
+    missing = _extract(configuration, datasets, sources)["fields"][QPF]
+    assert missing["value"] is None and missing["missing_reasons"]
+
+
+def test_qpf_negative_native_corner_cannot_hide_behind_positive_interpolation(configuration):
+    datasets, sources = _case()
+    for model in datasets:
+        _add_qpf(datasets[model][0], 3.0)
+    datasets["HRRR"][0][QPF].values[0, 0, 0] = -1.0
+    # At the center these four corners would average to +2 kg/m². The negative
+    # native corner still invalidates this model's interpolated depth.
+    result = _extract(configuration, datasets, sources)
+    hrrr = result["contributors"]["HRRR"]["fields"][QPF]
+    assert hrrr["value"] is None and hrrr["missing_reasons"]
+    assert result["fields"][QPF]["value"] == 3.0
+    assert result["fields"][QPF]["weights"] == {"GFS": 1.0}
+    assert result["fields"][QPF]["status"] == "fallback"
+
+
+@pytest.mark.parametrize(
+    "attribute,value",
+    [
+        ("unit_id", "inch"),
+        ("temporal_semantics", "instantaneous"),
+        ("interval_closure", "left_closed_right_open"),
+    ],
+)
+def test_qpf_rejects_incompatible_units_or_temporal_semantics(configuration, attribute, value):
+    datasets, sources = _case()
+    for model in datasets:
+        _add_qpf(datasets[model][0], 1.0)
+    datasets["HRRR"][0][QPF].attrs[attribute] = value
+    result = _extract(configuration, datasets, sources)
+    assert result["contributors"]["HRRR"]["fields"][QPF]["value"] is None
+    assert result["contributors"]["HRRR"]["fields"][QPF]["missing_reasons"]
+    assert result["fields"][QPF]["weights"] == {"GFS": 1.0}
+
+
+def test_qpf_temporal_rollups_conserve_hourly_depth_across_weight_change(configuration):
+    hours = tuple(range(1, 37))
+    datasets = {
+        model: (_dataset(model, age=age, hours=hours), CRS, None)
+        for model, age in (("HRRR", 0), ("GFS", 6))
+    }
+    _add_qpf(datasets["HRRR"][0], [hour / 10.0 for hour in hours])
+    _add_qpf(datasets["GFS"][0], [hour / 5.0 for hour in hours])
+    values = []
+    previous_end = None
+    for hour in hours:
+        sources = [_temperature_source(model, row[0], hour) for model, row in datasets.items()]
+        qpf = _extract(configuration, datasets, sources, horizon=hour)["fields"][QPF]
+        if previous_end is not None:
+            assert qpf["interval_start"] == previous_end
+        previous_end = qpf["interval_end"]
+        expected = hour * (0.13 if hour <= 18 else 0.14)
+        assert qpf["value"] == pytest.approx(expected)
+        values.append(qpf["value"])
+    six_hour_totals = [math.fsum(values[start : start + 6]) for start in range(0, 36, 6)]
+    expected_36h = 0.13 * sum(range(1, 19)) + 0.14 * sum(range(19, 37))
+    assert math.fsum(values) == pytest.approx(expected_36h)
+    assert math.fsum(six_hour_totals) == pytest.approx(expected_36h)
+    assert math.fsum(values[15:21]) == pytest.approx(0.13 * (16 + 17 + 18) + 0.14 * (19 + 20 + 21))
+
+
+def test_qpf_parent_provenance_survives_repeated_extraction_without_mutation(configuration):
+    datasets, sources = _case(horizon=2)
+    for model, (dataset, crs, _) in tuple(datasets.items()):
+        _add_qpf(dataset, 1.0)
+        lead = 2 if model == "HRRR" else 8
+        parents = [{"model": model, "source_lead_hours": lead, "raw_sha256": "a" * 64}]
+        if model == "GFS":
+            parents.append({"model": model, "source_lead_hours": 7, "raw_sha256": "b" * 64})
+        dataset.attrs["qpf_metadata_json"] = json.dumps({str(lead): {"parents": parents}})
+        manifest = {
+            "inputs": [{"model": model, "source_lead_hours": lead, "extra_messages": []}],
+            "qpf_inputs": [
+                {**parent, "messages": [{"raw_sha256": parent["raw_sha256"]}]} for parent in parents
+            ],
+            "prepared_files": {model: {"sha256": "c" * 64}},
+        }
+        datasets[model] = dataset, crs, manifest
+    originals = {model: dataset.copy(deep=True) for model, (dataset, _, _) in datasets.items()}
+    first = _extract(configuration, datasets, sources, horizon=2)
+    assert first == _extract(configuration, datasets, sources, horizon=2)
+    for model, (dataset, _, manifest) in datasets.items():
+        field = first["contributors"][model]["fields"][QPF]
+        assert field["value"] == 1.0
+        assert (
+            field["normalization"]
+            == json.loads(dataset.attrs["qpf_metadata_json"])["2" if model == "HRRR" else "8"]
+        )
+        assert field["provenance"]["prepared_sha256"] == "c" * 64
+        assert field["provenance"]["source_inputs"] == manifest["qpf_inputs"]
+        xr.testing.assert_identical(dataset, originals[model])
+    # Mutating presentation evidence must not change retained datasets/manifests.
+    first["contributors"]["GFS"]["fields"][QPF]["provenance"]["source_inputs"][0][
+        "messages"
+    ].clear()
+    assert datasets["GFS"][2]["qpf_inputs"][0]["messages"]
+    datasets["GFS"][2]["qpf_inputs"] = []
+    unavailable = _extract(configuration, datasets, sources, horizon=2)
+    assert unavailable["contributors"]["GFS"]["fields"][QPF]["value"] is None
+    assert unavailable["fields"][QPF]["weights"] == {"HRRR": 1.0}

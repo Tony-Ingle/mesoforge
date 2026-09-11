@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from mesoforge.guidance.sources.current_availability import (
+    QPF_FIELD,
     ProviderEvidenceError,
     probe_temperature,
 )
@@ -82,6 +83,53 @@ def probe(transport, model="HRRR", **kwargs):
         decision_time=DECISION,
         **kwargs,
     )
+
+
+@pytest.mark.parametrize("model,start,count", [("HRRR", 5, 1), ("GFS", 0, 2)])
+def test_qpf_discovery_retains_only_exact_accumulation_windows(model, start, count):
+    transport = MetadataTransport(model)
+    lines = ["1:0:d=2026091018:TMP:2 m above ground:6 hour fcst:"]
+    lines += [
+        f"{index + 2}:{40 * (index + 1)}:d=2026091018:APCP:surface:{start}-6 hour acc fcst:"
+        for index in range(count)
+    ]
+    # This incompatible total must not be selected instead of the approved window.
+    lines.append(
+        f"{count + 2}:160:d=2026091018:APCP:surface:{0 if model == 'HRRR' else 3}-6 hour acc fcst:"
+    )
+    transport.index.content = ("\n".join(lines) + "\n").encode()
+    result = probe(transport, model, qpf_fields=True)
+    assert result.available
+    evidence = result.evidence
+    assert evidence["missing_qpf"] is None
+    assert len(evidence["qpf_messages"]) == count
+    assert all(item["canonical_variable_id"] == QPF_FIELD for item in evidence["qpf_messages"])
+    expected_start = (CYCLE + timedelta(hours=start)).isoformat().replace("+00:00", "Z")
+    assert all(item["accumulation_start"] == expected_start for item in evidence["qpf_messages"])
+    assert all(
+        item["accumulation_end"] == "2026-09-11T00:00:00Z" for item in evidence["qpf_messages"]
+    )
+    assert [call[0] for call in transport.calls] == ["GET", "HEAD"]
+
+
+def test_missing_optional_qpf_does_not_change_temperature_availability():
+    result = probe(MetadataTransport(), qpf_fields=True)
+    assert result.available and result.evidence["qpf_messages"] == []
+    assert "no compatible QPF accumulation" in result.evidence["missing_qpf"]
+
+
+def test_qpf_wrong_cycle_and_unexpected_duplicates_fail_closed():
+    for rows in (
+        "2:40:d=2026091006:APCP:surface:5-6 hour acc fcst:\n",
+        "2:40:d=2026091018:APCP:surface:5-6 hour acc fcst:\n"
+        "3:80:d=2026091018:APCP:surface:5-6 hour acc fcst:\n",
+    ):
+        transport = MetadataTransport()
+        transport.index.content = (
+            "1:0:d=2026091018:TMP:2 m above ground:6 hour fcst:\n" + rows
+        ).encode()
+        with pytest.raises(ProviderEvidenceError, match="cycle|duplicate"):
+            probe(transport, qpf_fields=True)
 
 
 @pytest.mark.parametrize("model", ["HRRR", "GFS", "RAP", "IFS"])

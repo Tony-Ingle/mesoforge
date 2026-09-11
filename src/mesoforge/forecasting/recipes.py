@@ -121,6 +121,21 @@ def with_surface_fields(configuration: ContributorConfiguration) -> ContributorC
     )
 
 
+def with_qpf_fields(configuration: ContributorConfiguration) -> ContributorConfiguration:
+    """Register retained HRRR/GFS interval QPF without changing any recipe weights."""
+    field = "liquid_equivalent_precipitation_amount_1h"
+    return configuration.model_copy(
+        update={
+            "models": tuple(
+                model.model_copy(update={"supported_fields": (*model.supported_fields, field)})
+                if model.model_id in {"HRRR", "GFS"} and field not in model.supported_fields
+                else model
+                for model in configuration.models
+            )
+        }
+    )
+
+
 def evaluate_recipe(recipe: Recipe, values: Mapping[str, float | None]) -> RecipeEvaluation:
     """Blend normalized finite scalars; missing contributors never change the row.
 

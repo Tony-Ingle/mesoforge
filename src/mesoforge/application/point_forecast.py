@@ -17,6 +17,7 @@ import pyproj
 import xarray as xr
 
 from mesoforge.alignment.station_frame import StationAlignmentError, align_station_to_model
+from mesoforge.application.prepared_qpf import read_qpf_inputs, required_qpf_leads
 from mesoforge.application.spatial_coverage import (
     CoverageRequiredError,
     UnsupportedCoordinateError,
@@ -32,6 +33,7 @@ from mesoforge.forecasting.recipes import (
     DEFAULT_CONFIGURATION,
     ContributorConfiguration,
     evaluate_recipe,
+    with_qpf_fields,
     with_surface_fields,
 )
 
@@ -233,6 +235,24 @@ def _load_source_manifest(
                 _verify_file(directory, extra["raw_file"], extra["raw_sha256"])
                 if (directory / extra["raw_file"]).stat().st_size != extra["raw_bytes"]:
                     raise ValueError("Retained extra field byte count disagrees")
+        if manifest.get("qpf_fields"):
+            qpf_rows = [
+                row
+                for row in manifest.get("qpf_inputs", [])
+                if models is None or row["model"] in models
+            ]
+            read_qpf_inputs(directory, qpf_rows)
+            for row in qpf_rows:
+                dataset = guidance[row["model"]]
+                leads = tuple(
+                    int(value / np.timedelta64(1, "h")) for value in dataset.source_lead_time.values
+                )
+                if row["cycle"] != _iso(dataset.forecast_reference_time.values[()]) or row[
+                    "source_lead_hours"
+                ] not in required_qpf_leads(row["model"], leads):
+                    raise ValueError(
+                        "Retained QPF parent cycle/lead disagrees with prepared guidance"
+                    )
         for model, dataset in guidance.items():
             prepared = manifest["prepared_files"][model]
             if prepared["file"] != f"{model}.nc":
@@ -702,6 +722,13 @@ class PreparedPointForecast:
                     configuration=self._surface_configuration,
                     selection=selection,
                 )
+        contributor_configuration = (
+            with_surface_fields(self._configuration)
+            if self._surface_configuration is not None
+            else self._configuration
+        )
+        if self._manifest is not None and self._manifest.get("qpf_fields"):
+            contributor_configuration = with_qpf_fields(contributor_configuration)
         result: dict[str, Any] = {
             "data_kind": self.data_kind,
             "notice": self.notice,
@@ -709,14 +736,23 @@ class PreparedPointForecast:
             "longitude": longitude,
             "target_reference_time": _iso(self._target_reference_time),
             "hours": hours,
-            "contributor_configuration": (
-                with_surface_fields(self._configuration)
-                if self._surface_configuration is not None
-                else self._configuration
-            ).model_dump(mode="json"),
+            "contributor_configuration": contributor_configuration.model_dump(mode="json"),
         }
         if self._manifest_sha256 is not None:
             result["manifest_sha256"] = self._manifest_sha256
+        if self._manifest is not None and self._manifest.get("qpf_fields"):
+            result["qpf_preparation"] = {
+                "created_at": self._manifest.get("created_at"),
+                "code_identity": self._manifest.get("code_identity"),
+                "acquisition": self._manifest.get("qpf_acquisition"),
+                "source_selection": (
+                    "QPF discovered with the current model set"
+                    if self._manifest.get("current_model_set", {})
+                    .get("selection", {})
+                    .get("qpf_fields")
+                    else "QPF added by later preparation; original discovery is historical"
+                ),
+            }
         if self._manifest is not None and "cycle_selection" in self._manifest:
             selection = self._manifest["cycle_selection"]
             # Full acquisition/discovery evidence stays in the checksummed manifest.

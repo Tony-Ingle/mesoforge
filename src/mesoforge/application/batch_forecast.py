@@ -23,6 +23,7 @@ from mesoforge.application.spatial_preparation import ensure_coverage
 from mesoforge.forecasting.recipes import (
     DEFAULT_CONFIGURATION,
     ContributorConfiguration,
+    with_qpf_fields,
     with_surface_fields,
 )
 from mesoforge.guidance.runtime import SystemClock
@@ -216,6 +217,7 @@ def validate_current_control(configuration: ContributorConfiguration) -> None:
         if models.get(model) not in (
             expected,
             with_surface_fields(DEFAULT_CONFIGURATION).model_map()[model],
+            with_qpf_fields(with_surface_fields(DEFAULT_CONFIGURATION)).model_map()[model],
         ):
             raise ValueError(f"Batch issuance must retain the default {model} model definition")
     if any(

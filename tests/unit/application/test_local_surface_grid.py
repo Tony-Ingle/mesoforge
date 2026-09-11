@@ -34,12 +34,14 @@ from tests.unit.application.test_surface_forecast import (
     DEW,
     DIRECTION,
     GUST,
+    QPF,
     RH,
     SPEED,
     TARGET,
     T,
     U,
     V,
+    _add_qpf,
     _dataset,
 )
 
@@ -457,9 +459,22 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
         )
         for model, dataset in prepared_surface._guidance.items()
     }
-    prepared = replace(prepared_surface, _guidance=datasets, _horizons=(1,))
+    manifest = deepcopy(prepared_surface._manifest)
+    manifest["qpf_inputs"] = []
+    for model, dataset in datasets.items():
+        _add_qpf(dataset, [0.125] * 36)
+        lead = int(dataset.source_lead_time.values[0] / np.timedelta64(1, "h"))
+        parent = {"model": model, "source_lead_hours": lead}
+        dataset.attrs["qpf_metadata_json"] = json.dumps({str(lead): {"parents": [parent]}})
+        dataset["qpf_finite_precision_floor_applied"] = xr.zeros_like(dataset[QPF], dtype=np.uint8)
+        manifest["qpf_inputs"].append({**parent, "messages": [{"raw_sha256": "f" * 64}]})
+    prepared = replace(prepared_surface, _guidance=datasets, _manifest=manifest, _horizons=(1,))
     result = prepared.forecast(latitude=LATITUDE, longitude=LONGITUDE)
     assert result["hours"][0]["temperature"]["value"] is not None
+    center_qpf = result["hours"][0]["surface"]["contributors"]["HRRR"]["fields"][QPF]
+    assert center_qpf["value"] == pytest.approx(0.125)
+    assert center_qpf["spatial_extraction"]
+    assert "finite_precision_floor_at_source_corners" in center_qpf["normalization"]
     cells = result["local_grid_baseline"]["cells"]
     assert sum(cell["status"] == "unavailable" for cell in cells) == len(cells) - 1
     for cell in cells:
@@ -473,5 +488,94 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
             assert field["weights"] == {}
         for contributor in hour["surface"]["contributors"].values():
             assert all(field["value"] is None for field in contributor["fields"].values())
+            for field in contributor["fields"].values():
+                assert "spatial_extraction" not in field
+                assert "finite_precision_floor_at_source_corners" not in field.get(
+                    "normalization", {}
+                )
+        unavailable = hour["surface"]["contributors"]["HRRR"]["fields"][QPF]
+        assert unavailable["interval_start"] == center_qpf["interval_start"]
+        assert unavailable["provenance"] == center_qpf["provenance"]
     with pytest.raises(CoverageRequiredError):
         prepared.forecast(latitude=LATITUDE + 0.1, longitude=LONGITUDE)
+
+
+def test_qpf_spans_both_domains_and_exact_point_replays_with_provenance(prepared_surface):
+    datasets = {
+        model: source.copy(deep=True) for model, source in prepared_surface._guidance.items()
+    }
+    manifest = deepcopy(prepared_surface._manifest)
+    manifest["qpf_inputs"] = []
+    for model, factor in (("HRRR", 0.1), ("GFS", 0.2)):
+        dataset = datasets[model]
+        _add_qpf(dataset, [horizon * factor for horizon in HOURS])
+        longitude, latitude = np.meshgrid(dataset.x.values, dataset.y.values)
+        dataset[QPF].values += factor / 10 * _gradient(latitude, longitude)
+        metadata = {}
+        for lead_time in dataset.source_lead_time.values:
+            lead = int(lead_time / np.timedelta64(1, "h"))
+            parent = {"model": model, "source_lead_hours": lead, "raw_sha256": "f" * 64}
+            metadata[str(lead)] = {"parents": [parent]}
+            manifest["qpf_inputs"].append({**parent, "messages": [{"raw_sha256": "f" * 64}]})
+        dataset.attrs["qpf_metadata_json"] = json.dumps(metadata)
+    prepared = replace(prepared_surface, _guidance=datasets, _manifest=manifest)
+    numerical_before = prepared_surface._forecast_column(latitude=LATITUDE, longitude=LONGITUDE)
+    calculate = Mock(wraps=prepared._forecast_column)
+    with (
+        patch("xarray.open_dataset", side_effect=AssertionError("Already loaded guidance")),
+        patch("requests.Session", side_effect=AssertionError("No per-node downloads")),
+    ):
+        grid = build_local_surface_grid(
+            latitude=LATITUDE,
+            longitude=LONGITUDE,
+            calculate_column=calculate,
+            geometry=TEST_GEOMETRY,
+        )
+    assert calculate.call_count == 25
+    assert sum(cell["inside_editable_domain"] for cell in grid["cells"]) == 9
+    assert sum(cell["context_only"] for cell in grid["cells"]) == 16
+    for cell in grid["cells"]:
+        gradient = _gradient(cell["latitude"], cell["longitude"])
+        assert len(cell["hours"]) == 36
+        for hour in cell["hours"]:
+            horizon = hour["horizon_hours"]
+            qpf = hour["surface"]["fields"][QPF]
+            factor = 0.13 if horizon <= 18 else 0.14
+            assert qpf["value"] == pytest.approx(factor * (horizon + gradient / 10), abs=1e-12)
+            assert qpf["unit"] == "kg/m^2"
+            end = TARGET + np.timedelta64(horizon, "h")
+            assert qpf["interval_end"] == str(np.datetime_as_string(end, unit="s")) + "Z"
+            assert (
+                qpf["interval_start"]
+                == str(np.datetime_as_string(end - np.timedelta64(1, "h"), unit="s")) + "Z"
+            )
+            native = hour["surface"]["contributors"]
+            for model in ("HRRR", "GFS"):
+                field = native[model]["fields"][QPF]
+                assert field["provenance"]["prepared_sha256"] == "c" * 64
+                assert field["normalization"]["parents"][0]["raw_sha256"] == "f" * 64
+                assert field["spatial_extraction"]["method"] == "native_grid_bilinear_depth"
+            for model in ("RAP", "IFS"):
+                assert native[model]["fields"][QPF]["value"] is None
+                assert native[model]["fields"][QPF]["missing_reasons"]
+                assert native[model]["role"] == "shadow"
+    encoded = canonical_json_bytes(grid)
+    with patch.object(
+        PreparedPointForecast, "_forecast_column", side_effect=AssertionError("Grid replay")
+    ):
+        first = extract_grid_point(json.loads(encoded), latitude=LATITUDE, longitude=LONGITUDE)
+        second = extract_grid_point(json.loads(encoded), latitude=LATITUDE, longitude=LONGITUDE)
+    assert first == second and canonical_json_bytes(first["local_grid_baseline"]) == encoded
+    center = next(cell for cell in grid["cells"] if cell["is_forecast_point"])
+    assert first["hours"] == center["hours"]
+    for hour, before in zip(first["hours"], numerical_before["hours"], strict=True):
+        assert hour["temperature"] == before["temperature"]
+        for variable in FIELDS:
+            assert hour["surface"]["fields"][variable] == before["surface"]["fields"][variable]
+        for model in hour["surface"]["contributors"]:
+            for variable in FIELDS:
+                assert (
+                    hour["surface"]["contributors"][model]["fields"][variable]
+                    == before["surface"]["contributors"][model]["fields"][variable]
+                )
+    assert QPF not in prepared_surface._guidance["HRRR"]

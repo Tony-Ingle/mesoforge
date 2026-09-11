@@ -18,7 +18,12 @@ import xarray as xr
 from mesoforge.application import batch_forecast
 from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.point_forecast import PreparedPointForecast, prepare_demo_files
-from mesoforge.forecasting.recipes import DEFAULT_CONFIGURATION, ContributorConfiguration
+from mesoforge.forecasting.recipes import (
+    DEFAULT_CONFIGURATION,
+    ContributorConfiguration,
+    with_qpf_fields,
+    with_surface_fields,
+)
 from tests.support.in_memory_uow import InMemoryObjectStore, InMemoryUnitOfWorkFactory
 from tests.unit.application.test_prepared_temperature import (
     EXTENDED_HORIZONS,
@@ -322,9 +327,25 @@ def test_batch_cli_reads_contributors_config_and_persists_snapshot(
     assert all(hour["missing_reasons"] == [] for hour in forecast["hours"])
 
 
+def test_qpf_capabilities_preserve_the_approved_control_and_shadow_registration():
+    configuration = with_qpf_fields(with_surface_fields(shadow_configuration()))
+    batch_forecast.validate_current_control(configuration)
+    assert configuration.control_recipe == DEFAULT_CONFIGURATION.control_recipe
+    assert configuration.models[-1].status == "shadow"
+    assert all(
+        "liquid_equivalent_precipitation_amount_1h"
+        in configuration.model_map()[model].supported_fields
+        for model in ("HRRR", "GFS")
+    )
+
+
+@pytest.mark.parametrize("qpf", [False, True])
 @pytest.mark.parametrize("change", ["control", "active_model", "extra_active"])
-def test_batch_rejects_active_changes_before_any_preparation(tmp_path, monkeypatch, change):
-    snapshot = shadow_configuration().model_dump(mode="json")
+def test_batch_rejects_active_changes_before_any_preparation(tmp_path, monkeypatch, change, qpf):
+    original = shadow_configuration()
+    if qpf:
+        original = with_qpf_fields(with_surface_fields(original))
+    snapshot = original.model_dump(mode="json")
     if change == "control":
         snapshot["control_recipe"]["contributors"][0]["weight"] = 0.6
         snapshot["control_recipe"]["contributors"][1]["weight"] = 0.4

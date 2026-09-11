@@ -92,8 +92,8 @@ The long-term field direction includes temperature, dew point/RH, wind/gust,
 clouds, QPF, PoP, precipitation type, snow, and other useful fields as their
 scientific contracts are implemented. Conditions derive from underlying forecast
 fields rather than an unexplained standalone prediction. The smallest proposed
-next milestone is interval-aware liquid precipitation on the existing local surface
-grid, covering both context and editable domains before PoP or precipitation type
+next milestone is actual probabilistic precipitation guidance on the existing local
+grid, covering both context and editable domains before precipitation type
 (section 13).
 
 **Owner model direction, 2026-09-10:** the long-term model mix includes HRRR,
@@ -115,9 +115,15 @@ batch/forward runs, immutable PostgreSQL/MinIO issuance, temperature verificatio
 and model comparison exist. A coordinate-derived local surface grid covers the
 context domain and its smaller editable subset; the exact center-node forecast is
 extracted from those fields. Cloud cover is explicitly unavailable. There is no
-deterministic bias correction, AI editing, V2 precipitation, production deployment
+deterministic bias correction, AI editing, V2 PoP/precipitation type, production deployment
 or scheduling yet. Detailed commands, evidence and limits
 belong in [README.md](../../README.md).
+
+HRRR/GFS liquid precipitation now uses retained interval normalization and QPF rows
+across the same context/editable grid. Each amount retains exact hourly bounds and
+native parent provenance; GFS same-bucket differencing precedes spatial extraction.
+RAP/IFS precipitation is not enabled. Deterministic QPF does not imply probability
+or precipitation type, and small positive amounts are not spatially cleaned.
 
 Contributor capabilities and named/versioned recipes retain configuration snapshots,
 active contributions/applied weights, and separate shadows in immutable issuance.
@@ -767,17 +773,16 @@ These are sensible review units, not a mandatory seven-PR sequence. Adjacent sli
 combined/split for reviewability. The first slice has no dependency on learning, AI, email,
 accounts, long-term retention, or public SLOs.
 
-The local surface grid now represents temperature, dew point/RH, vector wind and gust
-across one context domain and its smaller editable subset. The next proposed milestone
-is interval-aware liquid precipitation across both portions of that same grid, using
-retained acquisition, normalization and QPF calculations where their contracts fit.
-Preserve accumulation start/end bounds, units, source cycles/leads, missingness and
-provenance; align comparable intervals before blending and extracting the point result.
-Acceptance should demonstrate interval alignment, shared-source reuse, immutable
-readback and offline replay without changing existing surface fields. Field blend rules
-must be applicable and approved; deterministic amounts do not establish precipitation
-probability or rain/snow type. This remains a recommendation for separate implementation
-approval, before PoP, precipitation type, bias correction or AI editing.
+The local grid now represents temperature, dew point/RH, vector wind, gust and
+interval-aware liquid precipitation across one context domain and its smaller editable
+subset. The next proposed milestone is a native probabilistic precipitation field,
+starting with retained NBM support where its event/interval contracts fit. Preserve
+the probability event threshold, native accumulation bounds, missingness and provenance;
+do not manufacture hourly probabilities from longer windows or infer them from QPF.
+Any field blend rule must be applicable and approved. Precipitation type should follow
+separately from supported categorical or thermodynamic guidance, not surface temperature
+alone. This remains a recommendation for separate implementation approval, before bias
+correction or AI editing.
 
 File/module/table/code/test/change-size estimates are non-binding planning aids per slice.
 Material overrun triggers review when it reveals changed design, not because of a line

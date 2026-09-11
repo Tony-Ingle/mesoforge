@@ -42,6 +42,30 @@ LOCATIONS = [
 OLD_AREA = BoundingBox(south=45.5, north=46.0, west=-93.5, east=-93.0)
 
 
+def test_qpf_inputs_change_shared_coverage_identity_without_changing_legacy_identity():
+    manifest = {
+        "data_kind": "real_prepared_guidance",
+        "target_reference_time": "2026-09-11T18:00:00Z",
+        "configuration_sha256": "a" * 64,
+        "inputs": [],
+        "target_horizon_hours": list(range(1, 37)),
+    }
+    original = spatial_preparation.source_identity(manifest)
+    assert original == hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+    qpf = {
+        **manifest,
+        "qpf_fields": True,
+        "qpf_inputs": [{"model": "HRRR", "source_lead_hours": 7, "raw_sha256": "b" * 64}],
+    }
+    assert spatial_preparation.source_identity(qpf) != original
+    assert spatial_preparation.source_identity({**qpf, "prepared_area": "another view"}) == (
+        spatial_preparation.source_identity(qpf)
+    )
+    assert spatial_preparation.source_identity({**qpf, "qpf_inputs": []}) != (
+        spatial_preparation.source_identity(qpf)
+    )
+
+
 @pytest.fixture(scope="module")
 def narrow_source(tmp_path_factory: pytest.TempPathFactory) -> Path:
     directory = tmp_path_factory.mktemp("narrow-spatial-source")

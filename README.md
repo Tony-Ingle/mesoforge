@@ -10,7 +10,8 @@ is described below. Start with [VISION.md](VISION.md) for release boundaries and
 
 The [on-demand forward run](#run-verification-and-current-issuance-together) produces
 real **36-hour surface forecasts**: temperature, dew point, derived RH, vector
-wind speed/direction and gust. Surface issuance now builds a small coordinate-derived
+wind speed/direction, gust and hourly liquid-equivalent precipitation (QPF).
+Surface issuance builds a small coordinate-derived
 [local baseline grid](#local-surface-baseline-grid) with a larger context domain and
 smaller editable subset, and extracts its exact center point.
 It verifies eligible previous temperature forecasts,
@@ -23,6 +24,10 @@ only required geographic inputs; names are optional display metadata.
   dew point and coupled wind/gust use the applicable retained Phase 2 70/30 rows for
   hours 1–18 and 60/40 for hours 19–36, with explicit approved fallbacks. RH derives
   from temperature/dew point. These are not optimized weights.
+- **Precipitation:** HRRR/GFS QPF uses the approved precipitation rows: 70/30 at
+  hours 1–18 and 60/40 at 19–36, with explicit approved fallbacks. Every amount
+  retains exact accumulation bounds; GFS buckets are differenced on native cells
+  before extraction. RAP/IFS precipitation is unavailable in this increment.
 - **Shadows:** real RAP and ECMWF IFS values/provenance accompany issuance with zero
   active weight. IFS preserves native three-hourly gaps and has no compatible
   instantaneous gust. Cloud cover is explicitly unavailable without an approved policy.
@@ -51,9 +56,11 @@ The context/editable-grid milestone passed **175 offline and 34 PostgreSQL/MinIO
 integration tests**, with byte-identical replay and unchanged point values; measurements
 are [recorded below](#local-surface-baseline-grid). Full acceptance,
 coverage, forecast skill and production reliability are not established by that demonstration.
+The QPF increment adds [real interval/conservation and offline replay evidence](#liquid-precipitation-on-the-local-grid);
+precipitation verification and probabilistic fields remain future work.
 
-There is **no deterministic bias correction, site learning, AI editing, V2 precipitation
-fields, production deployment or scheduling yet**. Bias/AI
+There is **no PoP, precipitation type, snowfall, deterministic bias correction,
+site learning, AI editing, production deployment or scheduling in the V2 path yet**. Bias/AI
 report stages are explicitly unimplemented and final values currently equal the baseline.
 Registration services and delivery also remain future work. The retained Phase 2 station
 baseline has HRRR/NBM/GFS, QPF and PoP support; its defaults and technical references
@@ -65,7 +72,8 @@ numerical, bias-corrected and final fields separate before exact-point interpola
 One-off requests stay untracked. See [VISION.md](VISION.md#intended-coordinate-driven-operation)
 and the [active RFC](docs/rfcs/mesoforge-v2-architecture.md). The first local surface grid
 and nested domains are implemented; the editing lifecycle remains future work. The next
-proposed increment is interval-aware liquid precipitation across both portions of this grid.
+proposed increment is native probabilistic precipitation guidance with explicit event
+thresholds and intervals, followed separately by precipitation type.
 
 Local Codex development continues; the Hermes development pipeline is paused. The RFC's
 unresolved implementation choices remain proposed, not blanket approval of the roadmap.
@@ -1848,13 +1856,15 @@ Surface policy and availability:
   this instantaneous-gust contract. [ECMWF attribution](#prepare-ecmwf-ifs-temperature-in-shadow-mode)
   and source/licence metadata remain attached.
 - **Cloud cover:** null with an explicit missing-policy reason; no cloud product is
-  acquired. Precipitation, weather-condition labels, bias correction and AI are absent.
+  acquired. Weather-condition labels, bias correction and AI are absent.
+- **Liquid amounts:** [interval-aware QPF](#liquid-precipitation-on-the-local-grid)
+  now follows the same grid and issuance path. Amounts do not imply probability or type.
 
 The normal forward command enables these fields automatically. For the separate
 discovery/preparation sequence, opt into field evidence when discovering:
 
 ```text
-python -B -m mesoforge.application.current_model_set --surface-fields --output-dir EXTERNAL_NEW_SELECTION_DIRECTORY
+python -B -m mesoforge.application.current_model_set --surface-fields --qpf-fields --output-dir EXTERNAL_NEW_SELECTION_DIRECTORY
 python -B -m mesoforge.application.selected_forecast --config locations.json --selection EXTERNAL_NEW_SELECTION_DIRECTORY/selection.json --output-dir EXTERNAL_NEW_PREPARED_DIRECTORY
 ```
 
@@ -1995,11 +2005,12 @@ python -B -m pytest tests/integration/application/test_forward_run.py tests/inte
 python -B -m pytest tests/integration/application/test_issued_temperature_verification.py::test_automatic_window_acquires_once_reuses_real_snapshot_and_skips_empty_window tests/integration/application/test_issued_temperature_verification.py::test_automatic_batch_isolates_locations_and_reuses_results_without_changing_issuances -q
 ```
 
-Next proposed: add interval-aware liquid precipitation amounts to the same local-grid
-path using retained QPF normalization/blending where its contracts fit. Preserve
-accumulation start/end bounds, units and missingness; prove interval alignment before
-adding PoP or precipitation type. Do not infer probability from deterministic QPF or
-rain/snow type from surface temperature alone. Bias/AI edits and deployment remain later.
+Next proposed: add PoP from actual probabilistic guidance, preserving its native
+event threshold and accumulation interval on this same grid. Retained NBM probability
+support is the first adapter to assess; field weights must have an applicable approved
+policy. Do not infer probability from deterministic QPF. Precipitation type is a
+separate later increment using supported categorical or thermodynamic guidance,
+not surface temperature alone. Bias/AI edits and deployment remain later.
 
 ### Local surface baseline grid
 
@@ -2125,7 +2136,138 @@ readback of the full context/editable grid and preservation of older forecasts.
 Fresh temporary services were stopped afterward. Ruff, formatting, mypy, import
 contracts, the locked-dependency check, documentation, repository hygiene and
 `git diff --check` passed. Full repository acceptance/coverage and deployed resource limits remain
-unverified; no bias correction, AI editing or precipitation was added.
+unverified. That spatial milestone added no bias correction, AI editing or precipitation;
+the following QPF increment extends the same representation.
+
+### Liquid precipitation on the local grid
+
+Every context/editable node now carries `liquid_equivalent_precipitation_amount_1h`.
+The exact point reads its QPF from the center node, just like the existing surface
+fields. Stored values remain unrounded **kg/m² (equivalent mm of liquid water)**,
+with `interval_start`, `interval_end` and `(start, end]` closure. Reports display
+inches by dividing by 25.4 and show the full UTC accumulation bounds. Valid zero,
+small positive amounts and unavailable amounts remain distinct; no trace cleanup,
+PoP or precipitation-type inference is performed.
+
+HRRR supplies rolling one-hour APCP. GFS uses the retained six-hour bucket selector
+and `compute_one_hour_qpf`: pass through the first hour after a bucket reset,
+otherwise subtract the preceding **same-bucket native grid** before spatial
+interpolation. The first requested hour may require one additional preceding GFS
+message. Early duplicate bucket candidates must be equivalent. Negative parents,
+incompatible windows and missing corners are explicit exclusions. The existing
+finite-precision difference tolerance of −0.000001 kg/m² may floor tiny negative
+differences, with its flag retained; positive amounts are never cleaned away.
+
+Only identical one-hour intervals enter `blend_qpf` and the retained QPF table:
+HRRR/GFS 70/30 through hour 18, then 60/40 through hour 36. Approved single-model
+rows retain the exclusion reason and applied weight; neither model available means
+null. RAP/IFS stay zero-weight surface shadows and have explicit unavailable QPF.
+Sum contiguous hourly intervals to obtain longer totals; across hour 18/19, sum
+the individually weighted hours rather than applying one weight to the whole period.
+This proves temporal accumulation consistency, not area-integrated conservation of
+bilinearly interpolated model-grid depths.
+
+New forward runs enable QPF discovery automatically. The separate discovery command
+above uses `--surface-fields --qpf-fields`; the exact selected precipitation objects,
+including a GFS parent when needed, are checked against discovery identities/cutoffs.
+Preparation is shared across coordinates, outside HTTP. Stored parent evidence includes
+native bounds/units, cycles/leads, URLs, ranges, hashes, availability/acquisition times,
+duplicate equivalence and finite-precision flags. Raw precipitation joins the existing
+manifest/raw-file/NetCDF path; there is no separate forecast history system.
+
+For an existing retained selected surface preparation, add only its missing QPF to a
+new snapshot, then build the grid. Old snapshots are not overwritten. The original
+model-set decision remains historical; later QPF acquisition is identified separately:
+
+```powershell
+$python = Join-Path $env:LOCALAPPDATA 'MesoForge/baselines/20260909-8d0983f-d6c8ced2/environment/Scripts/python.exe'
+$surface = Join-Path $env:LOCALAPPDATA 'MesoForge/forward-runs/surface-20260911T182732Z/prepared'
+$qpf = Join-Path $env:LOCALAPPDATA 'MesoForge/forward-runs/qpf-20260911-retained/prepared'
+$replay = "$qpf-replay"
+$grids = Join-Path $env:LOCALAPPDATA 'MesoForge/local-grids/20260911-minneapolis-qpf-final'
+$env:PYTHONPATH = "$PWD/src"
+& $python -B -m mesoforge.application.prepared_qpf --prepared-run $surface --output-dir $qpf
+& $python -B -m mesoforge.application.prepared_qpf --prepared-run $qpf --output-dir $replay --from-raw
+& $python -B -m mesoforge.application.prepared_local_grid --config "$surface/../locations.json" --prepared-run $replay --output-dir $grids
+& $python -B -m mesoforge.api --data-dir $grids --port 8765
+```
+
+The first command acquires QPF once; `--from-raw` rebuilds model files with no provider
+access. Use new output directories for enrichment/raw rebuilding; the paths above
+already contain this demonstration. Grid rebuilding against identical prepared input
+is repeatable in place. Preparation/grid commands were exercised (including their Python
+entry functions); repeated `/forecast?lat=44.98859&lon=-93.25557` requests were checked
+through FastAPI's in-process client. The localhost server startup command is documented,
+not re-executed for this increment.
+
+Rebuilding records a new preparation timestamp while retaining original acquisition
+evidence. Scientific fields and intervals reproduce; building twice from the same
+prepared snapshot also reproduces the grid artifact bytes. The API only reads retained
+grids; building this export does not issue a new forecast or create verification history.
+
+**Minneapolis QPF demonstration (retained September 11 guidance):** HRRR/GFS both use
+2026-09-11 12Z, source leads 7–42, aligned to reference 18Z. The 36 hourly intervals run
+from `(September 11 18Z, 19Z]` through `(September 13 05Z, 06Z]`. Existing RAP 15Z and
+IFS 06Z surface shadows were reused. QPF was acquired separately at 20:15Z; this is a
+retained-input demonstration, not a newly discovered current forecast or an assertion
+that QPF was part of the original 18Z model-set decision.
+
+- 72 APCP messages: **23,261,188 bytes** of raw GRIB, **25,124,548 bytes** including
+  inventories. Original provider identities were checked before enriching the snapshot.
+  Raw data/provenance remain outside Git. No new RAP/IFS data were downloaded.
+- Same 7×7, 6 km grid: 49 context nodes, nine editable nodes. All **1,764 node-hours**
+  have QPF; 1,506 are zero and 258 positive. The 324 editable and 1,440 context-only
+  values have no missing HRRR/GFS intervals. RAP/IFS QPF remains explicitly unavailable.
+- HRRR/GFS prepared files total **21,964,672 bytes**; unchanged shadow NetCDFs total
+  **1,344,760 bytes**. The complete local artifact includes the original surface fields,
+  raw-parent evidence, weights and accumulation bounds: **73,101,016 bytes** canonical
+  JSON, **9,451,023 bytes** compressed. Building/retaining it took **57.9 seconds** in
+  this local measurement, plus **0.8 seconds** to load shared guidance.
+- Every blended node-hour exactly equals its independently weighted contributors.
+  All six GFS six-hour sums exactly equal separately decoded retained bucket-end values
+  across all 285 native subset cells: maximum difference **0 kg/m²**. Hourly totals also
+  reproduce longer totals across the 18/19-hour weight change.
+- The exact center matches its retained grid cell. Existing surface values are unchanged
+  (maximum difference **0**). Network-blocked raw rebuilding reproduces QPF arrays and
+  interval bounds exactly. Repeated grid builds and API reads are identical, with
+  **zero downloads**; HRRR/GFS/RAP/IFS are each opened once per shared grid build.
+
+At the point, HRRR is zero in every interval. The positive GFS/blend intervals below
+illustrate that tiny liquid amounts are retained. All other point hours are valid zero.
+
+| UTC interval on September 12 | HRRR mm | GFS mm | Baseline inches |
+|---|---:|---:|---:|
+| 01–02Z | 0 | 0.0027214463 | 0.0000321431 |
+| 02–03Z | 0 | 0.1360843389 | 0.0016072953 |
+| 03–04Z | 0 | 0.7415735537 | 0.0087587428 |
+| 04–05Z | 0 | 0.3819107852 | 0.0045107573 |
+| 05–06Z | 0 | 0.0611075000 | 0.0007217421 |
+
+The 00–06Z total is **0.39701928723 mm / 0.0156306806 inches**, also the 24- and
+36-hour point total for this dry example. This table rounds for reading; stored
+numerical values do not. The full 36-hour surface/contributor report, grid proof and
+independent native-bucket conservation proof are retained under
+`%LOCALAPPDATA%/MesoForge/baselines/20260911-qpf/`.
+
+QPF validation on September 11: **527 focused offline tests passed**, with no skips,
+across 26 preparation, discovery, grid/report, alignment, blend and retained scientific
+modules. The exact selection and JUnit/logs are in that evidence directory under
+`final-offline-20260911T202725Z/`. The new checks cover exact/mismatched intervals,
+bucket resets and missing parents, unit/display conversion, small positives versus
+zero/missing, bitmap/negative native cells, weights, provenance and deterministic replay.
+
+The selected **34 PostgreSQL/MinIO integration checks passed across an initial run
+and focused retest**: the first run had 33 passes and exposed a stale active-model
+capability guard, which was corrected; its surface forward-run case then passed.
+The integration selection was `tests/integration/application/test_forward_run.py`,
+`test_batch_issuance.py` and `test_issued_temperature_verification.py`. Generated
+guidance fixtures exercise real storage, including exact QPF/grid readback and unchanged
+older issued versions. Temporary services were stopped afterward. The real Minneapolis
+artifact above was retained/read through the local-grid API, not inserted as a new
+historical issuance. Ruff, formatting, mypy, all nine import contracts, the offline
+locked-dependency check, documentation, hygiene and `git diff --check` passed.
+Full repository acceptance/coverage, precipitation skill and operational resource limits
+remain unverified; no precipitation verification, PoP or type was added.
 
 ### Automatic current guidance
 

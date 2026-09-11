@@ -18,7 +18,7 @@ from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.prepared_ifs import IFS_CONFIGURATION
 from mesoforge.application.prepared_shadow import normalize_shadow_temperature
 from mesoforge.application.prepared_temperature import _write_prepared_file
-from mesoforge.forecasting.recipes import with_surface_fields
+from mesoforge.forecasting.recipes import with_qpf_fields, with_surface_fields
 from tests.support.in_memory_uow import InMemoryObjectStore, InMemoryUnitOfWorkFactory
 from tests.support.phase1_fixture_transports import FixedClock, RecordingSleeper
 from tests.unit.application.test_current_model_set import DECISION, NOW, TARGET, _select
@@ -34,8 +34,9 @@ from tests.unit.application.test_prepared_temperature import (
 LOCATIONS = [{"lat": 45.8, "lon": -93.1}, {"lat": 45.9, "lon": -93.0}]
 
 
+@pytest.mark.parametrize("qpf", [False, True])
 def test_surface_selection_rechecks_optional_field_evidence_against_retained_inventory(
-    selection, monkeypatch
+    selection, monkeypatch, qpf
 ):
     path, original = selection
     report = deepcopy(original)
@@ -49,17 +50,87 @@ def test_surface_selection_rechecks_optional_field_evidence_against_retained_inv
     for model in report["models"]:
         for probe in _selected_candidate(report, model)["probes"]:
             probe.update(extra_messages=[], missing_fields=deepcopy(missing))
+            if qpf:
+                probe.update(qpf_messages=[], missing_qpf="native QPF absent")
+    if qpf:
+        report["qpf_fields"] = True
+        report["contributor_configuration"] = with_qpf_fields(
+            with_surface_fields(IFS_CONFIGURATION)
+        ).model_dump(mode="json")
+        gfs = _selected_candidate(report, "GFS")
+        gfs["qpf_parent_probe"] = {
+            "model": "GFS",
+            "cycle": report["selected_cycles"]["GFS"],
+            "source_lead_hours": 4,
+            "valid_time": "2026-09-11T10:00:00Z",
+            "decision_time": report["decision_time"],
+            "qpf_only": True,
+            "status": "unavailable",
+            "reason": "Historical parent object unavailable",
+        }
+        monkeypatch.setattr(
+            selected_forecast, "_qpf_messages", Mock(return_value=([], "native QPF absent"))
+        )
     parsed = Mock(return_value=([], missing))
     monkeypatch.setattr(selected_forecast, "_surface_messages", parsed)
     path.write_text(json.dumps(report), encoding="utf-8")
     loaded, _, probes = selected_forecast.load_selection(path, clock=FixedClock(NOW))
     assert loaded == report and len(probes) == parsed.call_count == 120
+    if qpf:
+        invalid = deepcopy(report)
+        _selected_candidate(invalid, "GFS")["probes"][0]["missing_qpf"] = "changed"
+        path.write_text(json.dumps(invalid), encoding="utf-8")
+        with pytest.raises(ValueError, match="QPF evidence differs"):
+            selected_forecast.load_selection(path, clock=FixedClock(NOW))
+        invalid = deepcopy(report)
+        del _selected_candidate(invalid, "GFS")["qpf_parent_probe"]
+        path.write_text(json.dumps(invalid), encoding="utf-8")
+        with pytest.raises(ValueError, match="preceding-bucket evidence"):
+            selected_forecast.load_selection(path, clock=FixedClock(NOW))
     _selected_candidate(report, "GFS")["probes"][0]["missing_fields"]["wind_gust_10m"] = (
         "altered evidence"
     )
     path.write_text(json.dumps(report), encoding="utf-8")
     with pytest.raises(ValueError, match="differs from retained inventory"):
         selected_forecast.load_selection(path, clock=FixedClock(NOW))
+
+
+def test_qpf_acquisition_reuses_selected_objects_and_requests_only_accumulation_messages(
+    selection, tmp_path, monkeypatch
+):
+    _, report = selection
+    for model in ("HRRR", "GFS"):
+        for probe in _selected_candidate(report, model)["probes"]:
+            probe["qpf_messages"] = [{"canonical_variable_id": selected_forecast.QPF_FIELD}]
+    gfs = _selected_candidate(report, "GFS")
+    gfs["qpf_parent_probe"] = {
+        **deepcopy(gfs["probes"][0]),
+        "source_lead_hours": 4,
+        "qpf_only": True,
+    }
+    # A missing interior inventory stays absent rather than requesting another window.
+    _selected_candidate(report, "HRRR")["probes"][2]["qpf_messages"] = []
+    calls = {}
+    for model, name in (("HRRR", "acquire_hrrr_phase2_lead"), ("GFS", "acquire_gfs_lead")):
+        calls[model] = Mock(side_effect=lambda *args, **kwargs: object())
+        monkeypatch.setattr(selected_forecast, name, calls[model])
+    retain = Mock()
+    monkeypatch.setattr(selected_forecast, "retain_qpf_input", retain)
+    from tests.unit.application.test_prepared_temperature import phase2_configuration
+
+    clock, pinned = FixedClock(NOW), Mock(spec=[])
+    acquired = selected_forecast._acquire_qpf(
+        report, phase2_configuration(), tmp_path / "qpf", pinned, clock, RecordingSleeper(clock)
+    )
+    assert len(acquired["HRRR"]) == 35
+    assert len(acquired["GFS"]) == 37
+    assert calls["GFS"].call_args_list[0].kwargs["forecast_hour"] == 4
+    assert retain.call_count == 72
+    for acquire in calls.values():
+        for call in acquire.call_args_list:
+            assert call.kwargs["canonical_variables"] == (selected_forecast.QPF_FIELD,)
+            assert call.kwargs["transport"] is pinned
+            assert call.args[0].endpoint_order == ("fixture",)
 
 
 @pytest.fixture
@@ -262,11 +333,60 @@ def test_inventory_changed_during_copy_is_revalidated_before_acquisition(
     forbid_network.assert_not_called()
 
 
-@pytest.mark.parametrize("failure", [None, "RAP missing hour", "IFS missing hour", "IFS cycle"])
+@pytest.mark.parametrize(
+    "failure,qpf",
+    [
+        (None, False),
+        (None, True),
+        ("RAP missing hour", False),
+        ("IFS missing hour", False),
+        ("IFS cycle", False),
+    ],
+)
 def test_preparation_reuses_one_selected_source_set_and_rejects_partial_shadows(
-    selection, tmp_path, monkeypatch, failure
+    selection, tmp_path, monkeypatch, failure, qpf
 ):
     selection_path, selection_report = selection
+    expected_configuration = IFS_CONFIGURATION
+    qpf_acquired = {"HRRR": [], "GFS": []}
+    qpf_acquire = Mock(return_value=qpf_acquired)
+    monkeypatch.setattr(selected_forecast, "_acquire_qpf", qpf_acquire)
+    if qpf:
+        expected_configuration = with_qpf_fields(with_surface_fields(IFS_CONFIGURATION))
+        selection_report.update(
+            surface_fields=True,
+            qpf_fields=True,
+            contributor_configuration=expected_configuration.model_dump(mode="json"),
+        )
+        missing = {
+            field: "missing fixture field"
+            for field in selected_forecast.SURFACE_MODEL_FIELDS["HRRR"][1:]
+        }
+        for model in selection_report["models"]:
+            for probe in _selected_candidate(selection_report, model)["probes"]:
+                probe.update(
+                    extra_messages=[],
+                    missing_fields=missing,
+                    qpf_messages=[],
+                    missing_qpf="missing fixture QPF",
+                )
+        _selected_candidate(selection_report, "GFS")["qpf_parent_probe"] = {
+            "model": "GFS",
+            "cycle": selection_report["selected_cycles"]["GFS"],
+            "source_lead_hours": 4,
+            "valid_time": "2026-09-11T10:00:00Z",
+            "decision_time": selection_report["decision_time"],
+            "qpf_only": True,
+            "status": "unavailable",
+            "reason": "No retained fixture parent",
+        }
+        monkeypatch.setattr(
+            selected_forecast, "_surface_messages", Mock(return_value=([], missing))
+        )
+        monkeypatch.setattr(
+            selected_forecast, "_qpf_messages", Mock(return_value=([], "missing fixture QPF"))
+        )
+        selection_path.write_text(json.dumps(selection_report), encoding="utf-8")
     pinned = Mock(
         spec=selected_forecast.SelectedObjectTransport,
         validations=[{"status": "validated", "fixture": True}],
@@ -281,6 +401,9 @@ def test_preparation_reuses_one_selected_source_set_and_rejects_partial_shadows(
     def control(directory, **kwargs):
         directory.mkdir(parents=True)
         assert kwargs["acquired_inputs"] is acquired
+        if qpf:
+            assert kwargs["qpf_fields"] is True
+            assert kwargs["acquired_qpf_inputs"] is qpf_acquired
         manifest = {"inputs": [], "fixture": True}
         # Match the real helper's existing manifest, including exclusive creation.
         selected_forecast._write_bytes(directory / "manifest.json", json.dumps(manifest).encode())
@@ -319,7 +442,7 @@ def test_preparation_reuses_one_selected_source_set_and_rejects_partial_shadows(
         assert manifest["fixture"] is True
         assert manifest["current_model_set"]["selection"] == selection_report
         assert manifest["current_model_set"]["object_validation"] == pinned.validations
-        assert kwargs["contributor_configuration"] == IFS_CONFIGURATION
+        assert kwargs["contributor_configuration"] == expected_configuration
         return object(), {"fixture": True}
 
     cover = Mock(side_effect=coverage)
@@ -353,6 +476,11 @@ def test_preparation_reuses_one_selected_source_set_and_rejects_partial_shadows(
     pin.assert_called_once()
     assert len(pin.call_args.args[1]) == 120
     acquire.assert_called_once()
+    if qpf:
+        qpf_acquire.assert_called_once()
+        assert qpf_acquire.call_args.args[3] is pinned
+    else:
+        qpf_acquire.assert_not_called()
     prepare_control.assert_called_once()
     assert prepare_control.call_args.kwargs["hrrr_cycle"].isoformat() == "2026-09-11T06:00:00+00:00"
     assert prepare_control.call_args.kwargs["gfs_cycle"].isoformat() == "2026-09-11T06:00:00+00:00"

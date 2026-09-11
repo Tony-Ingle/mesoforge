@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from mesoforge.application.point_forecast import PreparedPointForecast
+from mesoforge.application.prepared_qpf import qpf_raw_bytes
 from mesoforge.application.prepared_temperature import _raw_byte_count, rebuild_temperature_guidance
 from mesoforge.application.spatial_coverage import (
     CONTEXT_KM,
@@ -32,6 +33,9 @@ def source_identity(manifest: dict[str, Any]) -> str:
         for key in ("data_kind", "target_reference_time", "configuration_sha256", "inputs")
     }
     value["target_horizon_hours"] = manifest.get("target_horizon_hours", [1, 2, 3])
+    if manifest.get("qpf_fields"):
+        value["qpf_fields"] = True
+        value["qpf_inputs"] = manifest.get("qpf_inputs", [])
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
@@ -246,7 +250,8 @@ def ensure_coverage(
         "context_km": CONTEXT_KM,
         "observation_search_km": 50,
         "downloaded_bytes": 0,
-        "retained_raw_bytes": _raw_byte_count(prepared._manifest["inputs"]),
+        "retained_raw_bytes": _raw_byte_count(prepared._manifest["inputs"])
+        + qpf_raw_bytes(prepared._manifest.get("qpf_inputs", [])),
         "retained_index_bytes": sum(row["index_bytes"] for row in prepared._manifest["inputs"]),
         "footprints": [
             {

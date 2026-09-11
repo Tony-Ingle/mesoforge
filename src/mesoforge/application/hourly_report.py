@@ -10,6 +10,22 @@ from zoneinfo import ZoneInfo
 
 from mesoforge.catalog.units import convert
 
+_QPF = "liquid_equivalent_precipitation_amount_1h"
+
+
+def _display_qpf(field: dict[str, Any]) -> dict[str, Any]:
+    """Liquid-equivalent depth in inches, retaining exact accumulation bounds."""
+    if field["unit"] != "kg/m^2":
+        raise ValueError("Hourly report requires canonical QPF in kg/m^2")
+    value = field["value"]
+    return {
+        "value": None if value is None else value / 25.4,
+        "unit": "inch",
+        "interval_start": field["interval_start"],
+        "interval_end": field["interval_end"],
+        "interval_closure": "left_open_right_closed",
+    }
+
 
 def _display_temperature(temperature: dict[str, Any]) -> dict[str, Any]:
     """Fahrenheit is a display value; the persisted scientific temperature stays K."""
@@ -77,6 +93,8 @@ def build_hourly_report(
         if "surface" in hour:
             hours[-1]["surface"] = deepcopy(hour["surface"])
             hours[-1]["final_surface_fields"] = deepcopy(hour["surface"]["fields"])
+            if _QPF in hour["surface"]["fields"]:
+                hours[-1]["display_qpf"] = _display_qpf(hour["surface"]["fields"][_QPF])
     return {
         "latitude": forecast["latitude"],
         "longitude": forecast["longitude"],
@@ -155,6 +173,8 @@ def _surface_value(fields: dict[str, Any], variable: str) -> str:
     if field is None or field["value"] is None:
         return "unavailable"
     value = field["value"]
+    if variable == _QPF:
+        return f"{_display_qpf(field)['value']:.6g}"
     if field["unit"] == "K":
         return _temperature_text(_display_temperature(field))
     if field["unit"] == "m/s":
@@ -182,9 +202,14 @@ def _surface_value(fields: dict[str, Any], variable: str) -> str:
     return f"{value:.1f}"
 
 
+def _qpf_interval_cells(fields: dict[str, Any]) -> list[str]:
+    field = fields.get(_QPF, {})
+    return [str(field.get(key) or "unavailable") for key in ("interval_start", "interval_end")]
+
+
 def _render_surface_report(report: dict[str, Any]) -> str:
     """Present the unchanged numerical surface baseline and native contributors."""
-    columns = (
+    columns: tuple[str, ...] = (
         "air_temperature_2m",
         "dew_point_temperature_2m",
         "relative_humidity_2m",
@@ -192,6 +217,11 @@ def _render_surface_report(report: dict[str, Any]) -> str:
         "wind_from_direction_10m",
         "wind_gust_10m",
     )
+    has_qpf = any(_QPF in hour.get("surface", {}).get("fields", {}) for hour in report["hours"])
+    if has_qpf:
+        columns += (_QPF,)
+    qpf_headers = " QPF in | Accumulation start UTC (exclusive) | End UTC (inclusive) |"
+    qpf_separator = " --- | --- | --- |"
     lines = [
         f"Surface forecast at {report['latitude']}, {report['longitude']}",
         "",
@@ -212,9 +242,23 @@ def _render_surface_report(report: dict[str, Any]) -> str:
         "values are unrounded, with source cycles, leads, raw hashes, rules and exclusion reasons.",
         "",
         "| Hour | UTC valid time | Local/display valid time | T °F | Td °F | RH % | "
-        "Wind mph | From | Gust mph | Missing / exclusions |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "Wind mph | From | Gust mph |"
+        + (qpf_headers if has_qpf else "")
+        + " Missing / exclusions |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+        + (qpf_separator if has_qpf else "")
+        + " --- |",
     ]
+    if has_qpf:
+        lines.insert(
+            -3,
+            "QPF is liquid-equivalent accumulation over (start, end], displayed in inches; "
+            "original unrounded kg/m² values and exact intervals remain stored. It is not "
+            "instantaneous precipitation, precipitation probability or precipitation type. "
+            "QPF uses approved Phase 2 HRRR/GFS 70/30 weights at hours 1–18 and 60/40 at "
+            "19–36 when both are eligible, with explicit approved fallbacks. Small positive "
+            "amounts remain positive; zero and unavailable are distinct.",
+        )
     reasons: dict[str, list[int]] = {}
     for hour in report["hours"]:
         surface = hour.get("surface", {})
@@ -235,6 +279,7 @@ def _render_surface_report(report: dict[str, Any]) -> str:
             hour["valid_time_utc"],
             hour["valid_time_local"],
             *(_surface_value(fields, v) for v in columns),
+            *(_qpf_interval_cells(fields) if has_qpf else []),
             ("; ".join(issues) if issues else "none") + "; cloud unavailable",
         ]
         lines.append("| " + " | ".join(cells) + " |")
@@ -252,8 +297,10 @@ def _render_surface_report(report: dict[str, Any]) -> str:
                 "",
                 f"### {model} native contributor ({native['role']}; cycle {native['cycle']})",
                 "",
-                "| Hour | Source lead | T °F | Td °F | RH % | Wind mph | From | Gust mph |",
-                "| --- | --- | --- | --- | --- | --- | --- | --- |",
+                "| Hour | Source lead | T °F | Td °F | RH % | Wind mph | From | Gust mph |"
+                + (qpf_headers if has_qpf else ""),
+                "| --- | --- | --- | --- | --- | --- | --- | --- |"
+                + (qpf_separator if has_qpf else ""),
             ]
         )
         for hour in report["hours"]:
@@ -263,6 +310,7 @@ def _render_surface_report(report: dict[str, Any]) -> str:
                 str(hour["horizon_hours"]),
                 str(source.get("source_lead_hours") or "unavailable"),
                 *(_surface_value(fields, v) for v in columns),
+                *(_qpf_interval_cells(fields) if has_qpf else []),
             ]
             lines.append("| " + " | ".join(cells) + " |")
             for variable, field in fields.items():

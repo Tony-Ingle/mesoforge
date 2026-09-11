@@ -21,6 +21,15 @@ import numpy as np
 import pyproj
 import xarray as xr
 
+from mesoforge.application.prepared_qpf import (
+    QPF_VARIABLE,
+    QpfPayloads,
+    add_qpf_fields,
+    qpf_raw_bytes,
+    read_qpf_inputs,
+    required_qpf_leads,
+    retain_qpf_input,
+)
 from mesoforge.application.prepared_shadow import SURFACE_UNITS, add_surface_fields
 from mesoforge.application.spatial_coverage import UnsupportedCoordinateError, native_bbox_bounds
 from mesoforge.catalog.configuration import Phase2Configuration, load_configuration_source
@@ -148,6 +157,7 @@ def normalize_temperature_messages(
     target_horizon_hours: tuple[int, ...] = _HORIZONS,
     area: BoundingBox | None = None,
     field_payloads: dict[str, dict[int, bytes]] | None = None,
+    qpf_payloads: QpfPayloads | None = None,
 ) -> xr.Dataset:
     """Decode temperature and retain an internal footprint plus a native-cell halo.
 
@@ -261,17 +271,18 @@ def normalize_temperature_messages(
             **({"prepared_area_json": area.model_dump_json()} if area is not None else {}),
         },
     )
+
+    def grid_reader(
+        field: xr.DataArray,
+    ) -> tuple[pyproj.CRS, np.ndarray, np.ndarray, np.ndarray]:
+        native_crs, native_x, native_y, _, _, native_order = _native_grid(model, field)
+        return native_crs, native_x, native_y, native_order
+
     if field_payloads is not None:
         surface_arrays: dict[str, list[np.ndarray]] = {name: [] for name in SURFACE_UNITS}
         missing: dict[str, dict[str, list[str]]] = {name: {} for name in SURFACE_UNITS}
         policies: dict[str, str] = {}
         contracts = {item.canonical_variable_id: item for item in settings.field_contracts}
-
-        def grid_reader(
-            field: xr.DataArray,
-        ) -> tuple[pyproj.CRS, np.ndarray, np.ndarray, np.ndarray]:
-            native_crs, native_x, native_y, _, _, native_order = _native_grid(model, field)
-            return native_crs, native_x, native_y, native_order
 
         # Decode only one lead's additional full grids at a time; retain the same
         # regional cells as temperature, not another full-grid cache per coordinate.
@@ -318,6 +329,15 @@ def normalize_temperature_messages(
             field_missing_reasons_json=json.dumps(missing, sort_keys=True),
             wind_rotation_policy_json=json.dumps(policies, sort_keys=True),
         )
+    if qpf_payloads is not None:
+        dataset = add_qpf_fields(
+            dataset,
+            model=model,
+            settings=settings,
+            cycle=source_cycle,
+            payloads_by_lead=qpf_payloads,
+            grid_reader=grid_reader,
+        )
     return dataset
 
 
@@ -339,6 +359,7 @@ def _code_identity() -> dict[str, Any]:
     paths = (
         "application/prepared_temperature.py",
         "application/prepared_shadow.py",
+        "application/prepared_qpf.py",
         "application/cycle_selection.py",
         "application/point_forecast.py",
         "application/spatial_coverage.py",
@@ -348,6 +369,7 @@ def _code_identity() -> dict[str, Any]:
         "guidance/cycle_selection.py",
         "guidance/http_fetch.py",
         "guidance/normalization.py",
+        "guidance/precipitation.py",
         "guidance/sources/hrrr_phase2_decoding.py",
         "guidance/sources/gfs_decoding.py",
         "alignment/station_frame.py",
@@ -477,6 +499,71 @@ def _retained_extra_payloads(source: Path, row: dict[str, Any]) -> dict[str, byt
     return payloads
 
 
+def _validate_qpf_acquisitions(
+    rows: list[Phase2LeadAcquisition], *, model: str, cycle: datetime, leads: tuple[int, ...]
+) -> None:
+    expected = set(required_qpf_leads(model, leads))
+    if len({row.forecast_hour for row in rows}) != len(rows) or any(
+        row.model.upper() != model
+        or row.cycle_date != cycle.date()
+        or row.cycle_hour != cycle.hour
+        or row.forecast_hour not in expected
+        or not row.selected_messages
+        or any(message.canonical_variable_id != QPF_VARIABLE for message in row.selected_messages)
+        for row in rows
+    ):
+        raise ValueError(f"{model}: QPF acquisitions disagree with required source cycles/parents")
+
+
+def _acquire_qpf_model(
+    model: str,
+    cycle: datetime,
+    leads: tuple[int, ...],
+    *,
+    configuration: Phase2Configuration,
+    transport: HttpTransport,
+    clock: Clock,
+    sleeper: Sleeper,
+    expected_inputs: dict[int, dict[str, Any]] | None = None,
+) -> list[Phase2LeadAcquisition]:
+    """Acquire QPF-only intervals/parents once, using the retained Phase 2 adapter."""
+    rows = []
+    for lead in required_qpf_leads(model, leads):
+        expected = (expected_inputs or {}).get(lead)
+        hrrr_settings, gfs_settings = configuration.hrrr, configuration.gfs
+        if expected is not None:
+            hrrr_settings = hrrr_settings.model_copy(
+                update={"endpoint_order": (expected["endpoint"],)}
+            )
+            gfs_settings = gfs_settings.model_copy(
+                update={"endpoint_order": (expected["endpoint"],)}
+            )
+        kwargs = dict(
+            transport=transport,
+            clock=clock,
+            sleeper=sleeper,
+            cycle_date=cycle.date(),
+            cycle_hour=cycle.hour,
+            forecast_hour=lead,
+            cycle_deadline=clock.now(),
+            canonical_variables=(QPF_VARIABLE,),
+        )
+        acquired = (
+            acquire_hrrr_phase2_lead(hrrr_settings, **kwargs)  # type: ignore[arg-type]
+            if model == "HRRR"
+            else acquire_gfs_lead(gfs_settings, **kwargs)  # type: ignore[arg-type]
+        )
+        if expected is not None and (
+            acquired.resolved_grib_url != expected["source_grib_url"]
+            or acquired.full_object_etag != expected["etag"]
+            or acquired.full_object_last_modified != expected["grib_last_modified"]
+            or hashlib.sha256(acquired.index_payload).hexdigest() != expected["index_sha256"]
+        ):
+            raise ValueError("QPF provider object differs from the retained surface source")
+        rows.append(acquired)
+    return rows
+
+
 def prepare_temperature_guidance(
     directory: Path,
     *,
@@ -493,6 +580,8 @@ def prepare_temperature_guidance(
     acquired_inputs: dict[str, list[Phase2LeadAcquisition]] | None = None,
     cycle_selection: dict[str, Any] | None = None,
     surface_fields: bool = False,
+    qpf_fields: bool = False,
+    acquired_qpf_inputs: dict[str, list[Phase2LeadAcquisition]] | None = None,
 ) -> dict[str, Any]:
     """Acquire both models for hours 1..36; retain raw evidence and prepare two files.
 
@@ -527,6 +616,8 @@ def prepare_temperature_guidance(
         )
     (directory / "raw").mkdir()
     inputs: list[dict[str, Any]] = []
+    qpf_inputs: list[dict[str, Any]] = []
+    qpf_fields = qpf_fields or acquired_qpf_inputs is not None
     prepared_files: dict[str, dict[str, str]] = {}
     surface_fields = surface_fields or bool(
         acquired_inputs
@@ -560,6 +651,25 @@ def prepare_temperature_guidance(
                     payloads[lead] = message.payload
                 else:
                     field_payloads[message.canonical_variable_id][lead] = message.payload
+        qpf_payloads: QpfPayloads | None = None
+        if qpf_fields:
+            qpf_acquired = (
+                acquired_qpf_inputs.get(model, [])
+                if acquired_qpf_inputs is not None
+                else _acquire_qpf_model(
+                    model,
+                    cycle,
+                    leads,
+                    configuration=configuration,
+                    transport=transport,
+                    clock=clock,
+                    sleeper=sleeper,
+                )
+            )
+            _validate_qpf_acquisitions(qpf_acquired, model=model, cycle=cycle, leads=leads)
+            retained_qpf = [retain_qpf_input(directory, row) for row in qpf_acquired]
+            qpf_inputs.extend(retained_qpf)
+            qpf_payloads = read_qpf_inputs(directory, retained_qpf)[0][model]
         for candidate in (area, *fallback_areas):
             try:
                 dataset = normalize_temperature_messages(
@@ -571,6 +681,7 @@ def prepare_temperature_guidance(
                     target_horizon_hours=target_horizon_hours,
                     area=candidate,
                     **({"field_payloads": field_payloads} if surface_fields else {}),
+                    qpf_payloads=qpf_payloads,
                 )
             except UnsupportedCoordinateError:
                 if candidate == (area, *fallback_areas)[-1]:
@@ -590,7 +701,10 @@ def prepare_temperature_guidance(
         "downloaded_bytes": getattr(
             transport,
             "downloaded_bytes",
-            _raw_byte_count(inputs) + sum(row["index_bytes"] for row in inputs),
+            _raw_byte_count(inputs)
+            + sum(row["index_bytes"] for row in inputs)
+            + qpf_raw_bytes(qpf_inputs)
+            + sum(row["index_bytes"] for row in qpf_inputs),
         ),
         "configuration_sha256": hashlib.sha256(
             configuration.model_dump_json().encode()
@@ -603,6 +717,7 @@ def prepare_temperature_guidance(
         ),
         **({"cycle_selection": cycle_selection} if cycle_selection is not None else {}),
         **({"surface_fields": True} if surface_fields else {}),
+        **({"qpf_fields": True, "qpf_inputs": qpf_inputs} if qpf_fields else {}),
     }
     _write_bytes(directory / "manifest.json", json.dumps(manifest, indent=2).encode())
     return manifest
@@ -615,6 +730,7 @@ def rebuild_temperature_guidance(
     configuration: Phase2Configuration,
     clock: Clock,
     area: BoundingBox | None = None,
+    acquired_qpf_inputs: dict[str, list[Phase2LeadAcquisition]] | None = None,
 ) -> dict[str, Any]:
     """Re-decode retained raw messages into a new snapshot, without provider access.
 
@@ -633,6 +749,16 @@ def rebuild_temperature_guidance(
     ):
         raise ValueError("Rebuild requires real guidance and the original source configuration")
     retained: dict[str, bytes] = {}
+    qpf_payloads: dict[str, QpfPayloads] = {"HRRR": {}, "GFS": {}}
+    qpf_rows = source.get("qpf_inputs", [])
+    qpf_fields = source.get("qpf_fields", False) or acquired_qpf_inputs is not None
+    if acquired_qpf_inputs is not None and source.get("qpf_fields"):
+        raise ValueError(
+            "QPF enrichment requires a source snapshot without QPF; rebuild existing QPF offline"
+        )
+    if source.get("qpf_fields"):
+        qpf_payloads, qpf_retained = read_qpf_inputs(source_directory, qpf_rows)
+        retained.update(qpf_retained)
     models: list[tuple[str, datetime, dict[int, bytes], dict[str, dict[int, bytes]]]] = []
     try:
         target = _hour(datetime.fromisoformat(source["target_reference_time"]))
@@ -648,6 +774,17 @@ def rebuild_temperature_guidance(
             rows = [row for row in source["inputs"] if row["model"] == model]
             cycle = _hour(datetime.fromisoformat(rows[0]["cycle"]))
             leads = _leads(target, cycle, horizons)
+            for qpf_row in (row for row in qpf_rows if row["model"] == model):
+                if qpf_row["cycle"] != _iso(cycle) or qpf_row[
+                    "source_lead_hours"
+                ] not in required_qpf_leads(model, leads):
+                    raise ValueError(
+                        "Retained QPF source cycle/lead disagrees with surface guidance"
+                    )
+            if acquired_qpf_inputs is not None:
+                _validate_qpf_acquisitions(
+                    acquired_qpf_inputs.get(model, []), model=model, cycle=cycle, leads=leads
+                )
             if len(rows) != len(horizons) or {r["source_lead_hours"] for r in rows} != set(leads):
                 raise ValueError(f"{model}: retained source leads are incomplete or duplicated")
             payloads: dict[int, bytes] = {}
@@ -688,6 +825,13 @@ def rebuild_temperature_guidance(
     (directory / "raw").mkdir()
     for filename, payload in retained.items():
         _write_bytes(directory / filename, payload)
+    if acquired_qpf_inputs is not None:
+        qpf_rows = [
+            retain_qpf_input(directory, row)
+            for model in ("HRRR", "GFS")
+            for row in acquired_qpf_inputs.get(model, [])
+        ]
+        qpf_payloads, _ = read_qpf_inputs(directory, qpf_rows)
     for row in source["inputs"]:
         _write_bytes(
             directory / row["raw_file"].replace(".grib2", ".json"),
@@ -704,6 +848,7 @@ def rebuild_temperature_guidance(
             target_horizon_hours=horizons,
             area=area,
             **({"field_payloads": field_payloads} if source.get("surface_fields") else {}),
+            qpf_payloads=qpf_payloads[model] if qpf_fields else None,
         )
         prepared_files[model] = _write_prepared_file(directory, model, dataset)
     manifest = {
@@ -717,9 +862,92 @@ def rebuild_temperature_guidance(
         "code_identity": _code_identity(),
         "source_manifest_file": "source-manifest.json",
         "source_manifest_sha256": _write_bytes(directory / "source-manifest.json", source_payload),
+        **({"qpf_fields": True, "qpf_inputs": qpf_rows} if qpf_fields else {}),
+        **(
+            {
+                "qpf_acquisition": {
+                    "recorded_at": _iso(clock.now()),
+                    "note": (
+                        "QPF separately acquired for the retained source cycles; original "
+                        "model-set discovery did not select these precipitation messages. "
+                        "No historical ingestion claim is made."
+                    ),
+                    "raw_bytes": qpf_raw_bytes(qpf_rows),
+                }
+            }
+            if acquired_qpf_inputs is not None
+            else {}
+        ),
     }
     _write_bytes(directory / "manifest.json", json.dumps(manifest, indent=2).encode())
     return manifest
+
+
+def enrich_prepared_qpf(
+    source_directory: Path,
+    directory: Path,
+    *,
+    configuration: Phase2Configuration,
+    transport: HttpTransport,
+    clock: Clock,
+    sleeper: Sleeper,
+) -> dict[str, Any]:
+    """Add bounded real QPF for an existing surface snapshot to a new snapshot.
+
+    The source is never modified. This is explicit preparation outside HTTP;
+    subsequent rebuilding uses the same retained raw/manifest path without I/O.
+    Existing selection evidence remains historical and is not rewritten to claim
+    that these newly acquired precipitation messages were ingested earlier.
+    """
+    if directory.exists() and any(directory.iterdir()):
+        raise ValueError("QPF enrichment requires an empty new output directory")
+    source = json.loads((source_directory / "manifest.json").read_bytes())
+    configuration_hash = hashlib.sha256(configuration.model_dump_json().encode()).hexdigest()
+    if (
+        source.get("data_kind") != _DATA_KIND
+        or not source.get("surface_fields")
+        or source.get("qpf_fields")
+        or source.get("configuration_sha256") != configuration_hash
+    ):
+        raise ValueError(
+            "QPF enrichment requires real retained surface guidance, "
+            "original configuration, and no existing QPF"
+        )
+    target = _hour(datetime.fromisoformat(source["target_reference_time"]))
+    horizons = tuple(source.get("target_horizon_hours", (1, 2, 3)))
+    acquired = {}
+    for model in ("HRRR", "GFS"):
+        rows = [row for row in source["inputs"] if row["model"] == model]
+        cycle = _hour(datetime.fromisoformat(rows[0]["cycle"]))
+        leads = _leads(target, cycle, horizons)
+        acquired[model] = _acquire_qpf_model(
+            model,
+            cycle,
+            leads,
+            configuration=configuration,
+            transport=transport,
+            clock=clock,
+            sleeper=sleeper,
+            expected_inputs={row["source_lead_hours"]: row for row in rows},
+        )
+    result = rebuild_temperature_guidance(
+        source_directory,
+        directory,
+        configuration=configuration,
+        clock=clock,
+        acquired_qpf_inputs=acquired,
+    )
+    result["downloaded_bytes"] = getattr(
+        transport,
+        "downloaded_bytes",
+        qpf_raw_bytes(result["qpf_inputs"])
+        + sum(row["index_bytes"] for row in result["qpf_inputs"]),
+    )
+    # This unpublished new snapshot is finalized before it can be loaded/issued.
+    completed = directory / "manifest.complete.json"
+    _write_bytes(completed, json.dumps(result, indent=2).encode())
+    completed.replace(directory / "manifest.json")
+    return result
 
 
 class BoundedHttpTransport(RequestsHrrrHttpTransport):

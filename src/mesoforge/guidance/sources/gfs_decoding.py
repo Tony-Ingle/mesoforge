@@ -19,6 +19,7 @@ from __future__ import annotations
 import math
 import tempfile
 import warnings
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -266,6 +267,7 @@ def decode_apcp_candidates(
     forecast_hour: int,
     cycle_date: date,
     cycle_hour: int,
+    validate_grid: Callable[[xr.DataArray], None] | None = None,
 ) -> tuple[ApcpCandidateRecord, ...]:
     """Decode every APCP candidate message into ``ApcpCandidateRecord``
     values, asserting level/unit/grid/cycle/valid-time semantics on
@@ -349,6 +351,9 @@ def decode_apcp_candidates(
             raise GfsDecodeError(
                 f"decoded GFS APCP candidate failed semantic assertion: {'; '.join(errors)}"
             )
+
+        if validate_grid is not None:
+            validate_grid(data_array)
 
         values = np.asarray(data_array.values, dtype=np.float64)
         records.append(

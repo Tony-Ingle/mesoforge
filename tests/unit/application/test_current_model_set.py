@@ -12,7 +12,7 @@ import pytest
 
 from mesoforge.application.current_model_set import select_model_set
 from mesoforge.application.prepared_ifs import IFS_CONFIGURATION
-from mesoforge.forecasting.recipes import with_surface_fields
+from mesoforge.forecasting.recipes import with_qpf_fields, with_surface_fields
 from mesoforge.guidance.sources.current_availability import (
     ProviderEvidenceError,
     TemperatureProbeResult,
@@ -29,6 +29,76 @@ LATEST = {
     "RAP": TARGET.replace(hour=9),
     "IFS": TARGET.replace(hour=6),
 }
+
+
+@pytest.mark.parametrize("parent_missing", [False, True])
+def test_qpf_discovery_proves_one_extra_gfs_parent_without_changing_temperature_cycles(
+    tmp_path, parent_missing
+):
+    probe = MetadataProbe()
+    probe.missing = lambda model, cycle, lead: parent_missing and model == "GFS" and lead == 4
+    clock = FixedClock(NOW)
+    report = select_model_set(
+        tmp_path / "qpf",
+        configuration=phase2_configuration(),
+        decision_time=DECISION,
+        transport=Mock(spec=[], downloaded_bytes=0),
+        clock=clock,
+        sleeper=RecordingSleeper(clock),
+        probe=probe,
+        surface_fields=True,
+        qpf_fields=True,
+    )
+    assert report["status"] == "selected"
+    assert report["selected_cycles"] == {model: _iso(cycle) for model, cycle in LATEST.items()}
+    assert report["contributor_configuration"] == with_qpf_fields(
+        with_surface_fields(IFS_CONFIGURATION)
+    ).model_dump(mode="json")
+    gfs = next(
+        row for row in report["models"]["GFS"]["candidates"] if row["status"] == "metadata_complete"
+    )
+    assert gfs["source_leads"] == list(range(5, 41))
+    assert gfs["qpf_parent_probe"]["source_lead_hours"] == 4
+    assert gfs["qpf_parent_probe"]["qpf_only"] is True
+    assert gfs["qpf_parent_probe"]["status"] == ("unavailable" if parent_missing else "available")
+    assert len(probe.calls) == 121
+
+
+def test_qpf_requires_surface_selection(tmp_path):
+    clock = FixedClock(NOW)
+    with pytest.raises(ValueError, match="requires surface_fields"):
+        select_model_set(
+            tmp_path / "qpf",
+            configuration=phase2_configuration(),
+            transport=Mock(spec=[]),
+            clock=clock,
+            sleeper=RecordingSleeper(clock),
+            qpf_fields=True,
+        )
+
+
+def test_qpf_bucket_reset_does_not_request_a_previous_gfs_lead(tmp_path):
+    decision = DECISION.replace(hour=12)
+    probe = MetadataProbe(expected_decision=decision)
+    clock = FixedClock(decision + timedelta(minutes=5))
+    report = select_model_set(
+        tmp_path / "qpf",
+        configuration=phase2_configuration(),
+        decision_time=decision,
+        transport=Mock(spec=[], downloaded_bytes=0),
+        clock=clock,
+        sleeper=RecordingSleeper(clock),
+        probe=probe,
+        surface_fields=True,
+        qpf_fields=True,
+    )
+    assert report["status"] == "selected"
+    selected = next(
+        row for row in report["models"]["GFS"]["candidates"] if row["status"] == "metadata_complete"
+    )
+    assert selected["source_leads"] == list(range(1, 37))
+    assert "qpf_parent_probe" not in selected
+    assert len(probe.calls) == 120
 
 
 def test_surface_discovery_keeps_temperature_cycle_policy_and_records_extended_capabilities(

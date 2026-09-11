@@ -20,6 +20,7 @@ from mesoforge.application.batch_forecast import (
 )
 from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.prepared_ifs import IFS_CONFIGURATION, prepare_ifs
+from mesoforge.application.prepared_qpf import qpf_raw_bytes, retain_qpf_input
 from mesoforge.application.prepared_rap import prepare_rap
 from mesoforge.application.prepared_temperature import (
     BoundedHttpTransport,
@@ -33,16 +34,25 @@ from mesoforge.application.spatial_coverage import plan_regions, validate_coordi
 from mesoforge.application.spatial_preparation import ensure_coverage
 from mesoforge.catalog.configuration import Phase2Configuration, _lists_to_tuples
 from mesoforge.catalog.contributors import SURFACE_MODEL_FIELDS
-from mesoforge.forecasting.recipes import with_surface_fields
+from mesoforge.forecasting.recipes import (
+    ContributorConfiguration,
+    with_qpf_fields,
+    with_surface_fields,
+)
 from mesoforge.guidance.acquisition_v2 import (
     Phase2LeadAcquisition,
     acquire_gfs_lead,
     acquire_hrrr_phase2_lead,
 )
 from mesoforge.guidance.interfaces import Clock, HttpTransport, Sleeper
+from mesoforge.guidance.precipitation import is_bucket_reset_hour
 from mesoforge.guidance.runtime import SystemClock, SystemSleeper
-from mesoforge.guidance.selected_objects import SelectedObjectTransport
-from mesoforge.guidance.sources.current_availability import _surface_messages
+from mesoforge.guidance.selected_objects import SelectedObjectTransport, selected_messages
+from mesoforge.guidance.sources.current_availability import (
+    QPF_FIELD,
+    _qpf_messages,
+    _surface_messages,
+)
 from mesoforge.guidance.sources.rap import maximum_lead
 
 _ROOT = Path(__file__).resolve().parents[3]
@@ -56,6 +66,14 @@ def _time(value: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
+def selection_contributors(report: dict[str, Any]) -> ContributorConfiguration:
+    surface, qpf = report.get("surface_fields", False), report.get("qpf_fields", False)
+    if type(surface) is not bool or type(qpf) is not bool or (qpf and not surface):
+        raise ValueError("Invalid surface/QPF selection flags")
+    configuration = with_surface_fields(IFS_CONFIGURATION) if surface else IFS_CONFIGURATION
+    return with_qpf_fields(configuration) if qpf else configuration
+
+
 def load_selection(
     selection_path: Path, *, clock: Clock
 ) -> tuple[dict[str, Any], Phase2Configuration, list[dict[str, Any]]]:
@@ -66,9 +84,8 @@ def load_selection(
         target = _hour(_time(report["target_reference_time"]))
         first = target + timedelta(hours=1)
         surface = report.get("surface_fields", False)
-        if type(surface) is not bool:
-            raise ValueError("Invalid surface-field selection flag")
-        contributors = with_surface_fields(IFS_CONFIGURATION) if surface else IFS_CONFIGURATION
+        qpf = report.get("qpf_fields", False)
+        contributors = selection_contributors(report)
         models = contributors.model_map()
         if (
             report["status"] != "selected"
@@ -116,10 +133,31 @@ def load_selection(
             if (
                 len(entries) != len(required)
                 or sorted(p["source_lead_hours"] for p in entries) != required
+                or any(p.get("qpf_only") for p in entries)
             ):
                 raise ValueError(
                     f"{model}: selected inventory evidence is incomplete or duplicated"
                 )
+            parent = selected[0].get("qpf_parent_probe")
+            needs_parent = qpf and model == "GFS" and not is_bucket_reset_hour(required[0])
+            if needs_parent:
+                if (
+                    not isinstance(parent, dict)
+                    or parent.get("qpf_only") is not True
+                    or parent["source_lead_hours"] != required[0] - 1
+                    or parent["model"] != model
+                    or parent["cycle"] != _iso(cycle)
+                    or parent["valid_time"] != _iso(cycle + timedelta(hours=required[0] - 1))
+                    or _time(parent["decision_time"]) != decision
+                    or parent["status"] not in {"available", "unavailable"}
+                ):
+                    raise ValueError("GFS: missing or invalid QPF preceding-bucket evidence")
+                if parent["status"] == "available":
+                    entries = [*entries, parent]
+                elif not parent.get("reason"):
+                    raise ValueError("GFS: unavailable QPF parent requires an explicit reason")
+            elif parent is not None:
+                raise ValueError("Unexpected QPF preceding-bucket evidence")
             for probe in entries:
                 lead = probe["source_lead_hours"]
                 if (
@@ -148,8 +186,20 @@ def load_selection(
                     or len(payload) != inventory["content_bytes"]
                 ):
                     raise ValueError(f"{model}: retained inventory checksum or byte count differs")
-                probes.append(probe)
-                if surface:
+                if not probe.get("qpf_only") or probe.get("qpf_messages"):
+                    probes.append(probe)
+                if qpf:
+                    expected_qpf, expected_missing_qpf = _qpf_messages(
+                        model, payload, cycle, lead, probe["grib"]["content_length"]
+                    )
+                    if (
+                        probe.get("qpf_messages") != expected_qpf
+                        or probe.get("missing_qpf") != expected_missing_qpf
+                    ):
+                        raise ValueError(f"{model}: QPF evidence differs from retained inventory")
+                elif any(key in probe for key in ("qpf_messages", "missing_qpf", "qpf_only")):
+                    raise ValueError("QPF evidence requires an explicit QPF selection")
+                if surface and not probe.get("qpf_only"):
                     extras = probe.get("extra_messages", [])
                     fields = [item["canonical_variable_id"] for item in extras]
                     missing = probe.get("missing_fields", {})
@@ -220,6 +270,49 @@ def _acquire_control(
     return acquired
 
 
+def _acquire_qpf(
+    selection: dict[str, Any],
+    configuration: Phase2Configuration,
+    source: Path,
+    transport: SelectedObjectTransport,
+    clock: Clock,
+    sleeper: Sleeper,
+) -> dict[str, list[Phase2LeadAcquisition]]:
+    """Acquire only proved accumulation messages; shared indexes/HEADs are cached."""
+    (source / "raw").mkdir(parents=True)
+    acquired: dict[str, list[Phase2LeadAcquisition]] = {"HRRR": [], "GFS": []}
+    for model in acquired:
+        cycle = _time(selection["selected_cycles"][model])
+        candidate = next(
+            c
+            for c in selection["models"][model]["candidates"]
+            if c["status"] == "metadata_complete"
+        )
+        probes = list(candidate["probes"])
+        if candidate.get("qpf_parent_probe", {}).get("status") == "available":
+            probes.append(candidate["qpf_parent_probe"])
+        for probe in sorted(probes, key=lambda p: p["source_lead_hours"]):
+            if not probe["qpf_messages"]:
+                continue
+            settings = configuration.hrrr if model == "HRRR" else configuration.gfs
+            settings = settings.model_copy(update={"endpoint_order": (probe["selected_endpoint"],)})
+            acquire = acquire_hrrr_phase2_lead if model == "HRRR" else acquire_gfs_lead
+            row = acquire(
+                settings,  # type: ignore[arg-type]
+                cycle_date=cycle.date(),
+                cycle_hour=cycle.hour,
+                forecast_hour=probe["source_lead_hours"],
+                canonical_variables=(QPF_FIELD,),
+                transport=transport,
+                clock=clock,
+                sleeper=sleeper,
+                cycle_deadline=clock.now(),
+            )
+            retain_qpf_input(source, row)
+            acquired[model].append(row)
+    return acquired
+
+
 def prepare_selected(
     locations: list[Any],
     selection_path: Path,
@@ -266,7 +359,7 @@ def prepare_selected(
         + sum(
             {
                 (message["byte_start"], message["byte_end_exclusive"]): message["content_bytes"]
-                for message in (probe["selected_message"], *probe.get("extra_messages", []))
+                for message in selected_messages(probe)
             }.values()
         )
         for probe in probes
@@ -292,6 +385,18 @@ def prepare_selected(
         control_surface_kwargs: dict[str, Any] = (
             {"surface_fields": True} if selection.get("surface_fields") else {}
         )
+        if selection.get("qpf_fields"):
+            control_surface_kwargs.update(
+                qpf_fields=True,
+                acquired_qpf_inputs=_acquire_qpf(
+                    selection,
+                    configuration,
+                    output_directory / "acquired-qpf",
+                    pinned,
+                    clock,
+                    sleeper,
+                ),
+            )
         manifest = prepare_temperature_guidance(
             source,
             configuration=configuration,
@@ -381,11 +486,7 @@ def prepare_selected(
             locations,
             source,
             cache_directory=control,
-            contributor_configuration=(
-                with_surface_fields(IFS_CONFIGURATION)
-                if selection.get("surface_fields")
-                else IFS_CONFIGURATION
-            ),
+            contributor_configuration=selection_contributors(selection),
             shadow_directories={model: Path(path) for model, path in shadow_directories.items()},
         )
         report = {
@@ -409,6 +510,7 @@ def prepare_selected(
                 )
                 for row in manifest["inputs"]
             )
+            + qpf_raw_bytes(manifest.get("qpf_inputs", []))
             + sum(row["retained_raw_bytes"] for row in shadows.values()),
         }
         _write_bytes(output_directory / "preparation.json", json.dumps(report, indent=2).encode())
@@ -453,10 +555,8 @@ def run_selected_batch(
         Path(preparation["directory"]),
         issuer=issuer,
         require_future_hours=True,
-        contributor_configuration=(
-            with_surface_fields(IFS_CONFIGURATION)
-            if preparation["current_model_set"]["selection"].get("surface_fields")
-            else IFS_CONFIGURATION
+        contributor_configuration=selection_contributors(
+            preparation["current_model_set"]["selection"]
         ),
         shadow_directories={
             model: Path(path) for model, path in preparation["shadow_directories"].items()

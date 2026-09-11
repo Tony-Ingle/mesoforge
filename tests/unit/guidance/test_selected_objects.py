@@ -59,6 +59,49 @@ def acquire(wrapper, evidence):
     return wrapper.get(evidence["grib"]["url"], headers={"Range": "bytes=20-99"})
 
 
+def test_qpf_parent_acquires_only_both_proved_gfs_candidates_and_reuses_objects():
+    source = MetadataTransport("GFS")
+    source.index.content = (
+        b"1:0:d=2026091018:TMP:2 m above ground:6 hour fcst:\n"
+        b"2:40:d=2026091018:APCP:surface:0-6 hour acc fcst:\n"
+        b"3:100:d=2026091018:APCP:surface:0-6 hour acc fcst:\n"
+    )
+    evidence = probe(source, "GFS", qpf_fields=True).evidence
+    evidence["qpf_only"] = True
+    underlying = AcquisitionTransport("GFS")
+    underlying.index = source.index
+    wrapper = SelectedObjectTransport(
+        underlying,
+        [evidence],
+        decision_time=DECISION,
+        clock=FixedClock(DECISION + timedelta(minutes=2)),
+    )
+    wrapper.get(evidence["index"]["url"])
+    wrapper.head(evidence["grib"]["url"])
+    for start, end in ((40, 100), (100, 200)):
+        size = end - start
+        underlying.ranged = FakeHttpResponse(
+            206,
+            {
+                **underlying.grib.headers,
+                "Content-Length": str(size),
+                "Content-Range": f"bytes {start}-{end - 1}/200",
+            },
+            b"q" * size,
+        )
+        arguments = {"Range": f"bytes={start}-{end - 1}"}
+        original = wrapper.get(evidence["grib"]["url"], headers=arguments)
+        assert wrapper.get(evidence["grib"]["url"], headers=arguments).content == original.content
+    wrapper.assert_complete()
+    assert len(underlying.calls) == 4  # one index, one HEAD, two distinct APCP bodies
+    assert all(
+        row["canonical_variable_id"] == "liquid_equivalent_precipitation_amount_1h"
+        for row in wrapper.validations
+        if "canonical_variable_id" in row
+    )
+    assert all(row.get("byte_start") != 0 for row in wrapper.validations)
+
+
 @pytest.mark.parametrize("model", ["HRRR", "GFS", "RAP", "IFS"])
 def test_selected_native_message_matches_discovery_and_retains_acquisition_evidence(model):
     wrapper, underlying, evidence = selected(model)

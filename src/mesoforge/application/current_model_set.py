@@ -17,9 +17,10 @@ from typing import Any
 from mesoforge.application.prepared_ifs import IFS_CONFIGURATION
 from mesoforge.application.prepared_temperature import BoundedHttpTransport, _code_identity, _iso
 from mesoforge.catalog.configuration import Phase2Configuration, load_configuration_source
-from mesoforge.forecasting.recipes import with_surface_fields
+from mesoforge.forecasting.recipes import with_qpf_fields, with_surface_fields
 from mesoforge.guidance.cycle_selection import generate_candidate_reference_times
 from mesoforge.guidance.interfaces import Clock, HttpTransport, Sleeper
+from mesoforge.guidance.precipitation import is_bucket_reset_hour
 from mesoforge.guidance.runtime import SystemClock, SystemSleeper
 from mesoforge.guidance.sources.current_availability import (
     ProviderEvidenceError,
@@ -42,8 +43,11 @@ def select_model_set(
     decision_time: datetime | None = None,
     probe: Callable[..., Any] = probe_temperature,
     surface_fields: bool = False,
+    qpf_fields: bool = False,
 ) -> dict[str, Any]:
     """Newest metadata-complete cycles, or an explicit failure with retained evidence."""
+    if qpf_fields and not surface_fields:
+        raise ValueError("QPF selection requires surface_fields")
     started = clock.now()
     decision = decision_time or started
     if any(value.tzinfo is None or value.utcoffset() is None for value in (started, decision)):
@@ -83,7 +87,11 @@ def select_model_set(
         "selected_cycles": {},
         "models": {},
         "contributor_configuration": (
-            with_surface_fields(IFS_CONFIGURATION) if surface_fields else IFS_CONFIGURATION
+            with_qpf_fields(with_surface_fields(IFS_CONFIGURATION))
+            if qpf_fields
+            else with_surface_fields(IFS_CONFIGURATION)
+            if surface_fields
+            else IFS_CONFIGURATION
         ).model_dump(mode="json"),
         "source_configuration": configuration.model_dump(mode="json"),
         "code_identity": identity,
@@ -106,6 +114,13 @@ def select_model_set(
 
     if surface_fields:
         report["surface_fields"] = True
+    if qpf_fields:
+        report["qpf_fields"] = True
+        report["qpf_policy"] = (
+            "Optional HRRR rolling-hour and GFS same-bucket accumulation messages; "
+            "missing QPF never changes the selected temperature cycle. GFS requires "
+            "the preceding bucket value except at a 6k+1 reset."
+        )
 
     def save() -> None:
         report["completed_at"] = _iso(clock.now())
@@ -195,6 +210,7 @@ def select_model_set(
                         sleeper=sleeper,
                         decision_time=decision,
                         **({"surface_fields": True} if surface_fields else {}),
+                        **({"qpf_fields": True} if qpf_fields else {}),
                     )
                 except ProviderEvidenceError as exc:
                     candidate["probes"].append(retain(exc.evidence, exc.index_payloads))
@@ -211,6 +227,33 @@ def select_model_set(
                     break
                 save()
             else:
+                if qpf_fields and model == "GFS" and not is_bucket_reset_hour(required[0]):
+                    # This one parent lies outside the temperature forecast window.
+                    # It is optional QPF evidence, never a new temperature cycle rule.
+                    try:
+                        parent = probe(
+                            model=model,
+                            cycle=cycle,
+                            lead=required[0] - 1,
+                            configuration=configuration,
+                            transport=transport,
+                            clock=clock,
+                            sleeper=sleeper,
+                            decision_time=decision,
+                            qpf_fields=True,
+                        )
+                    except ProviderEvidenceError as exc:
+                        candidate["qpf_parent_probe"] = retain(exc.evidence, exc.index_payloads)
+                        candidate.update(status="error", reason=str(exc))
+                        report.update(status="error", selected_cycles={}, reason=str(exc))
+                        save()
+                        return report
+                    candidate["qpf_parent_probe"] = {
+                        **retain(parent.evidence, parent.index_payloads),
+                        "qpf_only": True,
+                    }
+                    if expired():
+                        return report
                 candidate.update(
                     status="metadata_complete",
                     reason=(
@@ -269,6 +312,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--surface-fields", action="store_true", help="Also discover native surface guidance"
     )
+    parser.add_argument(
+        "--qpf-fields",
+        action="store_true",
+        help="Include bounded HRRR/GFS interval QPF (requires --surface-fields)",
+    )
     args = parser.parse_args(argv)
     configuration, _ = load_configuration_source(
         base_path=_ROOT / "configs/base.yaml",
@@ -286,6 +334,7 @@ def main(argv: list[str] | None = None) -> int:
             configuration=configuration.phase2,
             decision_time=args.decision_time,
             surface_fields=args.surface_fields,
+            qpf_fields=args.qpf_fields,
             transport=transport,
             clock=clock,
             sleeper=SystemSleeper(),

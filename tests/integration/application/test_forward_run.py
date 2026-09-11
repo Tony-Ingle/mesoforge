@@ -38,6 +38,7 @@ from tests.support.phase1_fixture_transports import (
 )
 from tests.unit.application.test_batch_forecast import FIRST, LAST, OUTSIDE, write_config
 from tests.unit.application.test_prepared_observations import _record
+from tests.unit.application.test_prepared_qpf import QpfFixtureTransport
 from tests.unit.application.test_prepared_shadow import frame, geographic_frame
 from tests.unit.application.test_prepared_temperature import (
     EXTENDED_HORIZONS,
@@ -46,7 +47,6 @@ from tests.unit.application.test_prepared_temperature import (
     FixtureClock,
     FixtureSleeper,
     FixtureTransport,
-    SurfaceFixtureTransport,
     phase2_configuration,
 )
 
@@ -78,12 +78,13 @@ def prepared_current_fixture(
         hrrr_cycle=TARGET,
         gfs_cycle=GFS_CYCLE,
         target_horizon_hours=EXTENDED_HORIZONS,
-        transport=(SurfaceFixtureTransport if surface_fields else FixtureTransport)(
+        transport=(QpfFixtureTransport if surface_fields else FixtureTransport)(
             tuple(range(7, 43))
         ),
         clock=FixtureClock(),
         sleeper=FixtureSleeper(),
         surface_fields=surface_fields,
+        qpf_fields=surface_fields,
     )
     selection = {
         "status": "selected",
@@ -98,6 +99,8 @@ def prepared_current_fixture(
         "fixture_notice": "Generated test evidence; no real provider discovery is claimed.",
     }
     if surface_fields:
+        selection["surface_fields"] = True
+        selection["qpf_fields"] = True
         selection["source_configuration"] = phase2_configuration().model_dump(mode="json")
         selection["models"] = {
             model: {
@@ -436,6 +439,16 @@ def test_surface_forward_run_saves_exact_fields_and_preserves_older_temperature_
         assert domains["context"]["node_count"] > domains["editable"]["node_count"]
         assert any(cell["context_only"] for cell in grid["cells"])
         assert all(len(cell["hours"]) == 36 for cell in grid["cells"])
+        for cell in grid["cells"]:
+            for hour in cell["hours"]:
+                qpf = hour["surface"]["fields"]["liquid_equivalent_precipitation_amount_1h"]
+                assert qpf["value"] == pytest.approx(
+                    (0.0, 0.125, 0.375)[(hour["horizon_hours"] - 1) % 3]
+                )
+                assert qpf["interval_end"] == hour["valid_time"]
+                assert datetime.fromisoformat(qpf["interval_end"]) - datetime.fromisoformat(
+                    qpf["interval_start"]
+                ) == timedelta(hours=1)
         center = next(cell for cell in grid["cells"] if cell["is_forecast_point"])
         assert center["hours"] == forecast["hours"]
         assert forecast["local_grid"]["point_extraction"]["method"] == "exact_center_node"
@@ -477,6 +490,10 @@ def test_surface_forward_run_saves_exact_fields_and_preserves_older_temperature_
             )
             assert fields["dew_point_temperature_2m"]["weights"] == expected_weights
             assert fields["wind_gust_10m"]["weights"] == expected_weights
+            qpf = fields["liquid_equivalent_precipitation_amount_1h"]
+            assert qpf["weights"] == expected_weights
+            assert report["display_qpf"]["value"] == qpf["value"] / 25.4
+            assert report["display_qpf"]["interval_start"] == qpf["interval_start"]
             assert fields["cloud_area_fraction"]["value"] is None
             assert fields["cloud_area_fraction"]["missing_reasons"]
             contributors = hour["surface"]["contributors"]

@@ -24,8 +24,10 @@ from mesoforge.guidance.index_parsing import (
     compute_message_byte_range,
     parse_index_rows,
     select_field_row,
+    select_field_rows,
 )
 from mesoforge.guidance.interfaces import Clock, HttpResponse, HttpTransport, Sleeper
+from mesoforge.guidance.precipitation import compute_bucket_start
 from mesoforge.guidance.sources import gfs, hrrr_phase2, ifs, rap
 
 SURFACE_FIELDS = (
@@ -35,6 +37,7 @@ SURFACE_FIELDS = (
     "northward_wind_10m",
     "wind_gust_10m",
 )
+QPF_FIELD = "liquid_equivalent_precipitation_amount_1h"
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,6 +305,42 @@ def _publication(metadata: dict[str, Any]) -> datetime:
     return published
 
 
+def _qpf_messages(
+    model: str, payload: bytes, cycle: datetime, lead: int, length: int
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Retain exact native accumulation candidates; decoding resolves GFS duplicates."""
+    if model not in {"HRRR", "GFS"}:
+        return [], "Precipitation preparation is not enabled for this shadow model"
+    rows = parse_index_rows(payload.decode("utf-8"))
+    source = hrrr_phase2 if model == "HRRR" else gfs
+    selector = source.build_field_selector(QPF_FIELD, forecast_hour=lead)
+    if not any(re.search(selector, row.descriptor) for row in rows):
+        return [], f"{model} inventory has no compatible QPF accumulation at source lead {lead}"
+    selected = select_field_rows(rows, selector)
+    if len(selected) > (2 if model == "GFS" and lead <= 6 else 1):
+        raise GribIndexError(f"{model}: unexpected duplicate QPF accumulation candidates")
+    start_lead = lead - 1 if model == "HRRR" else compute_bucket_start(lead)
+    messages = []
+    for row in selected:
+        if row.line.split(":")[2] != f"d={cycle:%Y%m%d%H}":
+            raise GribIndexError(f"{model}: QPF inventory cycle does not match request")
+        start, end = compute_message_byte_range(rows, selected=row, full_object_length=length)
+        if start < 0 or end - start < 20 or end > length:
+            raise ValueError("Selected QPF range is outside the published GRIB object")
+        messages.append(
+            {
+                "canonical_variable_id": QPF_FIELD,
+                "index_row": row.line,
+                "byte_start": start,
+                "byte_end_exclusive": end,
+                "content_bytes": end - start,
+                "accumulation_start": _iso(cycle + timedelta(hours=start_lead)),
+                "accumulation_end": _iso(cycle + timedelta(hours=lead)),
+            }
+        )
+    return messages, None
+
+
 def probe_temperature(
     *,
     model: str,
@@ -313,6 +352,7 @@ def probe_temperature(
     sleeper: Sleeper,
     decision_time: datetime,
     surface_fields: bool = False,
+    qpf_fields: bool = False,
 ) -> TemperatureProbeResult:
     """Check one native lead with index GET + GRIB HEAD, never a GRIB GET.
 
@@ -438,6 +478,10 @@ def probe_temperature(
                 )
                 attempt.update(extra_messages=extra_messages, missing_fields=missing_fields)
                 evidence.update(extra_messages=extra_messages, missing_fields=missing_fields)
+            if qpf_fields:
+                qpf_messages, missing_qpf = _qpf_messages(model, index.payload, cycle, lead, length)
+                attempt.update(qpf_messages=qpf_messages, missing_qpf=missing_qpf)
+                evidence.update(qpf_messages=qpf_messages, missing_qpf=missing_qpf)
             return TemperatureProbeResult(True, None, evidence, index.payload, payloads)
     except (FetchError, GribIndexError, ifs.IfsIndexError, UnicodeDecodeError, ValueError) as exc:
         attempted = evidence["endpoints"]

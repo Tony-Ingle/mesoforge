@@ -15,6 +15,8 @@ from mesoforge.common.errors import MesoForgeError
 from mesoforge.guidance.acquisition_v2 import parse_provider_availability
 from mesoforge.guidance.http_fetch import header, parse_content_range
 from mesoforge.guidance.interfaces import Clock, HttpResponse, HttpTransport
+from mesoforge.guidance.sources.current_availability import QPF_FIELD
+from mesoforge.guidance.sources.gfs import build_field_selector
 
 
 class SelectedObjectError(MesoForgeError):
@@ -30,6 +32,16 @@ def _instant(value: str) -> datetime:
     if result.tzinfo is None or result.utcoffset() is None:
         raise ValueError("Selection timestamps must be timezone aware")
     return result.astimezone(UTC)
+
+
+def selected_messages(probe: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+    """The optional preceding GFS object supplies only accumulation parents."""
+    qpf = tuple(probe.get("qpf_messages", []))
+    if probe.get("qpf_only"):
+        if probe["model"] != "GFS" or not qpf:
+            raise ValueError("QPF-only probe requires GFS accumulation messages")
+        return qpf
+    return (probe["selected_message"], *probe.get("extra_messages", []), *qpf)
 
 
 @dataclass(slots=True)
@@ -113,10 +125,22 @@ class SelectedObjectTransport:
             self._gribs[urls[1]] = probe
             ranges: dict[str, dict[str, Any]] = {}
             fields: set[str] = set()
-            for entry in (message, *probe.get("extra_messages", [])):
+            for entry in selected_messages(probe):
+                duplicate_qpf = (
+                    entry.get("canonical_variable_id") == QPF_FIELD
+                    and probe["model"] == "GFS"
+                    and 1 <= probe["source_lead_hours"] <= 6
+                    and entry in probe.get("qpf_messages", [])
+                    and len(probe["qpf_messages"]) <= 2
+                    and re.search(
+                        build_field_selector(QPF_FIELD, forecast_hour=probe["source_lead_hours"]),
+                        entry.get("index_row", ""),
+                    )
+                    is not None
+                )
                 if (
                     not isinstance(entry.get("canonical_variable_id"), str)
-                    or entry["canonical_variable_id"] in fields
+                    or (entry["canonical_variable_id"] in fields and not duplicate_qpf)
                     or type(entry.get("byte_start")) is not int
                     or type(entry.get("byte_end_exclusive")) is not int
                     or entry["byte_start"] < 0
@@ -284,7 +308,7 @@ class SelectedObjectTransport:
             )
             if is_index or method == "head":
                 self._cache[(method, url)] = result
-            elif probe.get("extra_messages"):
+            elif probe.get("extra_messages") or probe.get("qpf_messages"):
                 assert requested_range is not None
                 self._range_cache[(url, requested_range)] = result
             return replace(result)

@@ -12,6 +12,7 @@ import pyproj
 import xarray as xr
 
 from mesoforge.alignment.station_frame import StationAlignmentError, align_station_to_model
+from mesoforge.application.precipitation_forecast import QPF, extract_precipitation_hour
 from mesoforge.catalog.configuration import Phase2BlendConfiguration
 from mesoforge.catalog.contributors import SURFACE_MODEL_FIELDS
 from mesoforge.forecasting.baseline import derive_wind_speed_and_direction
@@ -183,4 +184,18 @@ def extract_surface_hour(
         configuration=configuration,
     )
     result["contributors"] = contributors
+    qpf, native_qpf = extract_precipitation_hour(
+        datasets=datasets,
+        models=list(contributors),
+        latitude=latitude,
+        longitude=longitude,
+        horizon=horizon,
+        target_reference_time=target_reference_time,
+        configuration=configuration,
+    )
+    result["fields"][QPF] = qpf
+    for model, contributor in contributors.items():
+        contributor["fields"][QPF] = native_qpf[model]
+        if model in ("HRRR", "GFS") and model in datasets and QPF in datasets[model][0]:
+            contributor["native_supported_fields"].append(QPF)
     return result
