@@ -128,9 +128,13 @@ forecast value; no eligible real IFS/observation pairs were available at validat
 The first [bounded real historical backtest](#bounded-historical-temperature-backtest)
 now compares all four models and both recipes on 12 identical METAR pairs, without
 changing production or issued history. This is retrospective evaluation with explicit
-publication cutoffs, not a claim of historical local issuance. Next proposed: a staged,
-geographically stratified dataset with time/location holdouts and model-version cohorts
-before deriving any candidate weights.
+publication cutoffs, not a claim of historical local issuance. Forward accumulation
+is now the priority; the proposed 30-day historical backfill has not started.
+A separate [current four-model discovery command](#discover-the-current-four-model-set)
+now checks provider inventories and object metadata for a complete compatible
+HRRR/GFS/RAP/IFS set, retaining decision-time evidence outside Git. It does not
+prepare data or issue forecasts. Next proposed: consume that selection in the
+existing preparation and immutable batch-issuance paths for configured coordinates.
 The combined locations lifecycle remains future work.
 
 Future direction: configure locations using latitude/longitude only, with geographic
@@ -1646,6 +1650,94 @@ leads, valid times, hashes, configuration/code identity, and decoder versions.
 Provider availability and retrieval time are distinct; this manual historical
 demonstration does not apply an operational issuance cutoff. Raw messages remain
 intact outside Git even though the prepared views use only the small region.
+
+### Discover the current four-model set
+
+Run this once for the entire coordinate collection. No model cycles, target time,
+station IDs or geographic metadata are required:
+
+```text
+python -B -m mesoforge.application.current_model_set --output-dir EXTERNAL_NEW_SELECTION_DIRECTORY
+```
+
+Use the isolated interpreter documented above. This command form was executed on
+Windows; the `uv run --locked python` wrapper remains unverified here. The output
+directory must be new and outside the repository. The command prints its report
+and retains `selection.json` plus the original downloaded inventories there.
+An optional `--decision-time` accepts a timezone-aware instant at or before
+execution within the current UTC hour; omitting it uses execution time. It is not
+a historical replay option.
+
+The UTC whole-hour floor of the decision time defines the reference. HRRR, GFS
+and RAP each require **every hourly temperature lead** for hours 1–36. IFS requires
+every native three-hourly valid time in that same window: 12 values, with the other
+24 hours explicitly listed as native gaps and never interpolated. Cycles are aligned
+by actual valid time. RAP and IFS stay zero-weight shadows; the active HRRR/GFS
+70/30 demonstration recipe and Phase 2 defaults are unchanged.
+
+The selector considers newest capable cycles first, using the existing model
+registrations, URL builders, inventory selectors and HTTP retry behavior. A
+candidate's last required lead is checked first, then every interior lead. Each
+check downloads an inventory and makes a GRIB **HEAD** request; it downloads no
+GRIB body. Both objects must have provider publication timestamps at or before
+the fixed decision time. The selected temperature range must fit the GRIB object's
+reported length, with a strong ETag retained for later identity checks.
+
+An unpublished or incomplete candidate can yield to an older complete cycle within
+the existing adapter lead limits and a bounded lookback, with rejection reasons
+recorded. Access/transport failures, malformed inventories, or unprovable object
+identity/publication stop selection explicitly. Success requires all four models;
+failure returns an empty `selected_cycles`, a reason, and exit code 2. Individual
+model findings in a failed report are diagnostic evidence, not an approved partial
+set. A selection expires at its first valid hour, requiring a new current run.
+
+The retained evidence includes each cycle, lead and valid time; candidate rejection
+reasons; request URLs, timestamps and response headers; provider Last-Modified and
+ETag values; temperature byte ranges; inventory SHA-256 hashes; and source,
+contributor and code configuration identities. This establishes provider-metadata
+evidence, not that GRIB contents were decoded or locally ingested by decision time.
+The separate preparation step must revalidate these exact identities and availability,
+decode units/grids/model versions/valid times, and retain its actual acquisition and
+issuance times. Passing cycle arguments alone does not yet enforce that handoff.
+
+Real discovery on **September 11, 2026**, at decision time **16:43:43.475839Z**
+selected the following set for reference **16Z**, valid **September 11 17Z through
+September 13 04Z**:
+
+| Model | Selected September 11 cycle | Required source leads | Latest selected object publication (UTC) |
+| --- | --- | --- | --- |
+| HRRR | 12Z | 5–40, hourly | 13:37:48 |
+| GFS | 12Z | 5–40, hourly | 15:45:04 |
+| RAP | 15Z | 2–37, hourly | 16:09:26 |
+| IFS | 06Z | 12–45, every three hours | 12:27:09 |
+
+RAP 16Z lacked the required lead coverage. IFS 12Z's required inventory returned
+HTTP 404; the complete 06Z cycle was then checked and accepted. The successful run
+retained **120 inventories / 3,059,411 bytes**, with 120 successful GRIB HEAD checks
+and no GRIB body downloads. IFS valid times run from September 11 18Z through
+September 13 03Z; the intervening 24 hours remain explicit native gaps. All selected
+publication timestamps precede the decision cutoff, and discovery finished at
+16:46:00Z before the first valid hour.
+
+An earlier attempt at 16:39:39Z stopped safely after three ECMWF HTTP 503 responses,
+returning no selected set. Its failure evidence is retained too. Both attempts total
+**5,636,268 downloaded inventory bytes**, with zero model-data acquisition. Their
+reports and checksum audit are outside Git under
+`%LOCALAPPDATA%/MesoForge/baselines/20260911-current-model-set`.
+
+Validation: **55 focused offline tests passed**:
+
+```text
+python -B -m pytest tests/unit/application/test_current_model_set.py tests/unit/guidance/test_current_availability.py -q
+```
+
+Ruff format/lint, mypy, all nine import contracts, locked dependency consistency,
+documentation/hygiene checks and `git diff --check` passed. Tests cover incomplete
+interior leads, native-time alignment, bounded fallback, unsafe provider evidence,
+decision cutoffs/expiry, retained hashes and unchanged contributor weights/statuses.
+The real metadata audit also passed. No preparation, issuance, observations or services
+ran for this milestone; GRIB decoding, storage integration and full acceptance were
+not rerun.
 
 ### Automatic current guidance
 
