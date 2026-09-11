@@ -136,10 +136,12 @@ HRRR/GFS/RAP/IFS set, retaining decision-time evidence outside Git. It does not
 prepare data or issue forecasts. The separate [selected-set batch command](#prepare-and-issue-the-exact-selected-model-set)
 now consumes that artifact, revalidates provider identities, shares preparation,
 and issues through existing PostgreSQL/MinIO storage. Every successful forecast
-retains the decision evidence and RAP/IFS shadows. Next proposed: connect the
-existing configured-location verification step to this forward issuance command
-in one local run before adding VPS operation.
-The combined locations lifecycle remains future work.
+retains the decision evidence and RAP/IFS shadows. The [on-demand forward command](#run-verification-and-current-issuance-together)
+now connects prior-hour automatic verification to current-set issuance in one local
+run. Its saved hourly report keeps the numerical baseline separate from explicit
+unimplemented bias/AI stages; final values currently equal the baseline. Names are
+optional display metadata. VPS operation, scheduling, bias correction, AI and delivery
+remain future work.
 
 Future direction: configure locations using latitude/longitude only, with geographic
 context and suitable observation sources derived internally. The intended VPS workflow
@@ -1841,6 +1843,116 @@ immutable readback and existing comparison/verification coverage. Ruff, mypy,
 all nine import contracts, lock consistency, documentation/hygiene checks and
 `git diff --check` passed. Temporary PostgreSQL and MinIO were stopped. Full
 repository acceptance/coverage, VPS operation and scheduling were not tested.
+
+### Run verification and current issuance together
+
+The on-demand command uses the same PostgreSQL/MinIO settings as batch issuance
+and automatic verification. With those development services running, use the
+existing isolated Python environment from the repository root:
+
+```json
+{"locations":[{"lat":44.98859,"lon":-93.25557,"name":"Minneapolis"}]}
+```
+
+```text
+python -B -m mesoforge.application.forward_run --config locations.json --output-dir EXTERNAL_NEW_RUN_DIRECTORY --display-timezone America/Chicago
+```
+
+Only `lat` and `lon` are required geographic inputs. `name` is optional display
+metadata. `--display-timezone` is also optional: UTC is the default. It controls
+report presentation, never model/station selection or forecast values; automatic
+coordinate-to-timezone lookup is not implemented. America/Chicago displays this
+Minneapolis demonstration in local time, including the correct date and UTC offset.
+
+The command snapshots the coordinate list, selects previously saved hours before
+the run time, and applies the existing eligibility and ±15-minute observation rules.
+Ready valid times are grouped into bounded windows spanning at most six hours and
+passed to existing automatic verification. Exact issued versions stay independent;
+retained observations and saved verification facts are reused. No eligible hours
+means no observation download. Unavailable observations or a failed verification
+window do not prevent new issuance. One failed coordinate does not stop the others.
+
+After verification, one current four-model discovery and one shared preparation
+serve the entire collection. Provider identities are checked against that exact
+selection. The command does not accept manually specified cycles, stations, or
+regions. A missing/expired/changed current set produces an explicit issuance failure,
+while completed verification results remain saved. Raw model/observation evidence
+stays outside Git. A new run needs a new output directory and intentionally issues
+new immutable forecast versions; only verification facts are reused idempotently.
+
+The output directory contains `result.json`, the input snapshot, previous-verification
+results, current selection/preparation evidence, and a readable `hourly-report.md`.
+Each successful forecast saves `hourly_report` beside its original `hours` through
+the existing immutable PostgreSQL/MinIO path. `hours` retains the untouched numerical
+baseline; report temperatures preserve its exact Kelvin values, with Fahrenheit
+display values separately. Each row includes:
+
+- UTC and display/local valid time; HRRR, GFS, RAP, IFS and the raw 70/30 blend.
+- `bias_correction.status = not_implemented`, with applied delta **0 K**.
+- `ai_adjustment.action = not_run`, applied delta **0 K**, and reason
+  **AI forecast-desk stage not implemented yet**.
+- Final temperature exactly equal to the raw baseline, including null/missingness.
+- `verification.status = not_yet_verified` for this new immutable version and
+  `delivery_status = not_delivered`. Earlier versions' verification is reported separately.
+
+Zero here means no correction was applied; it is not an estimated site bias or an
+AI judgment. No AI, bias-learning, delivery, scheduler or deployment stage runs.
+IFS keeps its native three-hourly values and explicit intervening gaps. RAP/IFS
+remain zero-weight shadows, and Phase 2 defaults remain unchanged. Saved reports
+describe the state at issuance; later verification does not rewrite them.
+
+The real Minneapolis command completed on **September 11, 2026 at 17:46:15Z**.
+Decision time **17:41:36Z** selected **HRRR 12Z / GFS 12Z / RAP 15Z / IFS 06Z**
+without cycle arguments. It saved immutable forecast
+`b3b32ab2-8da7-4adf-b3e6-0f59bb148051`, covering **September 11 18Z through
+September 13 05Z** (September 11 1 PM through September 13 midnight CDT).
+All 36 active/RAP values exist; IFS has 12 native values and 24 explicit gaps.
+One actual hourly row, rounded only for display:
+
+| Local / UTC valid time | HRRR °F | GFS °F | RAP °F | IFS °F | Raw blend °F | Bias delta °F | AI action / nudge °F | Final °F | Verification |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Sept 11 13:00 CDT / 18:00Z | 81.7 | 86.7 | 82.6 | 84.6 | 83.2 | 0.0 (not implemented) | not_run / 0.0 | 83.2 | not_yet_verified |
+
+There were no earlier eligible saved hours at this exact Minneapolis coordinate:
+verification returned `nothing_to_verify`, with **zero observation downloads**.
+Repeating verification also performed no downloads or writes; no observations were
+manufactured. The eligible/idempotent branch was exercised by the storage integration
+case below. Exact readback and an offline prepared-guidance calculation matched the
+saved forecast. All **19 older issued versions** remained unchanged; one issuance row,
+its stored-object metadata, and one MinIO payload were added. Model discovery and
+preparation downloaded **80,043,080 bytes** in total, including **73,921,510 raw GRIB
+bytes** retained outside Git. Preparation used 120 unique temperature messages and
+all 360 provider-identity checks matched the discovery evidence. Offline replay made
+zero provider calls. Full JSON and all 36 report rows remain under
+`%LOCALAPPDATA%/MesoForge/forward-runs/20260911T174135Z`; demonstration checks are under
+`%LOCALAPPDATA%/MesoForge/baselines/20260911-forward-run`. Temporary services were stopped.
+
+Validation on September 11, 2026: **207 focused offline tests and 18 PostgreSQL/MinIO
+integration tests passed**. The new integration case uses generated model/observation
+fixtures with real storage: two previous versions produce four verification facts
+and eight unavailable hour results; repeat execution reuses all four facts without
+another observation request. Both supported locations receive 36-hour saved reports
+despite an invalid middle coordinate. Four new issuance IDs survive exact readback;
+the two original forecasts stay unchanged. The same tests cover preserved native IFS
+gaps, separate numerical baselines, and future-hour eligibility. Quality checks use
+the existing Ruff, mypy, import, lock, documentation and hygiene commands. Full
+acceptance/coverage and operational VPS reliability are not established by these checks.
+
+Focused commands actually run (the integration commands used a dedicated test database
+and test buckets, never the retained demonstration database):
+
+```text
+python -B -m pytest tests/unit/application/test_forward_run.py tests/unit/application/test_forward_verification.py tests/unit/application/test_hourly_report.py tests/unit/application/test_batch_forecast.py tests/unit/application/test_selected_forecast.py -q
+python -B -m pytest tests/unit/application/test_automatic_verification.py tests/unit/application/test_forecast_issuance.py tests/unit/application/test_issued_temperature_verification.py tests/unit/test_forecast_api.py -q
+python -B -m pytest tests/integration/application/test_forward_run.py tests/integration/application/test_batch_issuance.py -q
+python -B -m pytest tests/integration/application/test_issued_temperature_verification.py::test_automatic_window_acquires_once_reuses_real_snapshot_and_skips_empty_window tests/integration/application/test_issued_temperature_verification.py::test_automatic_batch_isolates_locations_and_reuses_results_without_changing_issuances -q
+```
+
+Next proposed: a manual VPS smoke run of this same command and storage configuration,
+then a single non-overlapping scheduled invocation with retained run logs. Collect
+forward verification before fitting any site-bias correction. A later bounded AI
+proposal/validation stage would populate the separate report action fields; it must
+not overwrite numerical history or publish unchecked adjustments.
 
 ### Automatic current guidance
 

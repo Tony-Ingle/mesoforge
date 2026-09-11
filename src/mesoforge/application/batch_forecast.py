@@ -8,7 +8,8 @@ import json
 import math
 import os
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from copy import deepcopy
 from datetime import datetime
 from importlib.metadata import version
 from pathlib import Path
@@ -43,6 +44,9 @@ def create_issuer() -> ForecastIssuanceService:
     for path in (
         "application/batch_forecast.py",
         "application/issuance.py",
+        "application/forward_run.py",
+        "application/forward_verification.py",
+        "application/hourly_report.py",
         "contracts/issued_forecasts.py",
         "storage/json.py",
         "storage/s3.py",
@@ -76,8 +80,12 @@ def _json_float(value: str) -> float | str:
 
 
 def _coordinates(location: object) -> tuple[float, float]:
-    message = "Each location must contain only finite numeric lat and lon."
-    if not isinstance(location, dict) or set(location) != {"lat", "lon"}:
+    message = "Each location requires finite numeric lat and lon, with an optional string name."
+    if (
+        not isinstance(location, dict)
+        or not {"lat", "lon"} <= set(location) <= {"lat", "lon", "name"}
+        or ("name" in location and not isinstance(location["name"], str))
+    ):
         raise ValueError(message)
     if any(type(location[key]) not in (int, float) for key in ("lat", "lon")):
         raise ValueError(message)
@@ -115,6 +123,7 @@ def run_batch(
     require_future_hours: bool = False,
     contributor_configuration: ContributorConfiguration = DEFAULT_CONFIGURATION,
     shadow_directories: Mapping[str, Path] | None = None,
+    forecast_report_builder: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Load guidance once; independently calculate and persist each successful location."""
     locations = load_locations(config_path)
@@ -141,6 +150,9 @@ def run_batch(
         else:
             try:
                 forecast = prepared.forecast(latitude=latitude, longitude=longitude)
+                if forecast_report_builder is not None:
+                    # Presentation stages are saved beside, never over, the numerical hours.
+                    forecast["hourly_report"] = forecast_report_builder(deepcopy(forecast))
                 if (
                     require_future_hours
                     and datetime.fromisoformat(forecast["hours"][0]["valid_time"])

@@ -7,6 +7,7 @@ import hashlib
 import json
 import shutil
 import sys
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -341,6 +342,7 @@ def run_selected_batch(
     transport: HttpTransport | None = None,
     clock: Clock | None = None,
     sleeper: Sleeper | None = None,
+    forecast_report_builder: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """No manual cycles; existing shared preparation and immutable persistence paths."""
     locations = load_locations(config_path)
@@ -362,6 +364,7 @@ def run_selected_batch(
         shadow_directories={
             model: Path(path) for model, path in preparation["shadow_directories"].items()
         },
+        forecast_report_builder=forecast_report_builder,
     )
     return {**batch, "preparation": preparation}
 
