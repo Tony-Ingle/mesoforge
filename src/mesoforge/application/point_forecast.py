@@ -510,6 +510,27 @@ class PreparedPointForecast:
         return True
 
     def forecast(self, *, latitude: float, longitude: float) -> dict[str, Any]:
+        """Extract the configured surface point from its local numerical baseline grid.
+
+        The older temperature-only prepared snapshots retain their historical path.
+        Grid construction belongs to explicit preparation/batch work, not HTTP reads.
+        """
+        if self._surface_configuration is not None:
+            from mesoforge.application.local_surface_grid import (
+                build_local_surface_grid,
+                extract_grid_point,
+            )
+
+            grid = build_local_surface_grid(
+                latitude=latitude,
+                longitude=longitude,
+                calculate_column=self._forecast_column,
+            )
+            return extract_grid_point(grid, latitude=latitude, longitude=longitude)
+        return self._forecast_column(latitude=latitude, longitude=longitude)
+
+    def _forecast_column(self, *, latitude: float, longitude: float) -> dict[str, Any]:
+        """Shared native extraction/science for a local grid node (no source I/O)."""
         self.check_coordinate(latitude, longitude)
         selected_shadows = {
             model: next(

@@ -25,13 +25,16 @@ from mesoforge.application.point_forecast import (
     PreparedPointForecast,
     prepare_demo_files,
 )
+from mesoforge.application.prepared_local_grid import PreparedLocalGrids
 from mesoforge.application.spatial_coverage import CoverageRequiredError, UnsupportedCoordinateError
 from mesoforge.application.spatial_preparation import PreparedRegions, load_prepared
 from mesoforge.common.errors import NotFound
 
 
 def _error(
-    message: str, status_code: int, prepared: PreparedPointForecast | PreparedRegions
+    message: str,
+    status_code: int,
+    prepared: PreparedPointForecast | PreparedRegions | PreparedLocalGrids,
 ) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
@@ -60,7 +63,11 @@ def _hour_query_error() -> JSONResponse:
 
 def create_app(directory: Path) -> FastAPI:
     """Read and close prepared files once, before accepting any forecast request."""
-    prepared = load_prepared(directory)
+    prepared = (
+        PreparedLocalGrids.from_directory(directory)
+        if (directory / "local-grids.json").is_file()
+        else load_prepared(directory)
+    )
     app = FastAPI(
         title="MesoForge prepared temperature demonstration",
         docs_url=None,
@@ -92,6 +99,21 @@ def create_app(directory: Path) -> FastAPI:
     @app.get("/forecast", response_model=None)
     def forecast(lat: float, lon: float) -> dict[str, Any] | JSONResponse:
         try:
+            regions = prepared.regions if isinstance(prepared, PreparedRegions) else [prepared]
+            if any(
+                isinstance(region, PreparedPointForecast)
+                and region._surface_configuration is not None
+                for region in regions
+            ):
+                # Native -> local regridding stays in explicit preparation/batch work.
+                # HTTP serves the retained grid, never builds a domain during a GET.
+                from mesoforge.application.spatial_coverage import validate_coordinate
+
+                validate_coordinate(lat, lon)
+                raise CoverageRequiredError(
+                    "Prepare local surface grids before HTTP with "
+                    "mesoforge.application.prepared_local_grid, then serve its output directory"
+                )
             return prepared.forecast(latitude=lat, longitude=lon)
         except UnsupportedCoordinateError as exc:
             return JSONResponse(
@@ -233,7 +255,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--data-dir",
         type=Path,
-        help="Existing prepared-file directory; omitted selects the synthetic demonstration.",
+        help="Retained local-grid or legacy prepared directory; omitted selects synthetic data.",
     )
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args(argv)

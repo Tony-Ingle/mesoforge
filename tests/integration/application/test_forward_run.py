@@ -425,6 +425,13 @@ def test_surface_forward_run_saves_exact_fields_and_preserves_older_temperature_
         saved = issuer.read(UUID(row["issued"]["issued_forecast_id"]))
         assert saved["forecast"] == forecast
         assert forecast["current_model_set"] == preparation["current_model_set"]
+        grid = saved["forecast"]["local_grid_baseline"]
+        assert grid["geometry"]["dimensions"] == {"x": 3, "y": 3}
+        assert len(grid["cells"]) == 9
+        assert all(len(cell["hours"]) == 36 for cell in grid["cells"])
+        center = next(cell for cell in grid["cells"] if cell["x_index"] == cell["y_index"] == 1)
+        assert center["hours"] == forecast["hours"]
+        assert forecast["local_grid"]["point_extraction"]["method"] == "exact_center_node"
         assert len(forecast["hours"]) == len(forecast["hourly_report"]["hours"]) == 36
         for hour, report, old_hour in zip(
             forecast["hours"],

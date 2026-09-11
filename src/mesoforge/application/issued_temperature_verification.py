@@ -22,6 +22,7 @@ from mesoforge.application.artifacts import (
     TransformationRequest,
 )
 from mesoforge.application.issuance import (
+    issued_forecast_context,
     read_issued_forecast,
     select_issued_forecast_hours,
     validate_hour_selection,
@@ -115,7 +116,7 @@ class IssuedTemperatureVerificationService:
             or match["issued_at"] != saved["issued_at"]
             or match["forecast"]
             != {"latitude": forecast["latitude"], "longitude": forecast["longitude"], **hour}
-            or match["forecast_context"] != {k: v for k, v in forecast.items() if k != "hours"}
+            or match["forecast_context"] != issued_forecast_context(forecast)
             or match["forecast_code_identity"] != saved["code_identity"]
         ):
             raise IntegrityError("Observation match does not describe the exact saved forecast")

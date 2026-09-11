@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from mesoforge.application.issuance import read_issued_forecast
+from mesoforge.application.issuance import issued_forecast_context, read_issued_forecast
 from mesoforge.application.phase2_replay import parse_station_snapshot
 from mesoforge.catalog.configuration import ObservationNormalizationPolicy
 from mesoforge.catalog.stations import StationDefinition
@@ -113,7 +113,7 @@ def preview_observation_match(issued_forecast_id: UUID, valid_time: datetime) ->
         "issued_forecast_id": saved["issued_forecast_id"],
         "issued_at": saved["issued_at"],
         "forecast": {"latitude": forecast["latitude"], "longitude": forecast["longitude"], **hour},
-        "forecast_context": {key: value for key, value in forecast.items() if key != "hours"},
+        "forecast_context": issued_forecast_context(forecast),
         "forecast_code_identity": saved["code_identity"],
         "selection_policy": {
             "max_distance_km": 50,

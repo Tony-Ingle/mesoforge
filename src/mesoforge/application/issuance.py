@@ -24,6 +24,17 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def issued_forecast_context(forecast: dict[str, Any]) -> dict[str, Any]:
+    """Point-hour audit context; the exact issuance retains the complete spatial grid.
+
+    Keep its local_grid checksum, geometry and extraction metadata here, without
+    duplicating every other cell/hour in each selection or verification result.
+    """
+    return {
+        key: value for key, value in forecast.items() if key not in ("hours", "local_grid_baseline")
+    }
+
+
 def validate_hour_selection(
     latitude: float, longitude: float, start_valid_time: datetime, end_valid_time: datetime
 ) -> IntervalDefinition:
@@ -137,7 +148,7 @@ class ForecastIssuanceService:
         for record in records:
             saved = self.read(record.issued_forecast_id)
             forecast = saved["forecast"]
-            context = {key: value for key, value in forecast.items() if key != "hours"}
+            context = issued_forecast_context(forecast)
             for hour in forecast["hours"]:
                 valid_time = datetime.fromisoformat(hour["valid_time"])
                 if valid_time.tzinfo is None:

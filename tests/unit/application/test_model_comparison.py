@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from mesoforge.application import model_comparison as application
+from mesoforge.application.local_surface_grid import build_local_surface_grid, extract_grid_point
 from mesoforge.application.point_forecast import PreparedPointForecast
 from mesoforge.application.prepared_rap import RAP_CONFIGURATION
 from mesoforge.common.errors import IntegrityError, NotFound
@@ -59,6 +60,69 @@ def test_read_compares_distinct_versions_without_writes_or_reverification(
     assert result["summary"]["all"]["paired_sample_count"] == 2
     assert verification_tests._inventory(case) == before
     forbidden.assert_not_called()
+
+
+def test_grid_backed_issuance_verifies_and_compares_with_compact_context(verification_case):
+    case = verification_case
+    forecast = deepcopy(case.forecast)
+    for hour in forecast["hours"]:
+        for source, value in zip(hour["sources"], (280.5, 283.0), strict=True):
+            source.update(temperature={"value": value, "unit": "K"}, missing_reasons=[])
+    grid = build_local_surface_grid(
+        latitude=45.8,
+        longitude=-93.1,
+        calculate_column=lambda **coordinates: {**forecast, **coordinates},
+    )
+    forecast = extract_grid_point(grid, latitude=45.8, longitude=-93.1)
+    issued = case.issuer.issue(forecast, batch_run_id=uuid4(), location_index=0)
+    original_bytes = case.objects.objects[issued.content_digest]
+    compact_context = deepcopy(forecast)
+    del compact_context["hours"], compact_context["local_grid_baseline"]
+    case.match.update(
+        issued_forecast_id=str(issued.issued_forecast_id),
+        forecast={"latitude": 45.8, "longitude": -93.1, **forecast["hours"][0]},
+        forecast_context=compact_context,
+    )
+    selected = case.issuer.select_hours(
+        latitude=45.8,
+        longitude=-93.1,
+        start_valid_time=verification_tests._VALID,
+        end_valid_time=verification_tests._CUTOFF,
+    )
+    selected_hour = next(
+        row
+        for row in selected["results"]
+        if row["issued"]["issued_forecast_id"] == str(issued.issued_forecast_id)
+    )
+    assert selected_hour["forecast_context"] == compact_context
+    assert selected_hour["forecast_context"]["local_grid"] == forecast["local_grid"]
+    verified = case.service.verify(issued.issued_forecast_id, verification_tests._VALID)
+    assert verified["status"] == "verified"
+    assert verified["result"]["temperature_error"]["value"] == 2.25
+    assert verified["result"]["match"]["forecast_context"] == compact_context
+    before_readback = verification_tests._inventory(case)
+    comparison = application.compare_verified(
+        [ArtifactId(verified["verification_id"])],
+        read_verification=case.service.read,
+        read_forecast=case.issuer.read,
+    )
+    row = comparison["results"][0]
+    assert row["provenance"]["forecast_context"] == compact_context
+    assert row["errors"] == {
+        "HRRR": 1.5,
+        "GFS": 4.0,
+        "blend_70_30": 2.25,
+        "blend_50_50": 2.75,
+    }
+    assert comparison["summary"]["all"]["paired_sample_count"] == 1
+    unverified = application.compare_issued(
+        issued.issued_forecast_id, read_forecast=case.issuer.read
+    )
+    assert unverified["forecast_context"] == compact_context
+    assert case.service.verify(issued.issued_forecast_id, verification_tests._VALID) == verified
+    assert case.issuer.read(issued.issued_forecast_id)["forecast"] == forecast
+    assert case.objects.objects[issued.content_digest] == original_bytes
+    assert verification_tests._inventory(case) == before_readback
 
 
 def test_old_issuance_without_guidance_keeps_control_score_and_explicit_missingness(

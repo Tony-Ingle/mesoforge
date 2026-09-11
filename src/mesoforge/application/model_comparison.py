@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from mesoforge.application.issuance import read_issued_forecast
+from mesoforge.application.issuance import issued_forecast_context, read_issued_forecast
 from mesoforge.application.issued_temperature_verification import configured_service
 from mesoforge.application.point_forecast import PreparedPointForecast
 from mesoforge.application.prepared_temperature import _code_identity
@@ -209,7 +209,7 @@ def compare_verified(
             or hour is None
             or match["forecast"]
             != {"latitude": forecast["latitude"], "longitude": forecast["longitude"], **hour}
-            or match["forecast_context"] != {k: v for k, v in forecast.items() if k != "hours"}
+            or match["forecast_context"] != issued_forecast_context(forecast)
             or match["forecast_code_identity"] != saved["code_identity"]
         ):
             raise IntegrityError("Verification does not describe the exact saved issued forecast")
@@ -323,9 +323,7 @@ def compare_issued(
         ),
         "issued": {key: value for key, value in saved.items() if key != "forecast"},
         "issued_forecast_digest": str(Digest.of_bytes(_JSON.serialize(saved))),
-        "forecast_context": {
-            key: value for key, value in saved["forecast"].items() if key != "hours"
-        },
+        "forecast_context": issued_forecast_context(saved["forecast"]),
         "comparison_code_identity": identity,
         "hours": hours,
     }
