@@ -92,8 +92,9 @@ The long-term field direction includes temperature, dew point/RH, wind/gust,
 clouds, QPF, PoP, precipitation type, snow, and other useful fields as their
 scientific contracts are implemented. Conditions derive from underlying forecast
 fields rather than an unexplained standalone prediction. The smallest proposed
-next milestone is a local MesoForge grid abstraction using the existing surface
-fields, before adding QPF, PoP, or precipitation type (section 13).
+next milestone is interval-aware liquid precipitation on the existing local surface
+grid, covering both context and editable domains before PoP or precipitation type
+(section 13).
 
 **Owner model direction, 2026-09-10:** the long-term model mix includes HRRR,
 RAP, NAM 3 km, NAM, GFS, RRFS / REFS, and NBM, with useful deterministic and
@@ -111,9 +112,11 @@ zero-active-weight shadows. IFS retains native three-hourly values and gaps, and
 its interval-maximum gust is unavailable under the instantaneous-gust contract.
 Automatic current-cycle discovery, coordinate-derived shared preparation, local
 batch/forward runs, immutable PostgreSQL/MinIO issuance, temperature verification,
-and model comparison exist. Cloud cover is explicitly unavailable. There is no
-local MesoForge grid, deterministic bias correction, AI editing, V2 precipitation,
-production deployment or scheduling yet. Detailed commands, evidence and limits
+and model comparison exist. A coordinate-derived local surface grid covers the
+context domain and its smaller editable subset; the exact center-node forecast is
+extracted from those fields. Cloud cover is explicitly unavailable. There is no
+deterministic bias correction, AI editing, V2 precipitation, production deployment
+or scheduling yet. Detailed commands, evidence and limits
 belong in [README.md](../../README.md).
 
 Contributor capabilities and named/versioned recipes retain configuration snapshots,
@@ -196,12 +199,19 @@ prepared coverage instead requires preparation outside HTTP (HTTP 409).
 
 These are current internal preparation and observation defaults, not the radius,
 resolution, shape or extent policy for an editable MesoForge grid. They do not
-change the locations file. Grid spacing, context/editable geometry, taper distances,
-weather-dependent sizing and storage layout must be designed and measured during
-implementation. Coverage preparation and the current numerical forward run do not
-implement a local forecast grid or the full future lifecycle below. MesoForge derives location
-identity, nearby observation candidates, bounding boxes, surrounding counties,
-native-grid coordinates, and any spatial zone or surrounding context internally
+change the locations file. The current surface baseline uses one WGS84
+azimuthal-equidistant lattice for the context domain and nested editable subset.
+Each node explicitly records editable/context-only and forecast-point membership;
+the exact configured point remains the center node. Signed projected Euclidean
+distance to the editable boundary is positive inside, zero on the boundary and
+negative outside. This supports a future smooth taper without applying edits or
+settling taper policy. Geometry parameters, axes, extents, membership masks and
+source/code identities are retained for deterministic replay. Measured defaults
+are recorded in [README.md](../../README.md#local-surface-baseline-grid); permanent
+grid spacing, geometry, taper distances, weather-dependent sizing and storage
+layout remain open. This does not implement the full future lifecycle below.
+MesoForge derives location identity, nearby observation candidates, bounding boxes,
+surrounding counties, native-grid coordinates, and any spatial zone or surrounding context internally
 when needed. Users do not maintain those derived geographic inputs. Service coverage,
 available guidance, and scientific suitability still bound what can be supported.
 
@@ -502,7 +512,7 @@ requested, separately bounded audit detail.
 
 The full future lifecycle composes the responsibilities above. Local coordinate
 batch/forward runs already combine verification and numerical issuance; persistent
-registration, local grids, learning, AI, delivery and production scheduling are not
+registration, learning, AI, delivery and production scheduling are not
 implemented. A configured collection may eventually be processed by a GitHub Actions
 caller one coordinate at a time or in bounded batches. Shared model acquisition and
 retention precede the per-location work. For each configured/registered location:
@@ -757,16 +767,17 @@ These are sensible review units, not a mandatory seven-PR sequence. Adjacent sli
 combined/split for reviewability. The first slice has no dependency on learning, AI, email,
 accounts, long-term retention, or public SLOs.
 
-The next proposed implementation milestone is the smallest local MesoForge forecast-grid
-abstraction for the already implemented temperature, dew point/RH, vector wind and gust.
-Derive it from a coordinate, retain distinct shared-source and local-grid identities, and
-produce the exact-coordinate spot forecast through deterministic interpolation. Choose
-geometry and resolution by measurement during that work. Acceptance should demonstrate
-coherent surface fields, preserved scientific/missingness semantics, source reuse across
-nearby coordinates, and retained-input numerical replay with explicit provenance. Preserve
-the current point baseline as a reference; quantify and review differences caused by
-regridding, interpolation or diagnostic order. This is a recommendation for separate
-implementation approval, before QPF/PoP/precipitation type, bias correction or AI editing.
+The local surface grid now represents temperature, dew point/RH, vector wind and gust
+across one context domain and its smaller editable subset. The next proposed milestone
+is interval-aware liquid precipitation across both portions of that same grid, using
+retained acquisition, normalization and QPF calculations where their contracts fit.
+Preserve accumulation start/end bounds, units, source cycles/leads, missingness and
+provenance; align comparable intervals before blending and extracting the point result.
+Acceptance should demonstrate interval alignment, shared-source reuse, immutable
+readback and offline replay without changing existing surface fields. Field blend rules
+must be applicable and approved; deterministic amounts do not establish precipitation
+probability or rain/snow type. This remains a recommendation for separate implementation
+approval, before PoP, precipitation type, bias correction or AI editing.
 
 File/module/table/code/test/change-size estimates are non-binding planning aids per slice.
 Material overrun triggers review when it reveals changed design, not because of a line

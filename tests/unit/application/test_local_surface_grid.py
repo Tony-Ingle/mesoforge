@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import replace
+from copy import deepcopy
+from dataclasses import FrozenInstanceError, replace
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -12,7 +13,12 @@ import pyproj
 import pytest
 import xarray as xr
 
-from mesoforge.application.local_surface_grid import build_local_surface_grid, extract_grid_point
+from mesoforge.application.local_surface_grid import (
+    SurfaceGridGeometry,
+    build_local_surface_grid,
+    derive_grid_geometry,
+    extract_grid_point,
+)
 from mesoforge.application.point_forecast import (
     PreparedPointForecast,
     _ShadowView,
@@ -40,6 +46,9 @@ from tests.unit.application.test_surface_forecast import (
 LATITUDE, LONGITUDE = 44.98859, -93.25557
 HOURS = tuple(range(1, 37))
 FIELDS = (T, DEW, RH, U, V, SPEED, DIRECTION, GUST)
+TEST_GEOMETRY = SurfaceGridGeometry(
+    context_half_width_cells=2, editable_half_width_cells=1, spacing_m=3000.0
+)
 
 
 def _gradient(latitude, longitude):
@@ -129,26 +138,71 @@ def calculated_grid(prepared_surface):
         patch("requests.Session", side_effect=AssertionError("Grid must not acquire guidance")),
     ):
         grid = build_local_surface_grid(
-            latitude=LATITUDE, longitude=LONGITUDE, calculate_column=calculate
+            latitude=LATITUDE,
+            longitude=LONGITUDE,
+            calculate_column=calculate,
+            geometry=TEST_GEOMETRY,
         )
     return grid, calculate, originals
+
+
+@pytest.fixture(scope="module")
+def legacy_grid(calculated_grid):
+    """Retain the original v1 shape without relying on Git or a rewritten artifact."""
+    current = calculated_grid[0]
+    source_geometry = current["geometry"]
+    geometry = {
+        key: deepcopy(source_geometry[key]) for key in ("center", "crs_wkt2", "wind_reference")
+    }
+    geometry.update(
+        dimensions={"x": 3, "y": 3},
+        spacing_m={"x": 3000.0, "y": 3000.0},
+        x_m=[-3000.0, 0.0, 3000.0],
+        y_m=[-3000.0, 0.0, 3000.0],
+        latitude=[row[1:4] for row in source_geometry["latitude"][1:4]],
+        longitude=[row[1:4] for row in source_geometry["longitude"][1:4]],
+    )
+    geometry["extent"] = {
+        "south": min(value for row in geometry["latitude"] for value in row),
+        "north": max(value for row in geometry["latitude"] for value in row),
+        "west": min(value for row in geometry["longitude"] for value in row),
+        "east": max(value for row in geometry["longitude"] for value in row),
+    }
+    cells = []
+    for cell in current["cells"]:
+        if 1 <= cell["x_index"] <= 3 and 1 <= cell["y_index"] <= 3:
+            old_cell = {
+                key: deepcopy(cell[key])
+                for key in ("latitude", "longitude", "status", "missing_reasons", "hours")
+            }
+            old_cell.update(x_index=cell["x_index"] - 1, y_index=cell["y_index"] - 1)
+            cells.append(old_cell)
+    return {
+        "version": "mesoforge.local-surface-baseline.v1",
+        "policy": "experimental-centered-3x3-3km.v1",
+        "transformation": deepcopy(current["transformation"]),
+        "geometry": geometry,
+        "forecast_context": deepcopy(current["forecast_context"]),
+        "cells": cells,
+    }
 
 
 def test_coordinate_only_geometry_and_shared_source_reuse(prepared_surface, calculated_grid):
     grid, calculate, originals = calculated_grid
     geometry = grid["geometry"]
     assert geometry["center"] == {"latitude": LATITUDE, "longitude": LONGITUDE}
-    assert geometry["dimensions"] == {"x": 3, "y": 3}
+    assert geometry["dimensions"] == {"x": 5, "y": 5}
     assert geometry["spacing_m"] == {"x": 3000.0, "y": 3000.0}
-    assert geometry["x_m"] == geometry["y_m"] == [-3000.0, 0.0, 3000.0]
+    assert geometry["x_m"] == geometry["y_m"] == [-6000.0, -3000.0, 0.0, 3000.0, 6000.0]
     assert geometry["wind_reference"] == "earth_relative"
-    assert calculate.call_count == 9
+    assert geometry["node_location"] == "sample_at_node_center"
+    assert calculate.call_count == 25
     assert calculate.call_args_list[0].kwargs == {"latitude": LATITUDE, "longitude": LONGITUDE}
-    assert len({tuple(call.kwargs.values()) for call in calculate.call_args_list}) == 9
+    assert len({tuple(call.kwargs.values()) for call in calculate.call_args_list}) == 25
     geod = pyproj.Geod(ellps="WGS84")
     for cell in grid["cells"]:
         _, _, distance = geod.inv(LONGITUDE, LATITUDE, cell["longitude"], cell["latitude"])
-        expected = 3000.0 * math.hypot(cell["x_index"] - 1, cell["y_index"] - 1)
+        expected = 3000.0 * math.hypot(cell["x_index"] - 2, cell["y_index"] - 2)
         assert distance == pytest.approx(expected, abs=1e-6)
         assert cell["status"] == "calculated" and not cell["missing_reasons"]
         assert len(cell["hours"]) == 36
@@ -157,6 +211,106 @@ def test_coordinate_only_geometry_and_shared_source_reuse(prepared_surface, calc
     for model, views in prepared_surface._shadow_views.items():
         xr.testing.assert_identical(views[0].dataset, originals[model])
     assert grid["transformation"]["source_sha256"]["application/local_surface_grid.py"]
+
+
+@pytest.mark.parametrize("context_half,editable_half,spacing", [(2, 1, 3000.0), (3, 2, 6000.0)])
+def test_nested_domains_and_boundary_distance_support_future_taper_without_edits(
+    context_half, editable_half, spacing
+):
+    specification = SurfaceGridGeometry(context_half, editable_half, spacing)
+    calculate = Mock(
+        side_effect=lambda **point: {
+            **point,
+            "hours": [{"horizon_hours": 1, "temperature": {"value": 280.0, "unit": "K"}}],
+        }
+    )
+    grid = build_local_surface_grid(
+        latitude=LATITUDE, longitude=LONGITUDE, calculate_column=calculate, geometry=specification
+    )
+    geometry = grid["geometry"]
+    assert geometry == derive_grid_geometry(
+        latitude=LATITUDE, longitude=LONGITUDE, geometry=specification
+    )
+    size, editable_size = 2 * context_half + 1, 2 * editable_half + 1
+    domains = geometry["domains"]
+    assert domains["context"]["dimensions"] == {"x": size, "y": size}
+    assert domains["editable"]["dimensions"] == {"x": editable_size, "y": editable_size}
+    assert domains["context"]["node_count"] == size**2
+    assert domains["editable"]["node_count"] == editable_size**2
+    for domain_name, half_width in (("context", context_half), ("editable", editable_half)):
+        edge = half_width * spacing
+        assert domains[domain_name]["bounds_m"] == {
+            "x_min": -edge,
+            "x_max": edge,
+            "y_min": -edge,
+            "y_max": edge,
+        }
+        assert domains[domain_name]["boundary_included"] is True
+    assert geometry["editable_boundary"]["distance_metric"] == (
+        "signed_euclidean_distance_in_projected_meters"
+    )
+    assert geometry["editable_boundary"]["taper_policy"] == "not_implemented"
+    assert domains["context"]["extent"] == geometry["extent"]
+    for edge in ("south", "west"):
+        assert domains["context"]["extent"][edge] < domains["editable"]["extent"][edge]
+    for edge in ("north", "east"):
+        assert domains["context"]["extent"][edge] > domains["editable"]["extent"][edge]
+    assert sum(cell["inside_editable_domain"] for cell in grid["cells"]) == editable_size**2
+    assert sum(cell["context_only"] for cell in grid["cells"]) == size**2 - editable_size**2
+    assert sum(cell["is_forecast_point"] for cell in grid["cells"]) == 1
+    assert calculate.call_count == size**2
+    signed_distances = {}
+    for cell in grid["cells"]:
+        x, y = cell["x_index"] - context_half, cell["y_index"] - context_half
+        inside = abs(x) <= editable_half and abs(y) <= editable_half
+        assert cell["inside_editable_domain"] is inside
+        assert cell["context_only"] is not inside
+        assert cell["is_forecast_point"] is (x == y == 0)
+        if inside:
+            expected_distance = spacing * (editable_half - max(abs(x), abs(y)))
+        else:
+            expected_distance = -spacing * math.hypot(
+                max(abs(x) - editable_half, 0), max(abs(y) - editable_half, 0)
+            )
+        distance = cell["signed_distance_to_editable_boundary_m"]
+        assert distance == pytest.approx(expected_distance)
+        signed_distances[x, y] = distance
+        assert cell["hours"][0]["temperature"]["value"] == 280.0
+        assert "taper_weight" not in cell
+    for (x, y), distance in signed_distances.items():
+        assert signed_distances[-x, -y] == distance
+    assert signed_distances[0, 0] == spacing * editable_half
+    assert signed_distances[editable_half, 0] == 0.0
+    assert signed_distances[context_half, 0] < 0.0
+    point = extract_grid_point(grid, latitude=LATITUDE, longitude=LONGITUDE)
+    assert point["local_grid"]["point_extraction"]["x_index"] == context_half
+    assert point["local_grid"]["point_extraction"]["y_index"] == context_half
+
+
+@pytest.mark.parametrize(
+    "context_half,editable_half,spacing",
+    [
+        (1, 1, 3000.0),
+        (1, 2, 3000.0),
+        (0, 0, 3000.0),
+        (3, 0, 3000.0),
+        (3, -1, 3000.0),
+        (2.5, 1, 3000.0),
+        (3, True, 3000.0),
+        (3, 1, 0.0),
+        (3, 1, -3000.0),
+        (3, 1, math.nan),
+        (3, 1, math.inf),
+    ],
+)
+def test_invalid_geometry_is_rejected(context_half, editable_half, spacing):
+    with pytest.raises((ValueError, TypeError)):
+        SurfaceGridGeometry(context_half, editable_half, spacing)
+
+
+def test_geometry_configuration_is_immutable():
+    with pytest.raises(FrozenInstanceError):
+        TEST_GEOMETRY.spacing_m = 1000.0
 
 
 def test_every_grid_hour_preserves_surface_science_and_field_specific_weights(calculated_grid):
@@ -236,8 +390,11 @@ def test_forecast_uses_grid_center_with_exact_previous_point_equivalence(
     result = prepared_surface.forecast(latitude=LATITUDE, longitude=LONGITUDE)
     assert result["hours"] == previous["hours"]
     grid = result["local_grid_baseline"]
-    assert canonical_json_bytes(grid) == canonical_json_bytes(calculated_grid[0])
-    center = grid["cells"][4]
+    assert (
+        result["hours"]
+        == extract_grid_point(calculated_grid[0], latitude=LATITUDE, longitude=LONGITUDE)["hours"]
+    )
+    center = next(cell for cell in grid["cells"] if cell["is_forecast_point"])
     assert center["latitude"] == LATITUDE and center["longitude"] == LONGITUDE
     assert result["hours"] == center["hours"]
     assert result["local_grid"]["point_extraction"]["method"] == "exact_center_node"
@@ -259,7 +416,7 @@ def test_retained_grid_replays_without_source_calculation_and_is_not_mutated(cal
         second = extract_grid_point(replay, latitude=LATITUDE, longitude=LONGITUDE)
     assert first == second
     assert canonical_json_bytes(replay) == encoded
-    assert calculate.call_count == 9
+    assert calculate.call_count == 25
     first["hours"][0]["surface"]["fields"][T]["value"] = -1000.0
     first["local_grid_baseline"]["cells"][0]["hours"][0]["temperature"]["value"] = -1000.0
     assert canonical_json_bytes(replay) == encoded
@@ -304,9 +461,9 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
     result = prepared.forecast(latitude=LATITUDE, longitude=LONGITUDE)
     assert result["hours"][0]["temperature"]["value"] is not None
     cells = result["local_grid_baseline"]["cells"]
-    assert sum(cell["status"] == "unavailable" for cell in cells) == 8
-    for index, cell in enumerate(cells):
-        if index == 4:
+    assert sum(cell["status"] == "unavailable" for cell in cells) == len(cells) - 1
+    for cell in cells:
+        if cell["is_forecast_point"]:
             continue
         assert cell["missing_reasons"]
         hour = cell["hours"][0]

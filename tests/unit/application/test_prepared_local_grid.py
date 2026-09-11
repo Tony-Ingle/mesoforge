@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 from copy import deepcopy
 from datetime import datetime, timedelta
@@ -15,8 +16,11 @@ from mesoforge import api
 from mesoforge.application import prepared_local_grid
 from mesoforge.application.point_forecast import PreparedPointForecast
 from mesoforge.application.prepared_local_grid import PreparedLocalGrids, prepare_local_grids
+from mesoforge.contracts.serialization import canonical_json_bytes, canonical_json_digest
 from tests.unit.application.test_forecast_issuance import memory_service as memory_service
 from tests.unit.application.test_local_surface_grid import LATITUDE, LONGITUDE
+from tests.unit.application.test_local_surface_grid import calculated_grid as calculated_grid
+from tests.unit.application.test_local_surface_grid import legacy_grid as legacy_grid
 from tests.unit.application.test_local_surface_grid import prepared_surface as prepared_surface
 
 
@@ -81,7 +85,13 @@ def test_retained_grid_repeat_api_read_and_immutable_storage(
     saved = PreparedLocalGrids.from_directory(output)
     forecast = saved.forecast(latitude=LATITUDE, longitude=LONGITUDE)
     assert len(forecast["hours"]) == 36
-    assert len(forecast["local_grid_baseline"]["cells"]) == 9
+    grid = forecast["local_grid_baseline"]
+    assert len(grid["cells"]) == grid["geometry"]["domains"]["context"]["node_count"]
+    assert (
+        sum(cell["inside_editable_domain"] for cell in grid["cells"])
+        == grid["geometry"]["domains"]["editable"]["node_count"]
+    )
+    assert any(cell["context_only"] for cell in grid["cells"])
     assert (
         forecast["hours"]
         == prepared_surface._forecast_column(latitude=LATITUDE, longitude=LONGITUDE)["hours"]
@@ -119,13 +129,66 @@ def test_retained_grid_repeat_api_read_and_immutable_storage(
         invalid = client.get("/forecast", params={"lat": 100, "lon": LONGITUDE})
         assert invalid.status_code == 422
     assert (len(factory.issued_forecasts), len(objects.objects)) == before
-    forecast["local_grid_baseline"]["cells"][4]["hours"][0]["temperature"]["value"] = 0
+    center = next(cell for cell in grid["cells"] if cell["is_forecast_point"])
+    center["hours"][0]["temperature"]["value"] = 0
     assert service.read(first_id.issued_forecast_id)["forecast"] != forecast
     # Any accidental retained-byte modification is rejected at startup.
     artifact = next(output.glob("*.json.gz"))
     artifact.write_bytes(artifact.read_bytes() + b"corrupt")
     with pytest.raises(ValueError, match="checksum"):
         PreparedLocalGrids.from_directory(output)
+
+
+def test_historical_v1_grid_readback_preserves_original_shape_hash_and_bytes(legacy_grid, tmp_path):
+    from mesoforge.common.identifiers import Digest
+
+    payload = canonical_json_bytes(legacy_grid)
+    compressed = gzip.compress(payload, mtime=0)
+    artifact = tmp_path / "historical-v1.json.gz"
+    artifact.write_bytes(compressed)
+    index = tmp_path / "local-grids.json"
+    index.write_bytes(
+        canonical_json_bytes(
+            {
+                "version": "local-surface-grid-index.v1",
+                "grids": [
+                    {
+                        "latitude": LATITUDE,
+                        "longitude": LONGITUDE,
+                        "file": artifact.name,
+                        "sha256": str(Digest.of_bytes(payload)),
+                        "compressed_sha256": str(Digest.of_bytes(compressed)),
+                    }
+                ],
+            }
+        )
+    )
+    before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+    with (
+        patch.object(
+            PreparedPointForecast, "_forecast_column", side_effect=AssertionError("No rebuild")
+        ),
+        patch("requests.Session", side_effect=AssertionError("No acquisition")),
+        patch("xarray.open_dataset", side_effect=AssertionError("No source load")),
+    ):
+        saved = PreparedLocalGrids.from_directory(tmp_path)
+        first = saved.forecast(latitude=LATITUDE, longitude=LONGITUDE)
+        repeated = saved.forecast(latitude=LATITUDE, longitude=LONGITUDE)
+    assert first == repeated
+    assert first["hours"] == legacy_grid["cells"][4]["hours"]
+    assert first["local_grid"]["version"] == "mesoforge.local-surface-baseline.v1"
+    assert first["local_grid"]["policy"] == "experimental-centered-3x3-3km.v1"
+    assert first["local_grid"]["point_extraction"] == {
+        "method": "exact_center_node",
+        "x_index": 1,
+        "y_index": 1,
+    }
+    assert first["local_grid"]["geometry"] == legacy_grid["geometry"]
+    assert "domains" not in first["local_grid"]["geometry"]
+    assert first["local_grid"]["sha256"] == str(canonical_json_digest(legacy_grid))
+    assert canonical_json_bytes(first["local_grid_baseline"]) == payload
+    assert canonical_json_bytes(legacy_grid) == payload
+    assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
 
 
 @pytest.mark.parametrize("mismatch", ["cycles", "weights"])

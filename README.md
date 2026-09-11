@@ -11,7 +11,8 @@ is described below. Start with [VISION.md](VISION.md) for release boundaries and
 The [on-demand forward run](#run-verification-and-current-issuance-together) produces
 real **36-hour surface forecasts**: temperature, dew point, derived RH, vector
 wind speed/direction and gust. Surface issuance now builds a small coordinate-derived
-[local baseline grid](#local-surface-baseline-grid) and extracts its exact center point.
+[local baseline grid](#local-surface-baseline-grid) with a larger context domain and
+smaller editable subset, and extracts its exact center point.
 It verifies eligible previous temperature forecasts,
 discovers current model cycles, prepares shared guidance for the configured coordinate
 collection, and saves new immutable issuances. Failed locations do not stop later ones;
@@ -46,7 +47,9 @@ only required geographic inputs; names are optional display metadata.
 The surface milestone recorded **560 focused offline tests and 19 PostgreSQL/MinIO
 integration tests passing**, plus quality checks, real Minneapolis issuance, exact
 readback and offline rebuilding. See the [forward-run evidence](#run-verification-and-current-issuance-together).
-The local-grid milestone's focused checks and measurements are recorded below. Full acceptance,
+The context/editable-grid milestone passed **175 offline and 34 PostgreSQL/MinIO
+integration tests**, with byte-identical replay and unchanged point values; measurements
+are [recorded below](#local-surface-baseline-grid). Full acceptance,
 coverage, forecast skill and production reliability are not established by that demonstration.
 
 There is **no deterministic bias correction, site learning, AI editing, V2 precipitation
@@ -56,14 +59,13 @@ Registration services and delivery also remain future work. The retained Phase 2
 baseline has HRRR/NBM/GFS, QPF and PoP support; its defaults and technical references
 remain intact. Existing `_v2` names describe Phase 2 contracts.
 
-Future direction: extend the initial local baseline into coherent digital forecast domains,
-using shared source guidance, a larger inspection context and a smaller editable area.
+Future direction: add bounded spatial editing to the coherent context/editable baseline.
 Versioned deterministic tools would validate bounded GFE-style AI edit recipes, keeping
 numerical, bias-corrected and final fields separate before exact-point interpolation.
 One-off requests stay untracked. See [VISION.md](VISION.md#intended-coordinate-driven-operation)
 and the [active RFC](docs/rfcs/mesoforge-v2-architecture.md). The first local surface grid
-is implemented; the larger context/editing lifecycle is future work. The next proposed
-increment is interval-aware liquid precipitation on this grid.
+and nested domains are implemented; the editing lifecycle remains future work. The next
+proposed increment is interval-aware liquid precipitation across both portions of this grid.
 
 Local Codex development continues; the Hermes development pipeline is paused. The RFC's
 unresolved implementation choices remain proposed, not blanket approval of the roadmap.
@@ -2001,19 +2003,29 @@ rain/snow type from surface temperature alone. Bias/AI edits and deployment rema
 
 ### Local surface baseline grid
 
-Surface preparation/issuance now derives a **3 × 3 local MesoForge grid at 3 km
-spacing**, centered on the configured latitude/longitude. Its WGS84 azimuthal-equidistant
-projection spans 6 × 6 km between outer nodes. This is an implementation experiment,
-not the permanent grid resolution, editable-domain size or larger context policy.
+Surface preparation/issuance derives **one 7 × 7 context grid at 6 km spacing**,
+centered on the configured latitude/longitude, with a nested **3 × 3 editable subset**.
+Its WGS84 azimuthal-equidistant projection spans **36 × 36 km context / 12 × 12 km
+editable**, measured between outer node centers. These are replaceable implementation
+defaults in `SurfaceGridGeometry`, not permanent product geometry or resolution.
+The existing 150 km source-preparation footprint is separate from this measured grid.
 No geographic input beyond latitude/longitude is required; `name` remains optional.
 
-Each of the nine nodes uses the existing native extraction and surface operators for
+Each of the 49 nodes uses the existing native extraction and surface operators for
 all 36 hours. HRRR/GFS temperature remains 70/30; dew point and coupled U/V/gust retain
 the approved field-specific rows and fallbacks. RH derives from each node's resulting
 temperature/dew point, and wind speed/direction derive from earth-relative U/V.
 RAP/IFS remain zero-weight shadows with native valid-time gaps. Cells outside prepared
 coverage remain explicitly missing; they do not invalidate an available center or
 trigger acquisition. Other scientific exclusions remain per field/contributor.
+
+Each cell explicitly carries `inside_editable_domain`, `context_only`,
+`is_forecast_point` and `signed_distance_to_editable_boundary_m`. The editable square
+includes its boundary: distance is positive inside, zero on the boundary and negative
+outside. These projected Euclidean distances and retained geometry permit a future
+smooth taper; **no taper weights, edits or corrections are applied**. The 9 editable
+nodes and 40 context-only nodes share the same field representation. The point belongs
+to the editable subset; it is not a separate third domain.
 
 The configured point is an actual center node and is **extracted from the retained
 grid**, not recalculated through a second point-only surface path. Off-node local-grid
@@ -2023,13 +2035,16 @@ prepared local grid and receives `409 coverage_required`, not an unsupported-mod
 
 Explicit surface batch/forward issuance automatically includes `local_grid_baseline`
 in the existing immutable forecast JSON stored through PostgreSQL/MinIO. It retains
-axes, projection, geographic nodes, all hourly fields, contributor values, applied
+axes, projection, geometry parameters, domain extents/masks, boundary distances,
+geographic nodes, all hourly fields, contributor values, applied
 weights/row identities, missing reasons, source evidence and transformation/dependency
 hashes. The original baseline stays intact for future versioned regional/time edits.
 Point-hour selection/verification carries the grid checksum and extraction metadata;
 read the exact issuance for the full grid rather than duplicating it for every hour.
 This first representation favors inspectability; its JSON packaging is not a permanent
 large-grid storage design.
+Previously retained v1 3 × 3 grids remain readable with their original bytes and hashes;
+they are not rewritten or assigned invented context/editable masks.
 
 For offline preparation and HTTP reads, use an existing selected surface preparation
 directory containing `preparation.json`. It supplies the exact contributor configuration,
@@ -2038,7 +2053,7 @@ cycles and shadow paths automatically; no cycle or station arguments are needed:
 ```powershell
 $python = Join-Path $env:LOCALAPPDATA 'MesoForge/baselines/20260909-8d0983f-d6c8ced2/environment/Scripts/python.exe'
 $sourceRun = Join-Path $env:LOCALAPPDATA 'MesoForge/forward-runs/surface-20260911T182732Z'
-$grids = Join-Path $env:LOCALAPPDATA 'MesoForge/local-grids/20260911-minneapolis'
+$grids = Join-Path $env:LOCALAPPDATA 'MesoForge/local-grids/20260911-minneapolis-context'
 $env:PYTHONPATH = "$PWD/src"
 & $python -B -m mesoforge.application.prepared_local_grid --config "$sourceRun/locations.json" --prepared-run "$sourceRun/prepared" --output-dir $grids
 & $python -B -m mesoforge.api --data-dir $grids --port 8765
@@ -2057,30 +2072,59 @@ The offline export creates no new issuance or verification record.
 Minneapolis demonstration used retained **September 11, 2026** guidance: HRRR/GFS
 12Z, RAP 15Z and IFS 06Z; reference 18Z; valid times September 11 19Z–September 13 06Z.
 It did not reacquire current guidance. All eight baseline fields (including U/V and
-diagnostics) were present at all **9 × 36 = 324 node-hours**. IFS preserved 12 native
+diagnostics) were present at all **49 × 36 = 1,764 node-hours**. IFS preserved 12 native
 temperature times and 24 gaps per cell; instantaneous IFS gust stayed unavailable.
 Every center-hour value, source value and provenance entry matched the prior point-only
 demonstration exactly; maximum numerical difference was **0**. This demonstrates exact
 node extraction, not accuracy of future off-node interpolation or forecast skill.
 
-Measured extent: **44.961589–45.015585°N, −93.293629–−93.217511° longitude**.
-The four prepared NetCDF files occupy **19,219,528 bytes**. The initial grid occupied
-about **12.68 MB canonical JSON / 1.34 MB compressed**, took about **9–10 seconds** to
-build/retain after a **0.65-second** source load, and the complete replay/readback process
-peaked near **373 MB working memory** (including source arrays, historical comparison,
-JSON copies and API responses). This is a local measurement, not a VPS resource budget.
-Offline replay opened each model NetCDF once, downloaded **0 bytes**, reproduced the
-grid bytes, and returned identical repeated API responses without regridding or writes.
+Three candidates were measured sequentially in fresh processes against those same
+retained inputs. MB below are decimal; peak working memory includes serialization and
+the point-result grid copy, but not a running API or database. These measurements show
+implementation cost and point consistency, not optimal meteorological domain size.
 
-Twelve new focused tests cover analytic spatial fields, wind/RH/units, field weights, shadow gaps,
-missing native corners, peripheral missing cells, deterministic replay, preparation
-identity/weight rejection, read-only HTTP and immutable storage. Relevant retained
-science, API, issuance and verification tests are rerun alongside the new tests.
-**430 retained offline tests passed**; affected readback/verification/comparison checks
-were rerun after the compact point-context change. The expanded existing PostgreSQL/MinIO
-forward/issuance/verification integration selection passed **34 tests**;
-it read back the complete saved grid and preserved older forecasts. Temporary services
-were stopped. Full repository acceptance/coverage and deployed resource limits remain
+| Context / editable nodes | Spacing | Context / editable width | Editable / context-only nodes | Build | JSON / gzip | Peak memory |
+| --- | --- | --- | --- | --- | --- | --- |
+| 5 × 5 / 3 × 3 | 6 km | 24 / 12 km | 9 / 16 | 23.06 s | 31.55 / 3.31 MB | 432 MB |
+| **7 × 7 / 3 × 3 (default)** | **6 km** | **36 / 12 km** | **9 / 40** | **44.83 s** | **59.86 / 6.25 MB** | **651 MB** |
+| 7 × 7 / 3 × 3 | 10 km | 60 / 20 km | 9 / 40 | 45.53 s | 59.86 / 6.25 MB | 651 MB |
+
+The default gives two context rings extending another 12 km beyond the editable
+boundary on each side, with finer sampling than the similarly costly 10 km option.
+Build-only peak working memory was about 274 MB; loading the four source files took
+0.66 seconds, serialization 1.68 seconds and compression 0.67 seconds in that candidate
+measurement. The complete preparation command also extracts/copies the point payload.
+
+Geographic extents below describe outer node centers (latitude; longitude):
+
+| Candidate | Context extent | Editable extent |
+| --- | --- | --- |
+| 5 × 5, 6 km | 44.880508–45.096569; −93.408020–−93.103120 | 44.934574–45.042580; −93.331723–−93.179417 |
+| 7 × 7, 6 km | 44.826390–45.150558; −93.484460–−93.026680 | 44.934574–45.042580; −93.331723–−93.179417 |
+| 7 × 7, 10 km | 44.718004–45.258534; −93.637773–−92.873367 | 44.898536–45.078573; −93.382572–−93.128568 |
+
+The four prepared NetCDF files occupy **19,219,528 bytes**, shared by both domains.
+All three candidates opened each source once, made zero network attempts, left source
+files/hashes unchanged and matched all original point hours/provenance exactly.
+The chosen default retains **59,859,260 bytes canonical JSON / 6,251,091 bytes gzip**.
+The preparation command above was executed using the existing locked environment.
+Repeating it with network access blocked reproduced the exact grid/index bytes and
+reused the retained artifact. Repeated read-only API requests returned identical data
+without source loading or recalculation. The actual prior v1 artifact also read back
+with unchanged bytes, checksum and point values. Detailed measurements, the 36-hour
+Minneapolis report and replay evidence remain outside Git under
+`%LOCALAPPDATA%/MesoForge/baselines/20260911-nested-domains/`.
+
+Focused domain checks cover geometry variation, masks/boundary distance, legacy v1
+readback, deterministic replay, analytic spatial fields, wind/RH/units, field weights,
+shadow gaps, missing corners, preparation identity, read-only HTTP and storage.
+The retained scientific/application selection passed **175 offline tests** in this
+milestone. The existing forward-run, batch-issuance and temperature-verification
+PostgreSQL/MinIO selection passed **34 integration tests**, including exact immutable
+readback of the full context/editable grid and preservation of older forecasts.
+Fresh temporary services were stopped afterward. Ruff, formatting, mypy, import
+contracts, the locked-dependency check, documentation, repository hygiene and
+`git diff --check` passed. Full repository acceptance/coverage and deployed resource limits remain
 unverified; no bias correction, AI editing or precipitation was added.
 
 ### Automatic current guidance

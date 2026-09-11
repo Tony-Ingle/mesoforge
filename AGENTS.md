@@ -23,7 +23,8 @@ with physical, cross-field, continuity, cutoff and domain validation. Preserve t
 numerical baseline, bias-corrected fields, proposal and final forecast separately;
 measure AI's added value against the bias-corrected baseline on identical samples.
 Site knowledge must be versioned and inspectable, not assumed LLM memory.
-The local forecast grid, bias correction and AI editing are not implemented yet.
+The local surface baseline now uses one grid with context and smaller editable
+domains; bias correction and AI editing are not implemented yet.
 This direction does not authorize future stages during unrelated tasks or settle
 unapproved domain dimensions, grid spacing, tapering or storage choices.
 

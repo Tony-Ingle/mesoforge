@@ -26,9 +26,12 @@ added fields use applicable retained Phase 2 rules. RAP and IFS are real zero-we
 shadows; IFS keeps native three-hourly gaps and has no compatible instantaneous gust.
 Cloud cover is explicitly unavailable without an approved blend policy.
 
-Prepared files hold native model grids; **there is no local MesoForge forecast grid
-yet**. Deterministic bias correction, site learning, AI editing, precipitation fields
-in the V2 path, delivery and production deployment/scheduling are not implemented.
+Shared prepared files hold native model grids. The local MesoForge surface baseline
+uses one coordinate-derived grid covering a larger context domain, with a smaller
+editable subset and an exact forecast-point target. The spot forecast is extracted
+from its center node. Deterministic bias correction, site learning, AI editing,
+precipitation fields in the V2 path, delivery and production deployment/scheduling
+are not implemented.
 The existing on-demand forward run and explicit batch history are not a deployed
 registered-location service. [README.md](README.md) records commands, demonstrated
 results and validation gaps; temperature remains the verified/scored field today.
@@ -80,9 +83,14 @@ local forecast-grid design. Native-grid views are already shared across overlapp
 locations and can be rebuilt from retained raw messages; distant locations may use
 separate views of the same acquired guidance. Context ends at available model coverage.
 
-Local-grid radii, resolution, projection, shape, taper distances and storage layout
-remain implementation decisions to measure and design. This update fixes none of
-those parameters and does not add dynamic weather-dependent sizing.
+The current surface grid uses one WGS84 azimuthal-equidistant lattice, with explicit
+editable, context-only and forecast-point flags. Geometry parameters, extents and
+masks are retained with source and transformation identities. Signed distance to the
+editable boundary permits a future smooth taper; no taper or forecast adjustment is
+applied. Measured geometry defaults are recorded in [README.md](README.md#local-surface-baseline-grid),
+not permanent product constraints. Longer-term radii, resolution, projection, shape,
+taper distances and storage layout remain open; dynamic weather-dependent sizing is
+not implemented.
 
 For explicitly configured/registered locations, the eventual lifecycle is:
 
@@ -197,10 +205,11 @@ editing occur during preparation/issuance, outside the normal HTTP request path.
 
 The release direction remains a private operator-controlled forecast service with
 useful deterministic output, immutable configured-location history, suitable
-observation matching and bounded performance queries. An approved local-grid
-increment should establish the numerical field representation before precipitation
-or editing stages are added. Statistical correction, AI, delivery and long-term
-learning are not prerequisites for that increment.
+observation matching and bounded performance queries. The implemented local surface
+grid establishes the numerical representation across context and editable domains.
+The next proposed increment is interval-aware liquid precipitation on that same grid,
+before PoP, precipitation type or editing stages. Statistical correction, AI,
+delivery and long-term learning are not prerequisites for that increment.
 
 The exact wider release support matrix, authentication, measured resource limits,
 local-grid design and retention promises remain open. Existing approved field and

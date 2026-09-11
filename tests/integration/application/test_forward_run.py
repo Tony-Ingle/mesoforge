@@ -426,10 +426,17 @@ def test_surface_forward_run_saves_exact_fields_and_preserves_older_temperature_
         assert saved["forecast"] == forecast
         assert forecast["current_model_set"] == preparation["current_model_set"]
         grid = saved["forecast"]["local_grid_baseline"]
-        assert grid["geometry"]["dimensions"] == {"x": 3, "y": 3}
-        assert len(grid["cells"]) == 9
+        domains = grid["geometry"]["domains"]
+        assert grid["geometry"]["dimensions"] == domains["context"]["dimensions"]
+        assert len(grid["cells"]) == domains["context"]["node_count"]
+        assert (
+            sum(cell["inside_editable_domain"] for cell in grid["cells"])
+            == domains["editable"]["node_count"]
+        )
+        assert domains["context"]["node_count"] > domains["editable"]["node_count"]
+        assert any(cell["context_only"] for cell in grid["cells"])
         assert all(len(cell["hours"]) == 36 for cell in grid["cells"])
-        center = next(cell for cell in grid["cells"] if cell["x_index"] == cell["y_index"] == 1)
+        center = next(cell for cell in grid["cells"] if cell["is_forecast_point"])
         assert center["hours"] == forecast["hours"]
         assert forecast["local_grid"]["point_extraction"]["method"] == "exact_center_node"
         assert len(forecast["hours"]) == len(forecast["hourly_report"]["hours"]) == 36
