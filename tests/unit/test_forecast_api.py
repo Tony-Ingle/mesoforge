@@ -14,6 +14,8 @@ from fastapi.testclient import TestClient
 from mesoforge import api
 from mesoforge.application.point_forecast import PreparedPointForecast, prepare_demo_files
 from mesoforge.catalog.configuration import load_configuration_source
+from mesoforge.catalog.contributors import ModelDefinition
+from mesoforge.forecasting.recipes import DEFAULT_CONFIGURATION, ContributorConfiguration
 from mesoforge.guidance.sources.hrrr_transport import RequestsHrrrHttpTransport
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -361,3 +363,112 @@ def test_small_prepared_subset_requires_preparation_not_unsupported(client, lati
     assert response.status_code == 409
     assert response.json()["code"] == "coverage_required"
     assert "preparation" in response.json()["error"]
+
+
+def shadow_configuration(status: str = "shadow") -> ContributorConfiguration:
+    definition = ModelDefinition(
+        model_id="SYNTH_SHADOW",
+        provider="synthetic-fixture",
+        family="test",
+        domain="fixture",
+        supported_fields=("air_temperature_2m",),
+        cycle_hours=(0, 6, 12, 18),
+        supported_leads=tuple(range(49)),
+        status=status,
+        grid_type="geographic",
+    )
+    return ContributorConfiguration(
+        models=(*DEFAULT_CONFIGURATION.models, definition),
+        control_recipe=DEFAULT_CONFIGURATION.control_recipe,
+        comparison_recipes=DEFAULT_CONFIGURATION.comparison_recipes,
+    )
+
+
+def write_shadow(directory: Path, *, mutation: str | None = None) -> Path:
+    with xr.open_dataset(directory / "GFS.nc", engine="h5netcdf") as opened:
+        dataset = opened.load()
+    dataset.attrs.update(model="SYNTH_SHADOW", data_kind="synthetic_demonstration")
+    dataset["air_temperature_2m"].values += 10.0
+    if mutation == "outside":
+        dataset = dataset.assign_coords(x=dataset.x.values + 10.0)
+    elif mutation == "missing_hour":
+        dataset = dataset.isel(source_lead_time=[0, 2])
+    elif mutation == "nonfinite":
+        dataset["air_temperature_2m"].values[1, :, :] = np.nan
+    elif mutation == "units":
+        dataset["air_temperature_2m"].attrs["unit_id"] = "degC"
+    path = directory / "SYNTH_SHADOW.nc"
+    dataset.to_netcdf(path, engine="h5netcdf")
+    return path
+
+
+@pytest.mark.parametrize("status", ["shadow", "evaluated", "deprecated"])
+def test_registered_shadow_extracts_without_changing_active_forecast(
+    prepared_dir, monkeypatch, status
+):
+    import hashlib
+
+    baseline = PreparedPointForecast.from_directory(prepared_dir).forecast(
+        latitude=45.8, longitude=-93.1
+    )
+    path = write_shadow(prepared_dir)
+    configuration = shadow_configuration(status)
+    prepared = PreparedPointForecast.from_directory(prepared_dir, configuration=configuration)
+    expected_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    forbidden = Mock(side_effect=AssertionError("Forecast attempted to load guidance"))
+    monkeypatch.setattr(xr, "open_dataset", forbidden)
+    monkeypatch.setattr(Path, "read_bytes", forbidden)
+    result = prepared.forecast(latitude=45.8, longitude=-93.1)
+    for offset, (hour, original) in enumerate(zip(result["hours"], baseline["hours"], strict=True)):
+        assert {key: value for key, value in hour.items() if key != "shadow_sources"} == original
+        assert hour["shadow_sources"] == [
+            {
+                "model": "SYNTH_SHADOW",
+                "cycle": "2026-08-30T06:00:00Z",
+                "source_lead_hours": 7 + offset,
+                "weight": 0.0,
+                "temperature": {"value": pytest.approx(303.0 + offset), "unit": "K"},
+                "missing_reasons": [],
+                "data_kind": "synthetic_demonstration",
+                "prepared_sha256": expected_digest,
+            }
+        ]
+    assert result["contributor_configuration"] == configuration.model_dump(mode="json")
+    assert prepared.forecast(latitude=45.8, longitude=-93.1) == result
+    forbidden.assert_not_called()
+
+
+@pytest.mark.parametrize("mutation", ["missing_file", "outside", "missing_hour", "nonfinite"])
+def test_shadow_missingness_cannot_change_active_values_or_eligibility(prepared_dir, mutation):
+    baseline = PreparedPointForecast.from_directory(prepared_dir).forecast(
+        latitude=45.8, longitude=-93.1
+    )
+    if mutation != "missing_file":
+        write_shadow(prepared_dir, mutation=mutation)
+    result = PreparedPointForecast.from_directory(
+        prepared_dir, configuration=shadow_configuration()
+    ).forecast(latitude=45.8, longitude=-93.1)
+    for index, (hour, original) in enumerate(zip(result["hours"], baseline["hours"], strict=True)):
+        assert {key: value for key, value in hour.items() if key != "shadow_sources"} == original
+        source = hour["shadow_sources"][0]
+        if mutation in ("missing_file", "outside") or index == 1:
+            assert source["temperature"] == {"value": None, "unit": "K"}
+            assert source["missing_reasons"]
+        else:
+            assert source["temperature"]["value"] is not None
+            assert source["missing_reasons"] == []
+
+
+def test_retired_metadata_does_not_load_new_guidance(prepared_dir):
+    (prepared_dir / "SYNTH_SHADOW.nc").write_bytes(b"This must never be opened")
+    result = PreparedPointForecast.from_directory(
+        prepared_dir, configuration=shadow_configuration("retired")
+    ).forecast(latitude=45.8, longitude=-93.1)
+    assert all("shadow_sources" not in hour for hour in result["hours"])
+    assert result["contributor_configuration"]["models"][-1]["status"] == "retired"
+
+
+def test_invalid_shadow_units_fail_closed(prepared_dir):
+    write_shadow(prepared_dir, mutation="units")
+    with pytest.raises(ValueError, match="SYNTH_SHADOW: prepared temperature must use K"):
+        PreparedPointForecast.from_directory(prepared_dir, configuration=shadow_configuration())

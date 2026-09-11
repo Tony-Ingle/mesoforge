@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -11,20 +12,132 @@ from unittest.mock import Mock
 from uuid import UUID
 
 import pytest
+import xarray as xr
 
 from mesoforge.application import batch_forecast
 from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.point_forecast import PreparedPointForecast, prepare_demo_files
+from mesoforge.forecasting.recipes import DEFAULT_CONFIGURATION, ContributorConfiguration
 from tests.support.in_memory_uow import InMemoryObjectStore, InMemoryUnitOfWorkFactory
 from tests.unit.application.test_prepared_temperature import (
     EXTENDED_HORIZONS,
     TARGET,
     prepare_fixture_guidance,
 )
+from tests.unit.test_forecast_api import shadow_configuration, write_shadow
 
 FIRST = {"lat": 45.8, "lon": -93.1}
 LAST = {"lat": 45.9, "lon": -93.0}
 OUTSIDE = {"lat": 95.0, "lon": -93.27}  # Invalid latitude, not a prepared-region limit.
+
+
+def test_batch_issues_synthetic_shadow_and_configuration_without_changing_control(
+    tmp_path,
+    prepared_batch_data,
+    memory_issuance,
+):
+    data_dir = tmp_path / "guidance"
+    shutil.copytree(prepared_batch_data, data_dir)
+    config = write_config(tmp_path, [FIRST, OUTSIDE, LAST])
+    baseline = batch_forecast.run_batch(config, data_dir)
+    write_shadow(data_dir)
+    configuration = shadow_configuration()
+    result = batch_forecast.run_batch(config, data_dir, contributor_configuration=configuration)
+    assert [row["status"] for row in result["results"]] == ["ok", "error", "ok"]
+    service, factory, _ = memory_issuance
+    assert len(factory.issued_forecasts) == 4
+    for original, row in zip(baseline["results"], result["results"], strict=True):
+        if row["status"] != "ok":
+            continue
+        assert row["forecast"]["contributor_configuration"] == configuration.model_dump(mode="json")
+        saved = service.read(UUID(row["issued"]["issued_forecast_id"]))
+        assert saved["forecast"] == row["forecast"]
+        assert len(saved["forecast"]["hours"]) == 36
+        for old_hour, hour in zip(
+            original["forecast"]["hours"], saved["forecast"]["hours"], strict=True
+        ):
+            assert {
+                key: value for key, value in hour.items() if key != "shadow_sources"
+            } == old_hour
+            shadow = hour["shadow_sources"][0]
+            assert shadow["temperature"] == {
+                "value": pytest.approx(299 + hour["horizon_hours"]),
+                "unit": "K",
+            }
+            assert shadow["weight"] == 0.0
+            assert shadow["data_kind"] == "synthetic_demonstration"
+            assert shadow["missing_reasons"] == []
+            assert shadow["prepared_sha256"]
+
+
+def test_batch_cli_reads_contributors_config_and_persists_snapshot(
+    tmp_path, prepared_batch_data, capsys, memory_issuance
+):
+    config = write_config(tmp_path, [FIRST])
+    contributors = tmp_path / "contributors.json"
+    configuration = shadow_configuration()
+    contributors.write_text(configuration.model_dump_json(), encoding="utf-8")
+    assert (
+        batch_forecast.main(
+            [
+                "--config",
+                str(config),
+                "--data-dir",
+                str(prepared_batch_data),
+                "--contributors-config",
+                str(contributors),
+            ]
+        )
+        == 0
+    )
+    result = json.loads(capsys.readouterr().out)
+    forecast = result["results"][0]["forecast"]
+    assert forecast["contributor_configuration"] == configuration.model_dump(mode="json")
+    assert all(
+        hour["shadow_sources"][0]["temperature"]["value"] is None for hour in forecast["hours"]
+    )
+    assert all(hour["missing_reasons"] == [] for hour in forecast["hours"])
+
+
+@pytest.mark.parametrize("change", ["control", "active_model", "extra_active"])
+def test_batch_rejects_active_changes_before_any_preparation(tmp_path, monkeypatch, change):
+    snapshot = shadow_configuration().model_dump(mode="json")
+    if change == "control":
+        snapshot["control_recipe"]["contributors"][0]["weight"] = 0.6
+        snapshot["control_recipe"]["contributors"][1]["weight"] = 0.4
+    elif change == "active_model":
+        snapshot["models"][0]["grid_type"] = "either"
+    else:
+        snapshot["models"][-1]["status"] = "active"
+    configuration = ContributorConfiguration.model_validate_json(json.dumps(snapshot))
+    forbidden = Mock(side_effect=AssertionError("Invalid control must not load/prepare guidance"))
+    monkeypatch.setattr(batch_forecast, "ensure_coverage", forbidden)
+    with pytest.raises(ValueError, match="retain|outside"):
+        batch_forecast.run_batch(
+            write_config(tmp_path, [FIRST]),
+            tmp_path / "guidance",
+            contributor_configuration=configuration,
+        )
+    forbidden.assert_not_called()
+
+
+def test_real_shadow_prepared_checksum_is_verified(tmp_path, prepared_batch_data):
+    directory = tmp_path / "guidance"
+    shutil.copytree(prepared_batch_data, directory)
+    # Generated GRIB fixtures exercise the real-preparation format, not provider data.
+    with xr.open_dataset(directory / "GFS.nc", engine="h5netcdf") as opened:
+        shadow = opened.load()
+    shadow.attrs["model"] = "SYNTH_SHADOW"
+    shadow.to_netcdf(directory / "SYNTH_SHADOW.nc", engine="h5netcdf")
+    manifest_path = directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["prepared_files"]["SYNTH_SHADOW"] = {"file": "SYNTH_SHADOW.nc", "sha256": "0" * 64}
+    manifest["inputs"].extend(
+        [{**row, "model": "SYNTH_SHADOW"} for row in manifest["inputs"] if row["model"] == "GFS"]
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="Checksum mismatch for SYNTH_SHADOW.nc"):
+        PreparedPointForecast.from_directory(directory, configuration=shadow_configuration())
 
 
 @pytest.fixture(autouse=True)
@@ -87,7 +200,7 @@ def test_batch_reuses_one_load_and_preserves_36_hour_values_times_and_provenance
     monkeypatch.setattr(PreparedPointForecast, "forecast", forecast_without_io)
     result = batch_forecast.run_batch(config, prepared_batch_data)
 
-    loader.assert_called_once_with(prepared_batch_data)
+    loader.assert_called_once_with(prepared_batch_data, configuration=DEFAULT_CONFIGURATION)
     assert len(used_guidance) == 2
     assert all(item is used_guidance[0] for item in used_guidance)
     rows = result["results"]

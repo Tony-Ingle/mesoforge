@@ -19,7 +19,9 @@ from mesoforge.application.point_forecast import PreparedPointForecast
 from mesoforge.application.prepared_temperature import _code_identity
 from mesoforge.common.errors import IntegrityError, NotFound
 from mesoforge.common.identifiers import ArtifactId, Digest
+from mesoforge.forecasting.recipes import DEFAULT_CONFIGURATION, ContributorConfiguration
 from mesoforge.storage.json import CanonicalJsonSerializer
+from mesoforge.verification.issued_temperature import forecast_eligibility_reasons
 from mesoforge.verification.model_comparison import compare_hour, summarize
 
 _JSON = CanonicalJsonSerializer()
@@ -30,6 +32,16 @@ _EXTRACTION_SOURCES = (
     "forecasting/scalar_blend.py",
 )
 _EXTRACTION_DEPENDENCIES = ("numpy", "xarray", "pyproj", "h5netcdf")
+
+
+def _configuration(forecast: dict[str, Any]) -> ContributorConfiguration:
+    """Read the issued configuration, with the original recipes for pre-registry history."""
+    snapshot = forecast.get("contributor_configuration")
+    return (
+        ContributorConfiguration.model_validate_json(json.dumps(snapshot))
+        if snapshot is not None
+        else DEFAULT_CONFIGURATION
+    )
 
 
 def comparison_identity() -> dict[str, Any]:
@@ -202,8 +214,30 @@ def compare_verified(
         ):
             raise IntegrityError("Verification does not describe the exact saved issued forecast")
         resolved, contributor_evidence = resolver.resolve(saved, hour)
-        comparison = compare_hour(resolved, match["selected"]["temperature"])
-        if comparison["errors"]["blend_70_30"] != fact["temperature_error"]["value"]:
+        configuration = _configuration(forecast)
+        ineligible_models = {
+            source["model"]: forecast_eligibility_reasons(
+                {
+                    **resolved,
+                    "sources": [source],
+                    "temperature": source.get("temperature", {}),
+                    "missing_reasons": source.get("missing_reasons", []),
+                },
+                saved["issued_at"],
+                cutoff=datetime.fromisoformat(fact["verification_cutoff"]),
+            )
+            for source in resolved.get("shadow_sources", [])
+        }
+        comparison = compare_hour(
+            resolved,
+            match["selected"]["temperature"],
+            configuration=configuration,
+            ineligible_models=ineligible_models,
+        )
+        if (
+            comparison["errors"][configuration.control_recipe.result_key]
+            != fact["temperature_error"]["value"]
+        ):
             raise IntegrityError("Saved verification error disagrees with the retained control")
         rows.append(
             {
@@ -223,6 +257,7 @@ def compare_verified(
                 / 3600,
                 **comparison,
                 "sources": deepcopy(resolved["sources"]),
+                "shadow_sources": deepcopy(resolved.get("shadow_sources", [])),
                 "contributor_evidence": contributor_evidence,
                 "selected_observation": deepcopy(match["selected"]),
                 "provenance": {
@@ -265,6 +300,7 @@ def compare_issued(
         raise IntegrityError("Readback returned a different issued forecast")
     identity = comparison_identity()
     resolver = RetainedContributors(guidance_roots, identity)
+    configuration = _configuration(saved["forecast"])
     hours = []
     for hour in saved["forecast"]["hours"]:
         resolved, evidence = resolver.resolve(saved, hour)
@@ -272,8 +308,9 @@ def compare_issued(
             {
                 "valid_time": hour["valid_time"],
                 "horizon_hours": hour["horizon_hours"],
-                **compare_hour(resolved, None),
+                **compare_hour(resolved, None, configuration=configuration),
                 "sources": deepcopy(resolved["sources"]),
+                "shadow_sources": deepcopy(resolved.get("shadow_sources", [])),
                 "contributor_evidence": evidence,
             }
         )

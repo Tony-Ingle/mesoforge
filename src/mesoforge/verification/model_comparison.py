@@ -8,13 +8,19 @@ from __future__ import annotations
 
 import math
 from collections import Counter
+from collections.abc import Mapping, Sequence
 from typing import Any
 
-from mesoforge.forecasting.scalar_blend import Contribution, blend_scalar
+from mesoforge.forecasting.recipes import (
+    DEFAULT_CONFIGURATION,
+    ContributorConfiguration,
+    evaluate_recipe,
+)
 from mesoforge.verification.metrics import _compute_scalar_metrics
 
-PREDICTION_KEYS = ("HRRR", "GFS", "blend_70_30", "blend_50_50")
-_CONTROL_WEIGHTS = {"HRRR": 0.7, "GFS": 0.3}
+PREDICTION_KEYS = tuple(model.model_id for model in DEFAULT_CONFIGURATION.models) + tuple(
+    recipe.result_key for recipe in DEFAULT_CONFIGURATION.recipes()
+)
 _CONTROL_TOLERANCE_K = 1e-10
 _BUCKETS = ("1-6", "7-18", "19-36")
 
@@ -49,7 +55,13 @@ def _prediction(temperature: Any, reasons: Any, label: str) -> dict[str, Any]:
     return {"value": value, "unit": "K", "missing_reasons": list(dict.fromkeys(missing))}
 
 
-def compare_hour(hour: dict[str, Any], observation: dict[str, Any] | None) -> dict[str, Any]:
+def compare_hour(
+    hour: dict[str, Any],
+    observation: dict[str, Any] | None,
+    *,
+    configuration: ContributorConfiguration = DEFAULT_CONFIGURATION,
+    ineligible_models: Mapping[str, Sequence[str]] | None = None,
+) -> dict[str, Any]:
     """Compare retained values against the already-selected verified temperature.
 
     The caller supplies the observation from an eligible immutable verification;
@@ -57,58 +69,87 @@ def compare_hour(hour: dict[str, Any], observation: dict[str, Any] | None) -> di
     legacy contributor values stay missing, even when the control was retained.
     """
     bucket = _lead_bucket(hour.get("horizon_hours"))
-    sources = hour.get("sources")
+    active = hour.get("sources")
+    shadows = hour.get("shadow_sources", [])
+    control_recipe = configuration.control_recipe
+    if control_recipe.field != "air_temperature_2m":
+        raise ValueError("temperature comparison requires air_temperature_2m")
+    weights = {item.model: item.weight for item in control_recipe.contributors}
     if (
-        not isinstance(sources, list)
-        or len(sources) != 2
-        or any(not isinstance(source, dict) for source in sources)
-        or {source.get("model") for source in sources} != set(_CONTROL_WEIGHTS)
+        not isinstance(active, list)
+        or len(active) != len(weights)
+        or any(not isinstance(source, dict) for source in active)
+        or {source.get("model") for source in active} != set(weights)
     ):
-        raise ValueError("comparison requires exactly the HRRR and GFS contributors")
+        raise ValueError("comparison requires exactly the saved control recipe contributors")
+    if not isinstance(shadows, list) or any(not isinstance(source, dict) for source in shadows):
+        raise ValueError("shadow_sources must contain contributor records")
+    sources = active + shadows
+    by_model = {source["model"]: source for source in sources}
+    if len(by_model) != len(sources) or not set(by_model).issubset(configuration.model_map()):
+        raise ValueError("comparison has duplicate or unregistered contributors")
 
     predictions: dict[str, dict[str, Any]] = {}
-    for source in sources:
+    eligibility = {key: list(value) for key, value in (ineligible_models or {}).items()}
+    for source in active:
         model = source["model"]
         weight = source.get("weight")
-        if type(weight) not in (int, float) or weight != _CONTROL_WEIGHTS[model]:
-            raise ValueError(f"{model}: comparison requires the saved 70/30 control weights")
-        predictions[model] = _prediction(
-            source.get("temperature"), source.get("missing_reasons", []), model
+        if type(weight) not in (int, float) or weight != weights[model]:
+            raise ValueError(f"{model}: comparison requires the saved control recipe weights")
+    for source in shadows:
+        if type(source.get("weight")) not in (int, float) or source["weight"] != 0:
+            raise ValueError("shadow contributors must have zero active weight")
+    definitions: dict[str, Any] = {}
+    for model in configuration.models:
+        if model.status == "retired":
+            continue
+        source = by_model.get(model.model_id, {})
+        predictions[model.model_id] = _prediction(
+            source.get("temperature"), source.get("missing_reasons", []), model.model_id
         )
-    control = _prediction(hour.get("temperature"), hour.get("missing_reasons", []), "blend_70_30")
-    predictions["blend_70_30"] = control
-    contributors_missing = [
-        reason for model in _CONTROL_WEIGHTS for reason in predictions[model]["missing_reasons"]
-    ]
-    comparison_value = None
-    if not contributors_missing:
-        control_check = blend_scalar(
-            tuple(
-                Contribution(model, predictions[model]["value"], weight)
-                for model, weight in _CONTROL_WEIGHTS.items()
-            )
-        ).blended_value
-        if control["value"] is not None and not math.isclose(
-            control["value"], control_check, rel_tol=0.0, abs_tol=_CONTROL_TOLERANCE_K
-        ):
-            raise ValueError("saved 70/30 control disagrees with its retained contributors")
-        comparison_value = blend_scalar(
-            tuple(
-                Contribution(model, predictions[model]["value"], 0.5) for model in _CONTROL_WEIGHTS
-            )
-        ).blended_value
-    predictions["blend_50_50"] = {
-        "value": comparison_value,
-        "unit": "K",
-        "missing_reasons": list(contributors_missing),
-    }
+        definitions[model.model_id] = {
+            "kind": "model",
+            "model_id": model.model_id,
+            "field": control_recipe.field,
+        }
+    values = {name: prediction["value"] for name, prediction in predictions.items()}
+    for recipe in configuration.recipes():
+        evaluated = evaluate_recipe(recipe, values)
+        key = recipe.result_key
+        reasons = [
+            reason
+            for model in evaluated.missing_models
+            for reason in predictions[model]["missing_reasons"]
+        ]
+        prediction: dict[str, Any] = {
+            "value": evaluated.value,
+            "unit": "K",
+            "missing_reasons": reasons,
+        }
+        if recipe == control_recipe:
+            prediction = _prediction(hour.get("temperature"), hour.get("missing_reasons", []), key)
+            if (
+                prediction["value"] is not None
+                and evaluated.value is not None
+                and not math.isclose(
+                    prediction["value"], evaluated.value, rel_tol=0.0, abs_tol=_CONTROL_TOLERANCE_K
+                )
+            ):
+                raise ValueError("saved control disagrees with its retained contributors")
+        predictions[key] = prediction
+        definitions[key] = {"kind": "recipe", **recipe.model_dump(mode="json")}
+        eligibility[key] = [
+            f"{item.model}: {reason}"
+            for item in recipe.contributors
+            for reason in eligibility.get(item.model, [])
+        ]
     observed = _prediction(observation, [], "observation")
     errors: dict[str, float | None] = {}
-    for name in PREDICTION_KEYS:
+    for name in predictions:
         value = predictions[name]["value"]
         error = (
             value - observed["value"]
-            if value is not None and observed["value"] is not None
+            if value is not None and observed["value"] is not None and not eligibility.get(name)
             else None
         )
         if error is not None and not math.isfinite(error):
@@ -118,11 +159,14 @@ def compare_hour(hour: dict[str, Any], observation: dict[str, Any] | None) -> di
     if observed["value"] is None:
         exclusions.append("observation_missing")
     exclusions.extend(
-        f"{name}_missing" for name in PREDICTION_KEYS if predictions[name]["value"] is None
+        f"{name}_missing" for name in predictions if predictions[name]["value"] is None
     )
+    exclusions.extend(f"{name}_ineligible" for name in predictions if eligibility.get(name))
     return {
         "lead_bucket": bucket,
         "predictions": predictions,
+        "prediction_definitions": definitions,
+        "ineligible_reasons": {name: eligibility.get(name, []) for name in predictions},
         "observation": observed,
         "errors": errors,
         "error_unit": "K",
@@ -131,10 +175,12 @@ def compare_hour(hour: dict[str, Any], observation: dict[str, Any] | None) -> di
     }
 
 
-def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    paired = [row for row in rows if row["paired_sample"]]
+def _summarize_rows(rows: list[dict[str, Any]], keys: tuple[str, ...]) -> dict[str, Any]:
+    paired = [
+        row for row in rows if row["paired_sample"] and all(key in row["errors"] for key in keys)
+    ]
     metrics: dict[str, Any] = {}
-    for name in PREDICTION_KEYS:
+    for name in keys:
         errors = [row["errors"][name] for row in paired]
         if any(type(error) not in (int, float) or not math.isfinite(error) for error in errors):
             raise ValueError("a complete paired comparison requires finite errors for every model")
@@ -146,9 +192,10 @@ def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "rmse": rmse,
             "unit": "K",
         }
-    exclusions = Counter(
-        reason for row in rows if not row["paired_sample"] for reason in row["exclusion_reasons"]
-    )
+    exclusions: Counter[str] = Counter()
+    for row in rows:
+        exclusions.update(row["exclusion_reasons"])
+        exclusions.update(f"{key}_missing" for key in keys if key not in row["errors"])
     return {
         "row_count": len(rows),
         "paired_sample_count": len(paired),
@@ -167,14 +214,24 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """
     if any(row["lead_bucket"] not in _BUCKETS for row in rows):
         raise ValueError("comparison contains an unsupported lead bucket")
+    definitions: dict[str, Any] = {}
+    for row in rows:
+        for key, definition in row.get("prediction_definitions", {}).items():
+            if key in definitions and definitions[key] != definition:
+                raise ValueError(f"Cannot pool different recipe definitions under {key!r}")
+            definitions[key] = definition
+    keys = (
+        tuple(dict.fromkeys(key for row in rows for key in row["predictions"])) or PREDICTION_KEYS
+    )
     return {
-        "all": _summarize_rows(rows),
+        "all": _summarize_rows(rows, keys),
         **{
-            bucket: _summarize_rows([row for row in rows if row["lead_bucket"] == bucket])
+            bucket: _summarize_rows([row for row in rows if row["lead_bucket"] == bucket], keys)
             for bucket in _BUCKETS
         },
         "interpretation": (
-            "Descriptive statistics of the same complete paired samples for all four predictions. "
+            "Descriptive statistics of the same complete paired samples for all requested "
+            "predictions. "
             "Issued versions remain separate samples; overlapping forecasts are not independent. "
             "Sample counts alone do not establish predictive skill. Exclusion reasons may overlap."
         ),

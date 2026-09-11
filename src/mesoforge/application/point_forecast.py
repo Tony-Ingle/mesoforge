@@ -24,7 +24,11 @@ from mesoforge.application.spatial_coverage import (
     validate_coordinate,
 )
 from mesoforge.catalog.domains import BoundingBox
-from mesoforge.forecasting.scalar_blend import Contribution, blend_scalar
+from mesoforge.forecasting.recipes import (
+    DEFAULT_CONFIGURATION,
+    ContributorConfiguration,
+    evaluate_recipe,
+)
 
 _DATA_KIND = "synthetic_demonstration"
 _NOTICE = "Synthetic demonstration data; not a current weather forecast."
@@ -35,7 +39,6 @@ _SELECTED_NOTICE = (
     "see source and valid times."
 )
 _VARIABLE = "air_temperature_2m"
-_WEIGHTS = {"HRRR": 0.7, "GFS": 0.3}
 # Owner-approved demonstration weights throughout hours 1..36, not optimized
 # weights or the Phase 2 table's 60/40 HRRR/GFS row for hours 19..36.
 _CRS = pyproj.CRS.from_epsg(4326)
@@ -170,7 +173,11 @@ def _verify_file(directory: Path, filename: str, expected: str) -> None:
 
 
 def _load_source_manifest(
-    directory: Path, guidance: dict[str, xr.Dataset], target: np.datetime64
+    directory: Path,
+    guidance: dict[str, xr.Dataset],
+    target: np.datetime64,
+    *,
+    models: set[str] | None = None,
 ) -> tuple[dict[str, Any], str]:
     """Verify retained source and prepared file identities before serving real inputs."""
     path = directory / "manifest.json"
@@ -184,8 +191,9 @@ def _load_source_manifest(
             or _target_time(manifest["target_reference_time"]) != target
         ):
             raise ValueError("Real guidance manifest data kind or target time disagrees")
-        entries = {(row["model"], row["valid_time"]): row for row in manifest["inputs"]}
-        if len(entries) != len(manifest["inputs"]):
+        rows = [row for row in manifest["inputs"] if models is None or row["model"] in models]
+        entries = {(row["model"], row["valid_time"]): row for row in rows}
+        if len(entries) != len(rows):
             raise ValueError("Real guidance manifest contains duplicate source times")
         for row in entries.values():
             for prefix in ("raw", "index"):
@@ -222,6 +230,8 @@ class PreparedPointForecast:
     _manifest: dict[str, Any] | None
     _manifest_sha256: str | None
     _horizons: tuple[int, ...]
+    _configuration: ContributorConfiguration
+    _shadow_metadata: dict[str, dict[str, Any]]
 
     @property
     def notice(self) -> str:
@@ -235,12 +245,18 @@ class PreparedPointForecast:
         return self._horizons
 
     @classmethod
-    def from_directory(cls, directory: Path) -> PreparedPointForecast:
+    def from_directory(
+        cls, directory: Path, *, configuration: ContributorConfiguration = DEFAULT_CONFIGURATION
+    ) -> PreparedPointForecast:
+        if configuration.control_recipe.field != _VARIABLE:
+            raise ValueError("Prepared point forecasts currently support temperature only")
         guidance: dict[str, xr.Dataset] = {}
         projections: dict[str, pyproj.CRS] = {}
         kinds: set[str] = set()
         target: np.datetime64 | None = None
-        for model in _WEIGHTS:
+        definitions = configuration.model_map()
+        active_models = tuple(item.model for item in configuration.control_recipe.contributors)
+        for model in active_models:
             path = directory / f"{model}.nc"
             if not path.exists():
                 continue
@@ -256,8 +272,8 @@ class PreparedPointForecast:
                 if not isinstance(wkt, str) or not wkt:
                     raise ValueError(f"{model}: real guidance requires crs_wkt2")
                 crs = pyproj.CRS.from_wkt(wkt)
-                if (model == "HRRR" and not crs.is_projected) or (
-                    model == "GFS" and not crs.is_geographic
+                if (definitions[model].grid_type == "projected" and not crs.is_projected) or (
+                    definitions[model].grid_type == "geographic" and not crs.is_geographic
                 ):
                     raise ValueError(f"{model}: incorrect native projection")
                 projections[model] = crs
@@ -268,10 +284,14 @@ class PreparedPointForecast:
             target = model_target
             guidance[model] = dataset
         if target is None:
-            raise ValueError("No prepared demonstration guidance: HRRR.nc and GFS.nc are missing")
+            raise ValueError(
+                "No prepared demonstration guidance: "
+                + " and ".join(f"{model}.nc" for model in active_models)
+                + " are missing"
+            )
         data_kind = kinds.pop()
         manifest, digest = (
-            _load_source_manifest(directory, guidance, target)
+            _load_source_manifest(directory, guidance, target, models=set(active_models))
             if data_kind == _REAL_KIND
             else (None, None)
         )
@@ -282,11 +302,56 @@ class PreparedPointForecast:
             raise ValueError(
                 "Prepared temperature horizons must be 1..36 or the retained 1..3 slice"
             )
-        return cls(guidance, target, projections, data_kind, manifest, digest, horizons)
+        shadow_metadata: dict[str, dict[str, Any]] = {}
+        for model, definition in definitions.items():
+            if definition.status not in ("shadow", "evaluated", "deprecated"):
+                continue
+            path = directory / f"{model}.nc"
+            if not path.exists():
+                continue
+            with xr.open_dataset(path, engine="h5netcdf") as opened:
+                dataset = opened.load()
+            if _validate_guidance(dataset, model) != target:
+                raise ValueError(f"{model}: shadow guidance disagrees on target_reference_time")
+            kind = str(dataset.attrs["data_kind"])
+            wkt = dataset.attrs.get("crs_wkt2")
+            if kind == _REAL_KIND and (not isinstance(wkt, str) or not wkt):
+                raise ValueError(f"{model}: real guidance requires crs_wkt2")
+            crs = pyproj.CRS.from_wkt(wkt) if wkt else _CRS
+            if (definition.grid_type == "projected" and not crs.is_projected) or (
+                definition.grid_type == "geographic" and not crs.is_geographic
+            ):
+                raise ValueError(f"{model}: incorrect native projection")
+            metadata: dict[str, Any] = {
+                "data_kind": kind,
+                "prepared_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+            if kind == _REAL_KIND:
+                shadow_manifest, shadow_digest = _load_source_manifest(
+                    directory, {model: dataset}, target, models={model}
+                )
+                metadata.update(manifest=shadow_manifest, manifest_sha256=shadow_digest)
+            guidance[model], projections[model] = dataset, crs
+            shadow_metadata[model] = metadata
+        return cls(
+            guidance,
+            target,
+            projections,
+            data_kind,
+            manifest,
+            digest,
+            horizons,
+            configuration,
+            shadow_metadata,
+        )
 
     def check_coordinate(self, latitude: float, longitude: float) -> None:
         validate_coordinate(latitude, longitude)
-        for model, dataset in self._guidance.items():
+        for contributor in self._configuration.control_recipe.contributors:
+            model = contributor.model
+            dataset = self._guidance.get(model)
+            if dataset is None:
+                continue
             crs = self._projections[model]
             attrs = dataset.attrs
             if "source_x_min" in attrs and not point_in_grid(
@@ -307,9 +372,11 @@ class PreparedPointForecast:
 
     def covers_area(self, area: BoundingBox) -> bool:
         """Geometry only: missing values/times remain forecast missingness, not coverage."""
-        if set(self._guidance) != set(_WEIGHTS):
+        active_models = {item.model for item in self._configuration.control_recipe.contributors}
+        if not active_models.issubset(self._guidance):
             return False
-        for model, dataset in self._guidance.items():
+        for model in active_models:
+            dataset = self._guidance[model]
             if bbox_in_grid(area, self._projections[model], dataset.x.values, dataset.y.values):
                 continue
             attrs = dataset.attrs
@@ -331,8 +398,19 @@ class PreparedPointForecast:
         for horizon in self._horizons:
             valid_time = self._target_reference_time + np.timedelta64(horizon, "h")
             sources: list[dict[str, Any]] = []
-            contributions: list[Contribution] = []
-            for model, weight in _WEIGHTS.items():
+            shadow_sources: list[dict[str, Any]] = []
+            weights = {
+                item.model: item.weight for item in self._configuration.control_recipe.contributors
+            }
+            shadow_models = {
+                model
+                for model, definition in self._configuration.model_map().items()
+                if definition.status in ("shadow", "evaluated", "deprecated")
+            }
+            for model, weight in (
+                *weights.items(),
+                *((model, 0.0) for model in sorted(shadow_models)),
+            ):
                 source_reasons: list[str] = []
                 source: dict[str, Any] = {
                     "model": model,
@@ -342,7 +420,19 @@ class PreparedPointForecast:
                     "temperature": {"value": None, "unit": "K"},
                     "missing_reasons": source_reasons,
                 }
-                sources.append(source)
+                is_shadow = model in shadow_models
+                source_manifest = self._manifest
+                if is_shadow:
+                    shadow_sources.append(source)
+                    metadata = self._shadow_metadata.get(model, {})
+                    source["data_kind"] = metadata.get("data_kind")
+                    if "prepared_sha256" in metadata:
+                        source["prepared_sha256"] = metadata["prepared_sha256"]
+                    if "manifest_sha256" in metadata:
+                        source["manifest_sha256"] = metadata["manifest_sha256"]
+                    source_manifest = metadata.get("manifest")
+                else:
+                    sources.append(source)
                 dataset = self._guidance.get(model)
                 if dataset is None:
                     source_reasons.append(f"{model}: prepared guidance file is missing")
@@ -356,18 +446,18 @@ class PreparedPointForecast:
                     source_reasons.append(f"{model}: no guidance for this valid time")
                     continue
                 source["source_lead_hours"] = int((valid_time - cycle) / np.timedelta64(1, "h"))
-                if self._manifest is not None:
+                if source_manifest is not None:
                     evidence = next(
                         row
-                        for row in self._manifest["inputs"]
+                        for row in source_manifest["inputs"]
                         if row["model"] == model and row["valid_time"] == _iso(valid_time)
                     )
                     source.update(
                         raw_sha256=evidence["raw_sha256"],
                         source_url=evidence["source_grib_url"],
-                        prepared_sha256=self._manifest["prepared_files"][model]["sha256"],
+                        prepared_sha256=source_manifest["prepared_files"][model]["sha256"],
                     )
-                    if "cycle_selection" in self._manifest:
+                    if "cycle_selection" in source_manifest and not is_shadow:
                         source["acquisition"] = {
                             key: evidence[key]
                             for key in (
@@ -406,11 +496,11 @@ class PreparedPointForecast:
                     source_reasons.append(f"{model}: no finite temperature for this valid time")
                     continue
                 source["temperature"]["value"] = aligned[horizon].value
-                contributions.append(
-                    Contribution(model=model, value=aligned[horizon].value, weight=weight)
-                )
             reasons = [reason for source in sources for reason in source["missing_reasons"]]
-            temperature = None if reasons else blend_scalar(tuple(contributions)).blended_value
+            temperature = evaluate_recipe(
+                self._configuration.control_recipe,
+                {source["model"]: source["temperature"]["value"] for source in sources},
+            ).value
             hours.append(
                 {
                     "horizon_hours": horizon,
@@ -418,6 +508,7 @@ class PreparedPointForecast:
                     "temperature": {"value": temperature, "unit": "K"},
                     "sources": sources,
                     "missing_reasons": reasons,
+                    **({"shadow_sources": shadow_sources} if shadow_sources else {}),
                 }
             )
         result: dict[str, Any] = {
@@ -427,6 +518,7 @@ class PreparedPointForecast:
             "longitude": longitude,
             "target_reference_time": _iso(self._target_reference_time),
             "hours": hours,
+            "contributor_configuration": self._configuration.model_dump(mode="json"),
         }
         if self._manifest_sha256 is not None:
             result["manifest_sha256"] = self._manifest_sha256

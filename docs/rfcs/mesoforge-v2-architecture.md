@@ -86,6 +86,27 @@ Current Phase 2 supports HRRR/NBM/GFS; the separately approved localhost slice
 uses only HRRR/GFS temperature, now approved through hours 1–36 with fixed
 demonstration weights of 70/30. Phase 2's late-horizon defaults remain unchanged.
 
+**Implemented contributor extension, 2026-09-10:** the local temperature path now
+uses shared model capability definitions and named/versioned scalar recipes, including
+the unchanged `temperature_control_v1` and comparison-only `temperature_equal_v1`.
+Capabilities identify provider, family/lineage, domain, fields, nominal cycles,
+adapter-supported leads and status; actual provider availability still requires discovery.
+Recipes contain arbitrary ordered contributor/weight lists and explicit `require_all`
+missingness. No silent redistribution or learned weighting is introduced.
+An issuance retains its configuration snapshot, active contributions/applied weights,
+and separate zero-active-weight shadow sources through the existing storage path.
+Comparison reads the saved snapshot, preserving the old HRRR/GFS interpretation for
+historical records without one. Shadow gaps never change the active blend or its
+verification eligibility; shadow scoring uses the existing eligibility rules.
+
+The contributor lifecycle is **shadow → evaluated → active → deprecated → retired**.
+These are explicit configuration states, not automatic promotions. Evaluated evidence
+does not approve activation; changing active recipes requires owner authorization.
+Retirement disables new use while preserving historical identities and retained facts.
+The synthetic third-contributor check proves extension mechanics only. New real models
+still require suitable acquisition/normalization adapters and capability registration;
+lineage-aware weighting, RAP integration and automatic promotion are not implemented.
+
 NAM/NAM 3 km are transition candidates. The September 9 NWS SCN 26-47/26-48
 updates schedule NAM and its nests' retirement and RRFS/REFS replacement for
 October 14, 2026 at 12:00 UTC, subject to weather-related delay. The source links

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -32,8 +33,15 @@ from mesoforge.application.prepared_observations import (
     prepare_bundle,
 )
 from mesoforge.application.station_discovery import StationDiscoveryService
+from mesoforge.catalog.contributors import ModelDefinition
 from mesoforge.common.errors import IntegrityError, NotFound
 from mesoforge.common.identifiers import ArtifactId, Digest
+from mesoforge.forecasting.recipes import (
+    DEFAULT_CONFIGURATION,
+    ContributorConfiguration,
+    Recipe,
+    RecipeContributor,
+)
 from mesoforge.observations.sources.stationinfo import discover_metar_stations
 from mesoforge.storage.json import CanonicalJsonSerializer
 from mesoforge.storage.postgres.idempotency_lock import PostgresIdempotencyLock
@@ -429,6 +437,118 @@ def test_two_issued_versions_for_the_same_hour_are_independently_verified(
         assert metrics["mae"] == pytest.approx(abs(error), abs=1e-6)
         assert metrics["rmse"] == pytest.approx(abs(error), abs=1e-6)
     assert comparison == compare_verified([ArtifactId(row["verification_id"]) for row in results])
+    assert complete_storage_inventory(migrated_dsn, object_store) == after
+    forbidden.assert_not_called()
+
+
+@pytest.mark.parametrize("shadow_available", [True, False])
+def test_saved_synthetic_shadow_recipe_preserves_control_and_verification_eligibility(
+    prepared_guidance: Path,
+    migrated_dsn: str,
+    object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+    shadow_available: bool,
+) -> None:
+    observations = seed_observation_preview_inputs(migrated_dsn, object_store, VALID_TIME)
+    monkeypatch.setenv("MESOFORGE_OBSERVATIONS_ARTIFACT_ID", str(observations.artifact_id))
+    issuer = make_issuer(migrated_dsn, object_store)
+    original = PreparedPointForecast.from_directory(prepared_guidance).forecast(
+        latitude=FIRST["lat"], longitude=FIRST["lon"]
+    )
+    older = issuer.issue(original, batch_run_id=uuid4(), location_index=0)
+    older_payload = issuer.read(older.issued_forecast_id)
+    shadow = ModelDefinition(
+        model_id="SYNTH_SHADOW",
+        provider="mesoforge.test-fixture",
+        family="synthetic integration fixture",
+        domain="CONUS",
+        supported_fields=("air_temperature_2m",),
+        cycle_hours=(0, 6, 12, 18),
+        supported_leads=tuple(range(49)),
+        status="shadow",
+    )
+    recipe = Recipe(
+        name="synthetic_three_contributor_comparison",
+        version="1",
+        contributors=(
+            RecipeContributor(model="HRRR", weight=0.4),
+            RecipeContributor(model="GFS", weight=0.3),
+            RecipeContributor(model="SYNTH_SHADOW", weight=0.3),
+        ),
+    )
+    configuration = ContributorConfiguration(
+        models=(*DEFAULT_CONFIGURATION.models, shadow),
+        control_recipe=DEFAULT_CONFIGURATION.control_recipe,
+        comparison_recipes=(*DEFAULT_CONFIGURATION.comparison_recipes, recipe),
+    )
+    forecast = deepcopy(original)
+    forecast["contributor_configuration"] = configuration.model_dump(mode="json")
+    fixture_digest = str(Digest.of_bytes(b"Synthetic shadow fixture: 285 K, not model data"))
+    for hour in forecast["hours"]:
+        hour["shadow_sources"] = [
+            {
+                "model": "SYNTH_SHADOW",
+                "data_kind": "synthetic_demonstration",
+                "notice": "Invented integration-test temperature; not real guidance.",
+                "cycle": "2026-08-30T12:00:00Z",
+                "source_lead_hours": hour["horizon_hours"],
+                "valid_time": hour["valid_time"],
+                "weight": 0.0,
+                "temperature": {"value": 285.0 if shadow_available else None, "unit": "K"},
+                "missing_reasons": [] if shadow_available else ["Synthetic shadow input missing"],
+                "source_url": "test-fixture://synthetic-shadow/285K",
+                "prepared_sha256": fixture_digest.removeprefix("sha256:"),
+            }
+        ]
+    issued = issuer.issue(forecast, batch_run_id=uuid4(), location_index=0)
+    saved = issuer.read(issued.issued_forecast_id)
+    assert saved["forecast"] == forecast
+    for original_hour, saved_hour in zip(original["hours"], forecast["hours"], strict=True):
+        assert saved_hour["temperature"] == original_hour["temperature"]
+        assert saved_hour["sources"] == original_hour["sources"]
+        assert saved_hour["missing_reasons"] == original_hour["missing_reasons"] == []
+    before = complete_storage_inventory(migrated_dsn, object_store)
+    result = make_verifier(migrated_dsn, object_store, issuer).verify(
+        issued.issued_forecast_id, VALID_TIME
+    )
+    assert result["status"] == "verified"
+    assert result["result"]["temperature_error"]["value"] == pytest.approx(-10.15, abs=1e-6)
+    after = complete_storage_inventory(migrated_dsn, object_store)
+    assert_forecasts_unchanged(before, after, object_store)
+
+    forbidden = Mock(
+        side_effect=AssertionError("Shadow comparison attempted calculation or a write")
+    )
+    for owner, method in (
+        (IssuedTemperatureVerificationService, "verify"),
+        (PreparedPointForecast, "forecast"),
+        (ForecastIssuanceService, "issue"),
+        (S3ArtifactObjectStore, "put_if_absent"),
+        (PostgresUnitOfWork, "commit"),
+    ):
+        monkeypatch.setattr(owner, method, forbidden)
+    identifiers = [ArtifactId(result["verification_id"])]
+    comparison = compare_verified(identifiers)
+    row = comparison["results"][0]
+    assert row["issued_forecast_id"] == str(issued.issued_forecast_id)
+    assert row["errors"]["blend_70_30"] == pytest.approx(-10.15, abs=1e-6)
+    assert row["predictions"]["blend_70_30"]["value"] == pytest.approx(283.0, abs=1e-6)
+    if shadow_available:
+        # Independent arithmetic: .4 * 280 + .3 * 290 + .3 * 285 = 284.5 K.
+        assert row["predictions"][recipe.result_key]["value"] == pytest.approx(284.5, abs=1e-6)
+        assert row["errors"][recipe.result_key] == pytest.approx(-8.65, abs=1e-6)
+        assert row["predictions"]["SYNTH_SHADOW"]["value"] == 285.0
+    else:
+        assert row["predictions"][recipe.result_key]["value"] is None
+        assert row["errors"][recipe.result_key] is None
+        assert (
+            "Synthetic shadow input missing"
+            in row["predictions"][recipe.result_key]["missing_reasons"]
+        )
+    assert compare_verified(identifiers) == comparison
+    assert issuer.read(older.issued_forecast_id) == older_payload
+    assert issuer.read(issued.issued_forecast_id) == saved
     assert complete_storage_inventory(migrated_dsn, object_store) == after
     forbidden.assert_not_called()
 

@@ -292,6 +292,9 @@ def _code_identity() -> dict[str, Any]:
         "alignment/station_frame.py",
         "alignment/spatial.py",
         "forecasting/scalar_blend.py",
+        "forecasting/recipes.py",
+        "catalog/contributors.py",
+        "alignment/temporal.py",
     )
     identity: dict[str, Any] = {
         "source_sha256": {

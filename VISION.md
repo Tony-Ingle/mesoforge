@@ -100,6 +100,19 @@ or a requirement to acquire every model simultaneously. The current Phase 2 path
 supports HRRR/NBM/GFS; the small coordinate endpoint uses HRRR/GFS temperature only.
 The 70/30 demonstration weights are not a policy for the eventual model blend.
 
+The coordinate temperature path now has common contributor capability definitions
+and named/versioned recipes with arbitrary contributor lists. Active forecasting
+remains HRRR/GFS 70/30, temperature, hours 1–36. The additional contributor used to
+test the extension is synthetic shadow data; RAP and other real additions remain future work.
+Model integration follows **shadow → evaluated → active → deprecated → retired**.
+Shadow values and configuration are retained separately from the active blend in
+the same immutable issuance, so they can be compared without changing the control.
+Evaluated means evidence is available, not automatic approval. Promotion remains
+a human-controlled versioned configuration decision; lineage is metadata for future
+diversity-aware weighting, not a weighting algorithm. Retirement preserves historical
+identities and issued records. Adapters still own model-specific acquisition,
+normalization, availability and domain semantics; registration does not make those automatic.
+
 NAM and NAM 3 km are transition/legacy candidates, not permanent dependencies.
 Verified on 2026-09-10: NWS [SCN 26-47, updated September 9](https://www.weather.gov/media/notification/pdf_2026/SCN26-47_Updated_Retire_NAM_SREF_HREF_HiresW_NAM_MOS.aab.pdf)
 announces retirement of NAM 12 km and its nests, along with SREF, HREF, HiresW,

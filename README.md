@@ -113,9 +113,11 @@ Newly issued hours now retain individual HRRR/GFS temperatures. The read-only
 the unchanged 70/30 control, a comparison-only 50/50 blend, and saved observation errors
 with descriptive MAE/bias/RMSE. Its real demonstration used 19 existing verified hours;
 these small, overlapping samples do not establish a better recipe.
-Proposed next milestone: generalize contributor/recipe descriptions while preserving
-the current control, so future models can be evaluated in shadow mode without affecting
-issued forecasts. The combined locations lifecycle remains future work.
+Contributor capabilities and named/versioned recipes now share a generic scalar path.
+A synthetic third shadow contributor can be retained and compared without changing the
+active forecast; no additional real model is implemented. Proposed next milestone:
+add a bounded RAP temperature adapter in shadow mode and evaluate it against the saved
+control. The combined locations lifecycle remains future work.
 
 Future direction: configure locations using latitude/longitude only, with geographic
 context and suitable observation sources derived internally. The intended VPS workflow
@@ -734,6 +736,44 @@ New forecast responses and immutable issuances include each source's extracted
 `temperature` in Kelvin and `missing_reasons`. The production control remains
 **70% HRRR / 30% GFS**. No weights are learned or changed by comparison.
 
+Model definitions in `catalog/contributors.py` describe provider, family/lineage,
+domain, supported fields, nominal UTC cycles, adapter-supported leads, grid type,
+and lifecycle status. Nominal cycles are capability metadata, not proof of provider
+availability. Current defaults describe the existing temperature adapter envelope,
+not every product the models publish; unknown lineage is left empty.
+`forecasting/recipes.py` defines `temperature_control_v1` and `temperature_equal_v1`
+as configurations evaluated by the same scalar function. The existing output keys
+`blend_70_30` and `blend_50_50` are retained for compatibility.
+
+An explicit batch can load model/recipe JSON without changing the locations file:
+
+```powershell
+python -c "from pathlib import Path; from mesoforge.forecasting.recipes import DEFAULT_CONFIGURATION; Path('contributors.json').write_text(DEFAULT_CONFIGURATION.model_dump_json(indent=2), encoding='utf-8')"
+python -B -m mesoforge.application.batch_forecast --config locations.json --data-dir PREPARED_DIRECTORY --contributors-config contributors.json
+```
+
+The default export contains only HRRR/GFS. A future adapter registers its capabilities
+and provides normalized prepared inputs; its metadata and a comparison recipe can be
+added to this configuration. This milestone does not acquire a new real model.
+Batch entry points reject changes to the approved control. Shadow, evaluated, and
+deprecated inputs already prepared as `MODEL_ID.nc` can be read with zero active weight;
+retired models are not loaded for new forecasts. A real shadow input must carry the
+existing manifest/raw/prepared checksum evidence. Synthetic inputs remain labeled.
+
+New issuances save the configuration snapshot and separate `shadow_sources`, including
+values, applied active weights, cycles/leads and provenance, in the existing immutable
+payload. Shadow missingness does not change active forecast eligibility. Comparison
+reads that saved configuration, retains named recipe definitions, and uses the existing
+eligibility checks before scoring shadow sources. Missing required contributors produce
+null recipe values without weight redistribution. Mixed history lacking a shadow is
+explicitly excluded from the common paired sample; different recipe definitions under
+one output key cannot be pooled. No historical forecast is rewritten.
+
+The lifecycle is **shadow → evaluated → active → deprecated → retired**. Status is an
+explicit configuration decision, not an automatic promotion or weight-learning policy.
+Evaluation provides evidence; activation requires an approved versioned recipe change.
+Historical snapshots remain readable after later configuration changes.
+
 With the existing PostgreSQL/MinIO environment, compare an exact saved verification:
 
 ```powershell
@@ -765,8 +805,8 @@ directory for comparison because their contributor values are already saved.
 
 Verified output preserves issuance/verification IDs, coordinates, source cycles and
 leads, valid times, observation revision/QC, and provenance. Errors are prediction minus
-observation. Aggregate metrics use the **same complete paired samples** for all four
-recipes. Buckets **1–6, 7–18, 19–36** use saved horizons since target reference time;
+observation. Aggregate metrics use the **same complete paired samples** for all requested
+predictions (four by default). Buckets **1–6, 7–18, 19–36** use saved horizons since target reference time;
 native model leads and elapsed hours since issuance remain separate. Zero samples
 produce null metrics. Counts and descriptive statistics are not claims of forecast skill.
 
@@ -779,10 +819,23 @@ Repeat output was identical; all 10 issued versions and all PostgreSQL/MinIO con
 stayed unchanged. No provider calls occurred. These CLI entry points were exercised
 using the isolated locked interpreter; `uv run --locked` remains unverified here.
 
-Focused checks: **238 offline tests** (132 comparison/verification and 106 existing
-forecast/API/issuance checks) and **12 PostgreSQL/MinIO integration tests** passed.
-Temporary services were stopped. Full acceptance/coverage and broader forecast-skill
-evaluation were not run.
+The contributor generalization was checked against committed `c42e3dd`: all **360 real
+hours across 10 saved versions** matched exactly, including control values and source
+provenance. All 19 real comparison values/errors and bucket metrics also matched.
+A separate synthetic fixture batch retained a third contributor at zero active weight;
+the 283 K control stayed unchanged while a named three-model comparison returned
+287.5 K. Both issued versions and their verification readbacks remained immutable.
+Those synthetic numbers demonstrate mechanics, not forecast skill. Raw numerical
+output/configuration is outside Git in
+`%LOCALAPPDATA%\MesoForge\baselines\20260910-generic-contributors`.
+
+Final focused checks: **314 offline tests** and **14 PostgreSQL/MinIO integration tests**
+passed, plus Ruff, formatting, typing, import, documentation, hygiene and diff checks.
+An initial integration repeat-check failure passed its isolated and complete reruns;
+no assertion or production behavior was weakened. Temporary services were stopped.
+No provider downloads occurred. Full acceptance/coverage and broader forecast-skill
+evaluation were not run. Missing shadow inputs are isolated; malformed shadow files
+(wrong units, times or checksums) intentionally fail loading closed.
 
 ### Discover and reuse nearby METAR stations
 

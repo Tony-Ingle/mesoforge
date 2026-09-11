@@ -222,7 +222,11 @@ def test_collection_loader_deduplicates_shared_files_and_http_reuses_loaded_guid
     loader = Mock(wraps=PreparedPointForecast.from_directory)
     monkeypatch.setattr(PreparedPointForecast, "from_directory", loader)
     app = api.create_app(cache)
-    loader.assert_called_once_with(Path(report["regions"][0]["directory"]))
+    from mesoforge.forecasting.recipes import DEFAULT_CONFIGURATION
+
+    loader.assert_called_once_with(
+        Path(report["regions"][0]["directory"]), configuration=DEFAULT_CONFIGURATION
+    )
     before = _inventory(cache)
     forbidden = Mock(side_effect=AssertionError("HTTP attempted prepared-data I/O"))
     with monkeypatch.context() as request_patch:

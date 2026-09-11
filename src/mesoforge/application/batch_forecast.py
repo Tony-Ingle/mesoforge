@@ -18,6 +18,7 @@ from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.prepared_temperature import _code_identity, prepare_locations
 from mesoforge.application.spatial_coverage import CoverageRequiredError, UnsupportedCoordinateError
 from mesoforge.application.spatial_preparation import ensure_coverage
+from mesoforge.forecasting.recipes import DEFAULT_CONFIGURATION, ContributorConfiguration
 from mesoforge.guidance.runtime import SystemClock
 from mesoforge.storage.postgres.database import resolve_database_dsn
 from mesoforge.storage.postgres.repositories import PostgresUnitOfWork
@@ -111,11 +112,15 @@ def run_batch(
     *,
     issuer: ForecastIssuanceService | None = None,
     require_future_hours: bool = False,
+    contributor_configuration: ContributorConfiguration = DEFAULT_CONFIGURATION,
 ) -> dict[str, Any]:
     """Load guidance once; independently calculate and persist each successful location."""
     locations = load_locations(config_path)
+    validate_current_control(contributor_configuration)
 
-    prepared, coverage = ensure_coverage(locations, data_dir)
+    prepared, coverage = ensure_coverage(
+        locations, data_dir, contributor_configuration=contributor_configuration
+    )
     if prepared.horizon_hours != tuple(range(1, 37)):
         raise ValueError("Batch forecasts require an existing dataset for hours 1..36.")
 
@@ -176,6 +181,21 @@ def run_batch(
     return {"batch_run_id": str(batch_run_id), "coverage": coverage, "results": results}
 
 
+def validate_current_control(configuration: ContributorConfiguration) -> None:
+    """This application milestone permits shadow additions, not a new issued recipe."""
+    if configuration.control_recipe != DEFAULT_CONFIGURATION.control_recipe:
+        raise ValueError("Batch issuance must retain the approved HRRR/GFS 70/30 control recipe")
+    models = configuration.model_map()
+    for model, expected in DEFAULT_CONFIGURATION.model_map().items():
+        if models.get(model) != expected:
+            raise ValueError(f"Batch issuance must retain the default {model} model definition")
+    if any(
+        definition.status == "active" and model not in DEFAULT_CONFIGURATION.model_map()
+        for model, definition in models.items()
+    ):
+        raise ValueError("Additional models must remain outside the active issued control")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True, help="JSON locations list.")
@@ -187,6 +207,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--target-reference-time", type=datetime.fromisoformat)
     parser.add_argument("--hrrr-cycle", type=datetime.fromisoformat)
     parser.add_argument("--gfs-cycle", type=datetime.fromisoformat)
+    parser.add_argument(
+        "--contributors-config",
+        type=Path,
+        help="Optional model/recipe JSON; active HRRR/GFS control must remain unchanged.",
+    )
     args = parser.parse_args(argv)
     times = (args.target_reference_time, args.hrrr_cycle, args.gfs_cycle)
     if args.data_dir is not None and any(value is not None for value in times):
@@ -194,6 +219,14 @@ def main(argv: list[str] | None = None) -> int:
     if any(value is not None for value in times) and any(value is None for value in times):
         parser.error("Explicit override requires target reference time and both source cycles")
     try:
+        contributor_configuration = (
+            ContributorConfiguration.model_validate_json(
+                args.contributors_config.read_text(encoding="utf-8-sig")
+            )
+            if args.contributors_config is not None
+            else DEFAULT_CONFIGURATION
+        )
+        validate_current_control(contributor_configuration)
         preparation = None
         data_dir = args.data_dir
         if data_dir is None:
@@ -214,6 +247,7 @@ def main(argv: list[str] | None = None) -> int:
             data_dir,
             issuer=issuer,
             require_future_hours=preparation is not None and all(value is None for value in times),
+            contributor_configuration=contributor_configuration,
         )
         if preparation is not None:
             payload["preparation"] = preparation

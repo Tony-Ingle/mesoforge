@@ -7,6 +7,13 @@ import math
 
 import pytest
 
+from mesoforge.catalog.contributors import ModelDefinition
+from mesoforge.forecasting.recipes import (
+    DEFAULT_CONFIGURATION,
+    ContributorConfiguration,
+    Recipe,
+    RecipeContributor,
+)
 from mesoforge.verification.model_comparison import PREDICTION_KEYS, compare_hour, summarize
 
 
@@ -133,11 +140,11 @@ def test_incompatible_units_are_rejected(target):
 def test_wrong_models_weights_and_inconsistent_control_are_rejected():
     hour = _hour()
     hour["sources"][1]["model"] = "HRRR"
-    with pytest.raises(ValueError, match="exactly the HRRR and GFS"):
+    with pytest.raises(ValueError, match="exactly the saved control recipe"):
         compare_hour(hour, None)
     hour = _hour()
     hour["sources"][0]["weight"] = 0.5
-    with pytest.raises(ValueError, match="saved 70/30"):
+    with pytest.raises(ValueError, match="saved control recipe"):
         compare_hour(hour, None)
     with pytest.raises(ValueError, match="disagrees"):
         compare_hour(_hour(control=283.001), None)
@@ -216,3 +223,98 @@ def test_summary_rejects_nonfinite_errors_in_a_claimed_complete_pair():
     row["errors"]["GFS"] = float("nan")
     with pytest.raises(ValueError, match="finite errors"):
         summarize([row])
+
+
+def _shadow_case():
+    shadow = ModelDefinition(
+        model_id="SYNTH_SHADOW",
+        provider="fixture",
+        family="synthetic",
+        lineage=("fixture-v1",),
+        domain="fixture grid",
+        supported_fields=("air_temperature_2m",),
+        cycle_hours=(0, 6, 12, 18),
+        supported_leads=tuple(range(49)),
+        status="shadow",
+    )
+    recipe = Recipe(
+        name="three_model_comparison",
+        version="1",
+        contributors=tuple(
+            RecipeContributor(model=model, weight=weight)
+            for model, weight in (("HRRR", 0.5), ("GFS", 0.25), ("SYNTH_SHADOW", 0.25))
+        ),
+    )
+    config = ContributorConfiguration(
+        models=(*DEFAULT_CONFIGURATION.models, shadow),
+        control_recipe=DEFAULT_CONFIGURATION.control_recipe,
+        comparison_recipes=(*DEFAULT_CONFIGURATION.comparison_recipes, recipe),
+    )
+    hour = _hour()
+    hour["shadow_sources"] = [
+        {
+            "model": "SYNTH_SHADOW",
+            "weight": 0.0,
+            "temperature": {"value": 300.0, "unit": "K"},
+            "missing_reasons": [],
+        }
+    ]
+    return config, hour
+
+
+def test_named_three_contributor_recipe_and_metrics_preserve_existing_results():
+    config, hour = _shadow_case()
+    observed = {"value": 282.0, "unit": "K"}
+    before = compare_hour(_hour(), observed)
+    result = compare_hour(hour, observed, configuration=config)
+    for key in before["predictions"]:
+        assert result["predictions"][key] == before["predictions"][key]
+        assert result["errors"][key] == before["errors"][key]
+    assert result["predictions"]["three_model_comparison"]["value"] == 287.5
+    assert result["errors"]["three_model_comparison"] == 5.5
+    assert result["errors"]["SYNTH_SHADOW"] == 18.0
+    metrics = summarize([result])["1-6"]["predictions"]["three_model_comparison"]
+    assert metrics == {"sample_count": 1, "mae": 5.5, "mean_bias": 5.5, "rmse": 5.5, "unit": "K"}
+
+
+@pytest.mark.parametrize("missing", [True, False])
+def test_missing_or_ineligible_shadow_is_explicit_and_does_not_change_control(missing):
+    config, hour = _shadow_case()
+    if missing:
+        hour["shadow_sources"][0]["temperature"]["value"] = None
+    result = compare_hour(
+        hour,
+        {"value": 282.0, "unit": "K"},
+        configuration=config,
+        ineligible_models={}
+        if missing
+        else {"SYNTH_SHADOW": ["source_cycle_after_forecast_issuance"]},
+    )
+    assert result["predictions"]["blend_70_30"]["value"] == 283.0
+    assert result["errors"]["blend_70_30"] == 1.0
+    assert result["predictions"]["blend_50_50"]["value"] == 285.0
+    assert result["errors"]["SYNTH_SHADOW"] is None
+    assert result["errors"]["three_model_comparison"] is None
+    assert result["exclusion_reasons"]
+    assert summarize([result])["all"]["paired_sample_count"] == 0
+
+
+def test_summary_refuses_to_pool_changed_recipe_definitions_under_same_key():
+    first = compare_hour(_hour(), {"value": 282.0, "unit": "K"})
+    second = copy.deepcopy(first)
+    second["prediction_definitions"]["blend_50_50"]["version"] = "different"
+    with pytest.raises(ValueError, match="different recipe definitions"):
+        summarize([first, second])
+
+
+def test_history_without_shadow_is_excluded_from_joint_shadow_comparison_explicitly():
+    config, hour = _shadow_case()
+    before = compare_hour(_hour(), {"value": 282.0, "unit": "K"})
+    after = compare_hour(hour, {"value": 282.0, "unit": "K"}, configuration=config)
+    metrics = summarize([before, after])["all"]
+    assert metrics["row_count"] == 2 and metrics["paired_sample_count"] == 1
+    assert metrics["excluded_count"] == 1
+    assert metrics["exclusion_counts"] == {
+        "SYNTH_SHADOW_missing": 1,
+        "three_model_comparison_missing": 1,
+    }

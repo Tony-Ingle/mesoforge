@@ -20,6 +20,7 @@ from mesoforge.application.spatial_coverage import (
     validate_coordinate,
 )
 from mesoforge.catalog.configuration import load_configuration_source
+from mesoforge.forecasting.recipes import DEFAULT_CONFIGURATION, ContributorConfiguration
 from mesoforge.guidance.runtime import SystemClock
 
 
@@ -71,15 +72,19 @@ class PreparedRegions:
         )
 
 
-def load_prepared(directory: Path) -> PreparedPointForecast | PreparedRegions:
+def load_prepared(
+    directory: Path, *, configuration: ContributorConfiguration = DEFAULT_CONFIGURATION
+) -> PreparedPointForecast | PreparedRegions:
     """Load all shared regions once. This function never prepares or downloads."""
     index = directory / "coverage.json"
     if not index.is_file():
-        return PreparedPointForecast.from_directory(directory)
+        return PreparedPointForecast.from_directory(directory, configuration=configuration)
     payload = json.loads(index.read_text())
     regions = []
     for row in {item["directory"]: item for item in payload["regions"]}.values():
-        region = PreparedPointForecast.from_directory(Path(row["directory"]))
+        region = PreparedPointForecast.from_directory(
+            Path(row["directory"]), configuration=configuration
+        )
         if (
             region._manifest is None
             or source_identity(region._manifest) != payload["source_identity"]
@@ -99,6 +104,7 @@ def ensure_coverage(
     source_directory: Path,
     *,
     cache_directory: Path | None = None,
+    contributor_configuration: ContributorConfiguration = DEFAULT_CONFIGURATION,
 ) -> tuple[PreparedPointForecast | PreparedRegions, dict[str, Any]]:
     """Inspect the whole collection, reuse prepared views or rebuild shared views from raw.
 
@@ -114,7 +120,9 @@ def ensure_coverage(
         cache_directory = cache_directory or source_directory
         source_directory = Path(json.loads(index.read_text())["source_directory"])
     source_directory = source_directory.resolve()
-    prepared = PreparedPointForecast.from_directory(source_directory)
+    prepared = PreparedPointForecast.from_directory(
+        source_directory, configuration=contributor_configuration
+    )
     if prepared.data_kind != "real_prepared_guidance":
         return prepared, {"regions": [], "downloaded_bytes": 0, "mode": "synthetic_fixture"}
     assert prepared._manifest is not None
@@ -136,7 +144,14 @@ def ensure_coverage(
                 continue
             manifest = json.loads(path.read_text())
             if source_identity(manifest) == identity:
-                candidates.append((path.parent, PreparedPointForecast.from_directory(path.parent)))
+                candidates.append(
+                    (
+                        path.parent,
+                        PreparedPointForecast.from_directory(
+                            path.parent, configuration=contributor_configuration
+                        ),
+                    )
+                )
     reports = []
     selected: list[PreparedPointForecast] = []
     failures: dict[tuple[float, float], str] = {}
@@ -173,7 +188,9 @@ def ensure_coverage(
                     clock=SystemClock(),
                     area=area,
                 )
-                item = PreparedPointForecast.from_directory(destination)
+                item = PreparedPointForecast.from_directory(
+                    destination, configuration=contributor_configuration
+                )
             except UnsupportedCoordinateError as exc:
                 failure_file.write_text(json.dumps({"message": str(exc)}))
                 # Other geographic groups still get prepared. The native-domain failure
