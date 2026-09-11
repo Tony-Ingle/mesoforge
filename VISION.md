@@ -33,6 +33,16 @@ editable subset and an exact forecast-point target. The spot forecast is extract
 from its center node. QPF retains exact hourly accumulation bounds and approved
 precipitation rows. PoP retains its native one-hour event (>0.01 inch liquid) and
 approved NBM-only passthrough; it is not inferred from deterministic QPF.
+NBM-only PoP is the current delivered baseline, not the intended final product.
+The intended PoP is a measured, calibrated multi-source probabilistic forecast.
+Native probability shadows now preserve source-specific thresholds, periods and
+spatial support; only identical events can be compared. The initial bounded
+experiment includes NBM/GEFS six-hour probabilities, REFS neighborhood heavy-rain
+probabilities and ECMWF ensemble 24-hour probabilities. These are zero-weight
+shadows, not interchangeable hourly probabilities or an approved final recipe.
+Deterministic QPF may eventually be a predictor in calibration, but rainfall
+amounts are not probabilities themselves. Final source weights and calibration
+must come from verification evidence, not assumptions or this small demonstration.
 Precipitation type, snowfall, deterministic bias correction,
 site learning, AI editing, delivery and production deployment/scheduling
 are not implemented.
@@ -49,7 +59,7 @@ normalization and passthrough contract. Other NBM fields are not activated by th
 The owner-approved long-term direction below guides future design. The
 [V2 RFC](docs/rfcs/mesoforge-v2-architecture.md) remains proposed where implementation
 choices are unresolved. Completed, individually approved milestones do not approve
-its entire release architecture. This documentation change implements no new behavior.
+its entire release architecture. Unapproved release choices remain open.
 Local Codex development continues; the Hermes pipeline remains paused.
 
 ## Intended coordinate-driven operation
@@ -211,8 +221,12 @@ The release direction remains a private operator-controlled forecast service wit
 useful deterministic output, immutable configured-location history, suitable
 observation matching and bounded performance queries. The implemented local surface
 grid establishes the numerical representation across context and editable domains.
-The next proposed increment is precipitation type from suitable categorical and/or
-thermodynamic guidance on that same grid. Statistical correction, AI,
+Before precipitation type, the next proposed probability increment is one comparable
+six-hour ECMWF ensemble event, using native guidance if available or an explicitly
+defined complete member population. It must preserve the same threshold and period
+as the NBM/GEFS comparison without converting hourly or daily probabilities.
+Precipitation type then requires suitable categorical and/or thermodynamic guidance
+on this same grid. Statistical correction, AI,
 delivery and long-term learning are not prerequisites for that increment.
 
 The exact wider release support matrix, authentication, measured resource limits,

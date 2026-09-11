@@ -84,6 +84,7 @@ def load_prepared(
     configuration: ContributorConfiguration = DEFAULT_CONFIGURATION,
     shadow_directories: Mapping[str, Path] | None = None,
     pop_guidance: dict[str, Any] | None = None,
+    probability_sources: list[dict[str, Any]] | None = None,
 ) -> PreparedPointForecast | PreparedRegions:
     """Load all shared regions once. This function never prepares or downloads."""
     index = directory / "coverage.json"
@@ -93,6 +94,7 @@ def load_prepared(
                 directory, configuration=configuration, shadow_directories=shadow_directories
             ),
             pop_guidance,
+            probability_sources=probability_sources,
         )
     payload = json.loads(index.read_text())
     regions = []
@@ -113,15 +115,21 @@ def load_prepared(
     if not regions:
         raise ValueError("No prepared regions in coverage index")
     failures = {(row["lat"], row["lon"]): row["message"] for row in payload.get("failures", [])}
-    return attach_pop_guidance(PreparedRegions(regions, failures), pop_guidance)
+    return attach_pop_guidance(
+        PreparedRegions(regions, failures), pop_guidance, probability_sources=probability_sources
+    )
 
 
 def attach_pop_guidance(
     prepared: PreparedPointForecast | PreparedRegions,
     descriptor: dict[str, Any] | None,
+    *,
+    probability_sources: list[dict[str, Any]] | None = None,
 ) -> PreparedPointForecast | PreparedRegions:
     """Load one shared field source before forecasts; never acquire from a grid node."""
     if descriptor is None:
+        if probability_sources:
+            raise ValueError("Probability shadows require the active NBM PoP attachment")
         return prepared
     from mesoforge.application.prepared_pop import load_pop_guidance
 
@@ -132,8 +140,19 @@ def attach_pop_guidance(
     if any(region._target_reference_time != target for region in regions):
         raise ValueError("Probability attachment requires one shared target reference time")
     views = load_pop_guidance(descriptor, target_reference_time=target)
+    from mesoforge.application.prepared_probability_sources import load_probability_sources
+
+    probability_views = load_probability_sources(
+        probability_sources or [], target_reference_time=target
+    )
     attached = [
-        replace(region, _pop_views=views, _pop_guidance=deepcopy(descriptor)) for region in regions
+        replace(
+            region,
+            _pop_views=views,
+            _pop_guidance=deepcopy(descriptor),
+            _probability_views=probability_views,
+        )
+        for region in regions
     ]
     return (
         PreparedRegions(attached, prepared.failures)

@@ -18,6 +18,10 @@ import xarray as xr
 
 from mesoforge.alignment.station_frame import StationAlignmentError, align_station_to_model
 from mesoforge.application.prepared_qpf import read_qpf_inputs, required_qpf_leads
+from mesoforge.application.probability_contributors import (
+    ProbabilityView,
+    extract_probability_contributors,
+)
 from mesoforge.application.probability_forecast import POP, extract_probability_hour
 from mesoforge.application.spatial_coverage import (
     CoverageRequiredError,
@@ -319,6 +323,7 @@ class PreparedPointForecast:
     _surface_configuration: Phase2BlendConfiguration | None = None
     _pop_views: list[tuple[xr.Dataset, pyproj.CRS, dict[str, Any]]] = field(default_factory=list)
     _pop_guidance: dict[str, Any] | None = None
+    _probability_views: list[ProbabilityView] = field(default_factory=list)
 
     @property
     def notice(self) -> str:
@@ -755,6 +760,16 @@ class PreparedPointForecast:
                         "native_supported_fields": [POP],
                         "fields": {POP: native_pop},
                     }
+                    if self._probability_views:
+                        hours[-1]["surface"]["probability_guidance"] = (
+                            extract_probability_contributors(
+                                self._probability_views,
+                                latitude=latitude,
+                                longitude=longitude,
+                                valid_time=_iso(valid_time),
+                                active={**pop, "spatial_support": {"kind": "grid_point"}},
+                            )
+                        )
         contributor_configuration = (
             with_surface_fields(self._configuration)
             if self._surface_configuration is not None
@@ -771,6 +786,22 @@ class PreparedPointForecast:
             "hours": hours,
             "contributor_configuration": contributor_configuration.model_dump(mode="json"),
         }
+        if self._probability_views:
+            result["probability_sources"] = [
+                {
+                    key: deepcopy(view.manifest.get(key))
+                    for key in (
+                        "source_id",
+                        "source_metadata",
+                        "manifest_sha256",
+                        "prepared_file",
+                        "created_at",
+                        "code_identity",
+                        "events",
+                    )
+                }
+                for view in self._probability_views
+            ]
         if self._manifest_sha256 is not None:
             result["manifest_sha256"] = self._manifest_sha256
         if self._pop_guidance is not None:

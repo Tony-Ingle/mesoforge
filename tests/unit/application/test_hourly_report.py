@@ -399,3 +399,118 @@ def test_pop_report_rejects_invalid_units_or_probability_range(pop_forecast, uni
     )
     with pytest.raises(ValueError, match="PoP"):
         build_hourly_report(pop_forecast)
+
+
+@pytest.fixture
+def native_probability_forecast(pop_forecast):
+    sources = {"NBM_6H": (6, 6, 0.6), "GEFS_6H": (6, 6, 0.35), "ECMWF_ENS_24H": (24, 24, 0.0)}
+    for hour in pop_forecast["hours"]:
+        rows = []
+        for source_id, (end_hour, duration, value) in sources.items():
+            row = {
+                "source_id": source_id,
+                "event_id": None,
+                "value": None,
+                "unit": "1",
+                "role": "shadow",
+                "active_weight": 0.0,
+                "status": "unavailable",
+                "missing_reasons": ["No native interval ends at this hour; no temporal filling"],
+            }
+            if hour["horizon_hours"] == end_hour:
+                end = datetime.fromisoformat(hour["valid_time"])
+                row.update(
+                    event_id=f"{source_id}:{end_hour}",
+                    value=value,
+                    interval_start=(end - timedelta(hours=duration)).isoformat(),
+                    interval_end=end.isoformat(),
+                    interval_closure="left_open_right_closed",
+                    threshold={
+                        "value": 1.0 if duration == 24 else 0.254,
+                        "unit": "kg/m^2",
+                        "comparison": "ge" if duration == 24 else "gt",
+                    },
+                    spatial_support={"kind": "grid_point"},
+                    source_cycle="2026-11-01T00:00:00Z",
+                    source_lead_hours=end_hour + 4,
+                    status="available",
+                    missing_reasons=[],
+                    provenance={"raw_sha256": source_id + "-fixture"},
+                )
+            rows.append(row)
+        comparisons = []
+        for row in rows:
+            comparisons.append(
+                {
+                    "left": {"source_id": "NBM_HOURLY_CONTROL", "event_id": "hourly_control"},
+                    "right": {key: row[key] for key in ("source_id", "event_id")},
+                    "status": "incompatible",
+                    "delta": None,
+                    "unit": "1",
+                    "reasons": ["Different native accumulation interval or interval closure"],
+                }
+            )
+        if hour["horizon_hours"] == 6:
+            comparisons.append(
+                {
+                    "left": {key: rows[0][key] for key in ("source_id", "event_id")},
+                    "right": {key: rows[1][key] for key in ("source_id", "event_id")},
+                    "status": "comparable",
+                    "delta": 0.25,
+                    "unit": "1",
+                    "reasons": [],
+                }
+            )
+        hour["surface"]["probability_guidance"] = {"contributors": rows, "comparisons": comparisons}
+    return pop_forecast
+
+
+def test_probability_shadows_keep_native_periods_and_only_display_comparable_differences(
+    native_probability_forecast,
+):
+    original = deepcopy(native_probability_forecast)
+    baseline = deepcopy(original)
+    for hour in baseline["hours"]:
+        del hour["surface"]["probability_guidance"]
+    report = build_hourly_report(native_probability_forecast)
+    rendered = render_hourly_report(report)
+    prefix, shadow = rendered.split("### Native-period probability shadows")
+    assert prefix.strip() == render_hourly_report(build_hourly_report(baseline)).strip()
+    assert "sole active probability source with weight 1.0" in prefix
+    assert "QPF in" in prefix
+    assert "zero active weight" in shadow
+    assert "six-hour and 24-hour probabilities are not hourly probabilities" in shadow
+    assert "| 6 | NBM_6H / NBM_6H:6 |" in shadow
+    assert "2026-11-01T04:00:00+00:00 | 2026-11-01T10:00:00+00:00" in shadow
+    assert "| > 0.254 kg/m^2 | kind=grid_point | 60 | available |" in shadow
+    assert "| > 0.254 kg/m^2 | kind=grid_point | 35 | available |" in shadow
+    assert "| ≥ 1 kg/m^2 | kind=grid_point | 0 | available |" in shadow
+    assert "| 6 | NBM_6H / NBM_6H:6 minus GEFS_6H / GEFS_6H:6 | +25 |" in shadow
+    assert "not verification scores" in shadow
+    assert "Hours 1–5, 7–36: NBM_6H: No native interval ends at this hour" in shadow
+    assert "Hours 1–23, 25–36: ECMWF_ENS_24H:" in shadow
+    assert (
+        "Hours 24: NBM_HOURLY_CONTROL / hourly_control minus "
+        "ECMWF_ENS_24H / ECMWF_ENS_24H:24: incompatible" in shadow
+    )
+    assert "Different native accumulation interval" in shadow
+    assert len([line for line in shadow.splitlines() if line.startswith("| 6 |")]) == 3
+    assert native_probability_forecast == original
+    for source, shown in zip(original["hours"], report["hours"], strict=True):
+        assert shown["surface"] == source["surface"]
+        assert shown["display_pop"]["value"] == 40
+        assert shown["display_qpf"]["value"] == 1
+    report["hours"][5]["surface"]["probability_guidance"]["contributors"][0]["provenance"].clear()
+    assert native_probability_forecast == original
+
+
+@pytest.mark.parametrize("unit,value", [("percent", 40), ("1", 1.1), ("1", -0.1)])
+def test_native_shadow_probability_report_does_not_mislabel_invalid_values(
+    native_probability_forecast, unit, value
+):
+    source = native_probability_forecast["hours"][5]["surface"]["probability_guidance"][
+        "contributors"
+    ][0]
+    source.update(unit=unit, value=value)
+    with pytest.raises(ValueError, match="PoP"):
+        render_hourly_report(build_hourly_report(native_probability_forecast))

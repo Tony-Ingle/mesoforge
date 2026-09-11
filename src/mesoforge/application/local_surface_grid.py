@@ -157,6 +157,7 @@ def _transformation_identity() -> dict[str, Any]:
         "application/surface_forecast.py",
         "application/precipitation_forecast.py",
         "application/probability_forecast.py",
+        "application/probability_contributors.py",
         "forecasting/surface.py",
         "forecasting/scalar_blend.py",
         "forecasting/vector_blend.py",
@@ -205,6 +206,13 @@ def _missing_hours(hours: list[dict[str, Any]], reason: str) -> list[dict[str, A
                 field.update(value=None, missing_reasons=[reason])
                 field.pop("spatial_extraction", None)
                 field.get("normalization", {}).pop("finite_precision_floor_at_source_corners", None)
+        guidance = surface.get("probability_guidance", {})
+        for contributor in guidance.get("contributors", []):
+            contributor.update(value=None, status="unavailable", missing_reasons=[reason])
+            contributor.pop("spatial_extraction", None)
+        for comparison in guidance.get("comparisons", []):
+            comparison.update(delta=None, status="unavailable", reasons=[reason])
+            comparison["left"]["value"] = comparison["right"]["value"] = None
         surface["source_validation"] = {
             model: {"status": "unavailable", "missing_reasons": [reason]}
             for model in surface.get("source_validation", {})

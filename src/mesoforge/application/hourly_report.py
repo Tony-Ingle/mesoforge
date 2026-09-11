@@ -229,6 +229,127 @@ def _interval_cells(fields: dict[str, Any], variable: str) -> list[str]:
     return [str(field.get(key) or "unavailable") for key in ("interval_start", "interval_end")]
 
 
+def _hour_ranges(hours: list[int]) -> str:
+    """Keep repeated native-period gaps readable without hiding which hours lack data."""
+    values = sorted(set(hours))
+    ranges = []
+    index = 0
+    while index < len(values):
+        start = end = values[index]
+        index += 1
+        while index < len(values) and values[index] == end + 1:
+            end = values[index]
+            index += 1
+        ranges.append(str(start) if start == end else f"{start}–{end}")
+    return ", ".join(ranges)
+
+
+def _probability_event_text(source: dict[str, Any]) -> str:
+    threshold = source["threshold"]
+    comparator = {"gt": ">", "ge": "≥", "lt": "<", "le": "≤"}.get(
+        threshold["comparison"], threshold["comparison"]
+    )
+    return f"{comparator} {threshold['value']:g} {threshold['unit']}"
+
+
+def _probability_support_text(support: Any) -> str:
+    if isinstance(support, dict):
+        return "; ".join(f"{key}={value}" for key, value in sorted(support.items()))
+    return str(support)
+
+
+def _render_probability_shadows(hours: list[dict[str, Any]]) -> list[str]:
+    """Keep each native event separate from the delivered hourly NBM probability."""
+    if not any("probability_guidance" in hour.get("surface", {}) for hour in hours):
+        return []
+    lines = [
+        "",
+        "### Native-period probability shadows",
+        "",
+        "All contributors below have zero active weight. NBM remains the sole active "
+        "hourly PoP source. A row appears at its native interval end; six-hour and "
+        "24-hour probabilities are not hourly probabilities and are not split or filled. "
+        "Threshold, interval and event spatial support must match before comparing sources.",
+        "",
+        "| End hour | Source / event | Cycle / source lead h | Native interval start UTC | "
+        "Native interval end UTC | Interval closure | Threshold | Spatial support | "
+        "Probability % | Status |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    missing: dict[str, list[int]] = {}
+    excluded: dict[str, list[int]] = {}
+    paired = []
+    for hour in hours:
+        horizon = hour["horizon_hours"]
+        guidance = hour.get("surface", {}).get("probability_guidance", {})
+        for source in guidance.get("contributors", []):
+            if source["value"] is None:
+                reasons = source.get("missing_reasons", []) or ["Native probability unavailable"]
+                missing.setdefault(f"{source['source_id']}: {'; '.join(reasons)}", []).append(
+                    horizon
+                )
+                continue
+            probability = _display_pop(source)["value"]
+            cells = [
+                str(horizon),
+                f"{source['source_id']} / {source['event_id']}",
+                f"{source['source_cycle']} / {source['source_lead_hours']}",
+                source["interval_start"],
+                source["interval_end"],
+                source["interval_closure"],
+                _probability_event_text(source),
+                _probability_support_text(source["spatial_support"]),
+                f"{probability:.6g}",
+                source["status"],
+            ]
+            lines.append("| " + " | ".join(cells) + " |")
+        for comparison in guidance.get("comparisons", []):
+            left, right = comparison["left"], comparison["right"]
+            # A missing native endpoint is already described in the availability
+            # summary, without manufacturing an interval to compare.
+            if left["event_id"] is None or right["event_id"] is None:
+                continue
+            identity = (
+                f"{left['source_id']} / {left['event_id']} minus "
+                f"{right['source_id']} / {right['event_id']}"
+            )
+            if comparison["status"] == "comparable":
+                delta = comparison["delta"]
+                if comparison["unit"] != "1" or delta is None or not math.isfinite(delta):
+                    raise ValueError(
+                        "Probability disagreement requires a finite fraction difference"
+                    )
+                paired.append(f"| {horizon} | {identity} | {delta * 100:+.6g} |")
+            else:
+                reason = f"{identity}: {comparison['status']}; " + "; ".join(comparison["reasons"])
+                excluded.setdefault(reason, []).append(horizon)
+    lines.extend(
+        [
+            "",
+            "Matched probability disagreements (percentage points, left minus right; "
+            "descriptive differences, not verification scores):",
+            "",
+        ]
+    )
+    if paired:
+        lines.extend(
+            ["| End hour | Compared source / event | Difference pp |", "| --- | --- | --- |"]
+        )
+        lines.extend(paired)
+    else:
+        lines.append("No comparable native probability pairs are available.")
+    for title, grouped in (
+        ("Native probability availability", missing),
+        ("Probability comparison exclusions", excluded),
+    ):
+        if grouped:
+            lines.extend(["", title + ":", ""])
+            lines.extend(
+                f"- Hours {_hour_ranges(values)}: {reason}" for reason, values in grouped.items()
+            )
+    return lines
+
+
 def _render_surface_report(report: dict[str, Any]) -> str:
     """Present the unchanged numerical surface baseline and native contributors."""
     columns: tuple[str, ...] = (
@@ -293,7 +414,7 @@ def _render_surface_report(report: dict[str, Any]) -> str:
             -3,
             "NBM PoP is the probability of liquid-equivalent accumulation strictly greater "
             "than 0.254 kg/m² (0.01 inch) over the displayed native (start, end] period. "
-            "The current product has one-hour periods. NBM is the sole probability source "
+            "The current product has one-hour periods. NBM is the sole active probability source "
             "with weight 1.0; PoP is not derived from deterministic QPF and does not identify "
             "precipitation type. Missing native periods stay unavailable; no new probability "
             "windows are synthesized. Percent display retains the original fraction in storage.",
@@ -391,4 +512,5 @@ def _render_surface_report(report: dict[str, Any]) -> str:
         lines.extend(["", "Explicit missingness and scientific exclusions:", ""])
         for reason, hours in reasons.items():
             lines.append(f"- Hours {', '.join(str(h) for h in sorted(set(hours)))}: {reason}")
+    lines.extend(_render_probability_shadows(report["hours"]))
     return "\n".join(lines) + "\n"

@@ -33,6 +33,9 @@ only required geographic inputs; names are optional display metadata.
   greater than 0.254 kg/m² (0.01 inch), using its approved weight-1 passthrough.
   Thresholds, intervals, native percentages, source evidence and missingness are
   preserved. PoP is separate from HRRR/GFS QPF and does not imply precipitation type.
+  NBM-only delivery is the current baseline, not the final product. A bounded
+  [multi-source probability shadow path](#native-probability-shadows) retains other
+  native events without changing delivered PoP.
 - **Shadows:** real RAP and ECMWF IFS values/provenance accompany issuance with zero
   active weight. IFS preserves native three-hourly gaps and has no compatible
   instantaneous gust. Cloud cover is explicitly unavailable without an approved policy.
@@ -78,8 +81,9 @@ numerical, bias-corrected and final fields separate before exact-point interpola
 One-off requests stay untracked. See [VISION.md](VISION.md#intended-coordinate-driven-operation)
 and the [active RFC](docs/rfcs/mesoforge-v2-architecture.md). The first local surface grid
 and nested domains are implemented; the editing lifecycle remains future work. The next
-proposed increment is precipitation type using suitable categorical and/or thermodynamic
-guidance, without inferring type from surface temperature alone.
+proposed increment is a comparable six-hour ECMWF ensemble probability event before
+precipitation type, preserving an explicit event and member population rather than
+converting a daily probability into hourly PoP.
 
 Local Codex development continues; the Hermes development pipeline is paused. The RFC's
 unresolved implementation choices remain proposed, not blanket approval of the roadmap.
@@ -2011,9 +2015,10 @@ python -B -m pytest tests/integration/application/test_forward_run.py tests/inte
 python -B -m pytest tests/integration/application/test_issued_temperature_verification.py::test_automatic_window_acquires_once_reuses_real_snapshot_and_skips_empty_window tests/integration/application/test_issued_temperature_verification.py::test_automatic_batch_isolates_locations_and_reuses_results_without_changing_issuances -q
 ```
 
-Next proposed: add precipitation type from supported categorical and/or thermodynamic
-guidance on this same grid, preserving time/support semantics and explicit uncertainty.
-Do not infer type from surface temperature alone. Bias/AI edits and deployment remain later.
+The current next recommendation is the comparable ensemble probability event described
+under [native probability shadows](#native-probability-shadows). Precipitation type
+requires supported categorical and/or thermodynamic guidance, preserving time/support
+semantics and uncertainty; do not infer it from surface temperature alone.
 
 ### Local surface baseline grid
 
@@ -2384,6 +2389,127 @@ were not evaluated; temperature remains the only verified/scored field.
 The real-data preparation, raw rebuild and grid commands above were exercised through
 their application functions; repeated `/forecast` requests were tested in-process.
 The shown standalone API startup command was not executed for this increment.
+
+### Native probability shadows
+
+**Delivered PoP remains the original NBM hourly field.** NBM-only PoP is the current
+implementation baseline, not the intended final product. Long-term PoP should be a
+measured/calibrated multi-source probabilistic forecast. Deterministic QPF may later
+be a calibration predictor, but rainfall amounts are not probabilities themselves.
+Final source weighting/calibration must be selected from verification evidence.
+
+The new bounded preparation command registers native probability products separately
+from deterministic model contributors. All new products have **zero active weight**.
+Each retains its native percentage and unrounded fraction, threshold/comparator,
+exact accumulation bounds, spatial support, model cycle/lead/version and raw/object
+provenance. No deterministic QPF or ensemble-member fractions are used to manufacture
+these probabilities. Existing HRRR/GFS QPF stays unchanged; this step does not enable
+additional RAP/IFS amount fields or precipitation type.
+
+The September 11, 2026 source inspection found:
+
+| Product | Native event inspected | Use in this increment |
+| --- | --- | --- |
+| NBM hourly | Point/grid probability >0.254 kg/m² over one hour | Unchanged active baseline. |
+| NBM native six-hour | Point/grid probability >0.254 kg/m² over six hours | Zero-weight native comparison reference, acquired directly—not aggregated hourly PoP. |
+| GEFS bias-corrected PQPF | Point/grid probability >0.254 kg/m² over six hours | Compatible with the matching native NBM six-hour event; incompatible with hourly control. |
+| REFS parallel | Neighborhood probability >12.7 kg/m² over one hour | Native shadow only; threshold/support differ, and the retained message does not encode neighborhood radius. |
+| ECMWF IFS ENS `tpg1` | Probability ≥1 kg/m² over 24 hours | Native shadow only; threshold, comparator and interval differ from hourly NBM. |
+
+NOAA documents the [GEFS PQPF products](https://www.nco.ncep.noaa.gov/pmb/products/gens/)
+and their [six-hour threshold inventory](https://www.nco.ncep.noaa.gov/pmb/products/gens/gepqpf.t00z.pgrb2a.0p50.bc_06hf024.shtml).
+The [September 9 NOAA notice](https://www.weather.gov/media/notification/pdf_2026/scn26-048_Updated_RRFS_and_REFS_Implementation_aad.pdf)
+describes the REFS parallel feed and planned October 14 operational transition,
+weather permitting. Its neighborhood products are not interchangeable with point PoP.
+ECMWF's [open-data catalog](https://www.ecmwf.int/en/forecasts/datasets/open-data)
+publishes 24-hour probability ranges stepped every 12 hours; the
+[`tpg1` definition](https://codes.ecmwf.int/grib/param-db/131060) is precipitation
+**1 mm or above**. ECMWF data are © ECMWF, licensed under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/); normalization and spatial
+interpolation here are MesoForge transformations, without ECMWF endorsement.
+
+The bounded Minneapolis experiment reused the existing 18Z-reference surface/QPF/PoP
+run and acquired one native message per new product. These are later research
+attachments (acquired about 22:48–22:49Z), not claims of availability at the original
+forecast decision. The exact source events are:
+
+| Source / source cycle | UTC interval `(start, end]` | Point probability |
+| --- | --- | ---: |
+| NBM native 6h / Sep 11 18Z | Sep 11 18Z–Sep 12 00Z, >0.254 kg/m² | 1.000000% |
+| GEFS native 6h / Sep 11 12Z | Same interval and threshold | 3.246593% |
+| REFS / Sep 11 12Z | Sep 11 18–19Z, neighborhood >12.7 kg/m² | 0% |
+| ECMWF ENS / Sep 11 12Z | Sep 12 00Z–Sep 13 00Z, ≥1 kg/m² | 90.319568% |
+
+GEFS exceeds the **native six-hour** NBM reference by **2.246593 percentage points**.
+That is a descriptive disagreement, not a forecast-error score or evidence of skill.
+All comparisons require identical threshold/comparator, actual interval/closure and
+known spatial support. Incompatible or missing pairs return a null difference with
+reasons. Provider population-related GRIB keys are retained without treating them as
+reconstructed member lists or inventing a denominator. No member fractions were used.
+
+All four products are sampled over the existing context/editable grid. Native periods
+appear at their own end times in a separate report table; other hours say no retained
+native interval is available. This deliberately bounded experiment does not claim
+that unacquired provider periods are unavailable. Hourly NBM is never replaced by
+six-hour/daily probabilities, and no probabilities are summed, split or interpolated
+in time. Normal forward runs continue with their existing active NBM behavior; broader
+automatic shadow-source discovery/collection is not added by this experiment.
+
+The command consumes a bounded **source-event request artifact**, separate from the
+unchanged latitude/longitude locations configuration. For the demonstrated events:
+
+```json
+[
+  {"source_id": "NBM_6H", "cycle": "2026-09-11T18:00:00Z", "start_hour": 0, "end_hour": 6},
+  {"source_id": "GEFS_6H", "cycle": "2026-09-11T12:00:00Z", "start_hour": 6, "end_hour": 12},
+  {"source_id": "REFS_1H", "cycle": "2026-09-11T12:00:00Z", "start_hour": 6, "end_hour": 7},
+  {"source_id": "ECMWF_ENS_24H", "cycle": "2026-09-11T12:00:00Z", "start_hour": 12, "end_hour": 36}
+]
+```
+
+```text
+python -B -m mesoforge.application.prepared_probability_sources --prepared-run EXISTING_SURFACE_POP_RUN --requests native-requests.json --output-dir NEW_SHADOW_RUN
+python -B -m mesoforge.application.prepared_probability_sources --prepared-run NEW_SHADOW_RUN --from-raw --output-dir NEW_OFFLINE_REPLAY
+python -B -m mesoforge.application.prepared_local_grid --config locations.json --prepared-run NEW_OFFLINE_REPLAY --output-dir NEW_LOCAL_GRID
+python -B -m mesoforge.api --data-dir NEW_LOCAL_GRID --port 8765
+```
+
+Geographic footprints come from the existing coordinate-derived preparation; no
+regions, grids or stations are manually configured. Raw messages are acquired once
+per source event and shared across all views/cells. Rebuilding from raw validates
+hashes and source events, preserves source provenance, and performs no provider calls.
+The acquisition command was covered with fixture transports; the real demonstration
+imported the already acquired messages through the same preparation function to avoid
+another download. Raw replay, grid preparation and in-process API reads were executed;
+the standalone server command was not executed in this increment.
+
+Four raw messages total **1,892,741 bytes**, with **356,717 bytes** of retained
+inventory/header evidence. Regional prepared native views total **518,756 bytes**.
+Artifacts and the full report are outside Git under
+`%LOCALAPPDATA%/MesoForge/baselines/20260911-pop-multisource/`; the usable prepared
+run is `%LOCALAPPDATA%/MesoForge/forward-runs/pop-multisource-20260911/replay-validated`.
+This is a normalization/comparison demonstration, not PoP verification or calibration.
+
+Validation: **233 focused offline tests passed**, including native product/time/grid
+identity, threshold/support mismatches, missing/invalid probabilities, zero shadow
+influence, preparation/replay and existing surface/grid/report behavior. The real
+Minneapolis check preserved every prior NBM/surface/QPF value over **49 × 36**
+node-hours; all four native shadow events were available at all 49 nodes, with the
+NBM/GEFS pair comparable at each. Each of nine prepared files loaded once per build.
+Independent percentage-corner reconstruction differed by at most **2.23e-16** as a
+fraction. Raw replay preserved native values and source provenance; repeated grid
+builds and two API reads matched exactly, with provider access blocked throughout.
+The grid artifact is **104,680,987 bytes**, **14,516,096 compressed**, built in about
+**75 seconds** on this workstation. Code/type/import, documentation, hygiene and
+whitespace checks passed. PostgreSQL/MinIO integration and full application acceptance
+were not rerun in this increment; no service was started and no PoP skill was measured.
+
+Next recommended: one explicitly defined six-hour ECMWF ensemble event matching the
+NBM/GEFS threshold and period, using native guidance if available or a documented
+complete member population. This would add a third comparable source before p-type.
+The current daily and neighborhood events must not be coerced into that comparison.
+Precipitation type remains a separate categorical/thermodynamic-guidance milestone;
+surface temperature alone is insufficient.
 
 ### Automatic current guidance
 

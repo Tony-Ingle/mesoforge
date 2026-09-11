@@ -29,6 +29,12 @@ from mesoforge.application.spatial_coverage import CoverageRequiredError
 from mesoforge.contracts.serialization import canonical_json_bytes, canonical_json_digest
 from mesoforge.forecasting.recipes import with_surface_fields
 from tests.unit.application.test_prepared_temperature import phase2_configuration
+from tests.unit.application.test_probability_contributors import (
+    _event as probability_event,
+)
+from tests.unit.application.test_probability_contributors import (
+    _view as probability_view,
+)
 from tests.unit.application.test_surface_forecast import (
     CRS,
     DEW,
@@ -65,6 +71,32 @@ def _spatial_dataset(model, *, age=0, hours=HOURS):
     for variable in (T, DEW):
         dataset[variable].values += _gradient(latitude, longitude)
     return dataset
+
+
+def _spatial_probability_views(*, end_horizon=6):
+    """Reuse native-event fixtures with one shared spatial gradient per source."""
+    views = []
+    for source, fraction, duration in (
+        ("NBM_NATIVE6", 0.4, 6),
+        ("GEFS_NATIVE6", 0.7, 6),
+        ("ENS_NATIVE24", 0.6, 24),
+    ):
+        end = TARGET + np.timedelta64(end_horizon, "h")
+        event = probability_event(hours=duration)
+        event.update(
+            interval_start=str(np.datetime_as_string(end - np.timedelta64(duration, "h"), unit="s"))
+            + "Z",
+            interval_end=str(np.datetime_as_string(end, unit="s")) + "Z",
+            source_lead_hours=int(
+                (end - np.datetime64("2026-09-11T00:00:00")) / np.timedelta64(1, "h")
+            ),
+        )
+        view = probability_view(source, fraction=fraction, events=[event])
+        view.dataset.coords.update({"x": [-94.0, -92.0], "y": [44.0, 46.0]})
+        longitude, latitude = np.meshgrid(view.dataset.x.values, view.dataset.y.values)
+        view.dataset.probability.values += 0.02 * _gradient(latitude, longitude)
+        views.append(view)
+    return views
 
 
 def surface_prepared(directory):
@@ -477,6 +509,7 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
         _horizons=(1,),
         _pop_views=[_pop_entry(hours=(1,))],
         _pop_guidance={"status": "prepared"},
+        _probability_views=_spatial_probability_views(end_horizon=1),
     )
     result = prepared.forecast(latitude=LATITUDE, longitude=LONGITUDE)
     assert result["hours"][0]["temperature"]["value"] is not None
@@ -487,6 +520,14 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
     center_pop = result["hours"][0]["surface"]["fields"][POP]
     assert center_pop["value"] == pytest.approx(0.4)
     assert center_pop["spatial_extraction"]["native_fraction_at_source_corners"] == [0.4] * 4
+    center_probabilities = result["hours"][0]["surface"]["probability_guidance"]
+    assert [source["value"] for source in center_probabilities["contributors"]] == pytest.approx(
+        [0.4, 0.7, 0.6]
+    )
+    paired = [
+        pair for pair in center_probabilities["comparisons"] if pair["status"] == "comparable"
+    ]
+    assert len(paired) == 1 and paired[0]["delta"] == pytest.approx(-0.3)
     cells = result["local_grid_baseline"]["cells"]
     assert sum(cell["status"] == "unavailable" for cell in cells) == len(cells) - 1
     for cell in cells:
@@ -517,6 +558,29 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
             assert field["interval_start"] == center_pop["interval_start"]
             assert field["interval_end"] == center_pop["interval_end"]
             assert field["provenance"] == center_pop["provenance"]
+        unavailable_probabilities = hour["surface"]["probability_guidance"]
+        for source, center_source in zip(
+            unavailable_probabilities["contributors"],
+            center_probabilities["contributors"],
+            strict=True,
+        ):
+            assert source["value"] is None and source["status"] == "unavailable"
+            assert source["missing_reasons"] == cell["missing_reasons"]
+            assert "spatial_extraction" not in source
+            for identity in (
+                "event_id",
+                "source_id",
+                "source_cycle",
+                "provenance",
+                "threshold",
+                "interval_start",
+                "interval_end",
+            ):
+                assert source[identity] == center_source[identity]
+        for pair in unavailable_probabilities["comparisons"]:
+            assert pair["delta"] is None and pair["status"] == "unavailable"
+            assert pair["left"]["value"] is None and pair["right"]["value"] is None
+            assert pair["reasons"] == cell["missing_reasons"]
     with pytest.raises(CoverageRequiredError):
         prepared.forecast(latitude=LATITUDE + 0.1, longitude=LONGITUDE)
 
@@ -552,6 +616,10 @@ def test_qpf_spans_both_domains_and_exact_point_replays_with_provenance(prepared
         _pop_views=[(pop_dataset, pop_crs, pop_manifest)],
         _pop_guidance={"status": "prepared", "source": "NBM fixture"},
     )
+    active_pop_before = prepared._forecast_column(latitude=LATITUDE, longitude=LONGITUDE)
+    probability_views = _spatial_probability_views()
+    probability_originals = [view.dataset.copy(deep=True) for view in probability_views]
+    prepared = replace(prepared, _probability_views=probability_views)
     calculate = Mock(wraps=prepared._forecast_column)
     with (
         patch("xarray.open_dataset", side_effect=AssertionError("Already loaded guidance")),
@@ -591,6 +659,44 @@ def test_qpf_spans_both_domains_and_exact_point_replays_with_provenance(prepared
             assert native["NBM"]["role"] == "field_source"
             assert set(native["NBM"]["fields"]) == {POP}
             assert native["NBM"]["fields"][POP]["value"] == pop["value"]
+            guidance = hour["surface"]["probability_guidance"]
+            assert len(guidance["contributors"]) == 3
+            paired = [pair for pair in guidance["comparisons"] if pair["status"] == "comparable"]
+            if horizon == 6:
+                assert [source["value"] for source in guidance["contributors"]] == pytest.approx(
+                    [base + 0.02 * gradient for base in (0.4, 0.7, 0.6)], abs=1e-12
+                )
+                assert len(paired) == 1
+                assert paired[0]["left"]["source_id"] == "NBM_NATIVE6"
+                assert paired[0]["right"]["source_id"] == "GEFS_NATIVE6"
+                assert paired[0]["delta"] == pytest.approx(-0.3, abs=1e-12)
+                for source, duration in zip(guidance["contributors"], (6, 6, 24), strict=True):
+                    assert source["status"] == "available"
+                    assert source["interval_end"] == hour["valid_time"]
+                    expected_start = end - np.timedelta64(duration, "h")
+                    assert (
+                        source["interval_start"]
+                        == str(np.datetime_as_string(expected_start, unit="s")) + "Z"
+                    )
+                    assert source["provenance"]["raw_sha256"] == "a" * 64
+                    assert source["manifest_sha256"] == "b" * 64
+                    assert (
+                        source["spatial_extraction"]["method"] == "native_grid_bilinear_probability"
+                    )
+                assert all(
+                    pair["delta"] is None for pair in guidance["comparisons"] if pair not in paired
+                )
+            else:
+                assert not paired
+                assert all(pair["delta"] is None for pair in guidance["comparisons"])
+                for source in guidance["contributors"]:
+                    assert source["value"] is None and source["status"] == "unavailable"
+                    assert "no temporal filling" in source["missing_reasons"][0]
+                    assert source["available_native_intervals"]
+            assert all(
+                source["role"] == "shadow" and source["active_weight"] == 0
+                for source in guidance["contributors"]
+            )
             assert (
                 native["NBM"]["fields"][POP]["provenance"]["source_inputs"][0]["raw_sha256"]
                 == "e" * 64
@@ -626,3 +732,8 @@ def test_qpf_spans_both_domains_and_exact_point_replays_with_provenance(prepared
                 )
     assert QPF not in prepared_surface._guidance["HRRR"]
     xr.testing.assert_identical(pop_dataset, pop_original)
+    for before, after in zip(active_pop_before["hours"], first["hours"], strict=True):
+        assert before["surface"]["fields"] == after["surface"]["fields"]
+        assert before["surface"]["contributors"] == after["surface"]["contributors"]
+    for original, view in zip(probability_originals, probability_views, strict=True):
+        xr.testing.assert_identical(original, view.dataset)
