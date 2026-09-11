@@ -49,7 +49,8 @@ def decode_selected_message(
     payload: bytes,
     *,
     contract: Phase2FieldContract,
-    settings: HrrrPhase2SourceSettings,
+    settings: HrrrPhase2SourceSettings | None = None,
+    read_keys: tuple[str, ...] | None = None,
     forecast_hour: int,
     cycle_date: date,
     cycle_hour: int,
@@ -57,7 +58,13 @@ def decode_selected_message(
     """Decode exactly one selected HRRR Phase 2 GRIB2 message and
     assert its keys/units/step/level/window/grid/cycle/valid-time
     against ``contract``."""
-    backend_kwargs = cfgrib_backend_kwargs(settings.read_keys)
+    # The same field/time/Lambert assertions also fit other projected models.
+    # Explicit decoder keys avoid constructing unrelated HRRR source settings.
+    if (settings is None) == (read_keys is None):
+        raise ValueError("Supply exactly one of settings or read_keys")
+    selected_read_keys = settings.read_keys if settings is not None else read_keys
+    assert selected_read_keys is not None
+    backend_kwargs = cfgrib_backend_kwargs(selected_read_keys)
 
     with tempfile.NamedTemporaryFile(suffix=".grib2", delete=False) as handle:
         handle.write(payload)

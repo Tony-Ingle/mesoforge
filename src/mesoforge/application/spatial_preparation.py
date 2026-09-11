@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -73,17 +74,24 @@ class PreparedRegions:
 
 
 def load_prepared(
-    directory: Path, *, configuration: ContributorConfiguration = DEFAULT_CONFIGURATION
+    directory: Path,
+    *,
+    configuration: ContributorConfiguration = DEFAULT_CONFIGURATION,
+    shadow_directories: Mapping[str, Path] | None = None,
 ) -> PreparedPointForecast | PreparedRegions:
     """Load all shared regions once. This function never prepares or downloads."""
     index = directory / "coverage.json"
     if not index.is_file():
-        return PreparedPointForecast.from_directory(directory, configuration=configuration)
+        return PreparedPointForecast.from_directory(
+            directory, configuration=configuration, shadow_directories=shadow_directories
+        )
     payload = json.loads(index.read_text())
     regions = []
     for row in {item["directory"]: item for item in payload["regions"]}.values():
         region = PreparedPointForecast.from_directory(
-            Path(row["directory"]), configuration=configuration
+            Path(row["directory"]),
+            configuration=configuration,
+            shadow_directories=shadow_directories,
         )
         if (
             region._manifest is None
@@ -105,6 +113,7 @@ def ensure_coverage(
     *,
     cache_directory: Path | None = None,
     contributor_configuration: ContributorConfiguration = DEFAULT_CONFIGURATION,
+    shadow_directories: Mapping[str, Path] | None = None,
 ) -> tuple[PreparedPointForecast | PreparedRegions, dict[str, Any]]:
     """Inspect the whole collection, reuse prepared views or rebuild shared views from raw.
 
@@ -121,7 +130,9 @@ def ensure_coverage(
         source_directory = Path(json.loads(index.read_text())["source_directory"])
     source_directory = source_directory.resolve()
     prepared = PreparedPointForecast.from_directory(
-        source_directory, configuration=contributor_configuration
+        source_directory,
+        configuration=contributor_configuration,
+        shadow_directories=shadow_directories,
     )
     if prepared.data_kind != "real_prepared_guidance":
         return prepared, {"regions": [], "downloaded_bytes": 0, "mode": "synthetic_fixture"}
@@ -148,7 +159,9 @@ def ensure_coverage(
                     (
                         path.parent,
                         PreparedPointForecast.from_directory(
-                            path.parent, configuration=contributor_configuration
+                            path.parent,
+                            configuration=contributor_configuration,
+                            shadow_directories=shadow_directories,
                         ),
                     )
                 )
@@ -189,7 +202,9 @@ def ensure_coverage(
                     area=area,
                 )
                 item = PreparedPointForecast.from_directory(
-                    destination, configuration=contributor_configuration
+                    destination,
+                    configuration=contributor_configuration,
+                    shadow_directories=shadow_directories,
                 )
             except UnsupportedCoordinateError as exc:
                 failure_file.write_text(json.dumps({"message": str(exc)}))

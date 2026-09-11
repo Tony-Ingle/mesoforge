@@ -10,6 +10,7 @@ from typing import Any
 from unittest.mock import Mock
 
 import pytest
+import xarray as xr
 from fastapi.testclient import TestClient
 
 from mesoforge import api
@@ -21,6 +22,7 @@ from mesoforge.application.prepared_temperature import (
 )
 from mesoforge.application.spatial_coverage import CoverageRequiredError, UnsupportedCoordinateError
 from mesoforge.catalog.domains import BoundingBox
+from tests.unit.application.test_batch_forecast import write_real_shadow_snapshot
 from tests.unit.application.test_prepared_temperature import (
     EXTENDED_HORIZONS,
     GFS_CYCLE,
@@ -30,6 +32,7 @@ from tests.unit.application.test_prepared_temperature import (
     FixtureTransport,
     phase2_configuration,
 )
+from tests.unit.test_forecast_api import shadow_configuration
 
 LOCATIONS = [
     {"lat": 45.8, "lon": -93.1},
@@ -111,6 +114,111 @@ def _assert_forecast(
             assert source["weight"] == weight
             assert source["raw_sha256"] == original["raw_sha256"]
             assert source["source_url"] == original["source_grib_url"]
+
+
+@pytest.mark.parametrize("subset", [False, True])
+def test_separate_shadow_regions_follow_shared_active_coverage_without_changing_identity(
+    narrow_source, tmp_path, monkeypatch, subset
+):
+    cache = tmp_path / "coverage"
+    baseline, original_report = spatial_preparation.ensure_coverage(
+        LOCATIONS, narrow_source, cache_directory=cache
+    )
+    original = {
+        (row["lat"], row["lon"]): baseline.forecast(latitude=row["lat"], longitude=row["lon"])
+        for row in LOCATIONS
+    }
+    active_region = original_report["regions"][0]
+    shadow_root = tmp_path / "shadow-regions"
+    locations = [LOCATIONS[0], LOCATIONS[2]] if subset else LOCATIONS
+    snapshot = write_real_shadow_snapshot(
+        narrow_source if subset else Path(active_region["directory"]), shadow_root / "nearby"
+    )
+    (shadow_root / "coverage.json").write_text(
+        json.dumps(
+            {
+                "regions": [
+                    {
+                        "area": {"south": 34.0, "north": 38.0, "west": -122.0, "east": -118.0},
+                        "directory": "far-away-not-opened",
+                    },
+                    {
+                        "area": OLD_AREA.model_dump() if subset else active_region["area"],
+                        "directory": "nearby",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    forbidden = Mock(side_effect=AssertionError("Retained active coverage must not be rebuilt"))
+    monkeypatch.setattr(spatial_preparation, "rebuild_temperature_guidance", forbidden)
+    configuration = shadow_configuration()
+    prepared, report = spatial_preparation.ensure_coverage(
+        locations,
+        cache,
+        contributor_configuration=configuration,
+        shadow_directories={"SYNTH_SHADOW": shadow_root},
+    )
+    assert report["source_identity"] == original_report["source_identity"]
+    assert report["downloaded_bytes"] == 0
+    reloaded = spatial_preparation.load_prepared(
+        cache, configuration=configuration, shadow_directories={"SYNTH_SHADOW": shadow_root}
+    )
+    for row in locations:
+        forecast = prepared.forecast(latitude=row["lat"], longitude=row["lon"])
+        assert reloaded.forecast(latitude=row["lat"], longitude=row["lon"]) == forecast
+        assert forecast["manifest_sha256"] == original[row["lat"], row["lon"]]["manifest_sha256"]
+        for old_hour, hour in zip(
+            original[row["lat"], row["lon"]]["hours"], forecast["hours"], strict=True
+        ):
+            assert {
+                key: value for key, value in hour.items() if key != "shadow_sources"
+            } == old_hour
+            shadow = hour["shadow_sources"][0]
+            assert shadow["temperature"]["value"] == pytest.approx(299 + hour["horizon_hours"])
+            assert shadow["source_metadata"] == snapshot["source_metadata"]
+    forbidden.assert_not_called()
+
+
+def test_nonoverlapping_shadow_region_is_explicit_missingness(narrow_source, tmp_path):
+    baseline = PreparedPointForecast.from_directory(narrow_source).forecast(
+        latitude=45.8, longitude=-93.1
+    )
+    root = tmp_path / "shadow"
+    shadow = root / "far-away"
+    manifest = write_real_shadow_snapshot(narrow_source, shadow)
+    path = shadow / "SYNTH_SHADOW.nc"
+    with xr.open_dataset(path, engine="h5netcdf") as opened:
+        dataset = opened.load().assign_coords(x=opened.x.values + 10.0)
+    dataset.to_netcdf(path, engine="h5netcdf")
+    manifest["prepared_files"]["SYNTH_SHADOW"]["sha256"] = hashlib.sha256(
+        path.read_bytes()
+    ).hexdigest()
+    (shadow / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (root / "coverage.json").write_text(
+        json.dumps(
+            {
+                "regions": [
+                    {
+                        "area": {"south": 34.0, "north": 38.0, "west": -122.0, "east": -118.0},
+                        "directory": "far-away",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    forecast = PreparedPointForecast.from_directory(
+        narrow_source,
+        configuration=shadow_configuration(),
+        shadow_directories={"SYNTH_SHADOW": root},
+    ).forecast(latitude=45.8, longitude=-93.1)
+    for original, hour in zip(baseline["hours"], forecast["hours"], strict=True):
+        assert {key: value for key, value in hour.items() if key != "shadow_sources"} == original
+        shadow = hour["shadow_sources"][0]
+        assert shadow["temperature"]["value"] is None
+        assert "no prepared shadow region" in shadow["missing_reasons"][0]
 
 
 def test_overlapping_coordinates_share_one_rebuild_with_36_hours_and_original_raw_provenance(
@@ -225,7 +333,9 @@ def test_collection_loader_deduplicates_shared_files_and_http_reuses_loaded_guid
     from mesoforge.forecasting.recipes import DEFAULT_CONFIGURATION
 
     loader.assert_called_once_with(
-        Path(report["regions"][0]["directory"]), configuration=DEFAULT_CONFIGURATION
+        Path(report["regions"][0]["directory"]),
+        configuration=DEFAULT_CONFIGURATION,
+        shadow_directories=None,
     )
     before = _inventory(cache)
     forbidden = Mock(side_effect=AssertionError("HTTP attempted prepared-data I/O"))

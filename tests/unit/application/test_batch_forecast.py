@@ -11,6 +11,7 @@ from typing import Any
 from unittest.mock import Mock
 from uuid import UUID
 
+import numpy as np
 import pytest
 import xarray as xr
 
@@ -29,6 +30,228 @@ from tests.unit.test_forecast_api import shadow_configuration, write_shadow
 FIRST = {"lat": 45.8, "lon": -93.1}
 LAST = {"lat": 45.9, "lon": -93.0}
 OUTSIDE = {"lat": 95.0, "lon": -93.27}  # Invalid latitude, not a prepared-region limit.
+
+
+def write_real_shadow_snapshot(source_directory: Path, directory: Path) -> dict[str, Any]:
+    """Generated fixtures in the real-preparation format, with their own retained evidence."""
+    directory.mkdir(parents=True)
+    original = json.loads((source_directory / "manifest.json").read_text(encoding="utf-8"))
+    with xr.open_dataset(source_directory / "GFS.nc", engine="h5netcdf") as opened:
+        dataset = opened.load()
+    dataset.attrs["model"] = "SYNTH_SHADOW"
+    dataset["air_temperature_2m"].values += 10.0
+    path = directory / "SYNTH_SHADOW.nc"
+    dataset.to_netcdf(path, engine="h5netcdf")
+    inputs = [
+        {**row, "model": "SYNTH_SHADOW"} for row in original["inputs"] if row["model"] == "GFS"
+    ]
+    for row in inputs:
+        for prefix in ("raw", "index"):
+            relative = Path(row[f"{prefix}_file"])
+            (directory / relative).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source_directory / relative, directory / relative)
+    manifest = {
+        **original,
+        "inputs": inputs,
+        "prepared_files": {
+            "SYNTH_SHADOW": {
+                "file": path.name,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+        },
+        "source_metadata": {
+            "model_definition": shadow_configuration().models[-1].model_dump(mode="json"),
+            "adapter_version": "synthetic_fixture_v1",
+            "product": "synthetic-GRIB",
+        },
+    }
+    (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return manifest
+
+
+def test_separate_shadow_manifest_preserves_control_and_acquisition_readback(
+    tmp_path, prepared_batch_data, memory_issuance, monkeypatch
+):
+    baseline = PreparedPointForecast.from_directory(prepared_batch_data).forecast(
+        **{"latitude": FIRST["lat"], "longitude": FIRST["lon"]}
+    )
+    original_manifest = (prepared_batch_data / "manifest.json").read_bytes()
+    shadow_directory = tmp_path / "shadow=guidance"
+    manifest = write_real_shadow_snapshot(prepared_batch_data, shadow_directory)
+    prepared = PreparedPointForecast.from_directory(
+        prepared_batch_data,
+        configuration=shadow_configuration(),
+        shadow_directories={"SYNTH_SHADOW": shadow_directory},
+    )
+    forbidden = Mock(side_effect=AssertionError("Requests must use loaded guidance"))
+    monkeypatch.setattr(xr, "open_dataset", forbidden)
+    forecast = prepared.forecast(latitude=FIRST["lat"], longitude=FIRST["lon"])
+    assert forecast["manifest_sha256"] == baseline["manifest_sha256"]
+    assert (prepared_batch_data / "manifest.json").read_bytes() == original_manifest
+    for original, hour, evidence in zip(
+        baseline["hours"], forecast["hours"], manifest["inputs"], strict=True
+    ):
+        assert {key: value for key, value in hour.items() if key != "shadow_sources"} == original
+        source = hour["shadow_sources"][0]
+        assert source["temperature"]["value"] == pytest.approx(299 + hour["horizon_hours"])
+        assert source["weight"] == 0.0
+        assert source["acquisition"] == evidence
+        assert source["source_metadata"] == manifest["source_metadata"]
+        assert (
+            source["manifest_sha256"]
+            == hashlib.sha256((shadow_directory / "manifest.json").read_bytes()).hexdigest()
+        )
+    assert prepared.forecast(latitude=FIRST["lat"], longitude=FIRST["lon"]) == forecast
+    issuer = memory_issuance[0]
+    issued = issuer.issue(forecast, batch_run_id=UUID(int=1), location_index=0)
+    assert issuer.read(issued.issued_forecast_id)["forecast"] == forecast
+    forbidden.assert_not_called()
+
+
+@pytest.mark.parametrize("mutation", [None, "raw", "cycle"])
+def test_shadow_regions_require_the_same_retained_cycle_and_raw_identity(
+    tmp_path, prepared_batch_data, mutation
+):
+    root = tmp_path / "shadow"
+    manifests = [
+        write_real_shadow_snapshot(prepared_batch_data, root / name) for name in ("a", "b")
+    ]
+    changed = manifests[1]
+    if mutation == "raw":
+        row = changed["inputs"][0]
+        raw = root / "b" / row["raw_file"]
+        raw.write_bytes(raw.read_bytes() + b"different retained message")
+        row["raw_sha256"] = hashlib.sha256(raw.read_bytes()).hexdigest()
+        row["raw_bytes"] = raw.stat().st_size
+    elif mutation == "cycle":
+        path = root / "b" / "SYNTH_SHADOW.nc"
+        with xr.open_dataset(path, engine="h5netcdf") as opened:
+            dataset = opened.load()
+        dataset = dataset.assign_coords(
+            forecast_reference_time=dataset.forecast_reference_time.values - np.timedelta64(6, "h"),
+            source_lead_time=dataset.source_lead_time.values + np.timedelta64(6, "h"),
+        )
+        dataset.to_netcdf(path, engine="h5netcdf")
+        changed["prepared_files"]["SYNTH_SHADOW"]["sha256"] = hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        cycle = str(np.datetime_as_string(dataset.forecast_reference_time.values, unit="s")) + "Z"
+        for row in changed["inputs"]:
+            row["cycle"] = cycle
+            row["source_lead_hours"] += 6
+    (root / "b" / "manifest.json").write_text(json.dumps(changed), encoding="utf-8")
+    (root / "coverage.json").write_text(
+        json.dumps(
+            {
+                "regions": [
+                    {
+                        "area": {"south": 45.5, "north": 46.0, "west": -93.5, "east": -93.0},
+                        "directory": name,
+                    }
+                    for name in ("a", "b")
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    kwargs = {"configuration": shadow_configuration(), "shadow_directories": {"SYNTH_SHADOW": root}}
+    if mutation is not None:
+        with pytest.raises(ValueError, match="shadow regions disagree on retained input identity"):
+            PreparedPointForecast.from_directory(prepared_batch_data, **kwargs)
+    else:
+        prepared = PreparedPointForecast.from_directory(prepared_batch_data, **kwargs)
+        assert prepared.forecast(latitude=FIRST["lat"], longitude=FIRST["lon"])["hours"][0][
+            "shadow_sources"
+        ][0]["temperature"]["value"] == pytest.approx(300.0)
+
+
+def test_batch_cli_separate_shadow_snapshot_is_reused_for_supported_locations(
+    tmp_path, prepared_batch_data, capsys
+):
+    config = write_config(tmp_path, [FIRST, OUTSIDE, LAST])
+    contributors = tmp_path / "contributors.json"
+    contributors.write_text(shadow_configuration().model_dump_json(), encoding="utf-8")
+    shadow_directory = tmp_path / "shadow=guidance"
+    write_real_shadow_snapshot(prepared_batch_data, shadow_directory)
+    assert (
+        batch_forecast.main(
+            [
+                "--config",
+                str(config),
+                "--data-dir",
+                str(prepared_batch_data),
+                "--contributors-config",
+                str(contributors),
+                "--shadow-data",
+                f"SYNTH_SHADOW={shadow_directory}",
+            ]
+        )
+        == 1
+    )
+    result = json.loads(capsys.readouterr().out)
+    assert [row["status"] for row in result["results"]] == ["ok", "error", "ok"]
+    successful = [row["forecast"] for row in result["results"] if row["status"] == "ok"]
+    for forecast in successful:
+        assert len(forecast["hours"]) == 36
+        assert all(
+            hour["shadow_sources"][0]["temperature"]["value"] is not None
+            for hour in forecast["hours"]
+        )
+    assert (
+        successful[0]["hours"][0]["shadow_sources"][0]["manifest_sha256"]
+        == successful[1]["hours"][0]["shadow_sources"][0]["manifest_sha256"]
+    )
+
+
+@pytest.mark.parametrize(
+    "attachment", ["HRRR=somewhere", "UNREGISTERED=somewhere", "SYNTH_SHADOW", "SYNTH_SHADOW="]
+)
+def test_cli_rejects_invalid_shadow_attachment_before_preparation(
+    tmp_path, capsys, monkeypatch, attachment
+):
+    contributors = tmp_path / "contributors.json"
+    contributors.write_text(shadow_configuration().model_dump_json(), encoding="utf-8")
+    forbidden = Mock(side_effect=AssertionError("Invalid attachment must not acquire or prepare"))
+    monkeypatch.setattr(batch_forecast, "prepare_locations", forbidden)
+    assert (
+        batch_forecast.main(
+            [
+                "--config",
+                str(write_config(tmp_path, [FIRST])),
+                "--output-dir",
+                str(tmp_path / "uncreated-preparation"),
+                "--contributors-config",
+                str(contributors),
+                "--shadow-data",
+                attachment,
+            ]
+        )
+        == 2
+    )
+    assert json.loads(capsys.readouterr().err)["error"]["code"] == "batch_failed"
+    forbidden.assert_not_called()
+
+
+@pytest.mark.parametrize("mutation", ["target", "raw", "prepared", "manifest"])
+def test_separate_shadow_evidence_is_validated(tmp_path, prepared_batch_data, mutation):
+    shadow_directory = tmp_path / "shadow"
+    manifest = write_real_shadow_snapshot(prepared_batch_data, shadow_directory)
+    if mutation == "target":
+        manifest["target_reference_time"] = "2026-08-30T13:00:00Z"
+        (shadow_directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    elif mutation == "raw":
+        (shadow_directory / manifest["inputs"][0]["raw_file"]).write_bytes(b"corrupt")
+    elif mutation == "prepared":
+        manifest["prepared_files"]["SYNTH_SHADOW"]["sha256"] = "0" * 64
+        (shadow_directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    else:
+        (shadow_directory / "manifest.json").unlink()
+    with pytest.raises(ValueError, match="target time|Checksum mismatch|requires manifest"):
+        PreparedPointForecast.from_directory(
+            prepared_batch_data,
+            configuration=shadow_configuration(),
+            shadow_directories={"SYNTH_SHADOW": shadow_directory},
+        )
 
 
 def test_batch_issues_synthetic_shadow_and_configuration_without_changing_control(
@@ -200,7 +423,9 @@ def test_batch_reuses_one_load_and_preserves_36_hour_values_times_and_provenance
     monkeypatch.setattr(PreparedPointForecast, "forecast", forecast_without_io)
     result = batch_forecast.run_batch(config, prepared_batch_data)
 
-    loader.assert_called_once_with(prepared_batch_data, configuration=DEFAULT_CONFIGURATION)
+    loader.assert_called_once_with(
+        prepared_batch_data, configuration=DEFAULT_CONFIGURATION, shadow_directories=None
+    )
     assert len(used_guidance) == 2
     assert all(item is used_guidance[0] for item in used_guidance)
     rows = result["results"]

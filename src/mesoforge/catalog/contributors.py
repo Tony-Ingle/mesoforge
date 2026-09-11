@@ -86,3 +86,20 @@ DEFAULT_MODEL_DEFINITIONS = (
         grid_type="geographic",
     ),
 )
+
+
+# Optional temperature adapter; never automatically joins the active defaults.
+# RAPv5 is the scientific system. The provider's deployment package version is
+# separate acquisition metadata, not a guarantee encoded by every GRIB message.
+RAP_MODEL_DEFINITION = ModelDefinition(
+    model_id="RAP",
+    provider="NOAA/NCEP",
+    family="RAP/WRF-ARW",
+    lineage=("Shared WRF-ARW/GSI lineage with HRRR",),
+    domain="CONUS",
+    supported_fields=("air_temperature_2m",),
+    cycle_hours=tuple(range(24)),
+    supported_leads=tuple(range(52)),
+    status="shadow",
+    grid_type="projected",
+)

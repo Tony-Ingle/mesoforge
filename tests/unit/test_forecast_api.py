@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import Mock
@@ -472,3 +474,98 @@ def test_invalid_shadow_units_fail_closed(prepared_dir):
     write_shadow(prepared_dir, mutation="units")
     with pytest.raises(ValueError, match="SYNTH_SHADOW: prepared temperature must use K"):
         PreparedPointForecast.from_directory(prepared_dir, configuration=shadow_configuration())
+
+
+def test_missing_external_shadow_does_not_fall_back_to_same_directory(prepared_dir):
+    write_shadow(prepared_dir)
+    baseline = PreparedPointForecast.from_directory(prepared_dir).forecast(
+        latitude=45.8, longitude=-93.1
+    )
+    result = PreparedPointForecast.from_directory(
+        prepared_dir,
+        configuration=shadow_configuration(),
+        shadow_directories={"SYNTH_SHADOW": prepared_dir / "not-prepared"},
+    ).forecast(latitude=45.8, longitude=-93.1)
+    for original, hour in zip(baseline["hours"], result["hours"], strict=True):
+        assert {key: value for key, value in hour.items() if key != "shadow_sources"} == original
+        assert hour["shadow_sources"][0]["temperature"]["value"] is None
+        assert hour["shadow_sources"][0]["missing_reasons"] == [
+            "SYNTH_SHADOW: prepared guidance file is missing"
+        ]
+
+
+@pytest.mark.parametrize(
+    "model,status", [("HRRR", "shadow"), ("UNKNOWN", "shadow"), ("SYNTH_SHADOW", "retired")]
+)
+def test_shadow_directory_requires_enabled_registered_nonactive_model(prepared_dir, model, status):
+    with pytest.raises(ValueError, match="registered shadow/evaluated/deprecated"):
+        PreparedPointForecast.from_directory(
+            prepared_dir,
+            configuration=shadow_configuration(status),
+            shadow_directories={model: prepared_dir},
+        )
+
+
+def test_shadow_views_are_selected_per_exact_point_without_active_area_or_request_io(
+    prepared_dir, monkeypatch
+):
+    baseline = PreparedPointForecast.from_directory(prepared_dir)
+    assert baseline._manifest is None  # No active prepared_area is required.
+    path = write_shadow(prepared_dir)
+    with xr.open_dataset(path, engine="h5netcdf") as opened:
+        dataset = opened.load()
+    root = prepared_dir / "shadow-regions"
+    regions, hashes = [], []
+    for name, indices in (("southwest", [0, 1]), ("northeast", [1, 2])):
+        view = dataset.isel(x=indices, y=indices)
+        directory = root / name
+        directory.mkdir(parents=True)
+        output = directory / path.name
+        view.to_netcdf(output, engine="h5netcdf")
+        hashes.append(hashlib.sha256(output.read_bytes()).hexdigest())
+        regions.append(
+            {
+                "directory": name,
+                "area": {
+                    "south": float(view.y.min()),
+                    "north": float(view.y.max()),
+                    "west": float(view.x.min()),
+                    "east": float(view.x.max()),
+                },
+            }
+        )
+    (root / "coverage.json").write_text(json.dumps({"regions": regions}), encoding="utf-8")
+    prepared = PreparedPointForecast.from_directory(
+        prepared_dir,
+        configuration=shadow_configuration(),
+        shadow_directories={"SYNTH_SHADOW": root},
+    )
+    forbidden = Mock(side_effect=AssertionError("Request attempted shadow guidance I/O"))
+    monkeypatch.setattr(xr, "open_dataset", forbidden)
+    monkeypatch.setattr(Path, "read_bytes", forbidden)
+    monkeypatch.setattr(Path, "read_text", forbidden)
+    for latitude, longitude, expected, digest in (
+        (45.625, -93.375, 301.75, hashes[0]),
+        (45.875, -93.125, 303.25, hashes[1]),
+        (45.9, -93.4, None, None),
+    ):
+        result = prepared.forecast(latitude=latitude, longitude=longitude)
+        original = baseline.forecast(latitude=latitude, longitude=longitude)
+        assert prepared.forecast(latitude=latitude, longitude=longitude) == result
+        for old_hour, hour in zip(original["hours"], result["hours"], strict=True):
+            assert {
+                key: value for key, value in hour.items() if key != "shadow_sources"
+            } == old_hour
+            source = hour["shadow_sources"][0]
+            if expected is None:
+                assert source["temperature"]["value"] is None
+                assert source["missing_reasons"] == [
+                    "SYNTH_SHADOW: no prepared shadow region covers the forecast coordinate"
+                ]
+            else:
+                assert source["temperature"]["value"] == pytest.approx(
+                    expected + hour["horizon_hours"] - 1, abs=1e-10
+                )
+                assert source["prepared_sha256"] == digest
+                assert source["missing_reasons"] == []
+    forbidden.assert_not_called()

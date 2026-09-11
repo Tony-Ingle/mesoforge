@@ -8,6 +8,7 @@ import json
 import math
 import os
 import sys
+from collections.abc import Mapping
 from datetime import datetime
 from importlib.metadata import version
 from pathlib import Path
@@ -113,13 +114,17 @@ def run_batch(
     issuer: ForecastIssuanceService | None = None,
     require_future_hours: bool = False,
     contributor_configuration: ContributorConfiguration = DEFAULT_CONFIGURATION,
+    shadow_directories: Mapping[str, Path] | None = None,
 ) -> dict[str, Any]:
     """Load guidance once; independently calculate and persist each successful location."""
     locations = load_locations(config_path)
     validate_current_control(contributor_configuration)
 
     prepared, coverage = ensure_coverage(
-        locations, data_dir, contributor_configuration=contributor_configuration
+        locations,
+        data_dir,
+        contributor_configuration=contributor_configuration,
+        shadow_directories=shadow_directories,
     )
     if prepared.horizon_hours != tuple(range(1, 37)):
         raise ValueError("Batch forecasts require an existing dataset for hours 1..36.")
@@ -212,6 +217,13 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="Optional model/recipe JSON; active HRRR/GFS control must remain unchanged.",
     )
+    parser.add_argument(
+        "--shadow-data",
+        action="append",
+        default=[],
+        metavar="MODEL=PATH",
+        help="Separate prepared shadow directory or coverage index root; repeat per model.",
+    )
     args = parser.parse_args(argv)
     times = (args.target_reference_time, args.hrrr_cycle, args.gfs_cycle)
     if args.data_dir is not None and any(value is not None for value in times):
@@ -227,6 +239,15 @@ def main(argv: list[str] | None = None) -> int:
             else DEFAULT_CONFIGURATION
         )
         validate_current_control(contributor_configuration)
+        shadow_directories = {}
+        for attachment in args.shadow_data:
+            model, separator, path = attachment.partition("=")
+            if not separator or not model or not path or model in shadow_directories:
+                raise ValueError("--shadow-data requires a unique MODEL=PATH entry per model")
+            definition = contributor_configuration.model_map().get(model)
+            if definition is None or definition.status not in ("shadow", "evaluated", "deprecated"):
+                raise ValueError(f"{model}: shadow data requires an enabled non-active model")
+            shadow_directories[model] = Path(path)
         preparation = None
         data_dir = args.data_dir
         if data_dir is None:
@@ -248,6 +269,7 @@ def main(argv: list[str] | None = None) -> int:
             issuer=issuer,
             require_future_hours=preparation is not None and all(value is None for value in times),
             contributor_configuration=contributor_configuration,
+            shadow_directories=shadow_directories,
         )
         if preparation is not None:
             payload["preparation"] = preparation

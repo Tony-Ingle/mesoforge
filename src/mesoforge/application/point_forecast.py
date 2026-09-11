@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -219,6 +221,34 @@ def _load_source_manifest(
     return manifest, hashlib.sha256(payload).hexdigest()
 
 
+def _shadow_directories(directory: Path) -> list[Path]:
+    """Resolve candidate views before requests; the exact point selects its view later."""
+    index = directory / "coverage.json"
+    if not index.is_file():
+        return [directory]
+    payload = json.loads(index.read_text(encoding="utf-8-sig"))
+    regions = payload.get("regions") if isinstance(payload, dict) else None
+    if not isinstance(regions, list):
+        raise ValueError("Shadow coverage index must contain a regions list")
+    candidates = []
+    for region in regions:
+        if not isinstance(region, dict) or not isinstance(region.get("directory"), str):
+            raise ValueError("Shadow coverage region requires a prepared directory")
+        area = BoundingBox.model_validate(region.get("area"))
+        path = Path(region["directory"])
+        if not path.is_absolute():
+            path = directory / path
+        candidates.append(((area.north - area.south) * (area.east - area.west), str(path), path))
+    return list(dict.fromkeys(item[2] for item in sorted(candidates)))
+
+
+@dataclass(frozen=True)
+class _ShadowView:
+    dataset: xr.Dataset
+    crs: pyproj.CRS
+    metadata: dict[str, Any]
+
+
 @dataclass(frozen=True)
 class PreparedPointForecast:
     """Eagerly loaded demonstration guidance; request-time calculation does no I/O."""
@@ -231,7 +261,7 @@ class PreparedPointForecast:
     _manifest_sha256: str | None
     _horizons: tuple[int, ...]
     _configuration: ContributorConfiguration
-    _shadow_metadata: dict[str, dict[str, Any]]
+    _shadow_views: dict[str, list[_ShadowView]]
 
     @property
     def notice(self) -> str:
@@ -246,7 +276,11 @@ class PreparedPointForecast:
 
     @classmethod
     def from_directory(
-        cls, directory: Path, *, configuration: ContributorConfiguration = DEFAULT_CONFIGURATION
+        cls,
+        directory: Path,
+        *,
+        configuration: ContributorConfiguration = DEFAULT_CONFIGURATION,
+        shadow_directories: Mapping[str, Path] | None = None,
     ) -> PreparedPointForecast:
         if configuration.control_recipe.field != _VARIABLE:
             raise ValueError("Prepared point forecasts currently support temperature only")
@@ -255,6 +289,16 @@ class PreparedPointForecast:
         kinds: set[str] = set()
         target: np.datetime64 | None = None
         definitions = configuration.model_map()
+        attached = dict(shadow_directories or {})
+        for model in attached:
+            if model not in definitions or definitions[model].status not in (
+                "shadow",
+                "evaluated",
+                "deprecated",
+            ):
+                raise ValueError(
+                    f"{model}: shadow data requires a registered shadow/evaluated/deprecated model"
+                )
         active_models = tuple(item.model for item in configuration.control_recipe.contributors)
         for model in active_models:
             path = directory / f"{model}.nc"
@@ -302,37 +346,53 @@ class PreparedPointForecast:
             raise ValueError(
                 "Prepared temperature horizons must be 1..36 or the retained 1..3 slice"
             )
-        shadow_metadata: dict[str, dict[str, Any]] = {}
+        shadow_views: dict[str, list[_ShadowView]] = {}
         for model, definition in definitions.items():
             if definition.status not in ("shadow", "evaluated", "deprecated"):
                 continue
-            path = directory / f"{model}.nc"
-            if not path.exists():
-                continue
-            with xr.open_dataset(path, engine="h5netcdf") as opened:
-                dataset = opened.load()
-            if _validate_guidance(dataset, model) != target:
-                raise ValueError(f"{model}: shadow guidance disagrees on target_reference_time")
-            kind = str(dataset.attrs["data_kind"])
-            wkt = dataset.attrs.get("crs_wkt2")
-            if kind == _REAL_KIND and (not isinstance(wkt, str) or not wkt):
-                raise ValueError(f"{model}: real guidance requires crs_wkt2")
-            crs = pyproj.CRS.from_wkt(wkt) if wkt else _CRS
-            if (definition.grid_type == "projected" and not crs.is_projected) or (
-                definition.grid_type == "geographic" and not crs.is_geographic
-            ):
-                raise ValueError(f"{model}: incorrect native projection")
-            metadata: dict[str, Any] = {
-                "data_kind": kind,
-                "prepared_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            }
-            if kind == _REAL_KIND:
-                shadow_manifest, shadow_digest = _load_source_manifest(
-                    directory, {model: dataset}, target, models={model}
-                )
-                metadata.update(manifest=shadow_manifest, manifest_sha256=shadow_digest)
-            guidance[model], projections[model] = dataset, crs
-            shadow_metadata[model] = metadata
+            views = shadow_views[model] = []
+            identities: set[str] = set()
+            for shadow_directory in _shadow_directories(attached.get(model, directory)):
+                path = shadow_directory / f"{model}.nc"
+                if not path.exists():
+                    continue
+                with xr.open_dataset(path, engine="h5netcdf") as opened:
+                    dataset = opened.load()
+                if _validate_guidance(dataset, model) != target:
+                    raise ValueError(f"{model}: shadow guidance disagrees on target_reference_time")
+                kind = str(dataset.attrs["data_kind"])
+                wkt = dataset.attrs.get("crs_wkt2")
+                if kind == _REAL_KIND and (not isinstance(wkt, str) or not wkt):
+                    raise ValueError(f"{model}: real guidance requires crs_wkt2")
+                crs = pyproj.CRS.from_wkt(wkt) if wkt else _CRS
+                if (definition.grid_type == "projected" and not crs.is_projected) or (
+                    definition.grid_type == "geographic" and not crs.is_geographic
+                ):
+                    raise ValueError(f"{model}: incorrect native projection")
+                metadata: dict[str, Any] = {
+                    "data_kind": kind,
+                    "prepared_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+                identity: dict[str, Any] = {
+                    "data_kind": kind,
+                    "cycle": _iso(
+                        cast(np.datetime64, dataset["forecast_reference_time"].values[()])
+                    ),
+                }
+                if kind == _REAL_KIND:
+                    shadow_manifest, shadow_digest = _load_source_manifest(
+                        shadow_directory, {model: dataset}, target, models={model}
+                    )
+                    metadata.update(manifest=shadow_manifest, manifest_sha256=shadow_digest)
+                    identity.update(
+                        inputs=[row for row in shadow_manifest["inputs"] if row["model"] == model],
+                        configuration_sha256=shadow_manifest.get("configuration_sha256"),
+                        source_metadata=shadow_manifest.get("source_metadata"),
+                    )
+                identities.add(json.dumps(identity, sort_keys=True))
+                if len(identities) > 1:
+                    raise ValueError(f"{model}: shadow regions disagree on retained input identity")
+                views.append(_ShadowView(dataset, crs, metadata))
         return cls(
             guidance,
             target,
@@ -342,7 +402,7 @@ class PreparedPointForecast:
             digest,
             horizons,
             configuration,
-            shadow_metadata,
+            shadow_views,
         )
 
     def check_coordinate(self, latitude: float, longitude: float) -> None:
@@ -394,6 +454,19 @@ class PreparedPointForecast:
 
     def forecast(self, *, latitude: float, longitude: float) -> dict[str, Any]:
         self.check_coordinate(latitude, longitude)
+        selected_shadows = {
+            model: next(
+                (
+                    view
+                    for view in views
+                    if point_in_grid(
+                        latitude, longitude, view.crs, view.dataset.x.values, view.dataset.y.values
+                    )
+                ),
+                None,
+            )
+            for model, views in self._shadow_views.items()
+        }
         hours: list[dict[str, Any]] = []
         for horizon in self._horizons:
             valid_time = self._target_reference_time + np.timedelta64(horizon, "h")
@@ -422,9 +495,13 @@ class PreparedPointForecast:
                 }
                 is_shadow = model in shadow_models
                 source_manifest = self._manifest
+                dataset = self._guidance.get(model)
+                crs = self._projections.get(model)
                 if is_shadow:
                     shadow_sources.append(source)
-                    metadata = self._shadow_metadata.get(model, {})
+                    view = selected_shadows[model]
+                    dataset, crs = (view.dataset, view.crs) if view else (None, None)
+                    metadata = view.metadata if view else {}
                     source["data_kind"] = metadata.get("data_kind")
                     if "prepared_sha256" in metadata:
                         source["prepared_sha256"] = metadata["prepared_sha256"]
@@ -433,9 +510,12 @@ class PreparedPointForecast:
                     source_manifest = metadata.get("manifest")
                 else:
                     sources.append(source)
-                dataset = self._guidance.get(model)
                 if dataset is None:
-                    source_reasons.append(f"{model}: prepared guidance file is missing")
+                    source_reasons.append(
+                        f"{model}: no prepared shadow region covers the forecast coordinate"
+                        if is_shadow and self._shadow_views[model]
+                        else f"{model}: prepared guidance file is missing"
+                    )
                     continue
                 cycle = cast(
                     np.datetime64,
@@ -457,6 +537,12 @@ class PreparedPointForecast:
                         source_url=evidence["source_grib_url"],
                         prepared_sha256=source_manifest["prepared_files"][model]["sha256"],
                     )
+                    if is_shadow:
+                        # Retain the exact per-message evidence without changing the
+                        # active control's source dictionary or manifest identity.
+                        source["acquisition"] = deepcopy(evidence)
+                        if "source_metadata" in source_manifest:
+                            source["source_metadata"] = deepcopy(source_manifest["source_metadata"])
                     if "cycle_selection" in source_manifest and not is_shadow:
                         source["acquisition"] = {
                             key: evidence[key]
@@ -480,7 +566,7 @@ class PreparedPointForecast:
                 try:
                     aligned = align_station_to_model(
                         dataset,
-                        crs=self._projections[model],
+                        crs=cast(pyproj.CRS, crs),
                         station_latitude=latitude,
                         station_longitude=longitude,
                         canonical_variable_id=_VARIABLE,

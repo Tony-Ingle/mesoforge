@@ -114,10 +114,13 @@ the unchanged 70/30 control, a comparison-only 50/50 blend, and saved observatio
 with descriptive MAE/bias/RMSE. Its real demonstration used 19 existing verified hours;
 these small, overlapping samples do not establish a better recipe.
 Contributor capabilities and named/versioned recipes now share a generic scalar path.
-A synthetic third shadow contributor can be retained and compared without changing the
-active forecast; no additional real model is implemented. Proposed next milestone:
-add a bounded RAP temperature adapter in shadow mode and evaluate it against the saved
-control. The combined locations lifecycle remains future work.
+RAP is now an optional real temperature shadow contributor with **zero active weight**;
+the HRRR/GFS 70/30 control is unchanged. Its separate prepared inputs, provenance and
+values flow into new immutable issuances and the existing comparison command. See
+[RAP shadow preparation](#prepare-rap-temperature-in-shadow-mode) for scope and validation.
+Next: verify eligible hours from these saved shadow issuances as observations become
+available, collecting identical paired samples before considering another model family.
+The combined locations lifecycle remains future work.
 
 Future direction: configure locations using latitude/longitude only, with geographic
 context and suitable observation sources derived internally. The intended VPS workflow
@@ -754,7 +757,7 @@ python -B -m mesoforge.application.batch_forecast --config locations.json --data
 
 The default export contains only HRRR/GFS. A future adapter registers its capabilities
 and provides normalized prepared inputs; its metadata and a comparison recipe can be
-added to this configuration. This milestone does not acquire a new real model.
+added to this configuration. The optional RAP adapter below is the first real example.
 Batch entry points reject changes to the approved control. Shadow, evaluated, and
 deprecated inputs already prepared as `MODEL_ID.nc` can be read with zero active weight;
 retired models are not loaded for new forecasts. A real shadow input must carry the
@@ -836,6 +839,88 @@ no assertion or production behavior was weakened. Temporary services were stoppe
 No provider downloads occurred. Full acceptance/coverage and broader forecast-skill
 evaluation were not run. Missing shadow inputs are isolated; malformed shadow files
 (wrong units, times or checksums) intentionally fail loading closed.
+
+### Prepare RAP temperature in shadow mode
+
+RAP adds temperature predictions to **new** issued forecasts without changing the active
+HRRR/GFS recipe, its source cycles, its prepared files, or historical issued payloads.
+Use an existing real 36-hour control dataset and the same coordinates-only locations JSON.
+Preparation is explicit and happens before batch issuance or HTTP requests:
+
+```powershell
+$control = "$env:LOCALAPPDATA\MesoForge\prepared\automatic-conus\20260910T221229Z-cc93f80b"
+$rap = "$env:LOCALAPPDATA\MesoForge\prepared\rap-shadow-20260910T22Z-aws"
+python -B -m mesoforge.application.prepared_rap --config locations.json --data-dir $control --output-dir $rap
+python -B -m mesoforge.application.batch_forecast --config locations.json --data-dir $control --contributors-config "$rap\contributors.json" --shadow-data "RAP=$rap"
+python -B -m mesoforge.application.model_comparison --issued-forecast-id ISSUED_FORECAST_UUID
+```
+
+The generated contributor configuration adds RAP in `shadow` status; its applied active
+weight is always zero. PostgreSQL/MinIO settings are required for issuance and saved
+comparison, not preparation. `--shadow-data MODEL=PATH` is a generic attachment hook;
+shadow manifests never enter the active HRRR/GFS raw-rebuild or cache identity.
+Nearby locations share views; distant locations use separate internally derived views
+from the same acquired messages. No station IDs or geographic metadata are required.
+Each model's prepared view is selected in memory for the exact requested coordinate.
+
+The adapter checks inventories in [NOAA's public RAP mirror](https://registry.opendata.aws/noaa-rap/)
+and selects the newest observed complete extended cycle at or before the control reference.
+[RAP's documented coverage](https://www.nco.ncep.noaa.gov/pmb/products/rap/) is hourly
+through lead 21, with 03/09/15/21 UTC cycles extending through 51. Selection aligns by
+actual valid time, not matching HRRR/GFS lead numbers. If no complete cycle is found in
+the bounded lookback, a partial shadow remains explicit; it never substitutes a new
+control cycle or redistributes weights. An optional `--rap-cycle UTC_TIMESTAMP` fixes
+the shadow cycle for reproducibility. Corrupt inventories and provider access/rate
+rejections stop discovery rather than scanning more cycles.
+
+Only standalone 2 m temperature GRIB messages and their inventories are acquired.
+Raw native messages remain outside Git. Prepared files use the decoded RAP Lambert
+projection, temperature in K, and coordinate-derived footprints. Each issued shadow
+source retains its cycle, lead, URL, raw/index/prepared/manifest hashes, acquisition and
+availability times, capability metadata, and lineage. The scientific system RAPv5 and
+the documented NOAA deployment package are recorded separately; no patch version is
+inferred from a GRIB message. RAP and HRRR share WRF-ARW/GSI lineage, so RAP is not
+treated as independent-family evidence.
+
+Repeating the preparation command reuses that snapshot without provider calls. To
+rebuild its values from retained raw messages into a new directory, fully offline:
+
+```powershell
+python -B -m mesoforge.application.prepared_rap --config locations.json --data-dir $control --from-raw $rap --output-dir "$rap-rebuilt"
+```
+
+New output directories preserve prior snapshots. Rebuilt manifests record the original
+source-manifest hash and a new preparation identity; numerical values and acquisition
+evidence remain reproducible. Missing RAP hours remain null with reasons. Existing
+one-off `/forecast` behavior and all Phase 2 defaults remain unchanged.
+
+September 11 UTC validation selected **RAP September 10 21Z**, source leads **2–37**,
+for the retained **22Z control reference**: valid times September 10 23Z through
+September 12 10Z. Fresno, Wichita and Raleigh each received **36/36 RAP values**.
+The successful AWS acquisition transferred **3,956,932 bytes**, including inventories;
+retained temperature messages total **2,525,820 bytes**, and three prepared views total
+**765,627 bytes**. Earlier NOMADS metadata attempts exposed compound inventory syntax
+and rate limiting; neither acquired a GRIB message. One interrupted metadata retry's
+transfer total was not captured; the AWS figure is not an all-attempt network total.
+
+All **108 active hours and HRRR/GFS provenance matched committed `76c0b01` exactly**.
+Three new immutable PostgreSQL/MinIO issuances retained RAP values and provenance;
+all 10 prior versions stayed unchanged. Repeat preparation, offline raw rebuilding,
+and read-only comparison passed with zero provider downloads. Independent interpolation
+from the raw RAP cells agreed within **4e-13 K**. For example, read Fresno's saved
+comparison with `--issued-forecast-id 5414dbd9-86f2-4a7a-9d8d-957087d84975`.
+These new RAP versions have **0 eligible observed pairs** in each lead bucket; MAE,
+bias and RMSE are null. No RAP was attached retroactively or scored against an old
+issuance. The first two valid times precede the new issuance and cannot be verified
+as forecasts issued in advance. No skill conclusion follows from this demonstration.
+
+**345 focused offline tests and 14 PostgreSQL/MinIO integration tests passed**, along
+with lock, Ruff, formatting, mypy, import, documentation, hygiene and diff checks.
+The preparation, batch and comparison command entry points were exercised with the
+isolated locked Python environment. Full acceptance/coverage and real-observation
+RAP scoring were not run. Temporary services were stopped. Captured all-hour batch,
+comparison, acquisition and offline reports remain outside Git under
+`%LOCALAPPDATA%\MesoForge\baselines\20260911-rap-shadow`.
 
 ### Discover and reuse nearby METAR stations
 
