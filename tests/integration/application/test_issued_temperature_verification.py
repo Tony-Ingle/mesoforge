@@ -32,6 +32,7 @@ from mesoforge.application.prepared_observations import (
     load_observation_configuration,
     prepare_bundle,
 )
+from mesoforge.application.prepared_rap import RAP_CONFIGURATION
 from mesoforge.application.station_discovery import StationDiscoveryService
 from mesoforge.catalog.contributors import ModelDefinition
 from mesoforge.common.errors import IntegrityError, NotFound
@@ -442,13 +443,15 @@ def test_two_issued_versions_for_the_same_hour_are_independently_verified(
 
 
 @pytest.mark.parametrize("shadow_available", [True, False])
-def test_saved_synthetic_shadow_recipe_preserves_control_and_verification_eligibility(
+@pytest.mark.parametrize("model", ["SYNTH_SHADOW", "RAP"])
+def test_saved_shadow_preserves_control_versions_and_verification_eligibility(
     prepared_guidance: Path,
     migrated_dsn: str,
     object_store: S3ArtifactObjectStore,
     configured_retrieval_storage: None,
     monkeypatch: pytest.MonkeyPatch,
     shadow_available: bool,
+    model: str,
 ) -> None:
     observations = seed_observation_preview_inputs(migrated_dsn, object_store, VALID_TIME)
     monkeypatch.setenv("MESOFORGE_OBSERVATIONS_ARTIFACT_ID", str(observations.artifact_id))
@@ -482,13 +485,15 @@ def test_saved_synthetic_shadow_recipe_preserves_control_and_verification_eligib
         control_recipe=DEFAULT_CONFIGURATION.control_recipe,
         comparison_recipes=(*DEFAULT_CONFIGURATION.comparison_recipes, recipe),
     )
+    if model == "RAP":
+        configuration = RAP_CONFIGURATION
     forecast = deepcopy(original)
     forecast["contributor_configuration"] = configuration.model_dump(mode="json")
     fixture_digest = str(Digest.of_bytes(b"Synthetic shadow fixture: 285 K, not model data"))
     for hour in forecast["hours"]:
         hour["shadow_sources"] = [
             {
-                "model": "SYNTH_SHADOW",
+                "model": model,
                 "data_kind": "synthetic_demonstration",
                 "notice": "Invented integration-test temperature; not real guidance.",
                 "cycle": "2026-08-30T12:00:00Z",
@@ -501,19 +506,20 @@ def test_saved_synthetic_shadow_recipe_preserves_control_and_verification_eligib
                 "prepared_sha256": fixture_digest.removeprefix("sha256:"),
             }
         ]
-    issued = issuer.issue(forecast, batch_run_id=uuid4(), location_index=0)
-    saved = issuer.read(issued.issued_forecast_id)
-    assert saved["forecast"] == forecast
+    issued = [issuer.issue(forecast, batch_run_id=uuid4(), location_index=0) for _ in range(2)]
+    saved = {row.issued_forecast_id: issuer.read(row.issued_forecast_id) for row in issued}
+    assert all(payload["forecast"] == forecast for payload in saved.values())
     for original_hour, saved_hour in zip(original["hours"], forecast["hours"], strict=True):
         assert saved_hour["temperature"] == original_hour["temperature"]
         assert saved_hour["sources"] == original_hour["sources"]
         assert saved_hour["missing_reasons"] == original_hour["missing_reasons"] == []
     before = complete_storage_inventory(migrated_dsn, object_store)
-    result = make_verifier(migrated_dsn, object_store, issuer).verify(
-        issued.issued_forecast_id, VALID_TIME
+    verifier = make_verifier(migrated_dsn, object_store, issuer)
+    results = [verifier.verify(row.issued_forecast_id, VALID_TIME) for row in issued]
+    assert all(result["status"] == "verified" for result in results)
+    assert [result["result"]["temperature_error"]["value"] for result in results] == pytest.approx(
+        [-10.15, -10.15], abs=1e-6
     )
-    assert result["status"] == "verified"
-    assert result["result"]["temperature_error"]["value"] == pytest.approx(-10.15, abs=1e-6)
     after = complete_storage_inventory(migrated_dsn, object_store)
     assert_forecasts_unchanged(before, after, object_store)
 
@@ -528,27 +534,46 @@ def test_saved_synthetic_shadow_recipe_preserves_control_and_verification_eligib
         (PostgresUnitOfWork, "commit"),
     ):
         monkeypatch.setattr(owner, method, forbidden)
-    identifiers = [ArtifactId(result["verification_id"])]
+    identifiers = [ArtifactId(result["verification_id"]) for result in results]
     comparison = compare_verified(identifiers)
+    assert len(comparison["results"]) == 2
+    assert {row["issued_forecast_id"] for row in comparison["results"]} == {
+        str(item.issued_forecast_id) for item in issued
+    }
     row = comparison["results"][0]
-    assert row["issued_forecast_id"] == str(issued.issued_forecast_id)
     assert row["errors"]["blend_70_30"] == pytest.approx(-10.15, abs=1e-6)
     assert row["predictions"]["blend_70_30"]["value"] == pytest.approx(283.0, abs=1e-6)
-    if shadow_available:
+    if model == "SYNTH_SHADOW" and shadow_available:
         # Independent arithmetic: .4 * 280 + .3 * 290 + .3 * 285 = 284.5 K.
         assert row["predictions"][recipe.result_key]["value"] == pytest.approx(284.5, abs=1e-6)
         assert row["errors"][recipe.result_key] == pytest.approx(-8.65, abs=1e-6)
         assert row["predictions"]["SYNTH_SHADOW"]["value"] == 285.0
-    else:
+    elif model == "SYNTH_SHADOW":
         assert row["predictions"][recipe.result_key]["value"] is None
         assert row["errors"][recipe.result_key] is None
         assert (
             "Synthetic shadow input missing"
             in row["predictions"][recipe.result_key]["missing_reasons"]
         )
+    for row in comparison["results"]:
+        assert row["errors"][model] == (
+            pytest.approx(-8.15, abs=1e-6) if shadow_available else None
+        )
+        assert row["shadow_sources"] == forecast["hours"][0]["shadow_sources"]
+    summary = comparison["summary"]["1-6"]
+    assert summary["paired_sample_count"] == (2 if shadow_available else 0)
+    assert summary["excluded_count"] == (0 if shadow_available else 2)
+    for metrics in summary["predictions"].values():
+        assert metrics["sample_count"] == (2 if shadow_available else 0)
+        if not shadow_available:
+            assert metrics["mae"] is metrics["mean_bias"] is metrics["rmse"] is None
+    if shadow_available:
+        metrics = summary["predictions"][model]
+        assert metrics["mean_bias"] == pytest.approx(-8.15, abs=1e-6)
+        assert metrics["mae"] == metrics["rmse"] == pytest.approx(8.15, abs=1e-6)
     assert compare_verified(identifiers) == comparison
     assert issuer.read(older.issued_forecast_id) == older_payload
-    assert issuer.read(issued.issued_forecast_id) == saved
+    assert {row.issued_forecast_id: issuer.read(row.issued_forecast_id) for row in issued} == saved
     assert complete_storage_inventory(migrated_dsn, object_store) == after
     forbidden.assert_not_called()
 

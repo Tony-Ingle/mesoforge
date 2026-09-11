@@ -118,8 +118,11 @@ RAP is now an optional real temperature shadow contributor with **zero active we
 the HRRR/GFS 70/30 control is unchanged. Its separate prepared inputs, provenance and
 values flow into new immutable issuances and the existing comparison command. See
 [RAP shadow preparation](#prepare-rap-temperature-in-shadow-mode) for scope and validation.
-Next: verify eligible hours from these saved shadow issuances as observations become
-available, collecting identical paired samples before considering another model family.
+The saved RAP versions have now been [verified against real METAR observations](#verify-saved-rap-shadow-guidance):
+three identical paired samples, unchanged control/history, and an offline repeat with
+no new observations or verification artifacts. This validates the comparison mechanics,
+not model rankings. Next proposed: a bounded ECMWF IFS temperature shadow adapter,
+evaluated at its native available valid times; no activation or weight change is approved.
 The combined locations lifecycle remains future work.
 
 Future direction: configure locations using latitude/longitude only, with geographic
@@ -909,8 +912,8 @@ all 10 prior versions stayed unchanged. Repeat preparation, offline raw rebuildi
 and read-only comparison passed with zero provider downloads. Independent interpolation
 from the raw RAP cells agreed within **4e-13 K**. For example, read Fresno's saved
 comparison with `--issued-forecast-id 5414dbd9-86f2-4a7a-9d8d-957087d84975`.
-These new RAP versions have **0 eligible observed pairs** in each lead bucket; MAE,
-bias and RMSE are null. No RAP was attached retroactively or scored against an old
+At issuance, these new RAP versions had **0 eligible observed pairs** in each lead bucket;
+MAE, bias and RMSE were null. No RAP was attached retroactively or scored against an old
 issuance. The first two valid times precede the new issuance and cannot be verified
 as forecasts issued in advance. No skill conclusion follows from this demonstration.
 
@@ -921,6 +924,44 @@ isolated locked Python environment. Full acceptance/coverage and real-observatio
 RAP scoring were not run. Temporary services were stopped. Captured all-hour batch,
 comparison, acquisition and offline reports remain outside Git under
 `%LOCALAPPDATA%\MesoForge\baselines\20260911-rap-shadow`.
+
+### Verify saved RAP shadow guidance
+
+The existing automatic verification and read-only comparison commands handle saved RAP
+without new production logic. With the PostgreSQL/MinIO settings above and the existing
+Fresno/Wichita/Raleigh locations JSON, these entry points were exercised using the
+isolated locked Python environment:
+
+```powershell
+python -B -m mesoforge.application.automatic_verification --config locations.json --start-valid-time 2026-09-11T02:00:00Z --end-valid-time 2026-09-11T03:00:00Z
+python -B -m mesoforge.application.model_comparison --verification-ids-file "$env:LOCALAPPDATA\MesoForge\baselines\20260911-rap-verification\verification-ids.json"
+```
+
+The window is end-exclusive. Station candidates were reused automatically, and the
+derived **01:45–02:15 UTC** observation request retained **8,623 response bytes** outside
+Git. The nearest QC-eligible stations were KFCH (3.00 km, 01:55 UTC), KIAB (9.08 km,
+01:55 UTC), and KRDU (18.03 km, 01:51 UTC). No station IDs were supplied by the user.
+The initial 01:00 UTC attempt retained another 11,030 bytes but correctly rejected all
+three RAP versions: their selected observations preceded issuance at 00:55:26 UTC.
+
+The 02:00 UTC window saved nine verification facts, keeping overlapping versions separate.
+The comparison IDs file selects only the **three RAP-bearing issued versions**. Each
+of HRRR, GFS, RAP, 70/30 and 50/50 uses these same three observed samples. All are
+target-reference horizon 4 (**1–6 bucket: 3; 7–18: 0; 19–36: 0**); empty buckets have
+null metrics. For example, Fresno RAP **309.923567 K** versus **311.15 K** observed
+has error **−1.226433 K**. Individual values/errors, metrics, source cycles/leads,
+observation revisions, station candidates/QC, raw provenance and checksums are captured
+under `%LOCALAPPDATA%\MesoForge\baselines\20260911-rap-verification`.
+
+Independent calculations matched all errors, MAE, mean bias and RMSE. The same-checkout
+repeat reused all nine facts with provider calls blocked and no PostgreSQL/MinIO changes;
+comparison output was identical. All **13 historical issued payloads** remained exact,
+including the active HRRR/GFS values and RAP's zero active weight. No forecast was generated.
+**125 focused offline tests and six PostgreSQL/MinIO integration tests passed**, covering
+RAP eligibility/missingness, identical sample sets, separate versions and read-only readback.
+Formatting/lint, documentation/hygiene and whitespace checks passed. Temporary services
+were stopped. Full acceptance/coverage and broader skill evaluation were not run; three
+pairs at one valid time cannot establish long-term model rankings or justify new weights.
 
 ### Discover and reuse nearby METAR stations
 

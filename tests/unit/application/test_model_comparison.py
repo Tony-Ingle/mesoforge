@@ -9,6 +9,7 @@ import pytest
 
 from mesoforge.application import model_comparison as application
 from mesoforge.application.point_forecast import PreparedPointForecast
+from mesoforge.application.prepared_rap import RAP_CONFIGURATION
 from mesoforge.common.errors import IntegrityError, NotFound
 from mesoforge.common.identifiers import ArtifactId
 from tests.unit.application import test_issued_temperature_verification as verification_tests
@@ -116,17 +117,34 @@ def test_duplicate_verification_versions_of_same_issued_hour_require_explicit_ch
         )
 
 
-def test_saved_shadow_with_late_source_is_unscored_without_changing_control(verification_case):
+@pytest.mark.parametrize(
+    "model,state",
+    [("SYNTH_SHADOW", "late"), ("RAP", "eligible"), ("RAP", "missing"), ("RAP", "late")],
+)
+def test_saved_shadow_eligibility_preserves_control_and_common_comparison_samples(
+    verification_case, model, state
+):
     case = verification_case
     verified = issue_with_contributors(case)
     previous_id = UUID(verified["result"]["match"]["issued_forecast_id"])
     previous = case.issuer.read(previous_id)
     configuration, example = _shadow_case()
+    if model == "RAP":
+        configuration = RAP_CONFIGURATION
     forecast = deepcopy(previous["forecast"])
     forecast["contributor_configuration"] = configuration.model_dump(mode="json")
     for hour in forecast["hours"]:
         hour["shadow_sources"] = deepcopy(example["shadow_sources"])
-        hour["shadow_sources"][0]["cycle"] = "2026-01-01T13:00:00Z"
+        source = hour["shadow_sources"][0]
+        source.update(
+            model=model,
+            data_kind="synthetic_demonstration",
+            cycle="2026-01-01T13:00:00Z" if state == "late" else "2026-01-01T12:00:00Z",
+            source_lead_hours=hour["horizon_hours"] - (1 if state == "late" else 0),
+        )
+        if state == "missing":
+            source["temperature"]["value"] = None
+            source["missing_reasons"] = ["Synthetic RAP fixture input missing"]
     issued = case.issuer.issue(forecast, batch_run_id=uuid4(), location_index=0)
     case.match.update(
         issued_forecast_id=str(issued.issued_forecast_id),
@@ -135,17 +153,39 @@ def test_saved_shadow_with_late_source_is_unscored_without_changing_control(veri
     )
     fact = case.service.verify(issued.issued_forecast_id, verification_tests._VALID)
     assert fact["status"] == "verified"
-    row = application.compare_verified(
+    before = verification_tests._inventory(case)
+    comparison = application.compare_verified(
         [ArtifactId(fact["verification_id"])],
         read_verification=case.service.read,
         read_forecast=case.issuer.read,
-    )["results"][0]
+    )
+    row = comparison["results"][0]
     assert row["errors"]["blend_70_30"] == 2.25
-    assert row["predictions"]["SYNTH_SHADOW"]["value"] == 300.0
-    assert row["errors"]["SYNTH_SHADOW"] is None
-    assert row["errors"]["three_model_comparison"] is None
-    assert row["ineligible_reasons"]["SYNTH_SHADOW"] == ["source_cycle_after_forecast_issuance"]
+    assert row["errors"]["blend_50_50"] == 2.75
+    assert row["predictions"][model]["value"] == (None if state == "missing" else 300.0)
+    assert row["errors"][model] == (21.0 if state == "eligible" else None)
+    metrics = comparison["summary"]["all"]
+    assert metrics["paired_sample_count"] == (1 if state == "eligible" else 0)
+    for prediction in metrics["predictions"].values():
+        assert prediction["sample_count"] == (1 if state == "eligible" else 0)
+        if state != "eligible":
+            assert prediction["mae"] is prediction["mean_bias"] is prediction["rmse"] is None
+    if state == "eligible":
+        assert metrics["predictions"]["RAP"] == {
+            "sample_count": 1,
+            "mae": 21.0,
+            "mean_bias": 21.0,
+            "rmse": 21.0,
+            "unit": "K",
+        }
+    elif state == "late":
+        assert row["ineligible_reasons"][model] == ["source_cycle_after_forecast_issuance"]
+    else:
+        assert "RAP_missing" in row["exclusion_reasons"]
+    if model == "SYNTH_SHADOW":
+        assert row["errors"]["three_model_comparison"] is None
     assert case.issuer.read(previous_id) == previous
+    assert verification_tests._inventory(case) == before
 
 
 @pytest.mark.parametrize("change", ["digest", "match", "error"])
