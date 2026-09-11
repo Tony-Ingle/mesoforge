@@ -1,4 +1,4 @@
-"""Normalize decoded Lambert temperature frames for retained shadow guidance."""
+"""Normalize decoded native-grid temperature frames for retained shadow guidance."""
 
 from __future__ import annotations
 
@@ -79,13 +79,79 @@ def _lambert_grid(field: xr.DataArray) -> tuple[pyproj.CRS, np.ndarray, np.ndarr
 
 
 def _axis_slice(axis: np.ndarray, lower: float, upper: float) -> slice:
-    lower, upper = max(lower, axis[0]), min(upper, axis[-1])
+    ordered = np.sort(axis)
+    lower, upper = max(lower, ordered[0]), min(upper, ordered[-1])
     if lower > upper:
         raise UnsupportedCoordinateError("Requested footprint does not intersect the shadow domain")
     # Enclose the projected footprint and one additional native cell, clipped at the domain edge.
-    first = max(0, int(np.searchsorted(axis, lower, side="right")) - 2)
-    last = min(len(axis), int(np.searchsorted(axis, upper, side="left")) + 2)
+    first = max(0, int(np.searchsorted(ordered, lower, side="right")) - 2)
+    last = min(len(axis), int(np.searchsorted(ordered, upper, side="left")) + 2)
+    if axis[0] > axis[-1]:
+        return slice(len(axis) - last, len(axis) - first)
     return slice(first, last)
+
+
+def _geographic_grid(field: xr.DataArray) -> tuple[pyproj.CRS, np.ndarray, np.ndarray, np.ndarray]:
+    """Preserve regular geographic cells, including wrapped longitude and descending latitude."""
+    attrs = field.attrs
+    if field.dims != ("latitude", "longitude") or field.dtype.kind != "f":
+        raise ValueError(
+            "Geographic shadow temperature must have floating latitude/longitude values"
+        )
+    if any(
+        attrs.get(f"GRIB_{name}") != 0
+        for name in ("iScansNegatively", "jPointsAreConsecutive", "alternativeRowScanning")
+    ) or attrs.get("GRIB_jScansPositively") not in (0, 1):
+        raise ValueError("Unsupported geographic shadow native scanning arrangement")
+    radius = float(attrs.get("GRIB_radius", float("nan")))
+    if (
+        attrs.get("GRIB_shapeOfTheEarth") not in (0, 1, 6, 8)
+        or not np.isfinite(radius)
+        or radius <= 0
+    ):
+        raise ValueError(
+            "Geographic shadow normalization requires decoded spherical-earth metadata"
+        )
+    source_x = np.asarray(field.longitude.values, dtype=np.float64)
+    y = np.asarray(field.latitude.values, dtype=np.float64)
+    if (
+        field.longitude.dims != ("longitude",)
+        or field.latitude.dims != ("latitude",)
+        or min(len(source_x), len(y)) < 2
+        or field.shape != (attrs.get("GRIB_Nj"), attrs.get("GRIB_Ni"))
+        or not np.all(np.isfinite(source_x))
+        or not np.all(np.isfinite(y))
+        or np.any(np.abs(y) > 90)
+    ):
+        raise ValueError("Invalid geographic shadow native grid dimensions or coordinates")
+    # A native longitude sequence can begin at 180 degrees and wrap through zero.
+    unwrapped = np.rad2deg(np.unwrap(np.deg2rad(source_x)))
+    dx = float(attrs["GRIB_iDirectionIncrementInDegrees"])
+    dy = float(attrs["GRIB_jDirectionIncrementInDegrees"])
+    y_direction = 1 if attrs["GRIB_jScansPositively"] else -1
+    if (
+        not np.isfinite(dx)
+        or not np.isfinite(dy)
+        or dx <= 0
+        or dy <= 0
+        or not np.allclose(np.diff(unwrapped), dx, rtol=0, atol=1e-6)
+        or not np.allclose(np.diff(y), y_direction * dy, rtol=0, atol=1e-6)
+    ):
+        raise ValueError("Geographic shadow coordinates disagree with native grid increments")
+    for index, endpoint in ((0, "First"), (-1, "Last")):
+        longitude = float(attrs[f"GRIB_longitudeOf{endpoint}GridPointInDegrees"])
+        latitude = float(attrs[f"GRIB_latitudeOf{endpoint}GridPointInDegrees"])
+        if not np.isclose(y[index], latitude, rtol=0, atol=1e-6) or not np.isclose(
+            (source_x[index] - longitude + 180) % 360 - 180, 0, rtol=0, atol=1e-6
+        ):
+            raise ValueError("Decoded geographic shadow cells disagree with native grid endpoints")
+    normalized_x = (source_x + 180) % 360 - 180
+    order = np.argsort(normalized_x)
+    x = normalized_x[order]
+    if not np.all(np.diff(x) > 0):
+        raise ValueError("Geographic shadow longitude cells must be unique")
+    crs = pyproj.CRS.from_proj4(f"+proj=longlat +R={radius} +no_defs")
+    return crs, x, y, order
 
 
 def normalize_shadow_temperature(
@@ -128,7 +194,12 @@ def normalize_shadow_temperature(
             for name, value in expected.items()
         ):
             raise ValueError(f"{model}: decoded shadow cycle/lead/valid time mismatch")
-        crs, x, y = _lambert_grid(field)
+        if field.attrs.get("GRIB_gridType") == "regular_ll":
+            crs, x, y, order = _geographic_grid(field)
+            values = field.values[:, order]
+        else:
+            crs, x, y = _lambert_grid(field)
+            values = field.values
         if native is None:
             native = crs, x, y
             if area is not None:
@@ -138,7 +209,7 @@ def normalize_shadow_temperature(
             crs != native[0] or not np.array_equal(x, native[1]) or not np.array_equal(y, native[2])
         ):
             raise ValueError(f"{model}: shadow native grid changes between leads")
-        frames.append(np.asarray(field.values[ys, xs], dtype=np.float64))
+        frames.append(np.asarray(values[ys, xs], dtype=np.float64))
     assert native is not None
     crs, x, y = native
     durations = np.array(leads, dtype="timedelta64[h]").astype("timedelta64[ns]")
@@ -162,11 +233,23 @@ def normalize_shadow_temperature(
             "data_kind": "real_prepared_guidance",
             "target_reference_time": target.astimezone(UTC).isoformat().replace("+00:00", "Z"),
             "crs_wkt2": crs.to_wkt(),
-            "grid_description": "Native Lambert shadow grid with a clipped one-cell footprint halo",
-            "source_x_min": float(x[0]),
-            "source_x_max": float(x[-1]),
-            "source_y_min": float(y[0]),
-            "source_y_max": float(y[-1]),
+            "grid_description": (
+                "Native Lambert shadow grid with a clipped one-cell footprint halo"
+                if crs.is_projected
+                else "Native geographic shadow grid with a clipped one-cell footprint halo"
+            ),
+            "source_x_min": float(np.min(x)),
+            "source_x_max": float(np.max(x)),
+            "source_y_min": float(np.min(y)),
+            "source_y_max": float(np.max(y)),
+            **(
+                {
+                    "source_earth_shape": int(decoded[leads[0]].attrs["GRIB_shapeOfTheEarth"]),
+                    "source_earth_radius_m": float(decoded[leads[0]].attrs["GRIB_radius"]),
+                }
+                if crs.is_geographic
+                else {}
+            ),
             **({"prepared_area_json": area.model_dump_json()} if area is not None else {}),
         },
     )

@@ -7,7 +7,11 @@ import math
 
 import pytest
 
-from mesoforge.catalog.contributors import ModelDefinition
+from mesoforge.catalog.contributors import (
+    IFS_MODEL_DEFINITION,
+    RAP_MODEL_DEFINITION,
+    ModelDefinition,
+)
 from mesoforge.forecasting.recipes import (
     DEFAULT_CONFIGURATION,
     ContributorConfiguration,
@@ -318,3 +322,72 @@ def test_history_without_shadow_is_excluded_from_joint_shadow_comparison_explici
         "SYNTH_SHADOW_missing": 1,
         "three_model_comparison_missing": 1,
     }
+
+
+def test_native_ifs_hour_and_missing_intermediate_hour_use_identical_pairs_for_every_model():
+    configuration = ContributorConfiguration(
+        models=(*DEFAULT_CONFIGURATION.models, RAP_MODEL_DEFINITION, IFS_MODEL_DEFINITION),
+        control_recipe=DEFAULT_CONFIGURATION.control_recipe,
+        comparison_recipes=DEFAULT_CONFIGURATION.comparison_recipes,
+    )
+    native = _hour(horizon=3)
+    native["valid_time"] = "2026-01-01T15:00:00Z"
+    native["sources"][0]["source_lead_hours"] = 9
+    native["sources"][1]["source_lead_hours"] = 15
+    native["shadow_sources"] = [
+        {
+            "model": model,
+            "cycle": "2026-01-01T12:00:00Z",
+            "source_lead_hours": 3,
+            "valid_time": native["valid_time"],
+            "weight": 0.0,
+            "temperature": {"value": value, "unit": "K"},
+            "missing_reasons": [],
+        }
+        for model, value in (("RAP", 286.0), ("IFS", 281.0))
+    ]
+    intermediate = copy.deepcopy(native)
+    intermediate.update(horizon_hours=2, valid_time="2026-01-01T14:00:00Z")
+    for source in intermediate["sources"]:
+        source["source_lead_hours"] -= 1
+    for source in intermediate["shadow_sources"]:
+        source.update(valid_time=intermediate["valid_time"], source_lead_hours=2)
+    intermediate["shadow_sources"][1].update(
+        source_lead_hours=None,
+        temperature={"value": None, "unit": "K"},
+        missing_reasons=["IFS: no native three-hourly guidance for this valid time"],
+    )
+    original = copy.deepcopy((native, intermediate))
+    result = compare_hour(native, {"value": 282.0, "unit": "K"}, configuration=configuration)
+    missing = compare_hour(intermediate, {"value": 287.0, "unit": "K"}, configuration=configuration)
+    expected = {
+        "HRRR": -2.0,
+        "GFS": 8.0,
+        "RAP": 4.0,
+        "IFS": -1.0,
+        "blend_70_30": 1.0,
+        "blend_50_50": 3.0,
+    }
+    assert result["errors"] == expected
+    assert result["paired_sample"] is True
+    assert missing["predictions"]["blend_70_30"]["value"] == 283.0
+    assert missing["errors"]["blend_70_30"] == -4.0
+    assert missing["predictions"]["IFS"]["value"] is None
+    assert missing["predictions"]["IFS"]["missing_reasons"] == [
+        "IFS: no native three-hourly guidance for this valid time"
+    ]
+    assert missing["errors"]["IFS"] is None
+    assert missing["exclusion_reasons"] == ["IFS_missing"]
+    summary = summarize([result, missing])["all"]
+    assert summary["row_count"] == 2
+    assert summary["paired_sample_count"] == summary["excluded_count"] == 1
+    assert summary["exclusion_counts"] == {"IFS_missing": 1}
+    for name, error in expected.items():
+        assert summary["predictions"][name] == {
+            "sample_count": 1,
+            "mae": abs(error),
+            "mean_bias": error,
+            "rmse": abs(error),
+            "unit": "K",
+        }
+    assert (native, intermediate) == original

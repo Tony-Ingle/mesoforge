@@ -103,3 +103,18 @@ RAP_MODEL_DEFINITION = ModelDefinition(
     status="shadow",
     grid_type="projected",
 )
+
+# Deterministic public IFS subset, preserving native three-hourly temperature.
+# This registration describes the adapter envelope, not every ECMWF product.
+IFS_MODEL_DEFINITION = ModelDefinition(
+    model_id="IFS",
+    provider="ECMWF Open Data",
+    family="ECMWF IFS",
+    lineage=("ECMWF Integrated Forecasting System deterministic forecast",),
+    domain="global",
+    supported_fields=("air_temperature_2m",),
+    cycle_hours=(0, 6, 12, 18),
+    supported_leads=tuple(range(0, 91, 3)),
+    status="shadow",
+    grid_type="geographic",
+)

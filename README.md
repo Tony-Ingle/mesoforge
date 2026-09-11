@@ -121,8 +121,12 @@ values flow into new immutable issuances and the existing comparison command. Se
 The saved RAP versions have now been [verified against real METAR observations](#verify-saved-rap-shadow-guidance):
 three identical paired samples, unchanged control/history, and an offline repeat with
 no new observations or verification artifacts. This validates the comparison mechanics,
-not model rankings. Next proposed: a bounded ECMWF IFS temperature shadow adapter,
-evaluated at its native available valid times; no activation or weight change is approved.
+not model rankings. [ECMWF IFS now also runs in shadow mode](#prepare-ecmwf-ifs-temperature-in-shadow-mode),
+using native three-hourly values with explicit missingness between them. Both shadows
+have zero active weight. The real three-location demonstration preserved every active
+forecast value; no eligible real IFS/observation pairs were available at validation.
+Next proposed: inventory retained inputs for one bounded four-model historical replay,
+including actual availability cutoffs and observation coverage before acquiring more data.
 The combined locations lifecycle remains future work.
 
 Future direction: configure locations using latitude/longitude only, with geographic
@@ -760,7 +764,7 @@ python -B -m mesoforge.application.batch_forecast --config locations.json --data
 
 The default export contains only HRRR/GFS. A future adapter registers its capabilities
 and provides normalized prepared inputs; its metadata and a comparison recipe can be
-added to this configuration. The optional RAP adapter below is the first real example.
+added to this configuration. The optional RAP and IFS adapters below are real examples.
 Batch entry points reject changes to the approved control. Shadow, evaluated, and
 deprecated inputs already prepared as `MODEL_ID.nc` can be read with zero active weight;
 retired models are not loaded for new forecasts. A real shadow input must carry the
@@ -962,6 +966,98 @@ RAP eligibility/missingness, identical sample sets, separate versions and read-o
 Formatting/lint, documentation/hygiene and whitespace checks passed. Temporary services
 were stopped. Full acceptance/coverage and broader skill evaluation were not run; three
 pairs at one valid time cannot establish long-term model rankings or justify new weights.
+
+### Prepare ECMWF IFS temperature in shadow mode
+
+IFS uses the official [ECMWF open-data feed](https://www.ecmwf.int/en/forecasts/datasets/open-data-0)
+through its public AWS mirror: deterministic `ifs/0p25/oper/fc`, 2-m temperature only.
+It shares RAP's preparation/retention flow and the generic contributor reader, recipes,
+issuance and comparison path. Its regular latitude/longitude grid is normalized with
+the decoded geometry. No IFS-specific forecasting, verification or storage path was added.
+Both RAP and IFS have **zero active weight**; HRRR 70% / GFS 30% remains unchanged.
+
+Using the existing coordinates-only `locations.json` and PostgreSQL/MinIO environment:
+
+```powershell
+$control = "$env:LOCALAPPDATA\MesoForge\prepared\automatic-conus\20260910T221229Z-cc93f80b"
+$rap = "$env:LOCALAPPDATA\MesoForge\prepared\rap-shadow-20260910T22Z-aws"
+$ifs = "$env:LOCALAPPDATA\MesoForge\prepared\ifs-shadow-20260910T22Z"
+python -B -m mesoforge.application.prepared_ifs --config locations.json --data-dir $control --output-dir $ifs
+python -B -m mesoforge.application.batch_forecast --config locations.json --data-dir $control --contributors-config "$ifs\contributors.json" --shadow-data "RAP=$rap" --shadow-data "IFS=$ifs"
+python -B -m mesoforge.application.model_comparison --issued-forecast-id cbf81fca-287a-43a6-8c26-9ab46a3db398
+```
+
+Preparation checks actual provider inventories for the newest usable cycle at or before
+the control reference time, preferring complete native guidance and falling back to older
+cycles when needed. The adapter checks up to 24 hours back and supports native leads
+0–90 every three hours. If no complete cycle is found, partial shadow guidance is reported
+explicitly. Add `--ifs-cycle 2026-09-10T18:00:00Z` to preparation for an explicit override;
+the existing output directory must describe that same cycle or a new directory is needed.
+Neither nominal cycle time nor control reference time implies provider availability;
+actual availability and acquisition timestamps are retained separately.
+
+IFS stays **natively three-hourly**. Matching uses actual valid times, never equal source
+lead numbers. Intervening forecast hours report null IFS temperature with
+`IFS: no guidance for this valid time`; they do not interpolate or change active weights.
+The decoder checks the documented IFS CY50R1 identity and native grid/time/unit contract.
+Manifests and issued shadow rows retain capabilities/lineage, source cycle/lead, URLs,
+byte ranges, hashes, acquisition/availability times, and source attribution.
+
+Repeating preparation reuses the snapshot without provider calls. To rebuild offline
+from retained raw messages into a new directory:
+
+```powershell
+python -B -m mesoforge.application.prepared_ifs --config locations.json --data-dir $control --from-raw $ifs --output-dir "${ifs}-rebuilt"
+```
+
+These entry points and offline rebuilding were exercised with the isolated locked
+interpreter. The explicit-cycle override was tested offline; `uv run --locked` was not
+executed. Preparation remains outside HTTP requests. Raw data stays outside Git.
+
+The September 11 UTC demonstration selected **September 10 18Z IFS**, source leads
+**6, 9, …, 39**, aligned to the existing **September 10 22Z** reference. Each location
+received 12 native IFS values at **September 11 00Z through September 12 09Z, every
+three hours** (forecast hours 2, 5, …, 35), and 24 explicitly missing IFS hours.
+Temperature examples at **September 11 03Z**, in K, rounded here only:
+
+| Location | HRRR | GFS | RAP (shadow) | IFS (shadow) | Active 70/30 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Fresno | 307.885474 | 309.872959 | 307.311420 | 309.767937 | 308.481720 |
+| Wichita | 296.079291 | 297.440890 | 296.246030 | 295.963318 | 296.487770 |
+| Raleigh | 299.792906 | 299.133767 | 299.381343 | 298.929347 | 299.595164 |
+
+The bounded preparation received **8,839,654 bytes**, plus a **40,025-byte** metadata
+preflight. Retained unique temperature messages occupy **7,875,280 bytes**, indexes
+**482,187 bytes**, and three regional prepared views **114,604 bytes**. Each message
+was acquired once and shared across regions; retained evidence is copied into regional
+snapshots. HRRR/GFS and RAP were reused without downloads. Offline rebuilding reproduced
+all values exactly; independent spatial interpolation from raw IFS cells agreed within
+**6e-14 K**. No temporal interpolation was performed.
+
+Against committed `855d681`, all **108 active hours and 108 RAP values**, including their
+source provenance, were exactly unchanged. Three new immutable issuances were read back
+from PostgreSQL/MinIO; all **13 previous issued versions** stayed unchanged. Repeat
+comparison created no rows or objects. Existing real RAP comparison results also matched.
+The new IFS versions were issued at **02:38 UTC**: native 00Z preceded issuance and the
+next native 03Z was still future. Thus there were **zero eligible real IFS/observation
+pairs** at validation, zero samples in every lead bucket, and null metrics. No observations
+were downloaded or comparison window manufactured. Later comparisons use the same complete
+paired native valid times for every included model/recipe and observation.
+
+**287 focused offline tests and five PostgreSQL/MinIO integration tests passed**, including
+synthetic four-model paired calculations, native missingness, separate issued versions,
+readback and unchanged history. Ruff, formatting, typing, import contracts, documentation,
+hygiene and diff checks passed. Full acceptance/coverage and real IFS skill evaluation
+were not run. Temporary services were stopped. Full all-hour outputs, immutable IDs,
+acquisition evidence and regression/rebuild reports remain outside Git under
+`%LOCALAPPDATA%\MesoForge\baselines\20260911-ifs-shadow`.
+
+ECMWF data is used under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), with
+[ECMWF's attribution terms](https://apps.ecmwf.int/datasets/licences/general/):
+**This service is based on data and products of the European Centre for Medium-Range
+Weather Forecasts (ECMWF).** MesoForge extracts temperature messages and regional/point
+values; it does not temporally interpolate IFS. Source/licence/attribution and these
+modifications are recorded with retained provenance. No ECMWF endorsement is implied.
 
 ### Discover and reuse nearby METAR stations
 

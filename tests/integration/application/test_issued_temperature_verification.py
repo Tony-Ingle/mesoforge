@@ -27,6 +27,7 @@ from mesoforge.application.issued_temperature_verification import (
 from mesoforge.application.model_comparison import compare_verified
 from mesoforge.application.observation_preview import preview_observation_match
 from mesoforge.application.point_forecast import PreparedPointForecast
+from mesoforge.application.prepared_ifs import IFS_CONFIGURATION
 from mesoforge.application.prepared_observations import (
     acquire_bundle,
     load_observation_configuration,
@@ -571,6 +572,136 @@ def test_saved_shadow_preserves_control_versions_and_verification_eligibility(
         metrics = summary["predictions"][model]
         assert metrics["mean_bias"] == pytest.approx(-8.15, abs=1e-6)
         assert metrics["mae"] == metrics["rmse"] == pytest.approx(8.15, abs=1e-6)
+    assert compare_verified(identifiers) == comparison
+    assert issuer.read(older.issued_forecast_id) == older_payload
+    assert {row.issued_forecast_id: issuer.read(row.issued_forecast_id) for row in issued} == saved
+    assert complete_storage_inventory(migrated_dsn, object_store) == after
+    forbidden.assert_not_called()
+
+
+def test_saved_rap_and_native_ifs_versions_use_only_identical_observed_pairs(
+    prepared_guidance: Path,
+    migrated_dsn: str,
+    object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native_time = datetime(2026, 8, 30, 15, tzinfo=UTC)
+    observations = seed_observation_preview_inputs(
+        migrated_dsn, object_store, VALID_TIME, extra_valid_times=(native_time,)
+    )
+    monkeypatch.setenv("MESOFORGE_OBSERVATIONS_ARTIFACT_ID", str(observations.artifact_id))
+    issuer = make_issuer(migrated_dsn, object_store)
+    original = PreparedPointForecast.from_directory(prepared_guidance).forecast(
+        latitude=FIRST["lat"], longitude=FIRST["lon"]
+    )
+    older = issuer.issue(original, batch_run_id=uuid4(), location_index=0)
+    older_payload = issuer.read(older.issued_forecast_id)
+    forecast = deepcopy(original)
+    forecast["contributor_configuration"] = IFS_CONFIGURATION.model_dump(mode="json")
+    for hour in forecast["hours"]:
+        hour["shadow_sources"] = []
+        for model, temperature in (("RAP", 285.0), ("IFS", 288.0)):
+            available = model == "RAP" or hour["horizon_hours"] % 3 == 0
+            digest = str(Digest.of_bytes(f"Synthetic {model} fixture: {temperature} K".encode()))
+            hour["shadow_sources"].append(
+                {
+                    "model": model,
+                    "data_kind": "synthetic_demonstration",
+                    "notice": "Invented integration-test temperature; not real guidance.",
+                    "cycle": "2026-08-30T12:00:00Z",
+                    "source_lead_hours": hour["horizon_hours"] if available else None,
+                    "valid_time": hour["valid_time"],
+                    "weight": 0.0,
+                    "temperature": {"value": temperature if available else None, "unit": "K"},
+                    "missing_reasons": []
+                    if available
+                    else ["IFS: no native three-hourly guidance for this valid time"],
+                    "source_url": f"test-fixture://synthetic-{model}/{temperature}K",
+                    "raw_sha256": digest.removeprefix("sha256:"),
+                    "prepared_sha256": digest.removeprefix("sha256:"),
+                    "source_metadata": {
+                        "model_definition": IFS_CONFIGURATION.model_map()[model].model_dump(
+                            mode="json"
+                        ),
+                        "adapter_version": "synthetic_integration_fixture_v1",
+                        "temporal_policy": "Native three-hourly values only"
+                        if model == "IFS"
+                        else "Hourly values",
+                    },
+                }
+            )
+        assert {key: value for key, value in hour.items() if key != "shadow_sources"} == (
+            original["hours"][hour["horizon_hours"] - 1]
+        )
+    issued = [issuer.issue(forecast, batch_run_id=uuid4(), location_index=0) for _ in range(2)]
+    saved = {row.issued_forecast_id: issuer.read(row.issued_forecast_id) for row in issued}
+    assert all(payload["forecast"] == forecast for payload in saved.values())
+    before = complete_storage_inventory(migrated_dsn, object_store)
+    verifier = make_verifier(migrated_dsn, object_store, issuer)
+    results = [
+        verifier.verify(row.issued_forecast_id, valid_time)
+        for valid_time in (VALID_TIME, native_time)
+        for row in issued
+    ]
+    assert all(result["status"] == "verified" for result in results)
+    assert len({result["verification_id"] for result in results}) == 4
+    assert [result["result"]["temperature_error"]["value"] for result in results] == pytest.approx(
+        [-10.15, -10.15, -8.15, -8.15], abs=1e-6
+    )
+    after = complete_storage_inventory(migrated_dsn, object_store)
+    assert_forecasts_unchanged(before, after, object_store)
+    forbidden = Mock(side_effect=AssertionError("IFS comparison attempted calculation or a write"))
+    for owner, method in (
+        (IssuedTemperatureVerificationService, "verify"),
+        (PreparedPointForecast, "forecast"),
+        (ForecastIssuanceService, "issue"),
+        (S3ArtifactObjectStore, "put_if_absent"),
+        (PostgresUnitOfWork, "commit"),
+    ):
+        monkeypatch.setattr(owner, method, forbidden)
+    identifiers = [ArtifactId(result["verification_id"]) for result in results]
+    comparison = compare_verified(identifiers)
+    assert len(comparison["results"]) == 4
+    assert {row["issued_forecast_id"] for row in comparison["results"]} == {
+        str(item.issued_forecast_id) for item in issued
+    }
+    for row in comparison["results"]:
+        original_hour = forecast["hours"][row["horizon_hours"] - 1]
+        assert row["sources"] == original_hour["sources"]
+        assert row["shadow_sources"] == original_hour["shadow_sources"]
+        assert (
+            row["provenance"]["forecast_context"]["contributor_configuration"]
+            == (forecast["contributor_configuration"])
+        )
+        if row["valid_time"] == "2026-08-30T15:00:00Z":
+            assert row["shadow_sources"][1]["cycle"] == "2026-08-30T12:00:00Z"
+            assert row["shadow_sources"][1]["source_lead_hours"] == 3
+            assert row["paired_sample"] is True
+            assert row["predictions"]["IFS"]["value"] == 288.0
+        else:
+            assert row["paired_sample"] is False
+            assert row["predictions"]["IFS"]["value"] is None
+            assert row["errors"]["IFS"] is None
+            assert "IFS_missing" in row["exclusion_reasons"]
+    summary = comparison["summary"]["1-6"]
+    assert summary["row_count"] == 4
+    assert summary["paired_sample_count"] == summary["excluded_count"] == 2
+    assert summary["exclusion_counts"]["IFS_missing"] == 2
+    # Only the 15Z pairs count: HRRR282, GFS292, RAP285, IFS288 and observation293.15 K.
+    expected = {
+        "HRRR": -11.15,
+        "GFS": -1.15,
+        "RAP": -8.15,
+        "IFS": -5.15,
+        "blend_70_30": -8.15,
+        "blend_50_50": -6.15,
+    }
+    for model, error in expected.items():
+        metrics = summary["predictions"][model]
+        assert metrics["sample_count"] == 2
+        assert metrics["mean_bias"] == pytest.approx(error, abs=1e-6)
+        assert metrics["mae"] == metrics["rmse"] == pytest.approx(abs(error), abs=1e-6)
     assert compare_verified(identifiers) == comparison
     assert issuer.read(older.issued_forecast_id) == older_payload
     assert {row.issued_forecast_id: issuer.read(row.issued_forecast_id) for row in issued} == saved

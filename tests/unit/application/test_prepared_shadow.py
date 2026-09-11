@@ -1,4 +1,4 @@
-"""Independent geometry/time/value checks for decoded projected shadow preparation."""
+"""Independent geometry/time/value checks for decoded native shadow preparation."""
 
 from datetime import UTC, datetime, timedelta
 
@@ -150,7 +150,7 @@ def test_unrequested_or_noninteger_leads_are_rejected(lead):
         ("GRIB_units", "degC", "use K"),
         ("GRIB_iScansNegatively", 1, "scanning"),
         ("GRIB_radius", 6371000, "6371229"),
-        ("GRIB_gridType", "regular_ll", "Lambert"),
+        ("GRIB_gridType", "regular_ll", "latitude/longitude"),
     ],
 )
 def test_invalid_units_or_native_grid_metadata_is_rejected(attribute, value, message):
@@ -191,3 +191,148 @@ def test_missing_values_remain_missing_and_empty_input_does_not_invent_grid():
 def test_invalid_reference_times_are_rejected(cycle, target):
     with pytest.raises(ValueError, match="UTC|exact hours|after"):
         normalize_shadow_temperature({4: frame()}, model="RAP", cycle=cycle, target=target)
+
+
+def geographic_frame(lead=4, *, wrapped=False):
+    """Small regular geographic fixture; values are not acquired model guidance."""
+    longitude = np.array([180.0, 270.0, 0.0, 90.0]) if wrapped else 264.5 + 0.25 * np.arange(19)
+    latitude = 47.0 - 0.25 * np.arange(17)
+    lon, lat = np.meshgrid((longitude + 180) % 360 - 180, latitude)
+    return xr.DataArray(
+        270.0 + lead + 0.5 * (lat - 45) + 0.2 * (lon + 93),
+        dims=("latitude", "longitude"),
+        coords={
+            "latitude": latitude,
+            "longitude": longitude,
+            "time": np.datetime64(CYCLE.replace(tzinfo=None), "ns"),
+            "step": np.timedelta64(lead, "h"),
+            "valid_time": np.datetime64((CYCLE + timedelta(hours=lead)).replace(tzinfo=None), "ns"),
+        },
+        attrs={
+            "GRIB_units": "K",
+            "GRIB_gridType": "regular_ll",
+            "GRIB_iScansNegatively": 0,
+            "GRIB_jScansPositively": 0,
+            "GRIB_jPointsAreConsecutive": 0,
+            "GRIB_alternativeRowScanning": 0,
+            "GRIB_shapeOfTheEarth": 6,
+            "GRIB_radius": 6371229,
+            "GRIB_Ni": len(longitude),
+            "GRIB_Nj": len(latitude),
+            "GRIB_iDirectionIncrementInDegrees": 90.0 if wrapped else 0.25,
+            "GRIB_jDirectionIncrementInDegrees": 0.25,
+            "GRIB_latitudeOfFirstGridPointInDegrees": latitude[0],
+            "GRIB_latitudeOfLastGridPointInDegrees": latitude[-1],
+            "GRIB_longitudeOfFirstGridPointInDegrees": longitude[0],
+            "GRIB_longitudeOfLastGridPointInDegrees": longitude[-1],
+        },
+    )
+
+
+def test_sparse_geographic_native_steps_align_by_valid_time_without_hourly_interpolation():
+    target = CYCLE + timedelta(hours=4)
+    decoded = {lead: geographic_frame(lead) for lead in range(6, 40, 3)}
+    originals = {lead: field.copy(deep=True) for lead, field in decoded.items()}
+    result = normalize_shadow_temperature(
+        decoded, model="SYNTH_GEOGRAPHIC", cycle=CYCLE, target=target
+    )
+    crs = pyproj.CRS.from_wkt(result.attrs["crs_wkt2"])
+    assert crs.is_geographic and crs.ellipsoid.semi_major_metre == 6371229.0
+    assert crs.ellipsoid.semi_minor_metre == 6371229.0
+    assert result.attrs["source_earth_shape"] == 6
+    assert result.attrs["source_earth_radius_m"] == 6371229.0
+    assert result.air_temperature_2m.attrs == {"unit_id": "K", "units": "K"}
+    assert result.sizes["source_lead_time"] == 12  # No fabricated hourly source slots.
+    np.testing.assert_array_equal(result.y.values, decoded[6].latitude.values)
+    np.testing.assert_array_equal(result.air_temperature_2m.values[0], decoded[6].values)
+    aligned = align_station_to_model(
+        result,
+        crs=crs,
+        station_latitude=45.8,
+        station_longitude=-93.1,
+        canonical_variable_id="air_temperature_2m",
+        target_horizon_hours=tuple(range(1, 37)),
+        target_reference_time=np.datetime64(target.replace(tzinfo=None), "ns"),
+    )
+    assert set(aligned) == set(range(2, 36, 3))  # Source cycle + lead, not target hour modulo 3.
+    for horizon, value in aligned.items():
+        assert value.source_lead_hour == horizon + 4
+        assert value.value == pytest.approx(274.38 + horizon, abs=1e-10)
+    for lead, field in decoded.items():
+        xr.testing.assert_identical(field, originals[lead])
+
+
+def test_wrapped_geographic_longitude_reorders_values_with_their_original_cells():
+    field = geographic_frame(wrapped=True)
+    result = normalize_shadow_temperature(
+        {4: field}, model="SYNTH_GEOGRAPHIC", cycle=CYCLE, target=TARGET
+    )
+    np.testing.assert_array_equal(result.x.values, [-180.0, -90.0, 0.0, 90.0])
+    np.testing.assert_array_equal(result.air_temperature_2m.values[0], field.values)
+    shifted = field.roll(longitude=2, roll_coords=True)
+    shifted.attrs.update(
+        GRIB_longitudeOfFirstGridPointInDegrees=0.0,
+        GRIB_longitudeOfLastGridPointInDegrees=270.0,
+    )
+    reordered = normalize_shadow_temperature(
+        {4: shifted}, model="SYNTH_GEOGRAPHIC", cycle=CYCLE, target=TARGET
+    )
+    xr.testing.assert_identical(reordered, result)
+
+
+def test_geographic_footprint_retains_descending_rows_native_cells_and_missing_values():
+    field = geographic_frame()
+    field.values[0, 0] = np.nan
+    area = BoundingBox(south=45.79, north=45.81, west=-93.11, east=-93.09)
+    full = normalize_shadow_temperature(
+        {4: field}, model="SYNTH_GEOGRAPHIC", cycle=CYCLE, target=TARGET
+    )
+    subset = normalize_shadow_temperature(
+        {4: field}, model="SYNTH_GEOGRAPHIC", cycle=CYCLE, target=TARGET, area=area
+    )
+    assert np.isnan(full.air_temperature_2m.values[0, 0, 0])
+    assert subset.sizes["x"] < full.sizes["x"] and subset.sizes["y"] < full.sizes["y"]
+    assert min(subset.sizes["x"], subset.sizes["y"]) >= 4
+    assert np.all(np.diff(subset.y.values) < 0)
+    assert bbox_in_grid(
+        area, pyproj.CRS.from_wkt(subset.attrs["crs_wkt2"]), subset.x.values, subset.y.values
+    )
+    xr.testing.assert_equal(
+        subset.air_temperature_2m, full.air_temperature_2m.sel(x=subset.x, y=subset.y)
+    )
+    for name in ("source_x_min", "source_x_max", "source_y_min", "source_y_max"):
+        assert subset.attrs[name] == full.attrs[name]
+
+
+@pytest.mark.parametrize(
+    "attribute,value,message",
+    [
+        ("GRIB_shapeOfTheEarth", 5, "spherical-earth"),
+        ("GRIB_radius", 0.0, "spherical-earth"),
+        ("GRIB_Ni", 18, "dimensions"),
+        ("GRIB_iDirectionIncrementInDegrees", 0.5, "increments"),
+        ("GRIB_jScansPositively", 1, "increments"),
+        ("GRIB_longitudeOfLastGridPointInDegrees", 268.0, "endpoints"),
+        ("GRIB_jPointsAreConsecutive", 1, "scanning"),
+    ],
+)
+def test_geographic_metadata_must_describe_the_decoded_native_cells(attribute, value, message):
+    field = geographic_frame()
+    field.attrs[attribute] = value
+    with pytest.raises(ValueError, match=message):
+        normalize_shadow_temperature(
+            {4: field}, model="SYNTH_GEOGRAPHIC", cycle=CYCLE, target=TARGET
+        )
+
+
+def test_geographic_earth_metadata_and_grid_cannot_change_between_native_steps():
+    field = geographic_frame(6)
+    field.attrs.update(GRIB_shapeOfTheEarth=1, GRIB_radius=6371000)
+    single = normalize_shadow_temperature(
+        {6: field}, model="SYNTH_GEOGRAPHIC", cycle=CYCLE, target=TARGET
+    )
+    assert pyproj.CRS.from_wkt(single.attrs["crs_wkt2"]).ellipsoid.semi_major_metre == 6371000
+    with pytest.raises(ValueError, match="grid changes"):
+        normalize_shadow_temperature(
+            {4: geographic_frame(4), 6: field}, model="SYNTH_GEOGRAPHIC", cycle=CYCLE, target=TARGET
+        )

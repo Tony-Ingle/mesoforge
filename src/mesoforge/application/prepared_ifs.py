@@ -1,4 +1,4 @@
-"""Prepare a separate RAP temperature shadow snapshot for an existing control window.
+"""Prepare a separate IFS temperature shadow snapshot for an existing control window.
 
 This is an explicit pre-HTTP operation. Coordinates use the existing spatial planner;
 one set of temperature messages supplies all regions. The active source snapshot is
@@ -18,34 +18,27 @@ from mesoforge.application.batch_forecast import load_locations
 from mesoforge.application.prepared_shadow import normalize_shadow_temperature
 from mesoforge.application.prepared_temperature import BoundedHttpTransport, _code_identity
 from mesoforge.application.shadow_preparation import ShadowAdapter, prepare_shadow
-from mesoforge.catalog.contributors import RAP_MODEL_DEFINITION
+from mesoforge.catalog.contributors import IFS_MODEL_DEFINITION, RAP_MODEL_DEFINITION
 from mesoforge.forecasting.recipes import DEFAULT_CONFIGURATION, ContributorConfiguration
 from mesoforge.guidance.interfaces import Clock, HttpTransport, Sleeper
-from mesoforge.guidance.sources.rap import (
-    RAP_CAPABILITIES,
-    acquire_rap_lead,
+from mesoforge.guidance.sources.ifs import (
+    IFS_CAPABILITIES,
+    acquire_ifs_lead,
     decode_temperature_message,
-    discover_rap_cycle,
+    discover_ifs_cycle,
 )
 
-RAP_CONFIGURATION = ContributorConfiguration(
-    models=(*DEFAULT_CONFIGURATION.models, RAP_MODEL_DEFINITION),
+IFS_CONFIGURATION = ContributorConfiguration(
+    models=(*DEFAULT_CONFIGURATION.models, RAP_MODEL_DEFINITION, IFS_MODEL_DEFINITION),
     control_recipe=DEFAULT_CONFIGURATION.control_recipe,
     comparison_recipes=DEFAULT_CONFIGURATION.comparison_recipes,
 )
 _SOURCE_METADATA = {
-    "model_definition": RAP_MODEL_DEFINITION.model_dump(mode="json"),
-    "capabilities": json.loads(json.dumps(RAP_CAPABILITIES)),
-    "adapter_version": "rap_temperature_v1",
-    "product": "awp130pgrb",
-    "scientific_version": "RAPv5",
-    "documented_production_package": "rap.v5.1.24",
-    "version_note": "Documented NOAA package, not a patch version asserted by each GRIB message.",
-    "metadata_sources": [
-        "https://www.nco.ncep.noaa.gov/pmb/products/rap/",
-        "https://www.nco.ncep.noaa.gov/pmb/codes/nwprod/",
-        "https://www.weather.gov/media/notification/pdf2/scn20-46rap_v5_hrrr_v4_aab.pdf",
-    ],
+    "model_definition": IFS_MODEL_DEFINITION.model_dump(mode="json"),
+    "capabilities": json.loads(json.dumps(IFS_CAPABILITIES)),
+    "adapter_version": "ifs_temperature_v1",
+    "product": "IFS Open Data deterministic oper/fc, 0.25 degree, 2t",
+    "temporal_policy": "Native three-hourly valid times only; no temporal interpolation",
 }
 
 
@@ -53,16 +46,16 @@ def _identity() -> dict[str, Any]:
     identity = _code_identity()
     package = Path(__file__).resolve().parents[1]
     for name in (
-        "application/prepared_rap.py",
+        "application/prepared_ifs.py",
         "application/shadow_preparation.py",
         "application/prepared_shadow.py",
-        "guidance/sources/rap.py",
+        "guidance/sources/ifs.py",
     ):
         identity["source_sha256"][name] = hashlib.sha256((package / name).read_bytes()).hexdigest()
     return identity
 
 
-def prepare_rap(
+def prepare_ifs(
     locations: list[Any],
     control_directory: Path,
     output_directory: Path,
@@ -73,17 +66,17 @@ def prepare_rap(
     clock: Clock | None = None,
     sleeper: Sleeper | None = None,
 ) -> dict[str, Any]:
-    """Acquire once, or rebuild/reuse retained RAP independently of the control files."""
+    """Retain native IFS values separately; both IFS and RAP have zero active weight."""
     return prepare_shadow(
         locations,
         control_directory,
         output_directory,
         adapter=ShadowAdapter(
-            model="RAP",
+            model="IFS",
             source_metadata=_SOURCE_METADATA,
-            configuration=RAP_CONFIGURATION,
-            discover_cycle=discover_rap_cycle,
-            acquire_lead=acquire_rap_lead,
+            configuration=IFS_CONFIGURATION,
+            discover_cycle=discover_ifs_cycle,
+            acquire_lead=acquire_ifs_lead,
             decode_message=decode_temperature_message,
             normalize=normalize_shadow_temperature,
             code_identity=_identity,
@@ -104,15 +97,15 @@ def main(argv: list[str] | None = None) -> None:
         "--data-dir", type=Path, required=True, help="Existing real control snapshot"
     )
     parser.add_argument("--output-dir", type=Path, required=True, help="Shadow data outside Git")
-    parser.add_argument("--from-raw", type=Path, help="Rebuild offline from retained RAP evidence")
-    parser.add_argument("--rap-cycle", type=datetime.fromisoformat, help="Optional fixed UTC cycle")
+    parser.add_argument("--from-raw", type=Path, help="Rebuild offline from retained IFS evidence")
+    parser.add_argument("--ifs-cycle", type=datetime.fromisoformat, help="Optional fixed UTC cycle")
     args = parser.parse_args(argv)
-    report = prepare_rap(
+    report = prepare_ifs(
         load_locations(args.config),
         args.data_dir,
         args.output_dir,
         from_raw=args.from_raw,
-        cycle_override=args.rap_cycle,
+        cycle_override=args.ifs_cycle,
     )
     print(json.dumps(report, indent=2))
 
