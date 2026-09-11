@@ -23,6 +23,7 @@ from mesoforge.application.issued_temperature_verification import (
     IssuedTemperatureVerificationService,
     configured_service,
 )
+from mesoforge.application.model_comparison import compare_verified
 from mesoforge.application.observation_preview import preview_observation_match
 from mesoforge.application.point_forecast import PreparedPointForecast
 from mesoforge.application.prepared_observations import (
@@ -403,6 +404,33 @@ def test_two_issued_versions_for_the_same_hour_are_independently_verified(
     after = complete_storage_inventory(migrated_dsn, object_store)
     assert len(verification_artifacts(after)) == 2
     assert_forecasts_unchanged(before, after, object_store)
+
+    # Compare the exact persisted contributors and observation through production readers.
+    # A query must not issue, reverify, recalculate a forecast, or put another object.
+    forbidden = Mock(side_effect=AssertionError("Comparison attempted calculation or a write"))
+    monkeypatch.setattr(IssuedTemperatureVerificationService, "verify", forbidden)
+    monkeypatch.setattr(PreparedPointForecast, "forecast", forbidden)
+    monkeypatch.setattr(ForecastIssuanceService, "issue", forbidden)
+    monkeypatch.setattr(S3ArtifactObjectStore, "put_if_absent", forbidden)
+    monkeypatch.setattr(PostgresUnitOfWork, "commit", forbidden)
+    comparison = compare_verified([ArtifactId(row["verification_id"]) for row in results])
+    assert len({row["issued_forecast_id"] for row in comparison["results"]}) == 2
+    expected = {"HRRR": -13.15, "GFS": -3.15, "blend_70_30": -10.15, "blend_50_50": -8.15}
+    for row in comparison["results"]:
+        assert row["contributor_evidence"]["origin"] == "issued_payload"
+        assert row["predictions"]["HRRR"]["value"] == pytest.approx(280.0)
+        assert row["predictions"]["GFS"]["value"] == pytest.approx(290.0)
+        assert row["observation"]["value"] == 293.15
+        assert row["errors"] == pytest.approx(expected, abs=1e-6)
+    for name, error in expected.items():
+        metrics = comparison["summary"]["1-6"]["predictions"][name]
+        assert metrics["sample_count"] == 2
+        assert metrics["mean_bias"] == pytest.approx(error, abs=1e-6)
+        assert metrics["mae"] == pytest.approx(abs(error), abs=1e-6)
+        assert metrics["rmse"] == pytest.approx(abs(error), abs=1e-6)
+    assert comparison == compare_verified([ArtifactId(row["verification_id"]) for row in results])
+    assert complete_storage_inventory(migrated_dsn, object_store) == after
+    forbidden.assert_not_called()
 
 
 @pytest.mark.parametrize("case", ["issued_after_valid_time", "no_observation", "no_dataset"])

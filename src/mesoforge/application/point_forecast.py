@@ -332,18 +332,20 @@ class PreparedPointForecast:
             valid_time = self._target_reference_time + np.timedelta64(horizon, "h")
             sources: list[dict[str, Any]] = []
             contributions: list[Contribution] = []
-            reasons: list[str] = []
             for model, weight in _WEIGHTS.items():
+                source_reasons: list[str] = []
                 source: dict[str, Any] = {
                     "model": model,
                     "cycle": None,
                     "source_lead_hours": None,
                     "weight": weight,
+                    "temperature": {"value": None, "unit": "K"},
+                    "missing_reasons": source_reasons,
                 }
                 sources.append(source)
                 dataset = self._guidance.get(model)
                 if dataset is None:
-                    reasons.append(f"{model}: prepared guidance file is missing")
+                    source_reasons.append(f"{model}: prepared guidance file is missing")
                     continue
                 cycle = cast(
                     np.datetime64,
@@ -351,7 +353,7 @@ class PreparedPointForecast:
                 )
                 source["cycle"] = _iso(cycle)
                 if not np.any(dataset["source_valid_time"].values == valid_time):
-                    reasons.append(f"{model}: no guidance for this valid time")
+                    source_reasons.append(f"{model}: no guidance for this valid time")
                     continue
                 source["source_lead_hours"] = int((valid_time - cycle) / np.timedelta64(1, "h"))
                 if self._manifest is not None:
@@ -396,16 +398,18 @@ class PreparedPointForecast:
                         target_reference_time=self._target_reference_time,
                     )
                 except StationAlignmentError:
-                    reasons.append(
+                    source_reasons.append(
                         f"{model}: grid coverage or finite corner values are unavailable"
                     )
                     continue
                 if horizon not in aligned or not math.isfinite(aligned[horizon].value):
-                    reasons.append(f"{model}: no finite temperature for this valid time")
+                    source_reasons.append(f"{model}: no finite temperature for this valid time")
                     continue
+                source["temperature"]["value"] = aligned[horizon].value
                 contributions.append(
                     Contribution(model=model, value=aligned[horizon].value, weight=weight)
                 )
+            reasons = [reason for source in sources for reason in source["missing_reasons"]]
             temperature = None if reasons else blend_scalar(tuple(contributions)).blended_value
             hours.append(
                 {

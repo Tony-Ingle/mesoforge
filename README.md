@@ -108,9 +108,14 @@ demonstration saved 25 candidates and reused them with zero discovery calls on r
 Nine eligible real-observation verification results were saved and safely reused;
 all 10 issued versions stayed unchanged. **109 focused offline and 16 PostgreSQL/MinIO
 integration tests passed**. Broader acceptance/coverage was not rerun.
-Proposed next milestone:
-combine previous-hour verification, automatic guidance preparation, and immutable
-forecast issuance in one explicit locations run, continuing past location failures.
+Newly issued hours now retain individual HRRR/GFS temperatures. The read-only
+[model comparison command](#compare-temperature-models-and-blends) reports both models,
+the unchanged 70/30 control, a comparison-only 50/50 blend, and saved observation errors
+with descriptive MAE/bias/RMSE. Its real demonstration used 19 existing verified hours;
+these small, overlapping samples do not establish a better recipe.
+Proposed next milestone: generalize contributor/recipe descriptions while preserving
+the current control, so future models can be evaluated in shadow mode without affecting
+issued forecasts. The combined locations lifecycle remains future work.
 
 Future direction: configure locations using latitude/longitude only, with geographic
 context and suitable observation sources derived internally. The intended VPS workflow
@@ -722,6 +727,62 @@ the existing concurrency check also verifies reuse reporting. **56 offline tests
 and observation preview) passed, along with applicable quality checks. The integration
 window includes an unavailable hour between eligible hours. Broader suites were not
 rerun; operational validation gaps remain. The later real-observation demonstration follows.
+
+### Compare temperature models and blends
+
+New forecast responses and immutable issuances include each source's extracted
+`temperature` in Kelvin and `missing_reasons`. The production control remains
+**70% HRRR / 30% GFS**. No weights are learned or changed by comparison.
+
+With the existing PostgreSQL/MinIO environment, compare an exact saved verification:
+
+```powershell
+python -B -m mesoforge.application.model_comparison --verification-id art_dd886879-272b-4c54-b3e9-c3e0fa9eb495 --guidance-root "$env:LOCALAPPDATA\MesoForge\prepared"
+```
+
+Repeat `--verification-id` or use `--verification-ids-file ids.json`, containing a JSON
+list of saved verification IDs. This explicitly selects the observation revision;
+the command never rematches observations, generates issuances, or writes storage.
+Repeated identical IDs count once. Different issued versions remain separate samples;
+selecting two verification revisions of the same issued hour is rejected to avoid
+double counting. Missing contributors remain explicit and cannot be inferred from
+the blended value.
+
+To view all 36 prediction comparisons without selecting an observation or scoring:
+
+```text
+python -B -m mesoforge.application.model_comparison --issued-forecast-id ISSUED_FORECAST_UUID
+```
+
+`--guidance-root` is optional for old issuances that lack contributor values. It searches
+retained manifests by the exact issued checksum and reuses the existing prepared-input
+reader/extraction. Raw/prepared checksums, recorded scientific code/dependencies, source
+provenance and the original control must agree. Recovered contributors are labeled
+**reconstructed**, never inserted into old records. Older identity records omit the
+temporal-alignment module; that limitation and the current extraction identity are
+reported. No recovery data is downloaded or prepared. New issuances need no guidance
+directory for comparison because their contributor values are already saved.
+
+Verified output preserves issuance/verification IDs, coordinates, source cycles and
+leads, valid times, observation revision/QC, and provenance. Errors are prediction minus
+observation. Aggregate metrics use the **same complete paired samples** for all four
+recipes. Buckets **1–6, 7–18, 19–36** use saved horizons since target reference time;
+native model leads and elapsed hours since issuance remain separate. Zero samples
+produce null metrics. Counts and descriptive statistics are not claims of forecast skill.
+
+Actual September 10 read-only demonstration: **19** previously verified real-observation
+hours, with bucket counts **4 / 15 / 0**. At Fresno 22Z, HRRR **314.459054 K**, GFS
+**314.750977 K**, control **314.546631 K**, and 50/50 **314.605015 K** were compared
+with **313.15 K** observed. Complete rows and metrics are outside Git in
+`%LOCALAPPDATA%\MesoForge\baselines\20260910-model-comparison`.
+Repeat output was identical; all 10 issued versions and all PostgreSQL/MinIO contents
+stayed unchanged. No provider calls occurred. These CLI entry points were exercised
+using the isolated locked interpreter; `uv run --locked` remains unverified here.
+
+Focused checks: **238 offline tests** (132 comparison/verification and 106 existing
+forecast/API/issuance checks) and **12 PostgreSQL/MinIO integration tests** passed.
+Temporary services were stopped. Full acceptance/coverage and broader forecast-skill
+evaluation were not run.
 
 ### Discover and reuse nearby METAR stations
 

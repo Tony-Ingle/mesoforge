@@ -135,6 +135,13 @@ def test_batch_reuses_one_load_and_preserves_36_hour_values_times_and_provenance
                     "cycle": "2026-08-30T12:00:00Z" if age == 0 else "2026-08-30T06:00:00Z",
                     "source_lead_hours": horizon + age,
                     "weight": weight,
+                    "temperature": {
+                        "value": pytest.approx(
+                            (279 if model == "HRRR" else 289) + horizon, abs=1e-6
+                        ),
+                        "unit": "K",
+                    },
+                    "missing_reasons": [],
                     "raw_sha256": evidence["raw_sha256"],
                     "source_url": evidence["source_grib_url"],
                     "prepared_sha256": manifest["prepared_files"][model]["sha256"],

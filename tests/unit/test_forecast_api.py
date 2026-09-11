@@ -33,18 +33,23 @@ def client(prepared_dir: Path) -> Iterator[TestClient]:
 
 
 @pytest.mark.parametrize(
-    ("latitude", "longitude", "first_temperature"),
+    ("latitude", "longitude", "first_temperature", "first_hrrr", "first_gfs"),
     [
-        (45.8, -93.1, 286.14),
-        (45.625, -93.375, 284.75),
-        (45.5, -93.5, 284.0),
-        (46.0, -93.0, 287.0),
-        (46.0, -93.5, 285.3),
-        (45.5, -93.0, 285.7),
+        (45.8, -93.1, 286.14, 283.2, 293.0),
+        (45.625, -93.375, 284.75, 281.75, 291.75),
+        (45.5, -93.5, 284.0, 281.0, 291.0),
+        (46.0, -93.0, 287.0, 284.0, 294.0),
+        (46.0, -93.5, 285.3, 282.0, 293.0),
+        (45.5, -93.0, 285.7, 283.0, 292.0),
     ],
 )
 def test_coordinate_temperatures_match_independent_expected_values(
-    client: TestClient, latitude: float, longitude: float, first_temperature: float
+    client: TestClient,
+    latitude: float,
+    longitude: float,
+    first_temperature: float,
+    first_hrrr: float,
+    first_gfs: float,
 ) -> None:
     # Linear synthetic fields interpolate exactly. The expected first-hour values
     # above were calculated separately with the agreed 0.70/0.30 weights.
@@ -59,6 +64,13 @@ def test_coordinate_temperatures_match_independent_expected_values(
         [first_temperature, first_temperature + 1.0, first_temperature + 2.0], abs=1e-10
     )
     assert all(hour["missing_reasons"] == [] for hour in payload["hours"])
+    for offset, hour in enumerate(payload["hours"]):
+        for source, first in zip(hour["sources"], (first_hrrr, first_gfs), strict=True):
+            assert source["temperature"] == {
+                "value": pytest.approx(first + offset, abs=1e-10),
+                "unit": "K",
+            }
+            assert source["missing_reasons"] == []
 
 
 def test_response_preserves_units_valid_times_cycles_and_source_leads(client: TestClient) -> None:
@@ -75,12 +87,16 @@ def test_response_preserves_units_valid_times_cycles_and_source_leads(client: Te
                 "cycle": "2026-08-30T12:00:00Z",
                 "source_lead_hours": horizon,
                 "weight": 0.7,
+                "temperature": {"value": pytest.approx(282.2 + horizon, abs=1e-10), "unit": "K"},
+                "missing_reasons": [],
             },
             {
                 "model": "GFS",
                 "cycle": "2026-08-30T06:00:00Z",
                 "source_lead_hours": horizon + 6,
                 "weight": 0.3,
+                "temperature": {"value": pytest.approx(292.0 + horizon, abs=1e-10), "unit": "K"},
+                "missing_reasons": [],
             },
         ]
 
@@ -177,6 +193,12 @@ def test_missing_model_file_returns_null_without_renormalizing(
         )
         assert missing_source["cycle"] is None
         assert missing_source["source_lead_hours"] is None
+        assert missing_source["temperature"] == {"value": None, "unit": "K"}
+        assert missing_source["missing_reasons"] == hour["missing_reasons"]
+        retained = next(source for source in hour["sources"] if source["model"] != missing_model)
+        expected = (292.0 if missing_model == "HRRR" else 282.2) + hour["horizon_hours"]
+        assert retained["temperature"] == {"value": pytest.approx(expected, abs=1e-10), "unit": "K"}
+        assert retained["missing_reasons"] == []
     assert not missing_path.exists()
 
 
@@ -200,6 +222,17 @@ def test_missing_source_lead_only_nulls_its_matching_target_hour(
     assert missing["temperature"] == {"value": None, "unit": "K"}
     assert missing["missing_reasons"] == [f"{missing_model}: no guidance for this valid time"]
     assert [source["weight"] for source in missing["sources"]] == [0.7, 0.3]
+    for source in missing["sources"]:
+        if source["model"] == missing_model:
+            assert source["temperature"] == {"value": None, "unit": "K"}
+            assert source["missing_reasons"] == missing["missing_reasons"]
+        else:
+            expected = 294.0 if missing_model == "HRRR" else 284.2
+            assert source["temperature"] == {
+                "value": pytest.approx(expected, abs=1e-10),
+                "unit": "K",
+            }
+            assert source["missing_reasons"] == []
 
 
 @pytest.mark.parametrize("nonfinite", [float("nan"), float("inf")])
@@ -220,6 +253,11 @@ def test_nonfinite_extraction_is_explicit_missingness(prepared_dir: Path, nonfin
     assert missing["missing_reasons"][0].startswith("HRRR:")
     assert "finite" in missing["missing_reasons"][0]
     assert [source["weight"] for source in missing["sources"]] == [0.7, 0.3]
+    hrrr, gfs = missing["sources"]
+    assert hrrr["temperature"] == {"value": None, "unit": "K"}
+    assert hrrr["missing_reasons"] == missing["missing_reasons"]
+    assert gfs["temperature"] == {"value": pytest.approx(294.0, abs=1e-10), "unit": "K"}
+    assert gfs["missing_reasons"] == []
 
 
 def test_repeated_requests_use_loaded_guidance_without_provider_calls_or_file_changes(
