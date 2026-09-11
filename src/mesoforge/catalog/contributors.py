@@ -118,3 +118,20 @@ IFS_MODEL_DEFINITION = ModelDefinition(
     status="shadow",
     grid_type="geographic",
 )
+
+# Surface adapters are opt-in so retained temperature snapshots keep their exact
+# original capability metadata. IFS's three-hour maximum gust is not the
+# instantaneous surface-gust contract used by the other adapters.
+_SURFACE_FIELDS = (
+    "air_temperature_2m",
+    "dew_point_temperature_2m",
+    "eastward_wind_10m",
+    "northward_wind_10m",
+    "wind_gust_10m",
+)
+SURFACE_MODEL_FIELDS = {
+    "HRRR": _SURFACE_FIELDS,
+    "GFS": _SURFACE_FIELDS,
+    "RAP": _SURFACE_FIELDS,
+    "IFS": _SURFACE_FIELDS[:-1],
+}

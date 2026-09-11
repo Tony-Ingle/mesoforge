@@ -25,6 +25,7 @@ from mesoforge.guidance.acquisition_v2 import (
 from mesoforge.guidance.http_fetch import (
     FetchedObject,
     FetchError,
+    RequestAttempt,
     fetch_with_range,
     fetch_with_retry,
     header,
@@ -138,6 +139,7 @@ IFS_READ_KEYS = (
     "productionStatusOfProcessedData",
     "paramId",
     "tablesVersion",
+    "uvRelativeToGrid",
 )
 IFS_TEMPERATURE_CONTRACT = Phase2FieldContract(
     canonical_variable_id="air_temperature_2m",
@@ -147,6 +149,35 @@ IFS_TEMPERATURE_CONTRACT = Phase2FieldContract(
     type_of_level="heightAboveGround",
     level=2.0,
     expected_unit_id="K",
+)
+SURFACE_FIELD_CONTRACTS = {
+    "air_temperature_2m": IFS_TEMPERATURE_CONTRACT,
+    **{
+        variable: Phase2FieldContract(
+            canonical_variable_id=variable,
+            discipline=0,
+            parameter_category=category,
+            parameter_number=number,
+            type_of_level="heightAboveGround",
+            level=level,
+            expected_unit_id=unit,
+        )
+        for variable, category, number, level, unit in (
+            ("dew_point_temperature_2m", 0, 6, 2.0, "K"),
+            ("eastward_wind_10m", 2, 2, 10.0, "m/s"),
+            ("northward_wind_10m", 2, 3, 10.0, "m/s"),
+        )
+    },
+}
+SURFACE_PARAMETERS = {
+    "air_temperature_2m": ("2t", 167),
+    "dew_point_temperature_2m": ("2d", 168),
+    "eastward_wind_10m": ("10u", 165),
+    "northward_wind_10m": ("10v", 166),
+}
+GUST_TEMPORAL_MISMATCH = (
+    "IFS 10fg is a maximum since previous post-processing over a native three-hour "
+    "interval, not the instantaneous gust required here; it is not interpolated or substituted"
 )
 NO_NATIVE_GUIDANCE = "IFS has no native guidance at this valid time; published every 3 hours"
 
@@ -197,8 +228,20 @@ def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 def selected_temperature(
     payload: bytes, *, cycle: datetime, forecast_hour: int
 ) -> tuple[IndexRow, int]:
+    return selected_surface_field(
+        payload,
+        canonical_variable_id="air_temperature_2m",
+        cycle=cycle,
+        forecast_hour=forecast_hour,
+    )
+
+
+def selected_surface_field(
+    payload: bytes, *, canonical_variable_id: str, cycle: datetime, forecast_hour: int
+) -> tuple[IndexRow, int]:
     """Return the original JSON row and its exclusive physical byte-range end."""
     build_index_url(cycle=cycle, forecast_hour=forecast_hour)
+    parameter, _ = SURFACE_PARAMETERS[canonical_variable_id]
     candidates: list[tuple[IndexRow, int, dict[str, Any]]] = []
     previous_end = 0
     try:
@@ -217,14 +260,14 @@ def selected_temperature(
             if offset < previous_end:
                 raise IfsIndexError("IFS inventory byte ranges overlap or are unordered")
             previous_end = offset + length
-            if record.get("param") == "2t":
+            if record.get("param") == parameter:
                 candidates.append((IndexRow(number, offset, line), previous_end, record))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise IfsIndexError(f"Malformed IFS JSON-lines inventory: {exc}") from exc
     if not candidates:
-        raise IfsTemperatureUnavailableError("IFS inventory has no 2t temperature field")
+        raise IfsTemperatureUnavailableError(f"IFS inventory has no {parameter} surface field")
     if len(candidates) != 1:
-        raise IfsIndexError("Ambiguous IFS inventory: multiple 2t fields")
+        raise IfsIndexError(f"Ambiguous IFS inventory: multiple {parameter} fields")
     row, end, record = candidates[0]
     expected = {
         "domain": "g",
@@ -236,7 +279,7 @@ def selected_temperature(
         "stream": "oper",
         "step": str(forecast_hour),
         "levtype": "sfc",
-        "param": "2t",
+        "param": parameter,
     }
     for key, value in expected.items():
         if record.get(key) != value:
@@ -419,6 +462,7 @@ def acquire_ifs_lead(
     sleeper: Sleeper,
     cycle_deadline: datetime,
     retry_policy: RetryPolicy = IFS_RETRY_POLICY,
+    canonical_variables: tuple[str, ...] = ("air_temperature_2m",),
 ) -> Phase2LeadAcquisition:
     """Retain exact JSON inventory and the complete 2t message selected by offset/length."""
     cycle = _utc_hour(cycle)
@@ -432,7 +476,20 @@ def acquire_ifs_lead(
         retry_policy=retry_policy,
         cycle_deadline=cycle_deadline,
     )
-    row, end = selected_temperature(index.payload, cycle=cycle, forecast_hour=forecast_hour)
+    if not canonical_variables or len(set(canonical_variables)) != len(canonical_variables):
+        raise ValueError("IFS acquisition requires unique requested surface fields")
+    selected = [
+        (
+            variable,
+            *selected_surface_field(
+                index.payload,
+                canonical_variable_id=variable,
+                cycle=cycle,
+                forecast_hour=forecast_hour,
+            ),
+        )
+        for variable in canonical_variables
+    ]
     sleeper.sleep(0.5)
     length, etag, modified = _head_full_object_length(
         transport=transport,
@@ -443,23 +500,28 @@ def acquire_ifs_lead(
         retry_policy=retry_policy,
         cycle_deadline=cycle_deadline,
     )
-    if end > length:
-        raise IfsIndexError("IFS selected byte range exceeds the provider's full object length")
-    sleeper.sleep(0.5)
-    fetched = fetch_with_range(
-        transport,
-        clock,
-        sleeper,
-        endpoint=IFS_ENDPOINT,
-        url=grib_url,
-        range_header=f"bytes={row.byte_offset}-{end - 1}",
-        byte_start=row.byte_offset,
-        byte_end=end,
-        retry_policy=retry_policy,
-        cycle_deadline=cycle_deadline,
-        expected_length=end - row.byte_offset,
-        full_object_length=length,
-    )
+    messages = []
+    attempts: list[RequestAttempt] = []
+    for variable, row, end in selected:
+        if end > length:
+            raise IfsIndexError("IFS selected byte range exceeds the provider's full object length")
+        sleeper.sleep(0.5)
+        fetched = fetch_with_range(
+            transport,
+            clock,
+            sleeper,
+            endpoint=IFS_ENDPOINT,
+            url=grib_url,
+            range_header=f"bytes={row.byte_offset}-{end - 1}",
+            byte_start=row.byte_offset,
+            byte_end=end,
+            retry_policy=retry_policy,
+            cycle_deadline=cycle_deadline,
+            expected_length=end - row.byte_offset,
+            full_object_length=length,
+        )
+        messages.append(SelectedMessage(variable, row, row.byte_offset, end, fetched.payload))
+        attempts.extend(fetched.attempts)
     index_modified = header(index.headers, "Last-Modified")
     etag = etag or header(fetched.headers, "ETag")
     modified = modified or header(fetched.headers, "Last-Modified")
@@ -474,10 +536,8 @@ def acquire_ifs_lead(
         index_payload=index.payload,
         index_attempts=index.attempts,
         index_completed_at=index.completed_at,
-        selected_messages=(
-            SelectedMessage("air_temperature_2m", row, row.byte_offset, end, fetched.payload),
-        ),
-        grib_attempts=fetched.attempts,
+        selected_messages=tuple(messages),
+        grib_attempts=tuple(attempts),
         grib_completed_at=fetched.completed_at,
         full_object_etag=etag,
         full_object_last_modified=modified,
@@ -495,24 +555,38 @@ class IfsDecodeError(MesoForgeError):
 def decode_temperature_message(
     payload: bytes, *, cycle: datetime, forecast_hour: int
 ) -> xr.DataArray:
+    return decode_surface_message(
+        payload,
+        canonical_variable_id="air_temperature_2m",
+        cycle=cycle,
+        forecast_hour=forecast_hour,
+    )
+
+
+def decode_surface_message(
+    payload: bytes, *, canonical_variable_id: str, cycle: datetime, forecast_hour: int
+) -> xr.DataArray:
     """Reuse existing geographic temperature/time checks, adding IFS model identity."""
     build_grib_url(cycle=cycle, forecast_hour=forecast_hour)
     validate_grib_message_boundaries(
         payload, url="retained IFS temperature", range_header="retained"
     )
     datasets = _decode_all(payload, read_keys=IFS_READ_KEYS)
+    contract = SURFACE_FIELD_CONTRACTS[canonical_variable_id]
     fields = [
         _with_dataset_coords(field, dataset)
         for dataset in datasets
         for field in dataset.data_vars.values()
     ]
-    if len(fields) != 1 or not _matches_contract(fields[0], IFS_TEMPERATURE_CONTRACT):
-        raise IfsDecodeError("Expected exactly one IFS instantaneous 2-m temperature field")
+    if len(fields) != 1 or not _matches_contract(fields[0], contract):
+        raise IfsDecodeError(
+            f"Expected exactly one IFS instantaneous {canonical_variable_id} field"
+        )
     field = fields[0]
     try:
         _assert_instantaneous(
             field,
-            IFS_TEMPERATURE_CONTRACT,
+            contract,
             forecast_hour=forecast_hour,
             cycle_date=cycle.date(),
             cycle_hour=cycle.hour,
@@ -531,7 +605,7 @@ def decode_temperature_message(
         "typeOfGeneratingProcess": 2,
         "typeOfProcessedData": "fc",
         "productionStatusOfProcessedData": 0,
-        "paramId": 167,
+        "paramId": SURFACE_PARAMETERS[canonical_variable_id][1],
         "Ni": 1440,
         "Nj": 721,
         "iDirectionIncrementInDegrees": 0.25,

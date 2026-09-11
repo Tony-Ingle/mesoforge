@@ -9,6 +9,57 @@ import pytest
 from mesoforge.application.hourly_report import build_hourly_report, render_hourly_report
 
 
+def test_surface_report_preserves_baseline_and_displays_convenient_units(forecast):
+    fields = {
+        "air_temperature_2m": {"value": 273.15, "unit": "K", "missing_reasons": []},
+        "dew_point_temperature_2m": {"value": 263.15, "unit": "K", "missing_reasons": []},
+        "relative_humidity_2m": {"value": 46.0, "unit": "percent", "missing_reasons": []},
+        "wind_speed_10m": {"value": 4.4704, "unit": "m/s", "missing_reasons": []},
+        "wind_from_direction_10m": {"value": 359.0, "unit": "degree", "missing_reasons": []},
+        "wind_gust_10m": {"value": None, "unit": "m/s", "missing_reasons": ["missing gust"]},
+    }
+    for hour in forecast["hours"]:
+        hour["surface"] = {
+            "fields": deepcopy(fields),
+            "contributors": {
+                "HRRR": {
+                    "fields": deepcopy(fields),
+                    "cycle": "2026-11-01T00:00:00Z",
+                    "source_lead_hours": hour["horizon_hours"] + 4,
+                    "role": "active",
+                }
+            },
+        }
+    original = deepcopy(forecast)
+    report = build_hourly_report(forecast, display_timezone="America/Chicago")
+    text = render_hourly_report(report)
+    assert "Td °F" in text and "RH %" in text and "Gust mph" in text
+    assert "32.0 | 14.0 | 46.0 | 10.0 | N (359°) | unavailable" in text
+    assert "36 |" in text and "HRRR native contributor" in text
+    assert "not_run" in text and "not_implemented" in text
+    assert forecast == original
+    assert report["hours"][0]["final_surface_fields"] == fields
+    report["hours"][0]["final_surface_fields"]["air_temperature_2m"]["value"] = 0
+    assert report["hours"][0]["surface"]["fields"] == fields
+
+    # An approved single-model fallback can still produce a value. Its hour must
+    # not falsely claim there were no contributor exclusions.
+    for hour in forecast["hours"]:
+        hour["surface"]["fields"]["wind_gust_10m"].update(
+            value=8.0, missing_reasons=[], status="fallback", weights={"HRRR": 0.7, "GFS": 0.3}
+        )
+    forecast["hours"][0]["surface"]["fields"]["wind_gust_10m"].update(
+        weights={"GFS": 1.0}, missing_reasons=["HRRR: coupled wind/gust tuple rejected"]
+    )
+    rendered = render_hourly_report(build_hourly_report(forecast))
+    first = next(line for line in rendered.splitlines() if line.startswith("| 1 |"))
+    second = next(line for line in rendered.splitlines() if line.startswith("| 2 |"))
+    assert "wind_gust_10m: GFS-only fallback" in first
+    assert "none; cloud unavailable" not in first
+    assert "none; cloud unavailable" in second
+    assert "Hours 1: wind_gust_10m: HRRR: coupled wind/gust tuple rejected" in rendered
+
+
 @pytest.fixture
 def forecast() -> dict[str, Any]:
     target = datetime(2026, 11, 1, 4, tzinfo=UTC)

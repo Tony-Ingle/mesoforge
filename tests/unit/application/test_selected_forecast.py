@@ -18,6 +18,7 @@ from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.prepared_ifs import IFS_CONFIGURATION
 from mesoforge.application.prepared_shadow import normalize_shadow_temperature
 from mesoforge.application.prepared_temperature import _write_prepared_file
+from mesoforge.forecasting.recipes import with_surface_fields
 from tests.support.in_memory_uow import InMemoryObjectStore, InMemoryUnitOfWorkFactory
 from tests.support.phase1_fixture_transports import FixedClock, RecordingSleeper
 from tests.unit.application.test_current_model_set import DECISION, NOW, TARGET, _select
@@ -31,6 +32,34 @@ from tests.unit.application.test_prepared_temperature import (
 )
 
 LOCATIONS = [{"lat": 45.8, "lon": -93.1}, {"lat": 45.9, "lon": -93.0}]
+
+
+def test_surface_selection_rechecks_optional_field_evidence_against_retained_inventory(
+    selection, monkeypatch
+):
+    path, original = selection
+    report = deepcopy(original)
+    report["surface_fields"] = True
+    report["contributor_configuration"] = with_surface_fields(IFS_CONFIGURATION).model_dump(
+        mode="json"
+    )
+    missing = {
+        field: "native field absent" for field in selected_forecast.SURFACE_MODEL_FIELDS["HRRR"][1:]
+    }
+    for model in report["models"]:
+        for probe in _selected_candidate(report, model)["probes"]:
+            probe.update(extra_messages=[], missing_fields=deepcopy(missing))
+    parsed = Mock(return_value=([], missing))
+    monkeypatch.setattr(selected_forecast, "_surface_messages", parsed)
+    path.write_text(json.dumps(report), encoding="utf-8")
+    loaded, _, probes = selected_forecast.load_selection(path, clock=FixedClock(NOW))
+    assert loaded == report and len(probes) == parsed.call_count == 120
+    _selected_candidate(report, "GFS")["probes"][0]["missing_fields"]["wind_gust_10m"] = (
+        "altered evidence"
+    )
+    path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(ValueError, match="differs from retained inventory"):
+        selected_forecast.load_selection(path, clock=FixedClock(NOW))
 
 
 @pytest.fixture

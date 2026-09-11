@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
@@ -14,9 +16,117 @@ from mesoforge.guidance.normalization import (
     build_lambert_conformal_crs,
     compute_latlon_grid,
     compute_projected_coordinates,
+    rotate_wind_to_earth_relative,
 )
 
 _VARIABLE = "air_temperature_2m"
+SURFACE_UNITS = {
+    "dew_point_temperature_2m": "K",
+    "eastward_wind_10m": "m/s",
+    "northward_wind_10m": "m/s",
+    "wind_gust_10m": "m/s",
+}
+
+
+def add_surface_fields(
+    dataset: xr.Dataset,
+    decoded: dict[str, dict[int, xr.DataArray]],
+    *,
+    model: str,
+    cycle: datetime,
+    grid_reader: Callable[[xr.DataArray], tuple[pyproj.CRS, np.ndarray, np.ndarray, np.ndarray]],
+    missing_reasons: dict[str, dict[str, list[str]]] | None = None,
+) -> xr.Dataset:
+    """Add validated native surface values; rotate U/V together before point extraction.
+
+    The existing temperature dataset fixes the cells and times. Absent fields remain
+    NaN with reasons; a partial wind pair cannot be interpreted as an earth-relative
+    component. This helper never blends fields or changes temperature.
+    """
+    source_time = _utc_hour(cycle)
+    reasons = {
+        variable: dict((missing_reasons or {}).get(variable, {})) for variable in SURFACE_UNITS
+    }
+    shape = dataset[_VARIABLE].shape
+    values = {variable: np.full(shape, np.nan, dtype=np.float64) for variable in SURFACE_UNITS}
+    wind_policy: dict[str, str] = {}
+    for index, duration in enumerate(dataset.source_lead_time.values):
+        lead = int(duration / np.timedelta64(1, "h"))
+        fields: dict[str, tuple[np.ndarray, xr.DataArray, pyproj.CRS]] = {}
+        for variable, unit in SURFACE_UNITS.items():
+            field = decoded.get(variable, {}).get(lead)
+            if field is None:
+                reason = (
+                    "IFS native gust is an interval maximum; no approved instantaneous gust mapping"
+                    if model == "IFS" and variable == "wind_gust_10m"
+                    else f"{model} has no retained {variable} message for source lead {lead}"
+                )
+                reasons[variable].setdefault(str(lead), [reason])
+                continue
+            expected_units = {"k"} if unit == "K" else {"m/s", "m s-1", "m s**-1", "m s^-1"}
+            if str(field.attrs.get("GRIB_units", "")).strip().lower() not in expected_units:
+                raise ValueError(f"{model} {variable}: decoded units do not match {unit}")
+            expected = {
+                "time": source_time,
+                "step": np.timedelta64(lead, "h"),
+                "valid_time": source_time + np.timedelta64(lead, "h"),
+            }
+            if any(
+                name not in field.coords or field[name].ndim != 0 or field[name].values[()] != value
+                for name, value in expected.items()
+            ):
+                raise ValueError(f"{model} {variable}: surface cycle/lead/valid time mismatch")
+            crs, x, y, order = grid_reader(field)
+            if crs != pyproj.CRS.from_wkt(dataset.attrs["crs_wkt2"]):
+                raise ValueError(f"{model} {variable}: surface projection differs from temperature")
+            xi = np.flatnonzero(np.isin(x, dataset.x.values))
+            yi = np.flatnonzero(np.isin(y, dataset.y.values))
+            if not np.array_equal(x[xi], dataset.x.values) or not np.array_equal(
+                y[yi], dataset.y.values
+            ):
+                raise ValueError(f"{model} {variable}: surface cells differ from temperature")
+            fields[variable] = (
+                np.asarray(field.values[:, order][np.ix_(yi, xi)], dtype=np.float64),
+                field,
+                crs,
+            )
+        u, v = "eastward_wind_10m", "northward_wind_10m"
+        if u in fields and v in fields:
+            flags = [fields[name][1].attrs.get("GRIB_uvRelativeToGrid") for name in (u, v)]
+            if any(flag not in (0, 1) for flag in flags):
+                raise ValueError(f"{model}: U/V must declare uvRelativeToGrid as 0 or 1")
+            rotated = rotate_wind_to_earth_relative(
+                u_grid=fields[u][0],
+                v_grid=fields[v][0],
+                x=dataset.x.values,
+                y=dataset.y.values,
+                crs=fields[u][2],
+                u_relative_to_grid=bool(flags[0]),
+                v_relative_to_grid=bool(flags[1]),
+            )
+            values[u][index], values[v][index] = rotated.eastward, rotated.northward
+            wind_policy[str(lead)] = rotated.policy
+        else:
+            for variable in (u, v):
+                reasons[variable].setdefault(
+                    str(lead), ["Both native U/V components are required for earth-relative wind"]
+                )
+        for variable in ("dew_point_temperature_2m", "wind_gust_10m"):
+            if variable in fields:
+                values[variable][index] = fields[variable][0]
+    for variable, unit in SURFACE_UNITS.items():
+        dataset[variable] = (
+            ("source_lead_time", "y", "x"),
+            values[variable],
+            {"unit_id": unit, "units": unit, "temporal_semantics": "instantaneous"},
+        )
+    dataset.attrs.update(
+        surface_fields=1,
+        wind_reference="earth_relative",
+        field_missing_reasons_json=json.dumps(reasons, sort_keys=True),
+        wind_rotation_policy_json=json.dumps(wind_policy, sort_keys=True),
+    )
+    return dataset
 
 
 def _utc_hour(value: datetime) -> np.datetime64:
@@ -161,6 +271,8 @@ def normalize_shadow_temperature(
     cycle: datetime,
     target: datetime,
     area: BoundingBox | None = None,
+    decoded_surface: dict[str, dict[int, xr.DataArray]] | None = None,
+    field_missing_reasons: dict[str, dict[str, list[str]]] | None = None,
 ) -> xr.Dataset:
     """Prepare only available valid-time-aligned leads; never fill an absent forecast hour.
 
@@ -213,7 +325,7 @@ def normalize_shadow_temperature(
     assert native is not None
     crs, x, y = native
     durations = np.array(leads, dtype="timedelta64[h]").astype("timedelta64[ns]")
-    return xr.Dataset(
+    dataset = xr.Dataset(
         data_vars={
             _VARIABLE: (
                 ("source_lead_time", "y", "x"),
@@ -253,3 +365,22 @@ def normalize_shadow_temperature(
             **({"prepared_area_json": area.model_dump_json()} if area is not None else {}),
         },
     )
+    if decoded_surface is not None:
+
+        def grid_reader(
+            field: xr.DataArray,
+        ) -> tuple[pyproj.CRS, np.ndarray, np.ndarray, np.ndarray]:
+            if field.attrs.get("GRIB_gridType") == "regular_ll":
+                return _geographic_grid(field)
+            crs, x, y = _lambert_grid(field)
+            return crs, x, y, np.arange(len(x))
+
+        dataset = add_surface_fields(
+            dataset,
+            decoded_surface,
+            model=model,
+            cycle=cycle,
+            grid_reader=grid_reader,
+            missing_reasons=field_missing_reasons,
+        )
+    return dataset

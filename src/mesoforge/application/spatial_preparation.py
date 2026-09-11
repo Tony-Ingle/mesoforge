@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from mesoforge.application.point_forecast import PreparedPointForecast
-from mesoforge.application.prepared_temperature import rebuild_temperature_guidance
+from mesoforge.application.prepared_temperature import _raw_byte_count, rebuild_temperature_guidance
 from mesoforge.application.spatial_coverage import (
     CONTEXT_KM,
     MODEL_BUFFER_KM,
@@ -246,7 +246,7 @@ def ensure_coverage(
         "context_km": CONTEXT_KM,
         "observation_search_km": 50,
         "downloaded_bytes": 0,
-        "retained_raw_bytes": sum(row["raw_bytes"] for row in prepared._manifest["inputs"]),
+        "retained_raw_bytes": _raw_byte_count(prepared._manifest["inputs"]),
         "retained_index_bytes": sum(row["index_bytes"] for row in prepared._manifest["inputs"]),
         "footprints": [
             {

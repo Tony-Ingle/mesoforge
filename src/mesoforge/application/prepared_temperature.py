@@ -21,6 +21,7 @@ import numpy as np
 import pyproj
 import xarray as xr
 
+from mesoforge.application.prepared_shadow import SURFACE_UNITS, add_surface_fields
 from mesoforge.application.spatial_coverage import UnsupportedCoordinateError, native_bbox_bounds
 from mesoforge.catalog.configuration import Phase2Configuration, load_configuration_source
 from mesoforge.catalog.domains import BoundingBox
@@ -146,6 +147,7 @@ def normalize_temperature_messages(
     payloads_by_lead: dict[int, bytes],
     target_horizon_hours: tuple[int, ...] = _HORIZONS,
     area: BoundingBox | None = None,
+    field_payloads: dict[str, dict[int, bytes]] | None = None,
 ) -> xr.Dataset:
     """Decode temperature and retain an internal footprint plus a native-cell halo.
 
@@ -230,7 +232,7 @@ def normalize_temperature_messages(
     assert crs is not None
     cycle = np.datetime64(source_cycle.replace(tzinfo=None), "ns")
     durations = np.array(leads, dtype="timedelta64[h]").astype("timedelta64[ns]")
-    return xr.Dataset(
+    dataset = xr.Dataset(
         data_vars={
             _VARIABLE: (
                 ("source_lead_time", "y", "x"),
@@ -259,6 +261,64 @@ def normalize_temperature_messages(
             **({"prepared_area_json": area.model_dump_json()} if area is not None else {}),
         },
     )
+    if field_payloads is not None:
+        surface_arrays: dict[str, list[np.ndarray]] = {name: [] for name in SURFACE_UNITS}
+        missing: dict[str, dict[str, list[str]]] = {name: {} for name in SURFACE_UNITS}
+        policies: dict[str, str] = {}
+        contracts = {item.canonical_variable_id: item for item in settings.field_contracts}
+
+        def grid_reader(
+            field: xr.DataArray,
+        ) -> tuple[pyproj.CRS, np.ndarray, np.ndarray, np.ndarray]:
+            native_crs, native_x, native_y, _, _, native_order = _native_grid(model, field)
+            return native_crs, native_x, native_y, native_order
+
+        # Decode only one lead's additional full grids at a time; retain the same
+        # regional cells as temperature, not another full-grid cache per coordinate.
+        for index, lead in enumerate(leads):
+            decoded: dict[str, dict[int, xr.DataArray]] = {}
+            for variable in SURFACE_UNITS:
+                payload = field_payloads.get(variable, {}).get(lead)
+                if payload is None:
+                    continue
+                kwargs = dict(
+                    contract=contracts[variable],
+                    settings=settings,
+                    forecast_hour=lead,
+                    cycle_date=source_cycle.date(),
+                    cycle_hour=source_cycle.hour,
+                )
+                if model == "HRRR":
+                    field = decode_selected_message(payload, **kwargs)  # type: ignore[arg-type]
+                else:
+                    field = decode_instantaneous_message(payload, **kwargs)  # type: ignore[arg-type]
+                decoded[variable] = {lead: field}
+            prepared = add_surface_fields(
+                dataset.isel(source_lead_time=[index]).copy(),
+                decoded,
+                model=model,
+                cycle=source_cycle,
+                grid_reader=grid_reader,
+            )
+            for variable in SURFACE_UNITS:
+                surface_arrays[variable].append(prepared[variable].values[0])
+                missing[variable].update(
+                    json.loads(prepared.attrs["field_missing_reasons_json"])[variable]
+                )
+            policies.update(json.loads(prepared.attrs["wind_rotation_policy_json"]))
+        for variable, unit in SURFACE_UNITS.items():
+            dataset[variable] = (
+                ("source_lead_time", "y", "x"),
+                np.stack(surface_arrays[variable]),
+                {"unit_id": unit, "units": unit, "temporal_semantics": "instantaneous"},
+            )
+        dataset.attrs.update(
+            surface_fields=1,
+            wind_reference="earth_relative",
+            field_missing_reasons_json=json.dumps(missing, sort_keys=True),
+            wind_rotation_policy_json=json.dumps(policies, sort_keys=True),
+        )
+    return dataset
 
 
 def _write_bytes(path: Path, payload: bytes) -> str:
@@ -278,6 +338,7 @@ def _code_identity() -> dict[str, Any]:
     package = Path(__file__).resolve().parents[1]
     paths = (
         "application/prepared_temperature.py",
+        "application/prepared_shadow.py",
         "application/cycle_selection.py",
         "application/point_forecast.py",
         "application/spatial_coverage.py",
@@ -313,9 +374,14 @@ def _code_identity() -> dict[str, Any]:
 
 def _retain_input(directory: Path, acquired: Phase2LeadAcquisition) -> dict[str, Any]:
     model = acquired.model.upper()
-    if len(acquired.selected_messages) != 1:
-        raise ValueError("Temperature preparation must acquire exactly one message per lead")
-    message = acquired.selected_messages[0]
+    messages = {message.canonical_variable_id: message for message in acquired.selected_messages}
+    if len(messages) != len(acquired.selected_messages) or _VARIABLE not in messages:
+        raise ValueError(
+            "Preparation requires one temperature message and unique optional surface fields"
+        )
+    if set(messages) - {_VARIABLE, *SURFACE_UNITS}:
+        raise ValueError("Preparation received an unsupported surface field")
+    message = messages[_VARIABLE]
     raw_file = f"raw/{model}-f{acquired.forecast_hour:03d}.grib2"
     index_file = f"raw/{model}-f{acquired.forecast_hour:03d}.idx"
     raw_hash = _write_bytes(directory / raw_file, message.payload)
@@ -347,10 +413,68 @@ def _retain_input(directory: Path, acquired: Phase2LeadAcquisition) -> dict[str,
         "index_last_modified": acquired.index_last_modified,
         "etag": acquired.full_object_etag,
     }
+    retained_ranges = {(message.byte_start, message.byte_end): (raw_file, raw_hash)}
+    extras = []
+    for variable, selected in messages.items():
+        if variable == _VARIABLE:
+            continue
+        key = selected.byte_start, selected.byte_end
+        if key not in retained_ranges:
+            filename = f"raw/{model}-f{acquired.forecast_hour:03d}-{variable}.grib2"
+            retained_ranges[key] = filename, _write_bytes(directory / filename, selected.payload)
+        filename, checksum = retained_ranges[key]
+        if hashlib.sha256(selected.payload).hexdigest() != checksum:
+            raise ValueError("Selected fields disagree on bytes for the same provider range")
+        extras.append(
+            {
+                "canonical_variable_id": variable,
+                "raw_file": filename,
+                "raw_sha256": checksum,
+                "raw_bytes": len(selected.payload),
+                "byte_start": selected.byte_start,
+                "byte_end": selected.byte_end,
+            }
+        )
+    if extras:
+        entry["extra_messages"] = extras
     _write_bytes(
         directory / raw_file.replace(".grib2", ".json"), json.dumps(entry, indent=2).encode()
     )
     return entry
+
+
+def _raw_byte_count(rows: list[dict[str, Any]]) -> int:
+    """Count each retained physical message once, including multi-field RAP ranges."""
+    files = {
+        message["raw_file"]: message["raw_bytes"]
+        for row in rows
+        for message in (row, *row.get("extra_messages", []))
+    }
+    return sum(files.values())
+
+
+def _retained_extra_payloads(source: Path, row: dict[str, Any]) -> dict[str, bytes]:
+    """Validate optional surface messages, including shared U/V physical ranges."""
+    payloads: dict[str, bytes] = {}
+    model, lead = row["model"], row["source_lead_hours"]
+    allowed = {f"raw/{model}-f{lead:03d}-{variable}.grib2" for variable in SURFACE_UNITS}
+    for message in row.get("extra_messages", []):
+        variable, filename = message["canonical_variable_id"], message["raw_file"]
+        if variable not in SURFACE_UNITS or variable in payloads or filename not in allowed:
+            raise ValueError("Invalid or duplicate retained surface message")
+        path = (source / filename).resolve()
+        if not path.is_relative_to(source.resolve()):
+            raise ValueError("Retained surface path leaves its source directory")
+        payload = path.read_bytes()
+        if (
+            len(payload) != message["raw_bytes"]
+            or hashlib.sha256(payload).hexdigest() != message["raw_sha256"]
+        ):
+            raise ValueError(f"Checksum or byte count mismatch for {filename}")
+        if message["byte_end"] - message["byte_start"] != len(payload):
+            raise ValueError(f"Retained surface byte range disagrees for {filename}")
+        payloads[variable] = payload
+    return payloads
 
 
 def prepare_temperature_guidance(
@@ -368,6 +492,7 @@ def prepare_temperature_guidance(
     fallback_areas: tuple[BoundingBox, ...] = (),
     acquired_inputs: dict[str, list[Phase2LeadAcquisition]] | None = None,
     cycle_selection: dict[str, Any] | None = None,
+    surface_fields: bool = False,
 ) -> dict[str, Any]:
     """Acquire both models for hours 1..36; retain raw evidence and prepare two files.
 
@@ -403,8 +528,13 @@ def prepare_temperature_guidance(
     (directory / "raw").mkdir()
     inputs: list[dict[str, Any]] = []
     prepared_files: dict[str, dict[str, str]] = {}
+    surface_fields = surface_fields or bool(
+        acquired_inputs
+        and any(len(row.selected_messages) > 1 for rows in acquired_inputs.values() for row in rows)
+    )
     for model, cycle, leads in (("HRRR", hrrr_cycle, hrrr_leads), ("GFS", gfs_cycle, gfs_leads)):
         payloads: dict[int, bytes] = {}
+        field_payloads: dict[str, dict[int, bytes]] = {name: {} for name in SURFACE_UNITS}
         for lead in leads:
             kwargs = {
                 "transport": transport,
@@ -414,7 +544,9 @@ def prepare_temperature_guidance(
                 "cycle_hour": cycle.hour,
                 "forecast_hour": lead,
                 "cycle_deadline": clock.now(),
-                "canonical_variables": (_VARIABLE,),
+                "canonical_variables": (_VARIABLE, *SURFACE_UNITS)
+                if surface_fields
+                else (_VARIABLE,),
             }
             if acquired_inputs is not None:
                 acquired = next(row for row in acquired_inputs[model] if row.forecast_hour == lead)
@@ -423,7 +555,11 @@ def prepare_temperature_guidance(
             else:
                 acquired = acquire_gfs_lead(configuration.gfs, **kwargs)  # type: ignore[arg-type]
             inputs.append(_retain_input(directory, acquired))
-            payloads[lead] = acquired.selected_messages[0].payload
+            for message in acquired.selected_messages:
+                if message.canonical_variable_id == _VARIABLE:
+                    payloads[lead] = message.payload
+                else:
+                    field_payloads[message.canonical_variable_id][lead] = message.payload
         for candidate in (area, *fallback_areas):
             try:
                 dataset = normalize_temperature_messages(
@@ -434,6 +570,7 @@ def prepare_temperature_guidance(
                     payloads_by_lead=payloads,
                     target_horizon_hours=target_horizon_hours,
                     area=candidate,
+                    **({"field_payloads": field_payloads} if surface_fields else {}),
                 )
             except UnsupportedCoordinateError:
                 if candidate == (area, *fallback_areas)[-1]:
@@ -453,7 +590,7 @@ def prepare_temperature_guidance(
         "downloaded_bytes": getattr(
             transport,
             "downloaded_bytes",
-            sum(row["raw_bytes"] + row["index_bytes"] for row in inputs),
+            _raw_byte_count(inputs) + sum(row["index_bytes"] for row in inputs),
         ),
         "configuration_sha256": hashlib.sha256(
             configuration.model_dump_json().encode()
@@ -465,6 +602,7 @@ def prepare_temperature_guidance(
             "no operational cutoff applied."
         ),
         **({"cycle_selection": cycle_selection} if cycle_selection is not None else {}),
+        **({"surface_fields": True} if surface_fields else {}),
     }
     _write_bytes(directory / "manifest.json", json.dumps(manifest, indent=2).encode())
     return manifest
@@ -495,7 +633,7 @@ def rebuild_temperature_guidance(
     ):
         raise ValueError("Rebuild requires real guidance and the original source configuration")
     retained: dict[str, bytes] = {}
-    models: list[tuple[str, datetime, dict[int, bytes]]] = []
+    models: list[tuple[str, datetime, dict[int, bytes], dict[str, dict[int, bytes]]]] = []
     try:
         target = _hour(datetime.fromisoformat(source["target_reference_time"]))
         # Snapshots prepared before the 36-hour extension contain three hours
@@ -513,6 +651,7 @@ def rebuild_temperature_guidance(
             if len(rows) != len(horizons) or {r["source_lead_hours"] for r in rows} != set(leads):
                 raise ValueError(f"{model}: retained source leads are incomplete or duplicated")
             payloads: dict[int, bytes] = {}
+            field_payloads: dict[str, dict[int, bytes]] = {name: {} for name in SURFACE_UNITS}
             for row in rows:
                 lead = row["source_lead_hours"]
                 if row["cycle"] != _iso(cycle) or row["valid_time"] != _iso(
@@ -534,7 +673,13 @@ def rebuild_temperature_guidance(
                         raise ValueError(f"Checksum or byte count mismatch for {filename}")
                     retained[filename] = payload
                 payloads[lead] = retained[row["raw_file"]]
-            models.append((model, cycle, payloads))
+                for variable, payload in _retained_extra_payloads(source_directory, row).items():
+                    field_payloads[variable][lead] = payload
+                for message in row.get("extra_messages", []):
+                    retained[message["raw_file"]] = field_payloads[
+                        message["canonical_variable_id"]
+                    ][lead]
+            models.append((model, cycle, payloads, field_payloads))
     except (KeyError, TypeError, IndexError) as exc:
         raise ValueError("Incomplete retained guidance manifest") from exc
     directory.mkdir(parents=True, exist_ok=True)
@@ -549,7 +694,7 @@ def rebuild_temperature_guidance(
             json.dumps(row, indent=2).encode(),
         )
     prepared_files: dict[str, dict[str, str]] = {}
-    for model, cycle, payloads in models:
+    for model, cycle, payloads, field_payloads in models:
         dataset = normalize_temperature_messages(
             model=model,
             settings=configuration.hrrr if model == "HRRR" else configuration.gfs,
@@ -558,6 +703,7 @@ def rebuild_temperature_guidance(
             payloads_by_lead=payloads,
             target_horizon_hours=horizons,
             area=area,
+            **({"field_payloads": field_payloads} if source.get("surface_fields") else {}),
         )
         prepared_files[model] = _write_prepared_file(directory, model, dataset)
     manifest = {
@@ -577,11 +723,18 @@ def rebuild_temperature_guidance(
 
 
 class BoundedHttpTransport(RequestsHrrrHttpTransport):
-    """Streaming adapter with a cumulative 128 MiB body budget for the 72 messages."""
+    """Streaming adapter with a bounded body budget (128 MiB by default).
 
-    def __init__(self) -> None:
+    An exact selected model set can supply its discovered byte total before
+    acquisition when additional surface fields require more than the legacy limit.
+    """
+
+    def __init__(self, *, body_budget: int = _BODY_BUDGET) -> None:
+        if type(body_budget) is not int or body_budget <= 0:
+            raise ValueError("body_budget must be a positive integer byte count")
         super().__init__()
         self.downloaded_bytes = 0
+        self.body_budget = body_budget
 
     def get(
         self,
@@ -598,8 +751,8 @@ class BoundedHttpTransport(RequestsHrrrHttpTransport):
             start, end = (int(v) for v in requested_range.removeprefix("bytes=").split("-"))
             if end < start or end - start + 1 > limit:
                 raise ValueError("Selected message exceeds the 16 MiB acquisition limit")
-        if self.downloaded_bytes >= _BODY_BUDGET:
-            raise ValueError("Acquisition exhausted the cumulative 128 MiB body budget")
+        if self.downloaded_bytes >= self.body_budget:
+            raise ValueError("Acquisition exhausted the cumulative body budget")
         with self._session.get(
             url, headers=request_headers, timeout=timeout, stream=True
         ) as response:
@@ -610,7 +763,7 @@ class BoundedHttpTransport(RequestsHrrrHttpTransport):
                 raise ValueError("Provider ignored the uncompressed response request")
             declared = response.headers.get("Content-Length")
             expected = None if declared is None else int(declared)
-            remaining = min(limit, _BODY_BUDGET - self.downloaded_bytes)
+            remaining = min(limit, self.body_budget - self.downloaded_bytes)
             if expected is not None and (expected < 0 or expected > remaining):
                 raise ValueError("Response exceeds the remaining acquisition body budget")
             chunks: list[bytes] = []

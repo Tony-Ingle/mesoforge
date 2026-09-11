@@ -8,6 +8,15 @@ is described below. Start with [VISION.md](VISION.md) for release boundaries and
 
 ## Current status
 
+The [on-demand forward run](#run-verification-and-current-issuance-together) now
+prepares a **36-hour surface forecast**: temperature, dew point, derived relative
+humidity, vector wind speed/direction and gust. Temperature keeps its exact HRRR/GFS
+70/30 demonstration calculation. The added fields use applicable retained Phase 2
+rules, described below; RAP and IFS remain zero-weight shadows. Cloud cover is
+explicitly unavailable because no retained approved blend policy exists. Existing
+temperature-only inputs and historical issued versions remain readable. Verification
+and model-comparison metrics still cover temperature only.
+
 The localhost endpoint, `GET /forecast?lat=45.8&lon=-93.1`, now returns temperature
 from **real prepared HRRR/GFS guidance** for hours 1-36 at exact coordinates within
 the native model domains. Coordinate preparation now derives and shares spatial
@@ -1692,7 +1701,10 @@ reported length, with a strong ETag retained for later identity checks.
 An unpublished or incomplete candidate can yield to an older complete cycle within
 the existing adapter lead limits and a bounded lookback, with rejection reasons
 recorded. Access/transport failures, malformed inventories, or unprovable object
-identity/publication stop selection explicitly. Success requires all four models;
+identity/publication stop selection explicitly. The narrow exception is a final
+mirror's 403 after independent 404 evidence: that candidate has no proved usable
+endpoint, and the denied mirror remains unknown; an older cycle still needs complete
+evidence. Success requires all four models;
 failure returns an empty `selected_cycles`, a reason, and exit code 2. Individual
 model findings in a failed report are diagnostic evidence, not an approved partial
 set. A selection expires at its first valid hour, requiring a new current run.
@@ -1884,10 +1896,14 @@ The output directory contains `result.json`, the input snapshot, previous-verifi
 results, current selection/preparation evidence, and a readable `hourly-report.md`.
 Each successful forecast saves `hourly_report` beside its original `hours` through
 the existing immutable PostgreSQL/MinIO path. `hours` retains the untouched numerical
-baseline; report temperatures preserve its exact Kelvin values, with Fahrenheit
-display values separately. Each row includes:
+baseline; `hours[].surface` adds canonical surface values, per-model contributors,
+units, applied weight rows and their hashes, raw-message provenance, and explicit
+missingness. The readable report uses °F, %, mph and meteorological compass direction;
+stored Kelvin, m/s and degree values stay unrounded. Each row includes:
 
 - UTC and display/local valid time; HRRR, GFS, RAP, IFS and the raw 70/30 blend.
+- Dew point, relative humidity, sustained wind speed/direction, and gust, with
+  separate contributor tables and explicit missing/fallback reasons.
 - `bias_correction.status = not_implemented`, with applied delta **0 K**.
 - `ai_adjustment.action = not_run`, applied delta **0 K**, and reason
   **AI forecast-desk stage not implemented yet**.
@@ -1901,7 +1917,130 @@ IFS keeps its native three-hourly values and explicit intervening gaps. RAP/IFS
 remain zero-weight shadows, and Phase 2 defaults remain unchanged. Saved reports
 describe the state at issuance; later verification does not rewrite them.
 
-The real Minneapolis command completed on **September 11, 2026 at 17:46:15Z**.
+Surface policy and availability:
+
+- **Temperature:** unchanged HRRR/GFS 70/30 for all 36 hours; a missing required
+  temperature contributor still makes that hour's active temperature unavailable.
+- **Dew point and coupled U/V/gust:** use the retained Phase 2 scalar/vector fallback
+  table: HRRR/GFS **70/30 for hours 1–18**, **60/40 for hours 19–36** when both are
+  eligible. Explicit single-model rows apply only when their eligibility rules allow
+  them; weights are never silently renormalized. The policy snapshot, row ID/hash,
+  exclusions and actual applied weights are saved. Phase 2 defaults are unchanged.
+- **Humidity:** derive `100 × e(Td) / es(T)` from baseline temperature/dew point using
+  the [Bolton liquid-water equations documented by UCAR](https://archive.eol.ucar.edu/projects/ceop/dm/documents/refdata_report/eqns.html),
+  including below freezing. It is not separately weighted model RH. Inconsistent
+  dew point or invalid humidity produces an explicit unavailable result, not clipping.
+- **Wind:** rotate native grid U/V to earth-relative components before point extraction;
+  blend U/V, then derive speed and meteorological direction. Calm direction is null.
+  Retained gust consistency rules reject an invalid source wind/gust tuple or record
+  an allowed small source-gust floor. Native contributor values remain separately saved.
+- **Shadows:** RAP exposes its available instantaneous fields. IFS exposes native
+  three-hourly temperature, dew point and vector winds, with no time interpolation.
+  Its published gust is an interval maximum, so it is explicitly unavailable under
+  this instantaneous-gust contract. [ECMWF attribution](#prepare-ecmwf-ifs-temperature-in-shadow-mode)
+  and source/licence metadata remain attached.
+- **Cloud cover:** null with an explicit missing-policy reason; no cloud product is
+  acquired. Precipitation, weather-condition labels, bias correction and AI are absent.
+
+The normal forward command enables these fields automatically. For the separate
+discovery/preparation sequence, opt into field evidence when discovering:
+
+```text
+python -B -m mesoforge.application.current_model_set --surface-fields --output-dir EXTERNAL_NEW_SELECTION_DIRECTORY
+python -B -m mesoforge.application.selected_forecast --config locations.json --selection EXTERNAL_NEW_SELECTION_DIRECTORY/selection.json --output-dir EXTERNAL_NEW_PREPARED_DIRECTORY
+```
+
+Preparation acquires only field ranges recorded in that selection, once for the
+coordinate collection; RAP's shared U/V message is downloaded and retained once.
+Every range remains pinned to the discovered object identity. Missing optional
+fields stay explicit and do not change temperature cycle selection. Raw messages,
+inventories and metadata stay outside Git and support offline rebuilding.
+
+The real surface run exposed a provider-discovery edge case: two GFS mirrors
+returned 404 for a not-yet-usable candidate, then the final mirror returned 403.
+That combination now rejects only that candidate; the 403 stays recorded as
+access denied with **unknown** availability, never as proof of absence. An older
+candidate must pass every existing completeness/identity check. Access denial
+without independent missing-object evidence, rate limits, malformed evidence and
+transport failures still stop selection explicitly.
+
+The real **surface** run for Minneapolis completed on **September 11, 2026 at
+18:34:28Z**, issuing `9588a3d3-41a8-42fa-851f-936079c83743`. Automatic discovery at
+18:27:34Z selected **HRRR 12Z / GFS 12Z / RAP 15Z / IFS 06Z**, covering
+**September 11 19Z through September 13 06Z**. All 36 hours have every supported
+baseline surface field. HRRR/GFS/RAP supplied 36 native hours each; IFS supplied
+12 native temperature/dew-point/wind slots with 24 explicit gaps and no instantaneous
+gust. Cloud cover is unavailable throughout. One actual hour, rounded for display:
+
+**September 11, 16:00 CDT / 21:00 UTC**
+
+| Source | Temperature °F | Dew point °F | RH % | Wind mph | From degrees | Gust mph |
+| --- | --- | --- | --- | --- | --- | --- |
+| HRRR | 84.1 | 50.3 | 31.0 | 18.6 | 188.6 | 32.2 |
+| GFS | 88.7 | 50.4 | 27.0 | 14.5 | 194.3 | 27.6 |
+| RAP shadow | 83.2 | 54.4 | 37.1 | 18.9 | 188.6 | 31.7 |
+| IFS shadow | 86.3 | 50.7 | 29.4 | 16.6 | 185.2 | unavailable |
+| Active baseline / final | 85.5 | 50.3 | 29.8 | 17.4 | 190.1 | 30.8 |
+
+The successful model discovery/preparation downloaded **490,482,913 bytes**,
+retaining **484,358,119 unique raw GRIB bytes** plus inventories and provenance
+outside Git. Its four prepared NetCDF files total **19,219,528 bytes**. There were
+**552 distinct GRIB range requests** (HRRR 180, GFS 180, RAP 144, IFS 48), all
+matching the selected objects. Raw bytes may also have retained/rebuilt regional
+copies on disk; these figures count unique source messages. The initial failed
+discovery downloaded another 379,527 metadata bytes and no GRIB.
+
+Exact PostgreSQL/MinIO readback matched the complete saved forecast. All **20 older
+issued versions** stayed unchanged; all **35 overlapping temperature hours** matched
+the earlier Minneapolis version exactly, including individual HRRR/GFS values.
+The real saved-forecast GET returned that exact payload. Repeated prepared-forecast
+GETs returned identical baseline surface fields with no PostgreSQL/MinIO changes;
+these HTTP checks used FastAPI TestClient, without a listening server.
+Offline point replay made zero provider calls. Rebuilding all four datasets from
+retained raw messages with HTTP blocked reproduced every array, coordinate, unit,
+missingness marker and all 36 point forecasts exactly. Raw provenance and decision
+evidence were preserved; newly generated preparation/manifest hashes differ as
+expected. The previous Minneapolis 18Z forecast
+was verified against a real automatically selected METAR observation, with error
+**−0.956694 K** (forecast minus observation). Repeat verification with the same build
+reused its saved result and observations with zero downloads. The initial attempt
+acquired 4,773 METAR bytes and 2,257 station-metadata bytes; the completed run reused
+them. Code identities distinguish the verification versions created while this
+milestone was being validated.
+
+All 36 baseline rows, contributor tables and explicit missing reasons are in
+`%LOCALAPPDATA%/MesoForge/forward-runs/surface-20260911T182732Z/hourly-report.md`;
+the full payload/evidence is in that directory's `result.json`. Validation artifacts
+are under `%LOCALAPPDATA%/MesoForge/baselines/20260911-surface-forward`.
+Temporary PostgreSQL and MinIO were stopped after validation.
+
+Surface validation used the locked local environment. **560 distinct focused
+offline tests and 19 PostgreSQL/MinIO integration tests passed** across the relevant
+selections. Coverage includes independent RH/vector calculations, units, missing
+contributors, source cycle/lead/grid mismatches, source-gust consistency, exact
+temperature preservation, offline field rebuilding, changed provider objects and
+immutable readback. The integration fixture compares each coordinate against the
+same coordinate's temperature-only baseline; both supported locations succeed
+around an invalid middle entry and earlier saved payloads stay unchanged.
+
+New-field scientific/preparation selections (executed in smaller groups):
+
+```text
+python -B -m pytest -q tests/unit/forecasting/test_surface.py tests/unit/forecasting/test_scalar_blend.py tests/unit/forecasting/test_vector_blend.py tests/unit/forecasting/test_gust_blend.py tests/unit/forecasting/test_availability.py
+python -B -m pytest -q tests/unit/application/test_surface_forecast.py tests/unit/application/test_prepared_temperature.py tests/unit/application/test_prepared_shadow.py tests/unit/application/test_prepared_rap.py tests/unit/application/test_prepared_ifs.py
+python -B -m pytest -q tests/unit/guidance/test_current_availability.py tests/unit/guidance/test_selected_objects.py tests/unit/guidance/test_rap_temperature.py tests/unit/guidance/test_ifs_temperature.py
+```
+
+Existing forward-run, selected issuance, API, spatial coverage, normalization and
+automatic-verification selections were also run, including the storage commands
+below. No additional field is scored against observations in this milestone.
+Full acceptance/coverage, live-provider canary suites and VPS reliability remain
+unverified.
+Ruff, mypy, all nine import contracts, lock consistency, documentation/hygiene
+checks and `git diff --check` passed.
+
+The earlier **temperature-only** Minneapolis command completed on
+**September 11, 2026 at 17:46:15Z**.
 Decision time **17:41:36Z** selected **HRRR 12Z / GFS 12Z / RAP 15Z / IFS 06Z**
 without cycle arguments. It saved immutable forecast
 `b3b32ab2-8da7-4adf-b3e6-0f59bb148051`, covering **September 11 18Z through
@@ -1948,11 +2087,12 @@ python -B -m pytest tests/integration/application/test_forward_run.py tests/inte
 python -B -m pytest tests/integration/application/test_issued_temperature_verification.py::test_automatic_window_acquires_once_reuses_real_snapshot_and_skips_empty_window tests/integration/application/test_issued_temperature_verification.py::test_automatic_batch_isolates_locations_and_reuses_results_without_changing_issuances -q
 ```
 
-Next proposed: a manual VPS smoke run of this same command and storage configuration,
-then a single non-overlapping scheduled invocation with retained run logs. Collect
-forward verification before fitting any site-bias correction. A later bounded AI
-proposal/validation stage would populate the separate report action fields; it must
-not overwrite numerical history or publish unchecked adjustments.
+Next proposed: add interval-aware liquid precipitation amounts through the retained
+QPF normalization/blending path, preserving accumulation bounds and explicit gaps.
+Then establish compatible PoP threshold/interval support before adding probability,
+precipitation type and derived conditions. Do not infer PoP from deterministic QPF
+or precipitation type from surface temperature alone. VPS work and scheduling remain
+deferred.
 
 ### Automatic current guidance
 

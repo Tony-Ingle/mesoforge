@@ -25,11 +25,14 @@ from mesoforge.application.spatial_coverage import (
     point_in_grid,
     validate_coordinate,
 )
+from mesoforge.application.surface_forecast import FIELD_UNITS, extract_surface_hour
+from mesoforge.catalog.configuration import Phase2BlendConfiguration, _lists_to_tuples
 from mesoforge.catalog.domains import BoundingBox
 from mesoforge.forecasting.recipes import (
     DEFAULT_CONFIGURATION,
     ContributorConfiguration,
     evaluate_recipe,
+    with_surface_fields,
 )
 
 _DATA_KIND = "synthetic_demonstration"
@@ -127,6 +130,26 @@ def _validate_guidance(dataset: xr.Dataset, model: str) -> np.datetime64:
         raise ValueError(f"{model}: prepared temperature must use K")
     if field.dims != ("source_lead_time", "y", "x") or field.dtype.kind != "f":
         raise ValueError(f"{model}: temperature must have floating source_lead_time/y/x values")
+    for variable, unit in FIELD_UNITS.items():
+        if variable == _VARIABLE or variable not in dataset:
+            continue
+        extra = dataset[variable]
+        if (
+            extra.attrs.get("unit_id") != unit
+            or extra.attrs.get("units", unit) != unit
+            or extra.dims != field.dims
+            or extra.dtype.kind != "f"
+        ):
+            raise ValueError(
+                f"{model}: {variable} has invalid canonical units or native dimensions"
+            )
+        if (
+            variable in ("eastward_wind_10m", "northward_wind_10m")
+            and dataset.attrs.get("wind_reference") != "earth_relative"
+        ):
+            raise ValueError(
+                f"{model}: prepared winds must be earth-relative before point extraction"
+            )
     for axis in ("x", "y"):
         values = dataset[axis].values
         if (
@@ -200,6 +223,16 @@ def _load_source_manifest(
         for row in entries.values():
             for prefix in ("raw", "index"):
                 _verify_file(directory, row[f"{prefix}_file"], row[f"{prefix}_sha256"])
+            extras = row.get("extra_messages", [])
+            variables = [extra["canonical_variable_id"] for extra in extras]
+            if len(variables) != len(set(variables)) or not set(variables) <= set(FIELD_UNITS) - {
+                _VARIABLE
+            }:
+                raise ValueError(f"{row['model']}: invalid or duplicate extra field evidence")
+            for extra in extras:
+                _verify_file(directory, extra["raw_file"], extra["raw_sha256"])
+                if (directory / extra["raw_file"]).stat().st_size != extra["raw_bytes"]:
+                    raise ValueError("Retained extra field byte count disagrees")
         for model, dataset in guidance.items():
             prepared = manifest["prepared_files"][model]
             if prepared["file"] != f"{model}.nc":
@@ -262,9 +295,16 @@ class PreparedPointForecast:
     _horizons: tuple[int, ...]
     _configuration: ContributorConfiguration
     _shadow_views: dict[str, list[_ShadowView]]
+    _surface_configuration: Phase2BlendConfiguration | None = None
 
     @property
     def notice(self) -> str:
+        if self._surface_configuration is not None:
+            return (
+                "Real prepared surface guidance: temperature retains the 70/30 demonstration "
+                "control; other fields use explicit retained Phase 2 policies. "
+                "See source cycles, valid times and per-field missingness."
+            )
         if self._manifest is not None and (
             "cycle_selection" in self._manifest or "current_model_set" in self._manifest
         ):
@@ -285,7 +325,7 @@ class PreparedPointForecast:
         shadow_directories: Mapping[str, Path] | None = None,
     ) -> PreparedPointForecast:
         if configuration.control_recipe.field != _VARIABLE:
-            raise ValueError("Prepared point forecasts currently support temperature only")
+            raise ValueError("Prepared point forecasts require a temperature control recipe")
         guidance: dict[str, xr.Dataset] = {}
         projections: dict[str, pyproj.CRS] = {}
         kinds: set[str] = set()
@@ -341,6 +381,20 @@ class PreparedPointForecast:
             if data_kind == _REAL_KIND
             else (None, None)
         )
+        surface_configuration = None
+        if manifest is not None and manifest.get("surface_fields"):
+            policy = manifest["surface_blend_configuration"]
+            selected = manifest.get("current_model_set", {}).get("selection")
+            if (
+                selected is not None
+                and policy != selected["source_configuration"]["blend_configuration"]
+            ):
+                raise ValueError(
+                    "Surface blend policy differs from the retained decision configuration"
+                )
+            surface_configuration = Phase2BlendConfiguration.model_validate(
+                _lists_to_tuples(policy)
+            )
         horizons = tuple(manifest.get("target_horizon_hours", (1, 2, 3))) if manifest else (1, 2, 3)
         if horizons not in ((1, 2, 3), tuple(range(1, 37))) or any(
             type(hour) is not int for hour in horizons
@@ -405,6 +459,7 @@ class PreparedPointForecast:
             horizons,
             configuration,
             shadow_views,
+            surface_configuration,
         )
 
     def check_coordinate(self, latitude: float, longitude: float) -> None:
@@ -469,6 +524,17 @@ class PreparedPointForecast:
             )
             for model, views in self._shadow_views.items()
         }
+        surface_datasets = {
+            model: (dataset, self._projections[model], self._manifest)
+            for model, dataset in self._guidance.items()
+        }
+        surface_datasets.update(
+            {
+                model: (view.dataset, view.crs, view.metadata.get("manifest"))
+                for model, view in selected_shadows.items()
+                if view is not None
+            }
+        )
         hours: list[dict[str, Any]] = []
         for horizon in self._horizons:
             valid_time = self._target_reference_time + np.timedelta64(horizon, "h")
@@ -602,6 +668,19 @@ class PreparedPointForecast:
                     **({"shadow_sources": shadow_sources} if shadow_sources else {}),
                 }
             )
+            if self._surface_configuration is not None:
+                selection = (self._manifest or {}).get("current_model_set", {}).get("selection")
+                hours[-1]["surface"] = extract_surface_hour(
+                    datasets=surface_datasets,
+                    temperature_sources=[*sources, *shadow_sources],
+                    temperature_k=temperature,
+                    latitude=latitude,
+                    longitude=longitude,
+                    horizon=horizon,
+                    target_reference_time=self._target_reference_time,
+                    configuration=self._surface_configuration,
+                    selection=selection,
+                )
         result: dict[str, Any] = {
             "data_kind": self.data_kind,
             "notice": self.notice,
@@ -609,7 +688,11 @@ class PreparedPointForecast:
             "longitude": longitude,
             "target_reference_time": _iso(self._target_reference_time),
             "hours": hours,
-            "contributor_configuration": self._configuration.model_dump(mode="json"),
+            "contributor_configuration": (
+                with_surface_fields(self._configuration)
+                if self._surface_configuration is not None
+                else self._configuration
+            ).model_dump(mode="json"),
         }
         if self._manifest_sha256 is not None:
             result["manifest_sha256"] = self._manifest_sha256

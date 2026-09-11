@@ -17,6 +17,7 @@ from typing import Any
 from mesoforge.application.prepared_ifs import IFS_CONFIGURATION
 from mesoforge.application.prepared_temperature import BoundedHttpTransport, _code_identity, _iso
 from mesoforge.catalog.configuration import Phase2Configuration, load_configuration_source
+from mesoforge.forecasting.recipes import with_surface_fields
 from mesoforge.guidance.cycle_selection import generate_candidate_reference_times
 from mesoforge.guidance.interfaces import Clock, HttpTransport, Sleeper
 from mesoforge.guidance.runtime import SystemClock, SystemSleeper
@@ -40,6 +41,7 @@ def select_model_set(
     sleeper: Sleeper,
     decision_time: datetime | None = None,
     probe: Callable[..., Any] = probe_temperature,
+    surface_fields: bool = False,
 ) -> dict[str, Any]:
     """Newest metadata-complete cycles, or an explicit failure with retained evidence."""
     started = clock.now()
@@ -80,7 +82,9 @@ def select_model_set(
         "horizon_hours": list(_HOURS),
         "selected_cycles": {},
         "models": {},
-        "contributor_configuration": IFS_CONFIGURATION.model_dump(mode="json"),
+        "contributor_configuration": (
+            with_surface_fields(IFS_CONFIGURATION) if surface_fields else IFS_CONFIGURATION
+        ).model_dump(mode="json"),
         "source_configuration": configuration.model_dump(mode="json"),
         "code_identity": identity,
         "model_data_acquired": False,
@@ -99,6 +103,9 @@ def select_model_set(
             "time. Preserve actual later acquisition and issuance timestamps."
         ),
     }
+
+    if surface_fields:
+        report["surface_fields"] = True
 
     def save() -> None:
         report["completed_at"] = _iso(clock.now())
@@ -187,6 +194,7 @@ def select_model_set(
                         clock=clock,
                         sleeper=sleeper,
                         decision_time=decision,
+                        **({"surface_fields": True} if surface_fields else {}),
                     )
                 except ProviderEvidenceError as exc:
                     candidate["probes"].append(retain(exc.evidence, exc.index_payloads))
@@ -258,6 +266,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--decision-time", type=datetime.fromisoformat)
+    parser.add_argument(
+        "--surface-fields", action="store_true", help="Also discover native surface guidance"
+    )
     args = parser.parse_args(argv)
     configuration, _ = load_configuration_source(
         base_path=_ROOT / "configs/base.yaml",
@@ -274,6 +285,7 @@ def main(argv: list[str] | None = None) -> int:
             args.output_dir,
             configuration=configuration.phase2,
             decision_time=args.decision_time,
+            surface_fields=args.surface_fields,
             transport=transport,
             clock=clock,
             sleeper=SystemSleeper(),

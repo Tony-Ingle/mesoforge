@@ -1,5 +1,6 @@
 """Independent geometry/time/value checks for decoded native shadow preparation."""
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
@@ -11,6 +12,7 @@ from mesoforge.alignment.station_frame import align_station_to_model
 from mesoforge.application.prepared_shadow import normalize_shadow_temperature
 from mesoforge.application.spatial_coverage import UnsupportedCoordinateError, bbox_in_grid
 from mesoforge.catalog.domains import BoundingBox
+from mesoforge.guidance.normalization import WindRotationError
 
 CYCLE = datetime(2026, 9, 11, 3, tzinfo=UTC)
 TARGET = CYCLE + timedelta(hours=3)
@@ -93,6 +95,60 @@ def test_actual_projection_values_missing_hours_and_source_times_are_preserved()
     assert aligned[3].value == pytest.approx(270 + 6 + 0.2 * 5.5 + 0.3 * 6.25, abs=1e-9)
     for lead in decoded:
         xr.testing.assert_identical(decoded[lead], originals[lead])
+
+
+def test_surface_winds_rotate_before_extraction_and_temperature_remains_identical():
+    temperature = frame()
+    baseline = normalize_shadow_temperature(
+        {4: temperature}, model="RAP", cycle=CYCLE, target=TARGET
+    )
+    u, v = temperature.copy(deep=True), temperature.copy(deep=True)
+    u.values[:], v.values[:] = 5.0, 0.0
+    for component in (u, v):
+        component.attrs.update(GRIB_units="m s**-1", GRIB_uvRelativeToGrid=1)
+    result = normalize_shadow_temperature(
+        {4: temperature},
+        model="RAP",
+        cycle=CYCLE,
+        target=TARGET,
+        decoded_surface={"eastward_wind_10m": {4: u}, "northward_wind_10m": {4: v}},
+    )
+    xr.testing.assert_identical(result.air_temperature_2m, baseline.air_temperature_2m)
+    # Independent spherical initial-bearing formula between two native fixture
+    # cells: a pure +x grid wind follows that bearing, not true due east.
+    lat0, lat1 = np.deg2rad(temperature.latitude.values[0, :2])
+    lon0, lon1 = np.deg2rad(temperature.longitude.values[0, :2])
+    bearing = np.arctan2(
+        np.sin(lon1 - lon0) * np.cos(lat1),
+        np.cos(lat0) * np.sin(lat1) - np.sin(lat0) * np.cos(lat1) * np.cos(lon1 - lon0),
+    )
+    assert float(result.eastward_wind_10m[0, 0, 0]) == pytest.approx(5 * np.sin(bearing), abs=1e-9)
+    assert float(result.northward_wind_10m[0, 0, 0]) == pytest.approx(5 * np.cos(bearing), abs=1e-9)
+    assert result.attrs["wind_reference"] == "earth_relative"
+    assert json.loads(result.attrs["wind_rotation_policy_json"])["4"] == "grid-to-earth-pyproj.v1"
+    assert np.isnan(result.dew_point_temperature_2m).all()
+    np.testing.assert_array_equal(u.values, 5.0)
+
+
+@pytest.mark.parametrize("defect", ["units", "time", "wind_flag"])
+def test_surface_metadata_mismatch_is_rejected(defect):
+    u, v = frame(), frame()
+    for component in (u, v):
+        component.attrs.update(GRIB_units="m s**-1", GRIB_uvRelativeToGrid=0)
+    if defect == "units":
+        u.attrs["GRIB_units"] = "K"
+    elif defect == "time":
+        u = u.assign_coords(valid_time=u.valid_time.values + np.timedelta64(1, "h"))
+    else:
+        v.attrs["GRIB_uvRelativeToGrid"] = 1
+    with pytest.raises((ValueError, WindRotationError)):
+        normalize_shadow_temperature(
+            {4: frame()},
+            model="RAP",
+            cycle=CYCLE,
+            target=TARGET,
+            decoded_surface={"eastward_wind_10m": {4: u}, "northward_wind_10m": {4: v}},
+        )
 
 
 def test_footprint_subset_keeps_native_values_halo_and_full_source_extent():
@@ -227,6 +283,33 @@ def geographic_frame(lead=4, *, wrapped=False):
             "GRIB_longitudeOfLastGridPointInDegrees": longitude[-1],
         },
     )
+
+
+def test_ifs_surface_fields_keep_native_times_and_explicit_instantaneous_gust_gap():
+    decoded = {6: geographic_frame(6), 9: geographic_frame(9)}
+    surface = {
+        name: {} for name in ("dew_point_temperature_2m", "eastward_wind_10m", "northward_wind_10m")
+    }
+    for lead, temperature in decoded.items():
+        for variable, values in (
+            ("dew_point_temperature_2m", 270.0),
+            ("eastward_wind_10m", 3.0),
+            ("northward_wind_10m", 4.0),
+        ):
+            field = temperature.copy(deep=True)
+            field.values[:] = values
+            field.attrs["GRIB_units"] = "K" if variable == "dew_point_temperature_2m" else "m s**-1"
+            field.attrs["GRIB_uvRelativeToGrid"] = 0
+            surface[variable][lead] = field
+    actual = normalize_shadow_temperature(
+        decoded, model="IFS", cycle=CYCLE, target=TARGET, decoded_surface=surface
+    )
+    assert list(actual.source_lead_time.values / np.timedelta64(1, "h")) == [6, 9]
+    np.testing.assert_array_equal(actual.eastward_wind_10m, 3.0)
+    np.testing.assert_array_equal(actual.northward_wind_10m, 4.0)
+    assert np.isnan(actual.wind_gust_10m).all()
+    reasons = json.loads(actual.attrs["field_missing_reasons_json"])
+    assert "interval maximum" in reasons["wind_gust_10m"]["6"][0]
 
 
 def test_sparse_geographic_native_steps_align_by_valid_time_without_hourly_interpolation():

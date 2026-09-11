@@ -46,6 +46,7 @@ from tests.unit.application.test_prepared_temperature import (
     FixtureClock,
     FixtureSleeper,
     FixtureTransport,
+    SurfaceFixtureTransport,
     phase2_configuration,
 )
 
@@ -65,7 +66,9 @@ class DecisionClock(datetime):
         return DECISION.astimezone(tz) if tz is not None else DECISION.replace(tzinfo=None)
 
 
-def prepared_current_fixture(directory: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def prepared_current_fixture(
+    directory: Path, *, surface_fields: bool = False
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Use the retained fixture acquisition/normalization helpers, with a later reference."""
     control = directory / "control"
     manifest = prepare_temperature_guidance(
@@ -75,9 +78,12 @@ def prepared_current_fixture(directory: Path) -> tuple[dict[str, Any], dict[str,
         hrrr_cycle=TARGET,
         gfs_cycle=GFS_CYCLE,
         target_horizon_hours=EXTENDED_HORIZONS,
-        transport=FixtureTransport(tuple(range(7, 43))),
+        transport=(SurfaceFixtureTransport if surface_fields else FixtureTransport)(
+            tuple(range(7, 43))
+        ),
         clock=FixtureClock(),
         sleeper=FixtureSleeper(),
+        surface_fields=surface_fields,
     )
     selection = {
         "status": "selected",
@@ -91,6 +97,27 @@ def prepared_current_fixture(directory: Path) -> tuple[dict[str, Any], dict[str,
         },
         "fixture_notice": "Generated test evidence; no real provider discovery is claimed.",
     }
+    if surface_fields:
+        selection["source_configuration"] = phase2_configuration().model_dump(mode="json")
+        selection["models"] = {
+            model: {
+                "candidates": [
+                    {
+                        "status": "metadata_complete",
+                        "probes": [{"source_lead_hours": lead} for lead in leads],
+                    }
+                ]
+            }
+            for model, leads in (
+                ("HRRR", range(7, 43)),
+                ("GFS", range(13, 49)),
+                ("RAP", range(1, 37)),
+                ("IFS", range(3, 37, 3)),
+            )
+        }
+        manifest["surface_blend_configuration"] = (
+            phase2_configuration().blend_configuration.model_dump(mode="json")
+        )
     evidence = {
         "selection_sha256": str(Digest.of_bytes(json.dumps(selection).encode())),
         "selection": selection,
@@ -112,8 +139,34 @@ def prepared_current_fixture(directory: Path) -> tuple[dict[str, Any], dict[str,
             )
             for lead in leads
         }
+        extra = None
+        if surface_fields:
+            # Provider-shaped decoded fixtures retain each shadow's native time grid.
+            extra = {}
+            for variable, value, unit in (
+                ("dew_point_temperature_2m", 260.0, "K"),
+                ("eastward_wind_10m", 3.0, "m/s"),
+                ("northward_wind_10m", 4.0, "m/s"),
+                ("wind_gust_10m", 8.0, "m/s"),
+            ):
+                if model == "IFS" and variable == "wind_gust_10m":
+                    continue  # Native interval gust has no instantaneous mapping.
+                extra[variable] = {}
+                for lead, temperature in decoded.items():
+                    field = temperature.copy(
+                        data=np.full(
+                            temperature.shape,
+                            value + lead if variable == "dew_point_temperature_2m" else value,
+                        )
+                    )
+                    field.attrs.update(GRIB_units=unit, GRIB_uvRelativeToGrid=0)
+                    extra[variable][lead] = field
         dataset = normalize_shadow_temperature(
-            decoded, model=model, cycle=CURRENT_TARGET, target=CURRENT_TARGET
+            decoded,
+            model=model,
+            cycle=CURRENT_TARGET,
+            target=CURRENT_TARGET,
+            decoded_surface=extra,
         )
         dataset.attrs["data_kind"] = "synthetic_demonstration"
         shadow = directory / model
@@ -298,3 +351,145 @@ def test_forward_run_verifies_then_issues_and_reuses_verification_without_mutati
     for name in ("first", "repeat"):
         assert json.loads((tmp_path / name / "result.json").read_text())["summary"]["issued"] == 2
         assert "not_run" in (tmp_path / name / "hourly-report.md").read_text(encoding="utf-8")
+
+
+def test_surface_forward_run_saves_exact_fields_and_preserves_older_temperature_version(
+    tmp_path: Path,
+    migrated_dsn: str,
+    object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mesoforge.application import forward_run, selected_forecast
+
+    monkeypatch.setattr(forward_run, "datetime", DecisionClock)
+    monkeypatch.setattr(batch_forecast, "SystemClock", lambda: FixedClock(DECISION))
+    issuer = ForecastIssuanceService(
+        object_store,
+        lambda: PostgresUnitOfWork(migrated_dsn),
+        code_identity=verification_tests.CODE_IDENTITY,
+        clock=lambda: DECISION,
+    )
+    _, older_preparation = prepared_current_fixture(tmp_path / "older-temperature")
+    older_guidance = PreparedPointForecast.from_directory(
+        Path(older_preparation["directory"]),
+        configuration=IFS_CONFIGURATION,
+        shadow_directories={
+            model: Path(path) for model, path in older_preparation["shadow_directories"].items()
+        },
+    )
+    older_baselines = {
+        index: older_guidance.forecast(latitude=location["lat"], longitude=location["lon"])
+        for index, location in ((0, FIRST), (2, LAST))
+    }
+    older_forecast = older_baselines[0]
+    older_record = issuer.issue(older_forecast, batch_run_id=uuid4(), location_index=0)
+    older_saved = issuer.read(older_record.issued_forecast_id)
+
+    selection, preparation = prepared_current_fixture(
+        tmp_path / "surface-guidance", surface_fields=True
+    )
+
+    def discover(directory: Path) -> dict[str, Any]:
+        directory.mkdir()
+        (directory / "selection.json").write_text(json.dumps(selection), encoding="utf-8")
+        return selection
+
+    discovery = Mock(side_effect=discover)
+    preparation_call = Mock(return_value=preparation)
+    monkeypatch.setattr(forward_run, "_discover", discovery)
+    monkeypatch.setattr(selected_forecast, "prepare_selected", preparation_call)
+    config = write_config(tmp_path, [{**FIRST, "name": "Surface fixture"}, OUTSIDE, LAST])
+    result = forward_run.run_forward(
+        config, tmp_path / "surface-forward", issuer=issuer, display_timezone="America/Chicago"
+    )
+    assert [row["status"] for row in result["results"]] == ["ok", "error", "ok"], result
+    assert result["summary"]["issued"] == 2
+    discovery.assert_called_once()
+    preparation_call.assert_called_once()
+    assert preparation_call.call_args.args[0] == [
+        {**FIRST, "name": "Surface fixture"},
+        OUTSIDE,
+        LAST,
+    ]
+    assert result["preparation"]["downloaded_bytes"] == 0
+    assert result["coverage"]["downloaded_bytes"] == 0
+    assert "issued" not in result["results"][1]
+    before_readback = complete_storage_inventory(migrated_dsn, object_store)
+    assert len(before_readback["tables"]["issued_forecasts"]) == 3
+    for index in (0, 2):
+        row = result["results"][index]
+        assert row["verification"]["status"] == "nothing_to_verify"
+        assert row["verification"]["downloaded_bytes"] == 0
+        forecast = row["forecast"]
+        saved = issuer.read(UUID(row["issued"]["issued_forecast_id"]))
+        assert saved["forecast"] == forecast
+        assert forecast["current_model_set"] == preparation["current_model_set"]
+        assert len(forecast["hours"]) == len(forecast["hourly_report"]["hours"]) == 36
+        for hour, report, old_hour in zip(
+            forecast["hours"],
+            forecast["hourly_report"]["hours"],
+            older_baselines[index]["hours"],
+            strict=True,
+        ):
+            horizon = hour["horizon_hours"]
+            # Compare the identical native temperature messages at the identical
+            # coordinate. Different points have different bilinear float rounding
+            # even on constant grids; comparing LAST to FIRST is not a regression check.
+            assert hour["temperature"] == old_hour["temperature"]
+            for source, old_source in zip(hour["sources"], old_hour["sources"], strict=True):
+                assert source["raw_sha256"] == old_source["raw_sha256"]
+                assert source["temperature"] == old_source["temperature"]
+            assert hour["temperature"]["value"] == pytest.approx(288 + horizon, abs=1e-6)
+            assert (
+                report["raw_numerical_temperature"]
+                == report["final_temperature"]
+                == (hour["temperature"])
+            )
+            assert report["surface"] == hour["surface"]
+            fields = hour["surface"]["fields"]
+            assert fields["air_temperature_2m"]["value"] == hour["temperature"]["value"]
+            assert fields["dew_point_temperature_2m"]["value"] == pytest.approx(276 + horizon)
+            assert fields["dew_point_temperature_2m"]["unit"] == "K"
+            assert fields["relative_humidity_2m"]["unit"] == "%"
+            assert fields["eastward_wind_10m"]["value"] == pytest.approx(3.0)
+            assert fields["northward_wind_10m"]["value"] == pytest.approx(4.0)
+            assert fields["wind_speed_10m"]["value"] == pytest.approx(5.0)
+            assert fields["wind_from_direction_10m"]["value"] == pytest.approx(216.869897645844)
+            assert fields["wind_gust_10m"]["value"] == pytest.approx(8.0)
+            assert fields["wind_gust_10m"]["unit"] == "m/s"
+            expected_weights = (
+                {"HRRR": 0.7, "GFS": 0.3} if horizon <= 18 else {"HRRR": 0.6, "GFS": 0.4}
+            )
+            assert fields["dew_point_temperature_2m"]["weights"] == expected_weights
+            assert fields["wind_gust_10m"]["weights"] == expected_weights
+            assert fields["cloud_area_fraction"]["value"] is None
+            assert fields["cloud_area_fraction"]["missing_reasons"]
+            contributors = hour["surface"]["contributors"]
+            for model, lead_offset in (("HRRR", 6), ("GFS", 12)):
+                source = contributors[model]
+                assert source["source_lead_hours"] == horizon + lead_offset
+                dew = source["fields"]["dew_point_temperature_2m"]
+                assert dew["value"] == pytest.approx(276 + horizon)
+                assert dew["provenance"]["raw_sha256"]
+                assert dew["provenance"]["source_lead_hours"] == horizon + lead_offset
+                assert dew["provenance"]["cycle"] == selection["selected_cycles"][model].replace(
+                    "+00:00", "Z"
+                )
+            for model in ("RAP", "IFS"):
+                assert contributors[model]["role"] == "shadow"
+                dew = contributors[model]["fields"]["dew_point_temperature_2m"]
+                if model == "IFS" and horizon % 3:
+                    assert dew["value"] is None
+                    assert dew["missing_reasons"]
+                else:
+                    assert dew["value"] == pytest.approx(260 + horizon)
+            assert contributors["IFS"]["fields"]["wind_gust_10m"]["value"] is None
+            assert contributors["IFS"]["fields"]["wind_gust_10m"]["missing_reasons"]
+        # Independent high-precision e(Td)/es(T): T=15.85C, Td=3.85C.
+        assert forecast["hours"][0]["surface"]["fields"]["relative_humidity_2m"][
+            "value"
+        ] == pytest.approx(44.71519736562392)
+    assert issuer.read(older_record.issued_forecast_id) == older_saved
+    assert complete_storage_inventory(migrated_dsn, object_store) == before_readback
+    assert "surface" not in older_saved["forecast"]["hours"][0]

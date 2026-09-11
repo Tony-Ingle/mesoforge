@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -121,6 +121,87 @@ def test_one_acquisition_shared_across_regions_repeat_and_offline_rebuild(
             with xr.open_dataset(Path(second["directory"]) / "RAP.nc", engine="h5netcdf") as right:
                 np.testing.assert_array_equal(left.temperature, right.temperature)
     assert (control / "manifest.json").read_bytes() == original_control
+
+
+def test_surface_shadow_shared_ranges_retain_and_rebuild_without_network(
+    tmp_path: Path, preparation: tuple[Path, Mock, Mock], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control, discover, acquire = preparation
+    discover.return_value = _Selection(CYCLE, (4, 5, 6), (4, 5, 6), {})
+
+    def surface_acquired(**kwargs: Any) -> Phase2LeadAcquisition:
+        assert kwargs["canonical_variables"] == tuple(prepared_rap.SURFACE_FIELD_CONTRACTS)
+        original = _acquired(**kwargs)
+        messages = list(original.selected_messages)
+        wind = b"shared two-field RAP wind section"
+        offset = len(messages[0].payload)
+        for variable, payload in (
+            ("dew_point_temperature_2m", b"dew point"),
+            ("eastward_wind_10m", wind),
+            ("northward_wind_10m", wind),
+            ("wind_gust_10m", b"gust"),
+        ):
+            if variable == "northward_wind_10m":
+                offset -= len(wind)
+            messages.append(
+                SelectedMessage(
+                    variable, IndexRow(2, offset, variable), offset, offset + len(payload), payload
+                )
+            )
+            offset += len(payload)
+        return replace(original, selected_messages=tuple(messages))
+
+    acquire.side_effect = surface_acquired
+    decoder = Mock(side_effect=lambda payload, **kwargs: payload)
+    monkeypatch.setattr(prepared_rap, "decode_surface_message", decoder)
+    output = tmp_path / "rap-surface"
+    first = prepared_rap.prepare_rap(
+        LOCATIONS,
+        control,
+        output,
+        target_horizons=(1, 2, 3),
+        surface_fields=True,
+        transport=Mock(spec=[]),
+        clock=FixtureClock(),
+        sleeper=FixtureSleeper(),
+    )
+    assert acquire.call_count == 3
+    assert decoder.call_count == 12
+    manifest = json.loads((Path(first["source_directory"]) / "manifest.json").read_text())
+    assert manifest["surface_fields"] is True
+    assert manifest["source_metadata"]["adapter_version"] == "rap_surface_v1"
+    assert "wind_gust_10m" in manifest["source_metadata"]["model_definition"]["supported_fields"]
+    unique_bytes = 0
+    for row in manifest["inputs"]:
+        by_variable = {
+            message["canonical_variable_id"]: message for message in row["extra_messages"]
+        }
+        assert (
+            by_variable["eastward_wind_10m"]["raw_file"]
+            == by_variable["northward_wind_10m"]["raw_file"]
+        )
+        sizes = {
+            message["raw_file"]: message["raw_bytes"] for message in (row, *row["extra_messages"])
+        }
+        unique_bytes += sum(sizes.values())
+    assert first["retained_raw_bytes"] == unique_bytes
+    discover.side_effect = AssertionError("unexpected discovery")
+    acquire.side_effect = AssertionError("unexpected acquisition")
+    monkeypatch.setattr(
+        prepared_rap, "BoundedHttpTransport", Mock(side_effect=AssertionError("network"))
+    )
+    reused = prepared_rap.prepare_rap(LOCATIONS, control, output, target_horizons=(1, 2, 3))
+    assert reused["downloaded_bytes"] == 0
+    rebuilt = prepared_rap.prepare_rap(
+        LOCATIONS,
+        control,
+        tmp_path / "surface-rebuilt",
+        target_horizons=(1, 2, 3),
+        from_raw=output,
+    )
+    assert rebuilt["downloaded_bytes"] == 0
+    replay = json.loads((Path(rebuilt["source_directory"]) / "manifest.json").read_text())
+    assert replay["inputs"] == manifest["inputs"]
 
 
 def test_unavailable_hour_is_explicit_and_not_acquired(

@@ -12,6 +12,7 @@ import pytest
 
 from mesoforge.application.current_model_set import select_model_set
 from mesoforge.application.prepared_ifs import IFS_CONFIGURATION
+from mesoforge.forecasting.recipes import with_surface_fields
 from mesoforge.guidance.sources.current_availability import (
     ProviderEvidenceError,
     TemperatureProbeResult,
@@ -28,6 +29,34 @@ LATEST = {
     "RAP": TARGET.replace(hour=9),
     "IFS": TARGET.replace(hour=6),
 }
+
+
+def test_surface_discovery_keeps_temperature_cycle_policy_and_records_extended_capabilities(
+    tmp_path,
+):
+    probe = MetadataProbe()
+    probe.after_call = lambda kwargs: (
+        kwargs["surface_fields"] is True or pytest.fail("missing surface flag")
+    )
+    clock = FixedClock(NOW)
+    report = select_model_set(
+        tmp_path / "surface",
+        configuration=phase2_configuration(),
+        decision_time=DECISION,
+        transport=Mock(spec=[], downloaded_bytes=0),
+        clock=clock,
+        sleeper=RecordingSleeper(clock),
+        probe=probe,
+        surface_fields=True,
+    )
+    assert report["surface_fields"] is True
+    assert report["selected_cycles"] == {model: _iso(cycle) for model, cycle in LATEST.items()}
+    assert report["contributor_configuration"] == with_surface_fields(IFS_CONFIGURATION).model_dump(
+        mode="json"
+    )
+    assert report["contributor_configuration"][
+        "control_recipe"
+    ] == IFS_CONFIGURATION.control_recipe.model_dump(mode="json")
 
 
 def _iso(value):

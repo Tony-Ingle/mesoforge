@@ -169,6 +169,52 @@ def test_each_range_requires_revalidated_index_and_head():
     assert len(underlying.calls) == 1
 
 
+def test_multi_field_ranges_share_identity_and_compound_bytes_without_extra_downloads():
+    evidence = probe(MetadataTransport()).evidence
+    wind = {
+        "canonical_variable_id": "eastward_wind_10m",
+        "byte_start": 100,
+        "byte_end_exclusive": 200,
+        "content_bytes": 100,
+        "index_row": "compound u",
+    }
+    evidence["extra_messages"] = [
+        wind,
+        {**wind, "canonical_variable_id": "northward_wind_10m", "index_row": "compound v"},
+    ]
+    wrapper, underlying, evidence = selected(evidence=evidence)
+    acquire(wrapper, evidence)
+    with pytest.raises(SelectedObjectError, match="not acquired"):
+        wrapper.assert_complete()
+    underlying.ranged = FakeHttpResponse(
+        206,
+        {**underlying.grib.headers, "Content-Length": "100", "Content-Range": "bytes 100-199/200"},
+        b"shared u and v".ljust(100, b" "),
+    )
+    url = evidence["grib"]["url"]
+    first = wrapper.get(url, headers={"Range": "bytes=100-199"})
+    second = wrapper.get(url, headers={"Range": "bytes=100-199"})
+    assert first.content == second.content == underlying.ranged.content
+    wrapper.assert_complete()
+    assert len(underlying.calls) == 4  # One inventory, one HEAD, temperature, compound winds.
+    assert len(wrapper.validations) == 4  # Cache hits do not invent provider requests.
+    assert wrapper.validations[-1]["if_match"] == evidence["grib"]["etag"]
+
+
+def test_surface_ranges_reject_partial_overlap_before_network():
+    evidence = probe(MetadataTransport()).evidence
+    evidence["extra_messages"] = [
+        {
+            "canonical_variable_id": "eastward_wind_10m",
+            "byte_start": 80,
+            "byte_end_exclusive": 160,
+            "content_bytes": 80,
+        }
+    ]
+    with pytest.raises(ValueError, match="partially overlap"):
+        selected(evidence=evidence)
+
+
 def test_conflicting_conditional_header_is_not_silently_overwritten():
     wrapper, underlying, evidence = selected()
     wrapper.get(evidence["index"]["url"])

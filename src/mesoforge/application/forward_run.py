@@ -43,6 +43,7 @@ def _discover(directory: Path) -> dict[str, Any]:
             transport=transport,
             clock=SystemClock(),
             sleeper=SystemSleeper(),
+            surface_fields=True,
         )
     finally:
         transport.close()

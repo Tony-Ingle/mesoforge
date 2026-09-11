@@ -9,7 +9,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from mesoforge.catalog.contributors import DEFAULT_MODEL_DEFINITIONS, ModelDefinition
+from mesoforge.catalog.contributors import (
+    DEFAULT_MODEL_DEFINITIONS,
+    SURFACE_MODEL_FIELDS,
+    ModelDefinition,
+)
 from mesoforge.forecasting.scalar_blend import Contribution, blend_scalar
 
 
@@ -101,6 +105,20 @@ class ContributorConfiguration(BaseModel):
 class RecipeEvaluation:
     value: float | None
     missing_models: tuple[str, ...]
+
+
+def with_surface_fields(configuration: ContributorConfiguration) -> ContributorConfiguration:
+    """Enable registered native fields without changing recipes, weights or lifecycle status."""
+    return configuration.model_copy(
+        update={
+            "models": tuple(
+                model.model_copy(update={"supported_fields": SURFACE_MODEL_FIELDS[model.model_id]})
+                if model.model_id in SURFACE_MODEL_FIELDS
+                else model
+                for model in configuration.models
+            )
+        }
+    )
 
 
 def evaluate_recipe(recipe: Recipe, values: Mapping[str, float | None]) -> RecipeEvaluation:

@@ -28,6 +28,14 @@ from mesoforge.guidance.index_parsing import (
 from mesoforge.guidance.interfaces import Clock, HttpResponse, HttpTransport, Sleeper
 from mesoforge.guidance.sources import gfs, hrrr_phase2, ifs, rap
 
+SURFACE_FIELDS = (
+    "air_temperature_2m",
+    "dew_point_temperature_2m",
+    "eastward_wind_10m",
+    "northward_wind_10m",
+    "wind_gust_10m",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class TemperatureProbeResult:
@@ -223,6 +231,67 @@ def _metadata(fetched: FetchedObject, *, method: str) -> dict[str, Any]:
     return result
 
 
+def _surface_messages(
+    model: str, payload: bytes, cycle: datetime, lead: int, length: int
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Select optional instantaneous fields from the same proved provider object.
+
+    Temperature retains its existing cycle-completeness policy. Optional fields
+    never silently change the selected temperature cycle or their own semantics.
+    """
+    messages: list[dict[str, Any]] = []
+    missing: dict[str, str] = {}
+    for variable in SURFACE_FIELDS[1:]:
+        if model == "IFS" and variable == "wind_gust_10m":
+            missing[variable] = ifs.GUST_TEMPORAL_MISMATCH
+            continue
+        try:
+            if model == "IFS":
+                row, end = ifs.selected_surface_field(
+                    payload, canonical_variable_id=variable, cycle=cycle, forecast_hour=lead
+                )
+                start = row.byte_offset
+            else:
+                if model == "RAP":
+                    rows, row = rap.selected_surface_field(
+                        payload, canonical_variable_id=variable, cycle=cycle, forecast_hour=lead
+                    )
+                else:
+                    rows = parse_index_rows(payload.decode("utf-8"))
+                    source = hrrr_phase2 if model == "HRRR" else gfs
+                    selector = source.build_field_selector(variable, forecast_hour=lead)
+                    if not any(re.search(selector, entry.descriptor) for entry in rows):
+                        raise _TemperatureAbsentError(
+                            f"{model} inventory has no instantaneous {variable} "
+                            f"at source lead {lead}"
+                        )
+                    row = select_field_row(rows, selector)
+                    if row.line.split(":")[2] != f"d={cycle:%Y%m%d%H}":
+                        raise GribIndexError(f"{model} {variable} cycle does not match request")
+                start, end = compute_message_byte_range(
+                    rows, selected=row, full_object_length=length
+                )
+            if start < 0 or end - start < 20 or end > length:
+                raise ValueError(f"Selected {variable} range is outside the published GRIB object")
+        except (
+            _TemperatureAbsentError,
+            rap.RapTemperatureUnavailableError,
+            ifs.IfsTemperatureUnavailableError,
+        ) as exc:
+            missing[variable] = str(exc)
+            continue
+        messages.append(
+            {
+                "canonical_variable_id": variable,
+                "index_row": row.line,
+                "byte_start": start,
+                "byte_end_exclusive": end,
+                "content_bytes": end - start,
+            }
+        )
+    return messages, missing
+
+
 def _publication(metadata: dict[str, Any]) -> datetime:
     published = parse_provider_availability(metadata["last_modified"])
     if published is None:
@@ -243,12 +312,17 @@ def probe_temperature(
     clock: Clock,
     sleeper: Sleeper,
     decision_time: datetime,
+    surface_fields: bool = False,
 ) -> TemperatureProbeResult:
     """Check one native lead with index GET + GRIB HEAD, never a GRIB GET.
 
     Only missing objects/fields or publication after the cutoff allow a candidate
-    to be treated as unavailable. Malformed or unprovable evidence and provider
-    access/rate/transport errors fail closed rather than selecting an older run.
+    to be treated as unavailable. A final mirror's HTTP 403 can also reject this
+    candidate when an earlier independent mirror explicitly returned HTTP 404:
+    no endpoint proved usable, and the denied mirror remains unknown, not absent.
+    Any older candidate must pass the complete checks independently. Access denial
+    without that missing-object evidence, rate/transport errors, and malformed or
+    unprovable evidence still fail closed rather than selecting an older run.
     """
     for name, value in (("cycle", cycle), ("decision_time", decision_time)):
         if value.tzinfo is None or value.utcoffset() is None:
@@ -358,8 +432,43 @@ def probe_temperature(
                 grib=attempt["grib"],
                 selected_message=attempt["selected_message"],
             )
+            if surface_fields:
+                extra_messages, missing_fields = _surface_messages(
+                    model, index.payload, cycle, lead, length
+                )
+                attempt.update(extra_messages=extra_messages, missing_fields=missing_fields)
+                evidence.update(extra_messages=extra_messages, missing_fields=missing_fields)
             return TemperatureProbeResult(True, None, evidence, index.payload, payloads)
     except (FetchError, GribIndexError, ifs.IfsIndexError, UnicodeDecodeError, ValueError) as exc:
+        attempted = evidence["endpoints"]
+        last = attempted[-1]
+        independently_missing = any(
+            prior.get("status") == "unavailable"
+            and any(prior.get(kind, {}).get("status_code") == 404 for kind in ("index", "grib"))
+            for prior in attempted[:-1]
+        )
+        if (
+            isinstance(exc, FetchError)
+            and len(attempted) == len(endpoints)
+            and last["requests"]
+            and last["requests"][-1].get("status_code") == 403
+            and independently_missing
+        ):
+            last.update(
+                status="access_denied",
+                availability="unknown",
+                reason=str(exc),
+            )
+            reason = (
+                "No usable endpoint proved for this candidate: an independent mirror "
+                "returned HTTP 404 and the final mirror denied access (HTTP 403). "
+                "The denied mirror's availability is unknown; older candidates require "
+                "their own complete provider evidence."
+            )
+            evidence.update(status="unavailable", reason=reason)
+            return TemperatureProbeResult(
+                False, reason, evidence, next(reversed(payloads.values()), None), payloads
+            )
         evidence.update(status="error", reason=str(exc))
         raise ProviderEvidenceError(str(exc), evidence=evidence, index_payloads=payloads) from exc
     evidence.update(status="unavailable", reason=last_reason)

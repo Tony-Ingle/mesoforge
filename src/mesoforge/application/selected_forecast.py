@@ -32,6 +32,8 @@ from mesoforge.application.prepared_temperature import (
 from mesoforge.application.spatial_coverage import plan_regions, validate_coordinate
 from mesoforge.application.spatial_preparation import ensure_coverage
 from mesoforge.catalog.configuration import Phase2Configuration, _lists_to_tuples
+from mesoforge.catalog.contributors import SURFACE_MODEL_FIELDS
+from mesoforge.forecasting.recipes import with_surface_fields
 from mesoforge.guidance.acquisition_v2 import (
     Phase2LeadAcquisition,
     acquire_gfs_lead,
@@ -40,6 +42,7 @@ from mesoforge.guidance.acquisition_v2 import (
 from mesoforge.guidance.interfaces import Clock, HttpTransport, Sleeper
 from mesoforge.guidance.runtime import SystemClock, SystemSleeper
 from mesoforge.guidance.selected_objects import SelectedObjectTransport
+from mesoforge.guidance.sources.current_availability import _surface_messages
 from mesoforge.guidance.sources.rap import maximum_lead
 
 _ROOT = Path(__file__).resolve().parents[3]
@@ -62,12 +65,16 @@ def load_selection(
         decision = _time(report["decision_time"])
         target = _hour(_time(report["target_reference_time"]))
         first = target + timedelta(hours=1)
-        models = IFS_CONFIGURATION.model_map()
+        surface = report.get("surface_fields", False)
+        if type(surface) is not bool:
+            raise ValueError("Invalid surface-field selection flag")
+        contributors = with_surface_fields(IFS_CONFIGURATION) if surface else IFS_CONFIGURATION
+        models = contributors.model_map()
         if (
             report["status"] != "selected"
             or report["field"] != "air_temperature_2m"
             or report["horizon_hours"] != _HOURS
-            or report["contributor_configuration"] != IFS_CONFIGURATION.model_dump(mode="json")
+            or report["contributor_configuration"] != contributors.model_dump(mode="json")
             or set(report["selected_cycles"]) != set(models)
             or set(report["models"]) != set(models)
             or target != decision.replace(minute=0, second=0, microsecond=0)
@@ -142,6 +149,29 @@ def load_selection(
                 ):
                     raise ValueError(f"{model}: retained inventory checksum or byte count differs")
                 probes.append(probe)
+                if surface:
+                    extras = probe.get("extra_messages", [])
+                    fields = [item["canonical_variable_id"] for item in extras]
+                    missing = probe.get("missing_fields", {})
+                    expected_fields = set(SURFACE_MODEL_FIELDS["HRRR"][1:])
+                    if (
+                        len(fields) != len(set(fields))
+                        or set(fields) & set(missing)
+                        or set(fields) | set(missing) != expected_fields
+                        or not set(fields) <= set(SURFACE_MODEL_FIELDS[model][1:])
+                    ):
+                        raise ValueError(f"{model}: incomplete or invalid surface field evidence")
+                    expected_extras, expected_missing = _surface_messages(
+                        model,
+                        payload,
+                        cycle=cycle,
+                        lead=lead,
+                        length=probe["grib"]["content_length"],
+                    )
+                    if extras != expected_extras or missing != expected_missing:
+                        raise ValueError(
+                            f"{model}: surface evidence differs from retained inventory"
+                        )
     except (KeyError, TypeError, IndexError) as exc:
         raise ValueError("Incomplete current-model-set selection evidence") from exc
     return report, configuration, probes
@@ -176,7 +206,10 @@ def _acquire_control(
                 cycle_date=cycle.date(),
                 cycle_hour=cycle.hour,
                 forecast_hour=probe["source_lead_hours"],
-                canonical_variables=("air_temperature_2m",),
+                canonical_variables=(
+                    "air_temperature_2m",
+                    *(m["canonical_variable_id"] for m in probe.get("extra_messages", [])),
+                ),
                 transport=transport,
                 clock=clock,
                 sleeper=sleeper,
@@ -228,7 +261,23 @@ def prepare_selected(
     control = output_directory / "control"
     source = control / "source"
     target = _time(selection["target_reference_time"])
-    owned = BoundedHttpTransport() if transport is None else None
+    acquisition_budget = sum(
+        probe["index"]["content_bytes"]
+        + sum(
+            {
+                (message["byte_start"], message["byte_end_exclusive"]): message["content_bytes"]
+                for message in (probe["selected_message"], *probe.get("extra_messages", []))
+            }.values()
+        )
+        for probe in probes
+    )
+    owned = (
+        BoundedHttpTransport(body_budget=acquisition_budget)
+        if transport is None and selection.get("surface_fields")
+        else BoundedHttpTransport()
+        if transport is None
+        else None
+    )
     pinned = SelectedObjectTransport(
         transport if transport is not None else owned,  # type: ignore[arg-type]
         probes,
@@ -239,6 +288,9 @@ def prepare_selected(
     try:
         acquired = _acquire_control(
             selection, configuration, output_directory / "acquired", pinned, clock, sleeper
+        )
+        control_surface_kwargs: dict[str, Any] = (
+            {"surface_fields": True} if selection.get("surface_fields") else {}
         )
         manifest = prepare_temperature_guidance(
             source,
@@ -252,9 +304,27 @@ def prepare_selected(
             area=areas[0],
             fallback_areas=tuple(areas[1:]),
             acquired_inputs=acquired,
+            **control_surface_kwargs,
         )
         valid_locations = [{"lat": lat, "lon": lon} for lat, lon in coordinates]
         for model, prepare in (("RAP", prepare_rap), ("IFS", prepare_ifs)):
+            surface_kwargs: dict[str, Any] = {}
+            if selection.get("surface_fields"):
+                selected_candidate = next(
+                    row
+                    for row in selection["models"][model]["candidates"]
+                    if row["status"] == "metadata_complete"
+                )
+                surface_kwargs = {
+                    "surface_fields": True,
+                    "canonical_variables_by_lead": {
+                        probe["source_lead_hours"]: (
+                            "air_temperature_2m",
+                            *(m["canonical_variable_id"] for m in probe["extra_messages"]),
+                        )
+                        for probe in selected_candidate["probes"]
+                    },
+                }
             report = prepare(
                 valid_locations,
                 source,
@@ -263,6 +333,7 @@ def prepare_selected(
                 transport=pinned,
                 clock=clock,
                 sleeper=sleeper,
+                **surface_kwargs,
             )
             expected = [
                 int((_time(valid) - target).total_seconds() / 3600)
@@ -291,6 +362,11 @@ def prepare_selected(
             },
         }
         manifest["current_model_set"] = evidence
+        if selection.get("surface_fields"):
+            manifest["surface_fields"] = True
+            manifest["surface_blend_configuration"] = configuration.blend_configuration.model_dump(
+                mode="json"
+            )
         manifest["availability_note"] = (
             "Exact provider objects revalidated against the current-model-set decision cutoff; "
             "actual acquisition and issuance occur later and retain their own timestamps."
@@ -305,7 +381,11 @@ def prepare_selected(
             locations,
             source,
             cache_directory=control,
-            contributor_configuration=IFS_CONFIGURATION,
+            contributor_configuration=(
+                with_surface_fields(IFS_CONFIGURATION)
+                if selection.get("surface_fields")
+                else IFS_CONFIGURATION
+            ),
             shadow_directories={model: Path(path) for model, path in shadow_directories.items()},
         )
         report = {
@@ -315,7 +395,20 @@ def prepare_selected(
             "coverage": coverage,
             "shadows": shadows,
             "downloaded_bytes": pinned.downloaded_bytes,
-            "retained_raw_bytes": sum(row["raw_bytes"] for row in manifest["inputs"])
+            **(
+                {"acquisition_body_budget_bytes": acquisition_budget}
+                if selection.get("surface_fields")
+                else {}
+            ),
+            "retained_raw_bytes": sum(
+                sum(
+                    {
+                        item["raw_file"]: item["raw_bytes"]
+                        for item in (row, *row.get("extra_messages", []))
+                    }.values()
+                )
+                for row in manifest["inputs"]
+            )
             + sum(row["retained_raw_bytes"] for row in shadows.values()),
         }
         _write_bytes(output_directory / "preparation.json", json.dumps(report, indent=2).encode())
@@ -360,7 +453,11 @@ def run_selected_batch(
         Path(preparation["directory"]),
         issuer=issuer,
         require_future_hours=True,
-        contributor_configuration=IFS_CONFIGURATION,
+        contributor_configuration=(
+            with_surface_fields(IFS_CONFIGURATION)
+            if preparation["current_model_set"]["selection"].get("surface_fields")
+            else IFS_CONFIGURATION
+        ),
         shadow_directories={
             model: Path(path) for model, path in preparation["shadow_directories"].items()
         },

@@ -20,7 +20,11 @@ from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.prepared_temperature import _code_identity, prepare_locations
 from mesoforge.application.spatial_coverage import CoverageRequiredError, UnsupportedCoordinateError
 from mesoforge.application.spatial_preparation import ensure_coverage
-from mesoforge.forecasting.recipes import DEFAULT_CONFIGURATION, ContributorConfiguration
+from mesoforge.forecasting.recipes import (
+    DEFAULT_CONFIGURATION,
+    ContributorConfiguration,
+    with_surface_fields,
+)
 from mesoforge.guidance.runtime import SystemClock
 from mesoforge.storage.postgres.database import resolve_database_dsn
 from mesoforge.storage.postgres.repositories import PostgresUnitOfWork
@@ -47,6 +51,10 @@ def create_issuer() -> ForecastIssuanceService:
         "application/forward_run.py",
         "application/forward_verification.py",
         "application/hourly_report.py",
+        "application/surface_forecast.py",
+        "forecasting/surface.py",
+        "forecasting/vector_blend.py",
+        "forecasting/gust_blend.py",
         "contracts/issued_forecasts.py",
         "storage/json.py",
         "storage/s3.py",
@@ -204,7 +212,10 @@ def validate_current_control(configuration: ContributorConfiguration) -> None:
         raise ValueError("Batch issuance must retain the approved HRRR/GFS 70/30 control recipe")
     models = configuration.model_map()
     for model, expected in DEFAULT_CONFIGURATION.model_map().items():
-        if models.get(model) != expected:
+        if models.get(model) not in (
+            expected,
+            with_surface_fields(DEFAULT_CONFIGURATION).model_map()[model],
+        ):
             raise ValueError(f"Batch issuance must retain the default {model} model definition")
     if any(
         definition.status == "active" and model not in DEFAULT_CONFIGURATION.model_map()

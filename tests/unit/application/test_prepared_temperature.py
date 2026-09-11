@@ -147,9 +147,155 @@ class FixtureClock:
         return datetime(2026, 9, 1, 12, tzinfo=UTC)
 
 
+def surface_payload(model: str, horizon: int, variable: str) -> bytes:
+    """Existing tiny native GRIB fixtures with independently specified surface values."""
+    if variable == VARIABLE:
+        return temperature_payload(model, horizon)
+    value = {
+        "dew_point_temperature_2m": 270.0 + horizon,
+        "eastward_wind_10m": 3.0,
+        "northward_wind_10m": 4.0,
+        "wind_gust_10m": 8.0,
+    }[variable]
+    if model == "GFS":
+        return gfs_grib.make_instantaneous_message(
+            canonical_variable_id=variable,
+            forecast_hour=horizon + 6,
+            values=np.full((gfs_grib.NY, gfs_grib.NX), value),
+            cycle_date="20260830",
+            cycle_hour=6,
+            grid_relative_wind=False,
+        )
+    common = dict(forecast_hour=horizon, cycle_date="20260830", cycle_hour=12)
+    values = np.full((hrrr_grib.NY, hrrr_grib.NX), value)
+    if variable == "dew_point_temperature_2m":
+        return hrrr_grib.make_dew_point_message(values_k=values, **common)
+    if variable == "wind_gust_10m":
+        return hrrr_grib.make_gust_message(values_m_s=values, **common)
+    return hrrr_grib.make_wind_message(
+        component="u" if variable == "eastward_wind_10m" else "v",
+        values_m_s=values,
+        grid_relative=False,
+        **common,
+    )
+
+
+class SurfaceFixtureTransport(FixtureTransport):
+    """Five native messages per lead, acquired once for all requested coordinates."""
+
+    def __init__(self, horizons: tuple[int, ...] = (1, 2, 3)) -> None:
+        super().__init__(horizons)
+        self.products = {}
+        descriptors = {
+            VARIABLE: ("TMP", "2 m above ground"),
+            "dew_point_temperature_2m": ("DPT", "2 m above ground"),
+            "eastward_wind_10m": ("UGRD", "10 m above ground"),
+            "northward_wind_10m": ("VGRD", "10 m above ground"),
+            "wind_gust_10m": ("GUST", "surface"),
+        }
+        for model in ("HRRR", "GFS"):
+            for horizon in horizons:
+                cycle_hour = 12 if model == "HRRR" else 6
+                lead = horizon if model == "HRRR" else horizon + 6
+                full, lines = b"", []
+                for number, (variable, (parameter, level)) in enumerate(descriptors.items(), 1):
+                    payload = surface_payload(model, horizon, variable)
+                    lines.append(
+                        f"{number}:{len(full)}:d=20260830{cycle_hour:02}:"
+                        f"{parameter}:{level}:{lead} hour fcst:\n"
+                    )
+                    full += payload
+                self.products[model, horizon] = full, "".join(lines).encode()
+
+    def _product(self, url: str) -> tuple[str, int, bytes, bytes, str]:
+        model, horizon, _, _, modified = super()._product(url)
+        full, index = self.products[model, horizon]
+        return model, horizon, full, index, modified
+
+
 class FixtureSleeper:
     def sleep(self, seconds: float) -> None:
         raise AssertionError(f"Unexpected retry: {seconds}")
+
+
+@pytest.mark.parametrize("model", ["HRRR", "GFS"])
+def test_surface_normalization_preserves_temperature_units_and_missing_wind_pair(
+    model: str,
+) -> None:
+    horizons = (1, 2, 3)
+    cycle = TARGET if model == "HRRR" else GFS_CYCLE
+    age = 0 if model == "HRRR" else 6
+    kwargs = dict(
+        model=model,
+        settings=phase2_configuration().hrrr if model == "HRRR" else phase2_configuration().gfs,
+        target_reference_time=TARGET,
+        source_cycle=cycle,
+        payloads_by_lead={hour + age: temperature_payload(model, hour) for hour in horizons},
+        target_horizon_hours=horizons,
+    )
+    baseline = normalize_temperature_messages(**kwargs)
+    payloads = {
+        variable: {hour + age: surface_payload(model, hour, variable) for hour in horizons}
+        for variable in prepared_temperature.SURFACE_UNITS
+    }
+    del payloads["northward_wind_10m"][age + 2]
+    actual = normalize_temperature_messages(**kwargs, field_payloads=payloads)
+    xr.testing.assert_identical(actual.air_temperature_2m, baseline.air_temperature_2m)
+    np.testing.assert_array_equal(actual.source_valid_time, baseline.source_valid_time)
+    for index, hour in enumerate(horizons):
+        np.testing.assert_array_equal(actual.dew_point_temperature_2m[index], 270.0 + hour)
+        np.testing.assert_array_equal(actual.wind_gust_10m[index], 8.0)
+    np.testing.assert_array_equal(actual.eastward_wind_10m[0], 3.0)
+    np.testing.assert_array_equal(actual.northward_wind_10m[0], 4.0)
+    assert np.isnan(actual.eastward_wind_10m[1]).all()
+    assert np.isnan(actual.northward_wind_10m[1]).all()
+    assert actual.attrs["wind_reference"] == "earth_relative"
+    reasons = json.loads(actual.attrs["field_missing_reasons_json"])
+    assert reasons["northward_wind_10m"][str(age + 2)]
+    assert reasons["eastward_wind_10m"][str(age + 2)]
+    for variable, unit in prepared_temperature.SURFACE_UNITS.items():
+        assert actual[variable].attrs["unit_id"] == unit
+
+
+def test_surface_raw_retention_rebuild_and_tampering(tmp_path: Path) -> None:
+    source, rebuilt = tmp_path / "source", tmp_path / "rebuilt"
+    configuration = phase2_configuration()
+    manifest = prepare_temperature_guidance(
+        source,
+        configuration=configuration,
+        target_reference_time=TARGET,
+        hrrr_cycle=TARGET,
+        gfs_cycle=GFS_CYCLE,
+        transport=SurfaceFixtureTransport(),
+        clock=FixtureClock(),
+        sleeper=FixtureSleeper(),
+        target_horizon_hours=(1, 2, 3),
+        surface_fields=True,
+    )
+    assert manifest["surface_fields"] is True
+    assert all(len(row["extra_messages"]) == 4 for row in manifest["inputs"])
+    replay = prepared_temperature.rebuild_temperature_guidance(
+        source,
+        rebuilt,
+        configuration=configuration,
+        clock=FixtureClock(),
+    )
+    assert replay["downloaded_bytes"] == 0
+    assert replay["inputs"] == manifest["inputs"]
+    for model in ("HRRR", "GFS"):
+        with xr.open_dataset(source / f"{model}.nc", engine="h5netcdf") as left:
+            with xr.open_dataset(rebuilt / f"{model}.nc", engine="h5netcdf") as right:
+                xr.testing.assert_identical(left, right)
+    message = manifest["inputs"][0]["extra_messages"][0]
+    (source / message["raw_file"]).write_bytes(b"changed")
+    with pytest.raises(ValueError, match="Checksum or byte count mismatch"):
+        prepared_temperature.rebuild_temperature_guidance(
+            source,
+            tmp_path / "must-not-rebuild",
+            configuration=configuration,
+            clock=FixtureClock(),
+        )
+    assert not (tmp_path / "must-not-rebuild").exists()
 
 
 def prepare_fixture_guidance(
@@ -748,8 +894,10 @@ def test_bounded_transport_stops_at_cumulative_budget_without_content_length(
     assert transport.downloaded_bytes == 128 * 1024 * 1024
 
 
+@pytest.mark.parametrize("body_budget", [128 * 1024 * 1024, 4])
 def test_bounded_transport_retains_complete_selected_response_and_counts_body_bytes(
     monkeypatch: pytest.MonkeyPatch,
+    body_budget: int,
 ) -> None:
     session = MagicMock()
     response = session.get.return_value.__enter__.return_value
@@ -757,12 +905,15 @@ def test_bounded_transport_retains_complete_selected_response_and_counts_body_by
     response.headers = {"Content-Length": "4", "Content-Range": "bytes 0-3/8"}
     response.raw.read.side_effect = [b"GRIB", b""]
     monkeypatch.setattr("requests.Session", lambda: session)
-    transport = BoundedHttpTransport()
+    transport = BoundedHttpTransport(body_budget=body_budget)
     result = transport.get("https://provider.example/fixture", headers={"Range": "bytes=0-3"})
     assert result.content == b"GRIB"
     assert result.status_code == 206
     assert transport.downloaded_bytes == 4
     session.get.return_value.__exit__.assert_called_once()
+    if body_budget == 4:
+        with pytest.raises(ValueError, match="exhausted the cumulative body budget"):
+            transport.get("https://provider.example/fixture", headers={"Range": "bytes=0-3"})
 
 
 @pytest.mark.parametrize("outside_first", [False, True])

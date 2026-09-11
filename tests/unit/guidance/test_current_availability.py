@@ -69,7 +69,7 @@ class MetadataTransport:
         return self.grib
 
 
-def probe(transport, model="HRRR"):
+def probe(transport, model="HRRR", **kwargs):
     clock = FixedClock(DECISION + timedelta(minutes=1))
     return probe_temperature(
         model=model,
@@ -80,7 +80,57 @@ def probe(transport, model="HRRR"):
         clock=clock,
         sleeper=RecordingSleeper(clock),
         decision_time=DECISION,
+        **kwargs,
     )
+
+
+@pytest.mark.parametrize("model", ["HRRR", "GFS", "RAP", "IFS"])
+def test_surface_inventory_uses_same_identity_and_preserves_optional_missingness(model):
+    transport = MetadataTransport(model)
+    if model == "IFS":
+        first = json.loads(inventory(model))
+        payload = "\n".join(
+            json.dumps({**first, "param": param, "_offset": index * 40, "_length": 40})
+            for index, param in enumerate(("2t", "2d", "10u", "10v"))
+        ).encode()
+    elif model == "RAP":
+        payload = (
+            b"1:0:d=2026091018:TMP:2 m above ground:6 hour fcst:\n"
+            b"2:40:d=2026091018:DPT:2 m above ground:6 hour fcst:\n"
+            b"3.1:80:d=2026091018:UGRD:10 m above ground:6 hour fcst:\n"
+            b"3.2:80:d=2026091018:VGRD:10 m above ground:6 hour fcst:\n"
+            b"4:120:d=2026091018:GUST:surface:6 hour fcst:\n"
+        )
+    else:
+        payload = (
+            b"1:0:d=2026091018:TMP:2 m above ground:6 hour fcst:\n"
+            b"2:40:d=2026091018:DPT:2 m above ground:6 hour fcst:\n"
+            b"3:80:d=2026091018:UGRD:10 m above ground:6 hour fcst:\n"
+            b"4:120:d=2026091018:VGRD:10 m above ground:6 hour fcst:\n"
+            b"5:160:d=2026091018:GUST:surface:0-6 hour max fcst:\n"
+        )
+    transport.index.content = payload
+    result = probe(transport, model, surface_fields=True)
+    assert result.available
+    assert [method for method, _ in transport.calls] == ["GET", "HEAD"]
+    evidence = result.evidence
+    assert evidence["selected_message"]["canonical_variable_id"] == "air_temperature_2m"
+    fields = {entry["canonical_variable_id"]: entry for entry in evidence["extra_messages"]}
+    assert set(fields) == {
+        "dew_point_temperature_2m",
+        "eastward_wind_10m",
+        "northward_wind_10m",
+    } | ({"wind_gust_10m"} if model == "RAP" else set())
+    if model == "RAP":
+        assert fields["eastward_wind_10m"]["byte_start"] == 80
+        assert fields["northward_wind_10m"]["byte_start"] == 80
+        assert fields["northward_wind_10m"]["byte_end_exclusive"] == 120
+        assert fields["northward_wind_10m"]["index_row"].startswith("3.2:")
+        assert evidence["missing_fields"] == {}
+    else:
+        assert set(evidence["missing_fields"]) == {"wind_gust_10m"}
+        assert "instantaneous" in evidence["missing_fields"]["wind_gust_10m"]
+    assert evidence["index"]["sha256"] == hashlib.sha256(payload).hexdigest()
 
 
 @pytest.mark.parametrize("model", ["HRRR", "GFS", "RAP", "IFS"])
@@ -236,3 +286,49 @@ def test_ambiguous_temperature_is_not_a_complete_run():
     transport.index.content = inventory().replace(b":DPT:", b":TMP:")
     with pytest.raises(ProviderEvidenceError, match="ambiguous"):
         probe(transport)
+
+
+class _MissingArchivesDeniedFinalMirror(MetadataTransport):
+    def __init__(self, final_status=403):
+        super().__init__("GFS")
+        self.final_status = final_status
+
+    def get(self, url, *, headers=None, timeout=None):
+        self.calls.append(("GET", url))
+        if "nomads.ncep.noaa.gov" not in url:
+            return FakeHttpResponse(404)
+        if isinstance(self.final_status, Exception):
+            raise self.final_status
+        return FakeHttpResponse(self.final_status)
+
+
+def test_explicit_missing_archives_and_denied_final_mirror_reject_only_this_candidate():
+    result = probe(_MissingArchivesDeniedFinalMirror(), "GFS")
+    assert not result.available
+    assert result.evidence["status"] == "unavailable"
+    assert "availability is unknown" in result.reason
+    attempts = result.evidence["endpoints"]
+    assert [attempt["status"] for attempt in attempts] == [
+        "unavailable",
+        "unavailable",
+        "access_denied",
+    ]
+    assert [attempt["requests"][-1]["status_code"] for attempt in attempts] == [404, 404, 403]
+    assert attempts[-1]["availability"] == "unknown"
+    assert "HTTP 403" in attempts[-1]["reason"]
+    assert "selected_endpoint" not in result.evidence
+
+
+@pytest.mark.parametrize("failure", [429, RuntimeError("network unavailable")])
+def test_missing_archives_do_not_hide_rate_or_transport_failure(failure):
+    with pytest.raises(ProviderEvidenceError) as caught:
+        probe(_MissingArchivesDeniedFinalMirror(failure), "GFS")
+    assert caught.value.evidence["status"] == "error"
+
+
+def test_all_denied_mirrors_still_fail_without_independent_missing_evidence():
+    transport = MetadataTransport("GFS", index=FakeHttpResponse(403))
+    with pytest.raises(ProviderEvidenceError) as caught:
+        probe(transport, "GFS")
+    assert caught.value.evidence["status"] == "error"
+    assert len(caught.value.evidence["endpoints"]) == 1

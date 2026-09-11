@@ -18,6 +18,7 @@ from mesoforge.catalog.sources import Phase2FieldContract, RetryPolicy
 from mesoforge.common.errors import MesoForgeError
 from mesoforge.guidance.acquisition_v2 import (
     Phase2LeadAcquisition,
+    SelectedMessage,
     _fetch_selected,
     _head_full_object_length,
     resolve_available_at,
@@ -103,6 +104,7 @@ RAP_READ_KEYS = (
     "alternativeRowScanning",
     "shapeOfTheEarth",
     "radius",
+    "uvRelativeToGrid",
 )
 RAP_TEMPERATURE_CONTRACT = Phase2FieldContract(
     canonical_variable_id="air_temperature_2m",
@@ -113,6 +115,26 @@ RAP_TEMPERATURE_CONTRACT = Phase2FieldContract(
     level=2.0,
     expected_unit_id="K",
 )
+SURFACE_FIELD_CONTRACTS = {
+    "air_temperature_2m": RAP_TEMPERATURE_CONTRACT,
+    **{
+        variable: Phase2FieldContract(
+            canonical_variable_id=variable,
+            discipline=0,
+            parameter_category=category,
+            parameter_number=number,
+            type_of_level=level_type,
+            level=level,
+            expected_unit_id=unit,
+        )
+        for variable, category, number, level_type, level, unit in (
+            ("dew_point_temperature_2m", 0, 6, "heightAboveGround", 2.0, "K"),
+            ("eastward_wind_10m", 2, 2, "heightAboveGround", 10.0, "m/s"),
+            ("northward_wind_10m", 2, 3, "heightAboveGround", 10.0, "m/s"),
+            ("wind_gust_10m", 2, 22, "surface", 0.0, "m/s"),
+        )
+    },
+}
 
 
 def _utc_hour(value: datetime) -> datetime:
@@ -144,6 +166,21 @@ class RapTemperatureUnavailableError(GribIndexError):
 def _selected_temperature(
     payload: bytes, *, cycle: datetime, forecast_hour: int
 ) -> tuple[tuple[IndexRow, ...], IndexRow]:
+    return selected_surface_field(
+        payload,
+        canonical_variable_id="air_temperature_2m",
+        cycle=cycle,
+        forecast_hour=forecast_hour,
+    )
+
+
+def selected_surface_field(
+    payload: bytes, *, canonical_variable_id: str, cycle: datetime, forecast_hour: int
+) -> tuple[tuple[IndexRow, ...], IndexRow]:
+    from mesoforge.guidance.sources.hrrr_phase2 import build_field_selector
+
+    if canonical_variable_id not in SURFACE_FIELD_CONTRACTS:
+        raise ValueError(f"Unsupported RAP surface field {canonical_variable_id!r}")
     # RAP packs some wind components into one physical GRIB message. wgrib2
     # identifies their fields as e.g. 12.1/12.2 at the same byte offset. Collapse
     # those physical-message boundaries for the shared byte-range engine while
@@ -186,16 +223,17 @@ def _selected_temperature(
         f"{row.message_number}:" + row.line.split(":", 1)[1] for row in representatives
     )
     parse_index_rows(projected)
-    step = "anl" if forecast_hour == 0 else f"{forecast_hour} hour fcst"
     logical_rows = tuple(row for group in groups for _, row in group)
-    selector = rf":TMP:2 m above ground:{step}:$"
+    selector = build_field_selector(canonical_variable_id, forecast_hour=forecast_hour)
     if not any(re.search(selector, row.descriptor) for row in logical_rows):
         raise RapTemperatureUnavailableError(
-            f"RAP temperature selector {selector!r} matched zero rows"
+            f"RAP {canonical_variable_id} selector {selector!r} matched zero rows"
         )
     row = select_field_row(logical_rows, selector)
     selected_group = groups[row.message_number - 1]
-    if len(selected_group) != 1 or selected_group[0][0] is not None:
+    if canonical_variable_id == "air_temperature_2m" and (
+        len(selected_group) != 1 or selected_group[0][0] is not None
+    ):
         raise GribIndexError("Selected RAP temperature must be a standalone physical GRIB message")
     if row.line.split(":")[2] != f"d={cycle:%Y%m%d%H}":
         raise GribIndexError("RAP inventory temperature source cycle does not match the request")
@@ -382,6 +420,7 @@ def acquire_rap_lead(
     sleeper: Sleeper,
     cycle_deadline: datetime,
     retry_policy: RetryPolicy = RAP_RETRY_POLICY,
+    canonical_variables: tuple[str, ...] = ("air_temperature_2m",),
 ) -> Phase2LeadAcquisition:
     """Acquire and retain one complete native-grid temperature GRIB message."""
     cycle = _utc_hour(cycle)
@@ -395,7 +434,20 @@ def acquire_rap_lead(
         retry_policy=retry_policy,
         cycle_deadline=cycle_deadline,
     )
-    rows, selected = _selected_temperature(index.payload, cycle=cycle, forecast_hour=forecast_hour)
+    if not canonical_variables or len(set(canonical_variables)) != len(canonical_variables):
+        raise ValueError("RAP acquisition requires unique requested surface fields")
+    selected_rows = []
+    for variable in canonical_variables:
+        rows, selected = selected_surface_field(
+            index.payload,
+            canonical_variable_id=variable,
+            cycle=cycle,
+            forecast_hour=forecast_hour,
+        )
+        selected_rows.append((variable, selected))
+    # One physical GRIB message can contain both U and V. Fetch its bytes once;
+    # each logical field retains its own original inventory descriptor.
+    unique_rows = {row.byte_offset: (variable, row) for variable, row in selected_rows}
     sleeper.sleep(RAP_REQUEST_INTERVAL_SECONDS)
     length, etag, modified = _head_full_object_length(
         transport=transport,
@@ -414,13 +466,24 @@ def acquire_rap_lead(
         endpoint=RAP_ENDPOINT,
         grib_url=grib_url,
         rows=rows,
-        selected_rows=[("air_temperature_2m", selected)],
+        selected_rows=list(unique_rows.values()),
         retry_policy=retry_policy,
         cycle_deadline=cycle_deadline,
         full_object_content_length=length,
         full_object_etag=etag,
         full_object_last_modified=modified,
     )
+    physical_messages = {message.byte_start: message for message in messages}
+    messages = [
+        SelectedMessage(
+            variable,
+            row,
+            physical_messages[row.byte_offset].byte_start,
+            physical_messages[row.byte_offset].byte_end,
+            physical_messages[row.byte_offset].payload,
+        )
+        for variable, row in selected_rows
+    ]
     index_modified = header(index.headers, "Last-Modified")
     return Phase2LeadAcquisition(
         model="rap",
@@ -452,12 +515,23 @@ class RapDecodeError(MesoForgeError):
 def decode_temperature_message(
     payload: bytes, *, cycle: datetime, forecast_hour: int
 ) -> xr.DataArray:
+    return decode_surface_message(
+        payload,
+        canonical_variable_id="air_temperature_2m",
+        cycle=cycle,
+        forecast_hour=forecast_hour,
+    )
+
+
+def decode_surface_message(
+    payload: bytes, *, canonical_variable_id: str, cycle: datetime, forecast_hour: int
+) -> xr.DataArray:
     cycle = _utc_hour(cycle)
     build_grib_url(cycle=cycle, forecast_hour=forecast_hour)  # Validate cycle-specific lead range.
     try:
         field = decode_selected_message(
             payload,
-            contract=RAP_TEMPERATURE_CONTRACT,
+            contract=SURFACE_FIELD_CONTRACTS[canonical_variable_id],
             read_keys=RAP_READ_KEYS,
             forecast_hour=forecast_hour,
             cycle_date=cycle.date(),

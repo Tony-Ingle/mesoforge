@@ -40,7 +40,7 @@ class _Response:
 
 
 class SelectedObjectTransport:
-    """Allow only selected inventories and temperature ranges, with identity checks.
+    """Allow only selected inventories and message ranges, with identity checks.
 
     Successful index GETs and object HEADs are cached within this preparation.
     Every GRIB range GET is conditional on the discovery ETag and checked again;
@@ -65,7 +65,9 @@ class SelectedObjectTransport:
         self._indexes: dict[str, dict[str, Any]] = {}
         self._gribs: dict[str, dict[str, Any]] = {}
         self._cache: dict[tuple[str, str], _Response] = {}
-        self._acquired: set[str] = set()
+        self._ranges: dict[str, dict[str, dict[str, Any]]] = {}
+        self._range_cache: dict[tuple[str, str], _Response] = {}
+        self._acquired: set[tuple[str, str]] = set()
         if not probes:
             raise ValueError("At least one selected temperature probe is required")
         for original in probes:
@@ -109,6 +111,33 @@ class SelectedObjectTransport:
                 raise ValueError("Duplicate or conflicting selected object URLs")
             self._indexes[urls[0]] = probe
             self._gribs[urls[1]] = probe
+            ranges: dict[str, dict[str, Any]] = {}
+            fields: set[str] = set()
+            for entry in (message, *probe.get("extra_messages", [])):
+                if (
+                    not isinstance(entry.get("canonical_variable_id"), str)
+                    or entry["canonical_variable_id"] in fields
+                    or type(entry.get("byte_start")) is not int
+                    or type(entry.get("byte_end_exclusive")) is not int
+                    or entry["byte_start"] < 0
+                    or entry["byte_end_exclusive"] - entry["byte_start"] < 20
+                    or entry["byte_end_exclusive"] > grib["content_length"]
+                    or entry.get("content_bytes")
+                    != entry["byte_end_exclusive"] - entry["byte_start"]
+                ):
+                    raise ValueError("Discovery selected field identity or byte range is invalid")
+                fields.add(entry["canonical_variable_id"])
+                range_header = f"bytes={entry['byte_start']}-{entry['byte_end_exclusive'] - 1}"
+                for previous in ranges.values():
+                    if max(previous["byte_start"], entry["byte_start"]) < min(
+                        previous["byte_end_exclusive"], entry["byte_end_exclusive"]
+                    ) and (previous["byte_start"], previous["byte_end_exclusive"]) != (
+                        entry["byte_start"],
+                        entry["byte_end_exclusive"],
+                    ):
+                        raise ValueError("Selected message byte ranges partially overlap")
+                ranges.setdefault(range_header, entry)
+            self._ranges[urls[1]] = ranges
 
     @property
     def downloaded_bytes(self) -> int | None:
@@ -160,11 +189,12 @@ class SelectedObjectTransport:
             if requested_range is not None:
                 self._fail("A byte range is permitted only for a selected GRIB GET")
         else:
-            selected_range = f"bytes={message['byte_start']}-{message['byte_end_exclusive'] - 1}"
-            if requested_range != selected_range:
+            if requested_range not in self._ranges[url]:
                 self._fail(
                     "GRIB GET must request exactly the temperature range selected at discovery"
                 )
+            assert requested_range is not None
+            message = self._ranges[url][requested_range]
             if ("get", probe["index"]["url"]) not in self._cache or (
                 "head",
                 url,
@@ -178,6 +208,8 @@ class SelectedObjectTransport:
             }
             request_headers["If-Match"] = expected["etag"]
         cached = self._cache.get((method, url))
+        if cached is None and requested_range is not None:
+            cached = self._range_cache.get((url, requested_range))
         if cached is not None:
             return replace(cached)
         record: dict[str, Any] = {
@@ -236,6 +268,7 @@ class SelectedObjectTransport:
                 ):
                     raise SelectedObjectError("GRIB response range/length differs from discovery")
                 record.update(
+                    canonical_variable_id=message["canonical_variable_id"],
                     sha256=hashlib.sha256(payload).hexdigest(),
                     content_bytes=len(payload),
                     byte_start=message["byte_start"],
@@ -243,13 +276,17 @@ class SelectedObjectTransport:
                     full_object_length=expected["content_length"],
                     if_match=expected["etag"],
                 )
-                self._acquired.add(url)
+                assert requested_range is not None
+                self._acquired.add((url, requested_range))
             record.update(status="matched", completed_at=_iso(self.clock.now()))
             result = _Response(
                 response.status_code, MappingProxyType(dict(response.headers)), payload
             )
             if is_index or method == "head":
                 self._cache[(method, url)] = result
+            elif probe.get("extra_messages"):
+                assert requested_range is not None
+                self._range_cache[(url, requested_range)] = result
             return replace(result)
         except Exception as exc:
             record.update(status="failed", reason=str(exc), completed_at=_iso(self.clock.now()))
@@ -278,6 +315,9 @@ class SelectedObjectTransport:
         """Require every selected native message; expected non-native gaps are not probes."""
         if self.failed_reason is not None:
             raise SelectedObjectError(self.failed_reason)
-        missing = sorted(set(self._gribs).difference(self._acquired))
+        expected = {
+            (url, byte_range) for url, ranges in self._ranges.items() for byte_range in ranges
+        }
+        missing = sorted(expected.difference(self._acquired))
         if missing:
             raise SelectedObjectError(f"Selected temperature messages were not acquired: {missing}")

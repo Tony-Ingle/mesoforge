@@ -16,6 +16,7 @@ from mesoforge.guidance.sources.rap import (
     _selected_temperature,
     acquire_rap_lead,
     build_grib_url,
+    decode_surface_message,
     decode_temperature_message,
     discover_rap_cycle,
     maximum_lead,
@@ -341,6 +342,78 @@ def test_decodes_actual_rap_geometry_temperature_and_valid_time(rap_payload):
     assert decoded.attrs["GRIB_validityDate"] == 20260910
     assert decoded.attrs["GRIB_validityTime"] == 1900
     assert decoded.attrs["GRIB_dataTime"] == 1500
+
+
+@pytest.mark.parametrize(
+    "variable,category,number,level_type,level,value,unit",
+    [
+        ("dew_point_temperature_2m", 0, 6, "heightAboveGround", 2, 275.5, "K"),
+        ("eastward_wind_10m", 2, 2, "heightAboveGround", 10, 3.0, "m s**-1"),
+        ("northward_wind_10m", 2, 3, "heightAboveGround", 10, -4.0, "m s**-1"),
+        ("wind_gust_10m", 2, 22, "surface", 0, 7.0, "m s**-1"),
+    ],
+)
+def test_surface_decoder_preserves_units_orientation_time_and_native_values(
+    rap_payload, variable, category, number, level_type, level, value, unit
+):
+    import eccodes
+
+    message = eccodes.codes_new_from_message(rap_payload)
+    try:
+        for key, setting in {
+            "parameterCategory": category,
+            "parameterNumber": number,
+            "typeOfLevel": level_type,
+            "level": level,
+            "uvRelativeToGrid": 1,
+        }.items():
+            eccodes.codes_set(message, key, setting)
+        eccodes.codes_set_values(message, np.full(337 * 451, value))
+        payload = bytes(eccodes.codes_get_message(message))
+    finally:
+        eccodes.codes_release(message)
+    field = decode_surface_message(
+        payload, canonical_variable_id=variable, cycle=_cycle(15), forecast_hour=4
+    )
+    np.testing.assert_array_equal(field.values, np.full((337, 451), value))
+    assert field.attrs["GRIB_units"] == unit
+    assert field.attrs["GRIB_uvRelativeToGrid"] == 1
+    assert field.valid_time.values == np.datetime64("2026-09-10T19:00:00")
+    with pytest.raises(RapDecodeError, match="lead mismatch"):
+        decode_surface_message(
+            payload, canonical_variable_id=variable, cycle=_cycle(15), forecast_hour=5
+        )
+
+
+def test_surface_acquisition_downloads_compound_wind_range_once(rap_payload):
+    cycle, lead = _cycle(15), 4
+    length = len(rap_payload)
+    index = (
+        "1:0:d=2026091015:TMP:2 m above ground:4 hour fcst:\n"
+        f"2.1:{length}:d=2026091015:UGRD:10 m above ground:4 hour fcst:\n"
+        f"2.2:{length}:d=2026091015:VGRD:10 m above ground:4 hour fcst:\n"
+    )
+    # The range transport checks message framing; field decoding has separate tests.
+    published = _object(cycle, lead, rap_payload * 2)
+    published.index_text = lambda: index
+    transport = _transport({build_grib_url(cycle=cycle, forecast_hour=lead): published})
+    clock = FixedClock(TARGET)
+    fields = ("air_temperature_2m", "eastward_wind_10m", "northward_wind_10m")
+    acquired = acquire_rap_lead(
+        cycle=cycle,
+        forecast_hour=lead,
+        transport=transport,
+        clock=clock,
+        sleeper=RecordingSleeper(clock),
+        cycle_deadline=TARGET,
+        canonical_variables=fields,
+    )
+    assert tuple(message.canonical_variable_id for message in acquired.selected_messages) == fields
+    u, v = acquired.selected_messages[1:]
+    assert u.payload == v.payload == rap_payload
+    assert u.byte_start == v.byte_start == length
+    assert u.row.line.startswith("2.1:") and v.row.line.startswith("2.2:")
+    assert transport.range_headers == [f"bytes=0-{length - 1}", f"bytes={length}-{2 * length - 1}"]
 
 
 @pytest.mark.parametrize(

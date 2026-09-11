@@ -18,6 +18,7 @@ from mesoforge.guidance.sources.ifs import (
     acquire_ifs_lead,
     build_grib_url,
     build_index_url,
+    decode_surface_message,
     decode_temperature_message,
     discover_ifs_cycle,
     selected_temperature,
@@ -351,6 +352,75 @@ def test_decoder_preserves_temperature_identity_time_native_wrapped_grid(ifs_pay
     assert field.valid_time.values == np.datetime64("2026-09-11T00:00:00")
     assert field.longitude.values[0] == -180  # cfgrib normalizes native180 modulo360.
     assert field.longitude.values[-1] == 179.75
+
+
+@pytest.mark.parametrize(
+    "variable,param,value,unit",
+    [
+        ("dew_point_temperature_2m", 168, 275.5, "K"),
+        ("eastward_wind_10m", 165, 3.0, "m s**-1"),
+        ("northward_wind_10m", 166, -4.0, "m s**-1"),
+    ],
+)
+def test_surface_decoder_preserves_native_values_units_and_instantaneous_semantics(
+    ifs_payload, variable, param, value, unit
+):
+    import eccodes
+
+    message = eccodes.codes_new_from_message(ifs_payload)
+    try:
+        eccodes.codes_set(message, "paramId", param)
+        eccodes.codes_set(message, "uvRelativeToGrid", 0)
+        eccodes.codes_set_values(message, np.full(721 * 1440, value))
+        payload = bytes(eccodes.codes_get_message(message))
+    finally:
+        eccodes.codes_release(message)
+    field = decode_surface_message(
+        payload, canonical_variable_id=variable, cycle=CYCLE, forecast_hour=6
+    )
+    np.testing.assert_array_equal(field.values, np.full((721, 1440), value))
+    assert field.attrs["GRIB_units"] == unit
+    assert field.attrs["GRIB_uvRelativeToGrid"] == 0
+    assert field.attrs["GRIB_modelVersion"] == "cy50r1"
+    assert field.valid_time.values == np.datetime64("2026-09-11T00:00:00")
+    with pytest.raises(IfsDecodeError, match="lead mismatch"):
+        decode_surface_message(
+            payload, canonical_variable_id=variable, cycle=CYCLE, forecast_hour=9
+        )
+
+
+def test_surface_acquisition_retains_each_requested_range_and_no_gust(ifs_payload):
+    fields = (
+        "air_temperature_2m",
+        "dew_point_temperature_2m",
+        "eastward_wind_10m",
+        "northward_wind_10m",
+    )
+    published = IfsObject(
+        entries=tuple(
+            InventoryEntry(f"{param}:6", ifs_payload)
+            for param in ("2t", "2d", "10u", "10v", "10fg")
+        ),
+        cycle_date=CYCLE.date(),
+        cycle_hour=CYCLE.hour,
+    )
+    transport = _transport({build_grib_url(cycle=CYCLE, forecast_hour=6): published})
+    clock = FixedClock(TARGET)
+    acquired = acquire_ifs_lead(
+        cycle=CYCLE,
+        forecast_hour=6,
+        transport=transport,
+        clock=clock,
+        sleeper=RecordingSleeper(clock),
+        cycle_deadline=TARGET,
+        canonical_variables=fields,
+    )
+    assert tuple(message.canonical_variable_id for message in acquired.selected_messages) == fields
+    length = len(ifs_payload)
+    assert transport.range_headers == [
+        f"bytes={n * length}-{(n + 1) * length - 1}" for n in range(4)
+    ]
+    assert len(transport.head_calls) == 1
 
 
 @pytest.mark.parametrize(

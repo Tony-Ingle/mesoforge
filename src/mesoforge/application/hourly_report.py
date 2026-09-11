@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -73,6 +74,9 @@ def build_hourly_report(
                 },
             }
         )
+        if "surface" in hour:
+            hours[-1]["surface"] = deepcopy(hour["surface"])
+            hours[-1]["final_surface_fields"] = deepcopy(hour["surface"]["fields"])
     return {
         "latitude": forecast["latitude"],
         "longitude": forecast["longitude"],
@@ -94,6 +98,8 @@ def _temperature_text(temperature: dict[str, Any]) -> str:
 
 def render_hourly_report(report: dict[str, Any]) -> str:
     """Render every stored hour, without calculating any bias or AI correction."""
+    if any("surface" in hour for hour in report["hours"]):
+        return _render_surface_report(report)
     lines = [
         f"Forecast at {report['latitude']}, {report['longitude']}",
         "",
@@ -141,4 +147,131 @@ def render_hourly_report(report: dict[str, Any]) -> str:
     if missing:
         lines.extend(["", "Missing guidance (no interpolation or weight redistribution):", ""])
         lines.extend(f"- {reason}" for reason in missing)
+    return "\n".join(lines) + "\n"
+
+
+def _surface_value(fields: dict[str, Any], variable: str) -> str:
+    field = fields.get(variable)
+    if field is None or field["value"] is None:
+        return "unavailable"
+    value = field["value"]
+    if field["unit"] == "K":
+        return _temperature_text(_display_temperature(field))
+    if field["unit"] == "m/s":
+        return f"{value * 3600 / 1609.344:.1f}"
+    if variable == "wind_from_direction_10m":
+        points = (
+            "N",
+            "NNE",
+            "NE",
+            "ENE",
+            "E",
+            "ESE",
+            "SE",
+            "SSE",
+            "S",
+            "SSW",
+            "SW",
+            "WSW",
+            "W",
+            "WNW",
+            "NW",
+            "NNW",
+        )
+        return f"{points[math.floor((value + 11.25) / 22.5) % 16]} ({value:.0f}°)"
+    return f"{value:.1f}"
+
+
+def _render_surface_report(report: dict[str, Any]) -> str:
+    """Present the unchanged numerical surface baseline and native contributors."""
+    columns = (
+        "air_temperature_2m",
+        "dew_point_temperature_2m",
+        "relative_humidity_2m",
+        "wind_speed_10m",
+        "wind_from_direction_10m",
+        "wind_gust_10m",
+    )
+    lines = [
+        f"Surface forecast at {report['latitude']}, {report['longitude']}",
+        "",
+        f"Reference: {report['target_reference_time']}. "
+        f"Display zone: {report['display_timezone']}.",
+        "Temperature remains HRRR/GFS 70/30. Dew point and coupled vector wind/gust "
+        "use the retained Phase 2 rows: HRRR/GFS 70/30 at hours 1–18 and 60/40 at "
+        "19–36 when both are eligible; approved single-model fallbacks are labeled. "
+        "RAP/IFS are zero-weight shadows. "
+        "RH is derived over liquid water from temperature/dew point.",
+        "Bias correction: not_implemented, applied delta 0. AI action: not_run, nudge 0; "
+        "AI forecast-desk stage not implemented yet. Final surface fields equal the "
+        "numerical baseline. Delivery has not run. New issued hours are not_yet_verified; "
+        "verification of previous versions is separate.",
+        "Cloud cover: unavailable because no approved retained cloud blend policy exists. "
+        "IFS instantaneous gust: unavailable because its published gust is an interval maximum. "
+        "Native three-hourly IFS gaps are preserved. Stored Kelvin, m/s, degree and percent "
+        "values are unrounded, with source cycles, leads, raw hashes, rules and exclusion reasons.",
+        "",
+        "| Hour | UTC valid time | Local/display valid time | T °F | Td °F | RH % | "
+        "Wind mph | From | Gust mph | Missing / exclusions |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    reasons: dict[str, list[int]] = {}
+    for hour in report["hours"]:
+        surface = hour.get("surface", {})
+        fields = surface.get("fields", {})
+        issues = [f"{v}: unavailable" for v in columns if fields.get(v, {}).get("value") is None]
+        for variable in columns:
+            field = fields.get(variable, {})
+            if field.get("value") is not None:
+                weights = field.get("weights", {})
+                if len(weights) == 1:
+                    issues.append(f"{variable}: {next(iter(weights))}-only fallback")
+                elif field.get("missing_reasons"):
+                    issues.append(f"{variable}: contributor exclusions (see below)")
+            for reason in field.get("missing_reasons", []):
+                reasons.setdefault(f"{variable}: {reason}", []).append(hour["horizon_hours"])
+        cells = [
+            str(hour["horizon_hours"]),
+            hour["valid_time_utc"],
+            hour["valid_time_local"],
+            *(_surface_value(fields, v) for v in columns),
+            ("; ".join(issues) if issues else "none") + "; cloud unavailable",
+        ]
+        lines.append("| " + " | ".join(cells) + " |")
+    models = sorted(
+        {model for h in report["hours"] for model in h.get("surface", {}).get("contributors", {})}
+    )
+    for model in models:
+        native = next(
+            h["surface"]["contributors"][model]
+            for h in report["hours"]
+            if model in h.get("surface", {}).get("contributors", {})
+        )
+        lines.extend(
+            [
+                "",
+                f"### {model} native contributor ({native['role']}; cycle {native['cycle']})",
+                "",
+                "| Hour | Source lead | T °F | Td °F | RH % | Wind mph | From | Gust mph |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- |",
+            ]
+        )
+        for hour in report["hours"]:
+            source = hour.get("surface", {}).get("contributors", {}).get(model, {})
+            fields = source.get("fields", {})
+            cells = [
+                str(hour["horizon_hours"]),
+                str(source.get("source_lead_hours") or "unavailable"),
+                *(_surface_value(fields, v) for v in columns),
+            ]
+            lines.append("| " + " | ".join(cells) + " |")
+            for variable, field in fields.items():
+                for reason in field.get("missing_reasons", []):
+                    reasons.setdefault(f"{model} {variable}: {reason}", []).append(
+                        hour["horizon_hours"]
+                    )
+    if reasons:
+        lines.extend(["", "Explicit missingness and scientific exclusions:", ""])
+        for reason, hours in reasons.items():
+            lines.append(f"- Hours {', '.join(str(h) for h in sorted(set(hours)))}: {reason}")
     return "\n".join(lines) + "\n"

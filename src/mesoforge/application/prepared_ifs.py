@@ -17,13 +17,23 @@ from typing import Any
 from mesoforge.application.batch_forecast import load_locations
 from mesoforge.application.prepared_shadow import normalize_shadow_temperature
 from mesoforge.application.prepared_temperature import BoundedHttpTransport, _code_identity
-from mesoforge.application.shadow_preparation import ShadowAdapter, prepare_shadow
+from mesoforge.application.shadow_preparation import (
+    ShadowAdapter,
+    prepare_shadow,
+    retained_surface_mode,
+)
 from mesoforge.catalog.contributors import IFS_MODEL_DEFINITION, RAP_MODEL_DEFINITION
-from mesoforge.forecasting.recipes import DEFAULT_CONFIGURATION, ContributorConfiguration
+from mesoforge.forecasting.recipes import (
+    DEFAULT_CONFIGURATION,
+    ContributorConfiguration,
+    with_surface_fields,
+)
 from mesoforge.guidance.interfaces import Clock, HttpTransport, Sleeper
 from mesoforge.guidance.sources.ifs import (
     IFS_CAPABILITIES,
+    SURFACE_FIELD_CONTRACTS,
     acquire_ifs_lead,
+    decode_surface_message,
     decode_temperature_message,
     discover_ifs_cycle,
 )
@@ -66,19 +76,35 @@ def prepare_ifs(
     transport: HttpTransport | None = None,
     clock: Clock | None = None,
     sleeper: Sleeper | None = None,
+    surface_fields: bool = False,
+    canonical_variables_by_lead: dict[int, tuple[str, ...]] | None = None,
 ) -> dict[str, Any]:
     """Retain native IFS values separately; both IFS and RAP have zero active weight."""
+    surface_fields = surface_fields or retained_surface_mode(from_raw or output_directory)
+    configuration = with_surface_fields(IFS_CONFIGURATION) if surface_fields else IFS_CONFIGURATION
+    metadata = (
+        {
+            **_SOURCE_METADATA,
+            "model_definition": configuration.model_map()["IFS"].model_dump(mode="json"),
+            "adapter_version": "ifs_surface_v1",
+            "product": "IFS Open Data deterministic oper/fc, 0.25 degree, 2t/2d/10u/10v",
+        }
+        if surface_fields
+        else _SOURCE_METADATA
+    )
     return prepare_shadow(
         locations,
         control_directory,
         output_directory,
         adapter=ShadowAdapter(
             model="IFS",
-            source_metadata=_SOURCE_METADATA,
-            configuration=IFS_CONFIGURATION,
+            source_metadata=metadata,
+            configuration=configuration,
             discover_cycle=discover_ifs_cycle,
             acquire_lead=acquire_ifs_lead,
             decode_message=decode_temperature_message,
+            decode_surface_message=decode_surface_message,
+            surface_variables=tuple(SURFACE_FIELD_CONTRACTS),
             normalize=normalize_shadow_temperature,
             code_identity=_identity,
             transport_factory=BoundedHttpTransport,
@@ -89,6 +115,8 @@ def prepare_ifs(
         transport=transport,
         clock=clock,
         sleeper=sleeper,
+        surface_fields=surface_fields,
+        canonical_variables_by_lead=canonical_variables_by_lead,
     )
 
 

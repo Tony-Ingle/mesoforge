@@ -19,11 +19,14 @@ import xarray as xr
 
 from mesoforge.application.batch_forecast import _coordinates
 from mesoforge.application.point_forecast import _verify_file
+from mesoforge.application.prepared_shadow import SURFACE_UNITS
 from mesoforge.application.prepared_temperature import (
     BoundedHttpTransport,
     _hour,
     _iso,
+    _raw_byte_count,
     _retain_input,
+    _retained_extra_payloads,
     _write_bytes,
     _write_prepared_file,
 )
@@ -48,6 +51,8 @@ class ShadowAdapter:
     normalize: Callable[..., xr.Dataset]
     code_identity: Callable[[], dict[str, Any]]
     transport_factory: Callable[[], BoundedHttpTransport] = BoundedHttpTransport
+    decode_surface_message: Callable[..., xr.DataArray] | None = None
+    surface_variables: tuple[str, ...] = ()
 
 
 def _source(directory: Path) -> Path:
@@ -56,6 +61,16 @@ def _source(directory: Path) -> Path:
         Path(json.loads(coverage.read_text())["source_directory"])
         if coverage.is_file()
         else directory
+    )
+
+
+def retained_surface_mode(directory: Path) -> bool:
+    """Use a saved snapshot's declared scope when selecting its adapter metadata."""
+    manifest = _source(directory) / "manifest.json"
+    return (
+        bool(json.loads(manifest.read_text()).get("surface_fields"))
+        if manifest.is_file()
+        else False
     )
 
 
@@ -96,6 +111,7 @@ def _raw_inputs(source: Path, manifest: dict[str, Any], *, model: str) -> dict[i
             if (source / filename).stat().st_size != row[f"{prefix}_bytes"]:
                 raise ValueError(f"Retained {model} input byte count disagrees")
         inputs[lead] = (source / row["raw_file"]).read_bytes()
+        _retained_extra_payloads(source, row)
     return inputs
 
 
@@ -117,6 +133,8 @@ def prepare_shadow(
     transport: HttpTransport | None = None,
     clock: Clock | None = None,
     sleeper: Sleeper | None = None,
+    surface_fields: bool = False,
+    canonical_variables_by_lead: dict[int, tuple[str, ...]] | None = None,
 ) -> dict[str, Any]:
     """Acquire, rebuild or reuse shadow guidance independently of the control files."""
     model = adapter.model
@@ -147,6 +165,7 @@ def prepare_shadow(
             or manifest.get("requested_target_horizons", list(_HOURS)) != list(target_horizons)
             or report["requested_areas"] != [area.model_dump() for area in areas]
             or (cycle_override is not None and manifest["selected_cycle"] != _iso(cycle_override))
+            or bool(manifest.get("surface_fields")) != surface_fields
         ):
             raise ValueError(f"Existing {model} snapshot differs; use a new output directory")
         _raw_inputs(source, manifest, model=model)
@@ -168,6 +187,7 @@ def prepare_shadow(
     missing: dict[int, str] = {}
     rows = []
     payloads: dict[int, bytes] = {}
+    surface_payloads: dict[str, dict[int, bytes]] = {name: {} for name in SURFACE_UNITS}
     if from_raw is not None:
         retained = _source(from_raw)
         retained_payload = (retained / "manifest.json").read_bytes()
@@ -180,10 +200,15 @@ def prepare_shadow(
         ):
             raise ValueError(f"Retained {model} capabilities or control window differ")
         payloads = _raw_inputs(retained, manifest, model=model)
+        surface_fields = bool(manifest.get("surface_fields"))
         rows = manifest["inputs"]
         for row in rows:
             for prefix in ("raw", "index"):
                 shutil.copyfile(retained / row[f"{prefix}_file"], source / row[f"{prefix}_file"])
+            for variable, payload in _retained_extra_payloads(retained, row).items():
+                surface_payloads[variable][row["source_lead_hours"]] = payload
+            for filename in {message["raw_file"] for message in row.get("extra_messages", [])}:
+                shutil.copyfile(retained / filename, source / filename)
         _write_bytes(source / "source-manifest.json", retained_payload)
         missing = {int(hour): reason for hour, reason in manifest["missing_hours"].items()}
         cycle = (
@@ -222,6 +247,15 @@ def prepare_shadow(
                             clock=clock,
                             sleeper=sleeper,
                             cycle_deadline=clock.now(),
+                            **(
+                                {
+                                    "canonical_variables": canonical_variables_by_lead[lead]
+                                    if canonical_variables_by_lead is not None
+                                    else adapter.surface_variables
+                                }
+                                if surface_fields
+                                else {}
+                            ),
                         )
                     except (MesoForgeError, ValueError) as exc:
                         missing[hour] = (
@@ -229,16 +263,22 @@ def prepare_shadow(
                         )
                         continue
                     rows.append(_retain_input(source, acquired))
-                    payloads[lead] = acquired.selected_messages[0].payload
+                    for message in acquired.selected_messages:
+                        if message.canonical_variable_id == "air_temperature_2m":
+                            payloads[lead] = message.payload
+                        else:
+                            surface_payloads[message.canonical_variable_id][lead] = message.payload
             downloaded = getattr(
                 transport,
                 "downloaded_bytes",
-                sum(row["raw_bytes"] + row["index_bytes"] for row in rows),
+                _raw_byte_count(rows) + sum(row["index_bytes"] for row in rows),
             )
         finally:
             if owned_transport is not None:
                 owned_transport.close()
     decoded = {}
+    decoded_surface: dict[str, dict[int, xr.DataArray]] = {name: {} for name in SURFACE_UNITS}
+    field_missing: dict[str, dict[str, list[str]]] = {name: {} for name in SURFACE_UNITS}
     for lead, payload in payloads.items():
         assert cycle is not None
         hour = int((cycle + timedelta(hours=lead) - target).total_seconds() / 3600)
@@ -246,6 +286,23 @@ def prepare_shadow(
             decoded[lead] = adapter.decode_message(payload, cycle=cycle, forecast_hour=lead)
         except (MesoForgeError, ValueError) as exc:
             missing[hour] = f"{model} decoding unavailable: {type(exc).__name__}: {exc}"
+        if surface_fields:
+            if adapter.decode_surface_message is None:
+                raise ValueError(f"{model} adapter has no surface decoder")
+            for variable, by_lead in surface_payloads.items():
+                if lead not in by_lead:
+                    continue
+                try:
+                    decoded_surface[variable][lead] = adapter.decode_surface_message(
+                        by_lead[lead],
+                        canonical_variable_id=variable,
+                        cycle=cycle,
+                        forecast_hour=lead,
+                    )
+                except (MesoForgeError, ValueError) as exc:
+                    field_missing[variable][str(lead)] = [
+                        f"{model} {variable} decoding unavailable: {type(exc).__name__}: {exc}"
+                    ]
     supported = [
         hour
         for hour in _HOURS
@@ -275,6 +332,11 @@ def prepare_shadow(
         "missing_hours": missing,
         "downloaded_bytes": downloaded,
         "code_identity": adapter.code_identity(),
+        **(
+            {"surface_fields": True, "field_missing_reasons": field_missing}
+            if surface_fields
+            else {}
+        ),
     }
     if from_raw is not None:
         manifest["source_manifest_sha256"] = hashlib.sha256(retained_payload).hexdigest()
@@ -288,12 +350,23 @@ def prepare_shadow(
         for row in rows:
             for prefix in ("raw", "index"):
                 shutil.copyfile(source / row[f"{prefix}_file"], directory / row[f"{prefix}_file"])
+            for filename in {message["raw_file"] for message in row.get("extra_messages", [])}:
+                shutil.copyfile(source / filename, directory / filename)
         prepared_files = {}
         if decoded:
             assert cycle is not None
             try:
                 dataset = adapter.normalize(
-                    decoded, model=model, cycle=cycle, target=target, area=area
+                    decoded,
+                    model=model,
+                    cycle=cycle,
+                    target=target,
+                    area=area,
+                    **(
+                        {"decoded_surface": decoded_surface, "field_missing_reasons": field_missing}
+                        if surface_fields
+                        else {}
+                    ),
                 )
             except UnsupportedCoordinateError as exc:
                 failures.append({"area": area.model_dump(), "reason": str(exc)})
@@ -326,7 +399,7 @@ def prepare_shadow(
         "regions": regions,
         "failures": failures,
         "downloaded_bytes": downloaded,
-        "retained_raw_bytes": sum(row["raw_bytes"] for row in rows),
+        "retained_raw_bytes": _raw_byte_count(rows),
         "retained_index_bytes": sum(row["index_bytes"] for row in rows),
         "prepared_bytes": sum(row["prepared_bytes"] for row in regions),
         "mode": "rebuilt_offline" if from_raw is not None else "acquired_shadow",
