@@ -60,6 +60,7 @@ def prepare_ifs(
     control_directory: Path,
     output_directory: Path,
     *,
+    target_horizons: tuple[int, ...] = tuple(range(1, 37)),
     from_raw: Path | None = None,
     cycle_override: datetime | None = None,
     transport: HttpTransport | None = None,
@@ -83,6 +84,7 @@ def prepare_ifs(
             transport_factory=BoundedHttpTransport,
         ),
         from_raw=from_raw,
+        target_horizons=target_horizons,
         cycle_override=cycle_override,
         transport=transport,
         clock=clock,
@@ -99,6 +101,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--output-dir", type=Path, required=True, help="Shadow data outside Git")
     parser.add_argument("--from-raw", type=Path, help="Rebuild offline from retained IFS evidence")
     parser.add_argument("--ifs-cycle", type=datetime.fromisoformat, help="Optional fixed UTC cycle")
+    parser.add_argument(
+        "--hours",
+        nargs="+",
+        type=int,
+        default=list(range(1, 37)),
+        help="Bounded target hours to acquire; only native IFS valid times are available",
+    )
     args = parser.parse_args(argv)
     report = prepare_ifs(
         load_locations(args.config),
@@ -106,6 +115,7 @@ def main(argv: list[str] | None = None) -> None:
         args.output_dir,
         from_raw=args.from_raw,
         cycle_override=args.ifs_cycle,
+        target_horizons=tuple(args.hours),
     )
     print(json.dumps(report, indent=2))
 

@@ -299,10 +299,17 @@ def discover_ifs_cycle(
     sleeper: Sleeper,
     lookback_hours: int = 24,
     cycle_override: datetime | None = None,
+    target_horizons: tuple[int, ...] = tuple(range(1, 37)),
     retry_policy: RetryPolicy = IFS_RETRY_POLICY,
 ) -> IfsCycleSelection:
     """Prefer the freshest observed complete set of native slots within target1..36."""
     target = _utc_hour(target_reference_time)
+    if (
+        not target_horizons
+        or any(type(hour) is not int or not 1 <= hour <= 36 for hour in target_horizons)
+        or tuple(sorted(set(target_horizons))) != target_horizons
+    ):
+        raise ValueError("target_horizons must be a sorted unique nonempty subset of 1..36")
     now = clock.now()
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("IFS discovery clock must be timezone aware")
@@ -312,7 +319,9 @@ def discover_ifs_cycle(
     if cycle_override is not None:
         cycle_override = _utc_hour(cycle_override)
         build_grib_url(cycle=cycle_override, forecast_hour=0)
-        if cycle_override > latest or target - cycle_override > timedelta(hours=54):
+        if cycle_override > latest or target - cycle_override > timedelta(
+            hours=90 - max(target_horizons)
+        ):
             raise ValueError("IFS override must be at/before target and execution, with leads <=90")
         cycles = [cycle_override]
     else:
@@ -320,8 +329,18 @@ def discover_ifs_cycle(
             cycle
             for age in range(lookback_hours + 1)
             if (cycle := latest - timedelta(hours=age)).hour in (0, 6, 12, 18)
-            and target - cycle <= timedelta(hours=54)
+            and target - cycle <= timedelta(hours=90 - max(target_horizons))
         ]
+    if not any((target.hour + hour) % 3 == 0 for hour in target_horizons):
+        return IfsCycleSelection(
+            None,
+            (),
+            (),
+            (),
+            {hour: NO_NATIVE_GUIDANCE for hour in target_horizons},
+            (),
+            "No requested valid time has native IFS guidance; no cycle was probed or selected",
+        )
     probes: list[IfsCycleProbe] = []
 
     def selection(probe: IfsCycleProbe, reason: str) -> IfsCycleSelection:
@@ -337,9 +356,13 @@ def discover_ifs_cycle(
 
     for cycle in cycles:
         age = int((target - cycle).total_seconds() / 3600)
-        leads = tuple(age + hour for hour in range(1, 37))
+        leads = tuple(age + hour for hour in target_horizons)
         native = tuple(lead for lead in leads if lead % 3 == 0)
-        missing = {hour: NO_NATIVE_GUIDANCE for hour, lead in enumerate(leads, 1) if lead % 3}
+        missing = {
+            hour: NO_NATIVE_GUIDANCE
+            for hour, lead in zip(target_horizons, leads, strict=True)
+            if lead % 3
+        }
         available: list[int] = []
         urls: list[str] = []
         for lead in native:
@@ -381,7 +404,7 @@ def discover_ifs_cycle(
         (),
         (),
         (),
-        {hour: "No usable IFS cycle in bounded discovery" for hour in range(1, 37)},
+        {hour: "No usable IFS cycle in bounded discovery" for hour in target_horizons},
         tuple(probes),
         "IFS shadow unavailable; active forecast unchanged",
     )

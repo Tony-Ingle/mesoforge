@@ -115,6 +115,30 @@ def test_discovery_empty_provider_is_explicit_and_bounded():
     assert len(transport.get_calls) <= 7 * 36
 
 
+def test_bounded_discovery_uses_fresh_complete_short_cycle_and_only_requested_indexes():
+    hours = (3, 6, 9, 12)
+    transport = _transport(_published(TARGET, hours))
+    result = _discover(transport, target_horizons=hours)
+    assert result.cycle == TARGET
+    assert result.source_leads == result.available_leads == hours
+    assert result.missing_hours == {}
+    assert len(transport.get_calls) == 4
+    assert transport.head_calls == []
+    assert [url for url, _ in transport.get_calls] == [
+        build_grib_url(cycle=TARGET, forecast_hour=lead) + ".idx" for lead in hours
+    ]
+
+
+def test_bounded_override_preserves_target_hour_numbers_for_missing_leads():
+    hours = (3, 6, 9, 12)
+    transport = _transport(_published(_cycle(15), (6, 12, 15)))
+    result = _discover(transport, target_horizons=hours, cycle_override=_cycle(15))
+    assert result.source_leads == (6, 9, 12, 15)
+    assert result.available_leads == (6, 12, 15)
+    assert set(result.missing_hours) == {6}
+    assert len(transport.get_calls) == 4
+
+
 @pytest.mark.parametrize("status,attempts", [(403, 1), (429, 3)])
 def test_discovery_stops_on_provider_access_or_rate_rejection(status, attempts):
     transport = ScriptedProviderTransport(

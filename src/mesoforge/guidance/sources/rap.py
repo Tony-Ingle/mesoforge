@@ -252,6 +252,7 @@ def discover_rap_cycle(
     sleeper: Sleeper,
     lookback_hours: int = 24,
     cycle_override: datetime | None = None,
+    target_horizons: tuple[int, ...] = tuple(range(1, 37)),
     retry_policy: RetryPolicy = RAP_RETRY_POLICY,
 ) -> RapCycleSelection:
     """Find complete extended guidance first, otherwise explicitly partial shadow.
@@ -262,6 +263,12 @@ def discover_rap_cycle(
     subsequent provider failure must remain missing, never change active output.
     """
     target = _utc_hour(target_reference_time)
+    if (
+        not target_horizons
+        or any(type(hour) is not int or not 1 <= hour <= 36 for hour in target_horizons)
+        or tuple(sorted(set(target_horizons))) != target_horizons
+    ):
+        raise ValueError("target_horizons must be a sorted unique nonempty subset of 1..36")
     now = clock.now()
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("Discovery clock must be timezone aware")
@@ -282,11 +289,11 @@ def discover_rap_cycle(
         if cycle in probes:
             return probes[cycle]
         age = int((target - cycle).total_seconds() / 3600)
-        leads = tuple(age + hour for hour in range(1, 37))
+        leads = tuple(age + hour for hour in target_horizons)
         available: list[int] = []
         missing: dict[int, str] = {}
         urls: list[str] = []
-        for hour, lead in enumerate(leads, start=1):
+        for hour, lead in zip(target_horizons, leads, strict=True):
             if not 0 <= lead <= maximum_lead(cycle):
                 missing[hour] = f"RAP source lead {lead} exceeds cycle coverage"
                 continue
@@ -335,14 +342,17 @@ def discover_rap_cycle(
 
     # An older complete extended cycle wins over fresher, shorter/partial data.
     for cycle in candidates:
-        if cycle.hour not in RAP_EXTENDED_CYCLE_HOURS:
-            continue
-        if int((target - cycle).total_seconds() / 3600) + 36 > 51:
+        if int((target - cycle).total_seconds() / 3600) + max(target_horizons) > maximum_lead(
+            cycle
+        ):
             continue
         result = probe(cycle)
         if not result.missing_hours:
             return selection(
-                result, "Newest observed complete RAP extended cycle for all 36 valid times"
+                result,
+                "Newest observed complete RAP extended cycle for all 36 valid times"
+                if target_horizons == tuple(range(1, 37))
+                else "Newest observed complete RAP cycle for the requested target hours",
             )
 
     # Shadow-only fallback: freshest cycle with any usable temperature guidance.
@@ -357,7 +367,7 @@ def discover_rap_cycle(
         None,
         (),
         (),
-        {hour: "No usable RAP temperature cycle in bounded discovery" for hour in range(1, 37)},
+        {hour: "No usable RAP temperature cycle in bounded discovery" for hour in target_horizons},
         tuple(probes.values()),
         "No usable RAP temperature guidance; active forecast is unchanged",
     )

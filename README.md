@@ -125,8 +125,12 @@ not model rankings. [ECMWF IFS now also runs in shadow mode](#prepare-ecmwf-ifs-
 using native three-hourly values with explicit missingness between them. Both shadows
 have zero active weight. The real three-location demonstration preserved every active
 forecast value; no eligible real IFS/observation pairs were available at validation.
-Next proposed: inventory retained inputs for one bounded four-model historical replay,
-including actual availability cutoffs and observation coverage before acquiring more data.
+The first [bounded real historical backtest](#bounded-historical-temperature-backtest)
+now compares all four models and both recipes on 12 identical METAR pairs, without
+changing production or issued history. This is retrospective evaluation with explicit
+publication cutoffs, not a claim of historical local issuance. Next proposed: a staged,
+geographically stratified dataset with time/location holdouts and model-version cohorts
+before deriving any candidate weights.
 The combined locations lifecycle remains future work.
 
 Future direction: configure locations using latitude/longitude only, with geographic
@@ -1058,6 +1062,115 @@ ECMWF data is used under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0
 Weather Forecasts (ECMWF).** MesoForge extracts temperature messages and regional/point
 values; it does not temporally interpolate IFS. Source/licence/attribution and these
 modifications are recorded with retained provenance. No ECMWF endorsement is implied.
+
+### Bounded historical temperature backtest
+
+`application.historical_backtest` reads existing prepared guidance and immutable
+observation artifacts. It calls the existing point forecast, observation selection,
+forecast eligibility and comparison functions; it neither downloads data nor writes
+issued forecasts or verification facts. It reports all four contributors, the unchanged
+70/30 control and 50/50 comparison, selected observation/revision/QC, individual errors,
+and identical-sample MAE/bias/RMSE overall, by location and by lead bucket.
+
+The first real experiment used Fresno `(36.7378, -119.7871)`, Wichita
+`(37.6872, -97.3301)` and Raleigh `(35.7796, -78.6382)`. The historical decision time
+was **September 10, 2026 14Z**; native comparison times were **15Z, 18Z, 21Z and
+September 11 00Z**. The original prepared target remains 12Z. Buckets use hours since
+the retrospective 14Z decision (1, 4, 7, 10), with original prepared horizons
+(3, 6, 9, 12), source leads and cycles preserved separately.
+
+| Model | Fixed source cycle, September 10 UTC | Source leads | Latest required publication |
+| --- | --- | --- | --- |
+| HRRR | 12Z, retained | 3, 6, 9, 12 | 13:07:51Z |
+| GFS | 06Z, retained | 9, 12, 15, 18 | 09:37:43Z |
+| RAP | 09Z | 6, 9, 12, 15 | 09:52:51Z |
+| IFS | 06Z | 9, 12, 15, 18 | 12:27:05Z |
+
+Publication uses recorded GRIB/index Last-Modified evidence, not nominal run times.
+The earlier IFS 18Z demonstration was unsuitable for its 22Z control cutoff: it was
+published after midnight. The chosen earlier cycles pass the 14Z publication cutoff.
+Actual acquisition and station-metadata timestamps remain later and unchanged. Thus
+this is a **provider-available hindcast**, not proof that MesoForge possessed or issued
+these inputs at 14Z. Original publication/revision evidence is necessary for larger
+archive experiments; a later archive copy's timestamp cannot establish earlier availability.
+
+The existing shadow preparation commands now accept `--hours` to acquire only needed
+target hours. Defaults remain all 36 hours. Repeat/offline rebuilding must supply the
+same subset; unrequested slots remain explicitly missing. Using the existing locations JSON:
+
+```powershell
+$control = "$env:LOCALAPPDATA\MesoForge\prepared\20260910-conus-lifecycle"
+$rap = "$env:LOCALAPPDATA\MesoForge\prepared\historical-20260910T14Z-rap"
+$ifs = "$env:LOCALAPPDATA\MesoForge\prepared\historical-20260910T14Z-ifs"
+python -B -m mesoforge.application.prepared_rap --config locations.json --data-dir $control --output-dir $rap --rap-cycle 2026-09-10T09:00:00Z --hours 3 6 9 12
+python -B -m mesoforge.application.prepared_ifs --config locations.json --data-dir $control --output-dir $ifs --ifs-cycle 2026-09-10T06:00:00Z --hours 3 6 9 12
+```
+
+Observation preparation reused saved station discovery, then the existing
+`prepared_observations.acquire_for_valid_times()` and `prepare_bundle()` functions.
+For each coordinate, one bundle covers 15Z–21Z and one covers 00Z, each padded ±15 minutes;
+the existing six-hour acquisition bound is unchanged. The equivalent CLI preparation
+for the first bundle is below; repeat for the other coordinates with separate raw directories:
+
+```powershell
+python -B -m mesoforge.application.prepared_observations --raw-dir NEW_RAW_DIRECTORY --lat 36.7378 --lon -119.7871 --start-valid-time 2026-09-10T15:00:00Z --end-valid-time 2026-09-10T21:00:00Z
+python -B -m mesoforge.application.prepared_observations --raw-dir RETAINED_RAW_DIRECTORY --from-raw
+```
+
+Save the returned observation artifact IDs as a JSON list. With the existing local
+PostgreSQL/MinIO settings, the exercised replay command is:
+
+```powershell
+$run = "$env:LOCALAPPDATA\MesoForge\baselines\20260911-historical-backtest"
+python -B -m mesoforge.application.historical_backtest --config "$run\locations.json" --data-dir $control --contributors-config "$ifs\contributors.json" --shadow-data "RAP=$rap" --shadow-data "IFS=$ifs" --observation-ids-file "$run\observation-ids.json" --as-of 2026-09-10T14:00:00Z --start-valid-time 2026-09-10T15:00:00Z --end-valid-time 2026-09-11T00:00:00Z --evaluation-cutoff 2026-09-11T03:03:23.997769Z
+```
+
+Both valid-window endpoints are **inclusive**. The optional evaluation cutoff selects
+retained observation revisions available by that time; preserve it for exact replay.
+Each execution has a new report run ID and actual execution time, with a stable input
+digest for fixed inputs/code/cutoff. Reports are analysis output, not issued history.
+The complete three-hourly intersection has **12 samples**, four per location. Buckets
+1–6 and 7–18 have **six each**; 19–36 has **zero** and null metrics. The 18 intervening
+location-hours are excluded from every aggregate because no shadow messages were
+requested there; no temporal interpolation or weight redistribution occurs.
+
+| Prediction | Samples | MAE (K) | Mean bias (K) | RMSE (K) |
+| --- | ---: | ---: | ---: | ---: |
+| HRRR | 12 | 1.169261 | 0.976808 | 1.497897 |
+| GFS | 12 | 2.262840 | 2.189094 | 2.668673 |
+| RAP | 12 | 1.245844 | -0.224209 | 1.537875 |
+| IFS | 12 | 1.990748 | 1.029377 | 2.310410 |
+| 70/30 control | 12 | 1.428596 | 1.340494 | 1.764522 |
+| 50/50 comparison | 12 | 1.666951 | 1.582951 | 1.994016 |
+
+All four Fresno observations used KFCH (3.003 km). Wichita used KICT (9.853 km) at
+15Z and KIAB (9.077 km) thereafter; Raleigh used KRDU (18.028 km). Selection followed
+the existing QC, 50 km and ±15-minute rules, with no manual station IDs. Complete
+candidate explanations, source/observation provenance, all errors, and per-location/
+bucket metrics are retained in `backtest.json` and `results.md` under `$run` above.
+
+The experiment acquired **3,391,293 model bytes** plus **141,542 METAR bytes** (311
+normalized reports). No HRRR/GFS or station metadata was downloaded. Newly retained
+unique model messages total **2,910,471 bytes**, indexes **240,411 bytes**, and regional
+prepared shadow views **179,495 bytes**. Including reused guidance, unique retained
+model messages total **66,309,771 bytes**; regional copies and storage metadata add
+disk usage. Raw observation data and derived artifacts use existing storage.
+
+Validation: **168 focused offline tests passed**. The real PostgreSQL/MinIO replay,
+repeat, normalized-observation reuse and raw shadow rebuild passed, with zero provider
+calls during repeats. Independent arithmetic matched every error and summary; all
+**108 active forecast hours and 16 issued versions remained unchanged**. Read-only
+replay created no rows or objects. Quality checks passed and temporary services were
+stopped. These commands/functions used the isolated locked interpreter; the standalone
+observation CLI example above was not rerun separately, and `uv run --locked` remains
+unverified. Full acceptance/coverage was not run.
+
+Twelve pairs from one day do not establish a winner. The existing scientific and
+comparison functions are reusable at larger scale; this command is deliberately one
+bounded in-memory window, not a bulk backfill engine. Archive completeness, historical
+model/product versions (including older IFS contracts), availability evidence, station
+history, and independent weather-event/time/location splits must be addressed before
+a much larger training dataset. No production weights changed; RAP and IFS remain shadows.
 
 ### Discover and reuse nearby METAR stations
 

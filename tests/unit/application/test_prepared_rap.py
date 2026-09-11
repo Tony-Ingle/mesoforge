@@ -184,3 +184,68 @@ def test_offline_success_does_not_keep_a_previous_decode_failure_reason(
     repeated = prepared_rap.prepare_rap(LOCATIONS, control, tmp_path / "rebuilt", from_raw=output)
     assert repeated["supported_hours"] == list(range(1, 37))
     assert repeated["missing_hours"] == {}
+
+
+def test_bounded_hours_are_retained_and_reused_only_with_the_same_request(
+    tmp_path: Path, preparation: tuple[Path, Mock, Mock], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control, discover, acquire = preparation
+    hours = (3, 6, 9, 12)
+    leads = (6, 9, 12, 15)
+    discover.return_value = _Selection(CYCLE, leads, leads, {})
+    output = tmp_path / "bounded"
+    report = prepared_rap.prepare_rap(
+        LOCATIONS, control, output, target_horizons=hours, transport=Mock(spec=[])
+    )
+    assert discover.call_args.kwargs["target_horizons"] == hours
+    assert [call.kwargs["forecast_hour"] for call in acquire.call_args_list] == list(leads)
+    assert report["requested_target_horizons"] == report["supported_hours"] == list(hours)
+    assert len(report["missing_hours"]) == 32
+    assert all("not requested" in reason for reason in report["missing_hours"].values())
+    manifest = json.loads((output / "source/manifest.json").read_text())
+    assert manifest["target_horizon_hours"] == list(range(1, 37))
+    assert manifest["requested_target_horizons"] == list(hours)
+    assert len(manifest["inputs"]) == 4
+    monkeypatch.setattr(
+        prepared_rap, "BoundedHttpTransport", Mock(side_effect=AssertionError("network"))
+    )
+    discover.side_effect = acquire.side_effect = AssertionError("provider access")
+    repeated = prepared_rap.prepare_rap(LOCATIONS, control, output, target_horizons=hours)
+    rebuilt = prepared_rap.prepare_rap(
+        LOCATIONS, control, tmp_path / "rebuilt-bounded", target_horizons=hours, from_raw=output
+    )
+    assert repeated["downloaded_bytes"] == rebuilt["downloaded_bytes"] == 0
+    assert rebuilt["supported_hours"] == list(hours)
+    for a, b in zip(report["regions"], rebuilt["regions"], strict=True):
+        with (
+            xr.open_dataset(Path(a["directory"]) / "RAP.nc", engine="h5netcdf") as left,
+            xr.open_dataset(Path(b["directory"]) / "RAP.nc", engine="h5netcdf") as right,
+        ):
+            xr.testing.assert_identical(left, right)
+    with pytest.raises(ValueError, match="snapshot differs"):
+        prepared_rap.prepare_rap(LOCATIONS, control, output)
+    with pytest.raises(ValueError, match="window differ"):
+        prepared_rap.prepare_rap(LOCATIONS, control, tmp_path / "wrong-window", from_raw=output)
+
+
+def test_legacy_full_window_manifest_remains_reusable(
+    tmp_path: Path, preparation: tuple[Path, Mock, Mock]
+) -> None:
+    control, discover, acquire = preparation
+    output = tmp_path / "legacy"
+    prepared_rap.prepare_rap(LOCATIONS, control, output, transport=Mock(spec=[]))
+    for path in [output / "coverage.json", *output.rglob("manifest.json")]:
+        value = json.loads(path.read_text())
+        value.pop("requested_target_horizons")
+        path.write_text(json.dumps(value))
+    discover.side_effect = acquire.side_effect = AssertionError("provider access")
+    assert prepared_rap.prepare_rap(LOCATIONS, control, output)["downloaded_bytes"] == 0
+    assert prepared_rap.prepare_rap(
+        LOCATIONS, control, tmp_path / "legacy-rebuilt", from_raw=output
+    )["supported_hours"] == list(range(1, 37))
+
+
+@pytest.mark.parametrize("hours", [(), (3, 3), (6, 3), (True,), (0,), (37,)])
+def test_bounded_preparation_rejects_invalid_hours_before_io(tmp_path, hours):
+    with pytest.raises(ValueError, match="sorted unique nonempty"):
+        prepared_rap.prepare_rap([], tmp_path / "missing-control", tmp_path, target_horizons=hours)

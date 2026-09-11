@@ -74,6 +74,7 @@ def _raw_inputs(source: Path, manifest: dict[str, Any], *, model: str) -> dict[i
     """Check every retained byte before rebuilding or reporting offline reuse."""
     inputs: dict[int, bytes] = {}
     target = _hour(datetime.fromisoformat(manifest["target_reference_time"]))
+    requested = manifest.get("requested_target_horizons", list(_HOURS))
     for row in manifest["inputs"]:
         lead = row["source_lead_hours"]
         cycle = _hour(datetime.fromisoformat(row["cycle"]))
@@ -84,7 +85,7 @@ def _raw_inputs(source: Path, manifest: dict[str, Any], *, model: str) -> dict[i
             or lead in inputs
             or row["cycle"] != manifest["selected_cycle"]
             or row["valid_time"] != _iso(valid)
-            or valid not in [target + timedelta(hours=hour) for hour in _HOURS]
+            or valid not in [target + timedelta(hours=hour) for hour in requested]
         ):
             raise ValueError(f"{model} retained cycle, lead or valid time disagrees")
         for prefix, suffix in (("raw", "grib2"), ("index", "idx")):
@@ -110,6 +111,7 @@ def prepare_shadow(
     output_directory: Path,
     *,
     adapter: ShadowAdapter,
+    target_horizons: tuple[int, ...] = _HOURS,
     from_raw: Path | None = None,
     cycle_override: datetime | None = None,
     transport: HttpTransport | None = None,
@@ -118,6 +120,12 @@ def prepare_shadow(
 ) -> dict[str, Any]:
     """Acquire, rebuild or reuse shadow guidance independently of the control files."""
     model = adapter.model
+    if (
+        not target_horizons
+        or any(type(hour) is not int or hour not in _HOURS for hour in target_horizons)
+        or tuple(sorted(set(target_horizons))) != target_horizons
+    ):
+        raise ValueError("target_horizons must be a sorted unique nonempty subset of 1..36")
     clock, sleeper = clock or SystemClock(), sleeper or SystemSleeper()
     target = _target(control_directory, model=model)
     areas = plan_regions([_coordinates(location) for location in locations])
@@ -136,6 +144,7 @@ def prepare_shadow(
         if (
             manifest.get("source_metadata") != adapter.source_metadata
             or manifest["target_reference_time"] != _iso(target)
+            or manifest.get("requested_target_horizons", list(_HOURS)) != list(target_horizons)
             or report["requested_areas"] != [area.model_dump() for area in areas]
             or (cycle_override is not None and manifest["selected_cycle"] != _iso(cycle_override))
         ):
@@ -167,6 +176,7 @@ def prepare_shadow(
             manifest.get("source_metadata") != adapter.source_metadata
             or manifest.get("target_reference_time") != _iso(target)
             or manifest.get("target_horizon_hours") != list(_HOURS)
+            or manifest.get("requested_target_horizons", list(_HOURS)) != list(target_horizons)
         ):
             raise ValueError(f"Retained {model} capabilities or control window differ")
         payloads = _raw_inputs(retained, manifest, model=model)
@@ -194,6 +204,7 @@ def prepare_shadow(
                 clock=clock,
                 sleeper=sleeper,
                 cycle_override=cycle_override,
+                target_horizons=target_horizons,
             )
             selection = json.loads(json.dumps(asdict(selection_result), default=_json_default))
             cycle = selection_result.cycle
@@ -201,6 +212,8 @@ def prepare_shadow(
             if cycle is not None:
                 for lead in selection_result.available_leads:
                     hour = int((cycle + timedelta(hours=lead) - target).total_seconds() / 3600)
+                    if hour not in target_horizons:
+                        raise ValueError(f"{model} discovery returned an unrequested target hour")
                     try:
                         acquired = adapter.acquire_lead(
                             cycle=cycle,
@@ -242,12 +255,16 @@ def prepare_shadow(
     for hour in _HOURS:
         if hour not in supported:
             missing.setdefault(
-                hour, f"{model} has no retained valid temperature message for this hour"
+                hour,
+                f"{model} target hour was not requested in this bounded preparation"
+                if hour not in target_horizons
+                else f"{model} has no retained valid temperature message for this hour",
             )
     manifest = {
         "data_kind": "real_prepared_guidance",
         "target_reference_time": _iso(target),
         "target_horizon_hours": list(_HOURS),
+        "requested_target_horizons": list(target_horizons),
         "selected_cycle": _iso(cycle) if cycle is not None else None,
         "created_at": _iso(clock.now()),
         "inputs": rows,
@@ -300,6 +317,7 @@ def prepare_shadow(
     report = {
         "source_directory": str(source),
         "target_reference_time": _iso(target),
+        "requested_target_horizons": list(target_horizons),
         "selected_cycle": manifest["selected_cycle"],
         "supported_hours": supported,
         "missing_hours": missing,

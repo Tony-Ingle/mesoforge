@@ -203,6 +203,41 @@ def test_discovery_empty_is_bounded_and_never_assumes_nominal_availability():
     assert all(probe.cycle <= TARGET for probe in result.probes)
 
 
+def test_bounded_discovery_probes_only_requested_native_slots_and_retains_gaps():
+    hours = (1, 2, 5, 8, 11)
+    transport = _transport(_published(CYCLE, (6, 9, 12, 15)))
+    result = _discover(transport, target_horizons=hours)
+    assert result.cycle == CYCLE
+    assert result.source_leads == (5, 6, 9, 12, 15)
+    assert result.native_leads == result.available_leads == (6, 9, 12, 15)
+    assert result.missing_hours == {1: NO_NATIVE_GUIDANCE}
+    assert len(transport.get_calls) == 4
+    assert [url for url, _ in transport.get_calls] == [
+        build_index_url(cycle=CYCLE, forecast_hour=lead) for lead in result.native_leads
+    ]
+    assert transport.head_calls == []
+
+
+def test_bounded_override_preserves_target_hour_numbers_for_missing_native_leads():
+    transport = _transport(_published(CYCLE, (6, 12)))
+    result = _discover(transport, target_horizons=(2, 5, 8), cycle_override=CYCLE)
+    assert result.source_leads == (6, 9, 12)
+    assert result.available_leads == (6, 12)
+    assert set(result.missing_hours) == {5}
+    assert len(transport.get_calls) == 3
+
+
+@pytest.mark.parametrize("override", [None, CYCLE])
+def test_only_non_native_requested_hours_do_not_claim_an_available_cycle(override):
+    transport = _transport({})
+    result = _discover(transport, target_horizons=(1, 3, 4), cycle_override=override)
+    assert result.cycle is None
+    assert result.probes == result.native_leads == result.available_leads == ()
+    assert result.missing_hours == {hour: NO_NATIVE_GUIDANCE for hour in (1, 3, 4)}
+    assert "no cycle was probed or selected" in result.reason
+    assert transport.get_calls == transport.head_calls == []
+
+
 def test_discovery_stops_on_invalid_identity_instead_of_scanning_more_cycles():
     objects = _published(CYCLE - timedelta(hours=6), [6])
     wrong = next(iter(objects.values()))
