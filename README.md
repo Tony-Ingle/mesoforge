@@ -133,8 +133,12 @@ is now the priority; the proposed 30-day historical backfill has not started.
 A separate [current four-model discovery command](#discover-the-current-four-model-set)
 now checks provider inventories and object metadata for a complete compatible
 HRRR/GFS/RAP/IFS set, retaining decision-time evidence outside Git. It does not
-prepare data or issue forecasts. Next proposed: consume that selection in the
-existing preparation and immutable batch-issuance paths for configured coordinates.
+prepare data or issue forecasts. The separate [selected-set batch command](#prepare-and-issue-the-exact-selected-model-set)
+now consumes that artifact, revalidates provider identities, shares preparation,
+and issues through existing PostgreSQL/MinIO storage. Every successful forecast
+retains the decision evidence and RAP/IFS shadows. Next proposed: connect the
+existing configured-location verification step to this forward issuance command
+in one local run before adding VPS operation.
 The combined locations lifecycle remains future work.
 
 Future direction: configure locations using latitude/longitude only, with geographic
@@ -1698,7 +1702,8 @@ contributor and code configuration identities. This establishes provider-metadat
 evidence, not that GRIB contents were decoded or locally ingested by decision time.
 The separate preparation step must revalidate these exact identities and availability,
 decode units/grids/model versions/valid times, and retain its actual acquisition and
-issuance times. Passing cycle arguments alone does not yet enforce that handoff.
+issuance times. Use the selected-set command below to enforce that handoff;
+passing cycle arguments to the older preparation commands alone does not pin objects.
 
 Real discovery on **September 11, 2026**, at decision time **16:43:43.475839Z**
 selected the following set for reference **16Z**, valid **September 11 17Z through
@@ -1738,6 +1743,104 @@ decision cutoffs/expiry, retained hashes and unchanged contributor weights/statu
 The real metadata audit also passed. No preparation, issuance, observations or services
 ran for this milestone; GRIB decoding, storage integration and full acceptance were
 not rerun.
+
+### Prepare and issue the exact selected model set
+
+With the existing PostgreSQL/MinIO environment settings configured, run these
+commands from the repository root using the isolated interpreter:
+
+```text
+python -B -m mesoforge.application.current_model_set --output-dir EXTERNAL_NEW_SELECTION_DIRECTORY
+python -B -m mesoforge.application.selected_forecast --config locations.json --selection EXTERNAL_NEW_SELECTION_DIRECTORY/selection.json --output-dir EXTERNAL_NEW_PREPARED_DIRECTORY
+```
+
+The locations file still contains only coordinates, for example:
+
+```json
+{"locations":[{"lat":36.7378,"lon":-119.7871},{"lat":37.6872,"lon":-97.3301},{"lat":35.7796,"lon":-78.6382}]}
+```
+
+No source cycles or target reference time are supplied. The second command consumes
+the exact successful selection and its retained inventories. It checks completeness,
+inventory hashes and expiry, then pins each acquisition to the selected URL, range,
+ETag and provider publication time. Range requests use `If-Match`; changed objects,
+unselected mirrors or incomplete required native guidance stop the run before
+issuance. Retained inputs and a failure report stay outside Git. Use a new discovery
+and output directory after a failed or expired selection; the command does not
+silently choose replacement cycles.
+
+The acquired HRRR/GFS messages feed the existing normalization and coverage code.
+RAP and IFS use their existing shadow adapters at the selected cycles, with shared
+validated inventories. The complete coordinate collection determines regional views;
+distant locations need no giant shared subset and no separate model downloads.
+HRRR/GFS keep the 70/30 control, RAP/IFS have zero active weight, and IFS retains its
+12 native slots plus 24 explicit gaps. Phase 2 defaults and forecast calculations
+are unchanged.
+
+The command then uses existing batch issuance, returning each coordinate's forecast
+and immutable ID, or an explicit error while continuing to later coordinates.
+Issuance refuses elapsed first forecast hours. Each saved payload includes the
+complete `current_model_set` decision evidence, original selection hash, preparation
+module hashes, and validated provider request/response identities, alongside the
+existing contributor values, raw hashes and acquisition times. PostgreSQL retains
+issuance metadata and the object digest; MinIO retains the complete immutable payload.
+The original discovery inventories and raw GRIB messages remain outside Git in the
+external preparation directory.
+
+Read an exact version using the existing `GET /issued-forecasts/RETURNED_ID` endpoint
+or the existing readback function with the same storage settings:
+
+```text
+python -B -c "import json; from uuid import UUID; from mesoforge.application.issuance import read_issued_forecast; print(json.dumps(read_issued_forecast(UUID('RETURNED_ID')), indent=2))"
+```
+
+Readback does not recalculate forecasts or create history. Existing prepared/offline
+batch commands remain available for deliberate reissuance from retained inputs;
+they do not perform a new current-model discovery. This milestone adds no scheduler,
+VPS deployment, observations or historical backfill.
+
+Real end-to-end validation on **September 11, 2026** used decision time
+**17:10:06Z**, automatically selecting **HRRR 12Z / GFS 12Z / RAP 15Z / IFS 06Z**.
+All forecasts cover **September 11 18Z through September 13 05Z** and were issued
+around **17:20:48Z**, before the first valid hour. No cycle arguments were supplied.
+
+| Location | Immutable issued-forecast ID | Hours | First / last temperature (K) |
+| --- | --- | --- | --- |
+| Fresno | `0fd90b7c-feb0-405c-94aa-8782d7badcf5` | 36 | 306.415551 / 296.229429 |
+| Wichita | `209f1622-7c60-4c84-9bba-3e9eadd7df1f` | 36 | 302.946247 / 295.827867 |
+| Raleigh | `ce8c8491-7727-4af7-bd65-43aa3b021d62` | 36 | 308.146496 / 296.701427 |
+
+An invalid `95.0, -93.0` entry between Fresno and Wichita returned
+`unsupported_coordinate`, with no issuance, and both later locations succeeded.
+Each successful forecast carries the same selection and validated object evidence,
+36 RAP values, 12 native IFS values and 24 explicit IFS gaps. Every active value
+matched calculation without shadows exactly. Readback and an offline prepared-data
+repeat matched all three saved payloads; the 16 older versions were unchanged.
+Readback created no rows or objects. Exactly three new issuance rows, their stored
+object metadata, and three MinIO payload objects were created.
+
+The successful preparation made **120 unique temperature range downloads**, one
+per selected native model/lead, totaling **76,982,295 bytes** including inventories;
+**73,921,510 bytes** are raw temperature messages. All 360 index/HEAD/range checks
+matched discovery. Three regional views shared those inputs, totaling **12,440,910
+control bytes**, **765,627 RAP bytes**, and **114,604 IFS bytes**. Raw messages and
+full evidence remain outside Git; no coordinate caused a duplicate model download.
+
+The first attempt caught a manifest-finalization bug after acquisition and before
+issuance. The fix atomically finalizes only the newly created, unpublished manifest;
+a focused regression now reproduces the real helper's exclusive file creation.
+One bounded rerun used the same unexpired selection in a new output directory.
+Including that retained failed attempt and discovery, this demonstration downloaded
+**157,025,375 bytes**. Reports and all hourly responses are under
+`%LOCALAPPDATA%/MesoForge/baselines/20260911-selected-issuance`; the completed prepared
+set is `%LOCALAPPDATA%/MesoForge/prepared/selected-20260911T171801Z`.
+
+**322 focused offline tests and 16 PostgreSQL/MinIO integration tests passed**,
+including changed-object rejection, selection-copy races, native missingness,
+immutable readback and existing comparison/verification coverage. Ruff, mypy,
+all nine import contracts, lock consistency, documentation/hygiene checks and
+`git diff --check` passed. Temporary PostgreSQL and MinIO were stopped. Full
+repository acceptance/coverage, VPS operation and scheduling were not tested.
 
 ### Automatic current guidance
 

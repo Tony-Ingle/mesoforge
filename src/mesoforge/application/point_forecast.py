@@ -265,7 +265,9 @@ class PreparedPointForecast:
 
     @property
     def notice(self) -> str:
-        if self._manifest is not None and "cycle_selection" in self._manifest:
+        if self._manifest is not None and (
+            "cycle_selection" in self._manifest or "current_model_set" in self._manifest
+        ):
             return _SELECTED_NOTICE
         return _REAL_NOTICE if self.data_kind == _REAL_KIND else _NOTICE
 
@@ -543,7 +545,10 @@ class PreparedPointForecast:
                         source["acquisition"] = deepcopy(evidence)
                         if "source_metadata" in source_manifest:
                             source["source_metadata"] = deepcopy(source_manifest["source_metadata"])
-                    if "cycle_selection" in source_manifest and not is_shadow:
+                    if not is_shadow and (
+                        "cycle_selection" in source_manifest
+                        or "current_model_set" in source_manifest
+                    ):
                         source["acquisition"] = {
                             key: evidence[key]
                             for key in (
@@ -631,4 +636,6 @@ class PreparedPointForecast:
                 ]
                 for model, rows in selection["candidates"].items()
             }
+        if self._manifest is not None and "current_model_set" in self._manifest:
+            result["current_model_set"] = deepcopy(self._manifest["current_model_set"])
         return result

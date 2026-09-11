@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import Mock
 from uuid import UUID, uuid4
 
+import numpy as np
 import pytest
 import sqlalchemy as sa
 from alembic import command
@@ -20,12 +21,17 @@ from mesoforge import api
 from mesoforge.application.batch_forecast import run_batch
 from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.point_forecast import PreparedPointForecast
+from mesoforge.application.prepared_ifs import IFS_CONFIGURATION
+from mesoforge.application.prepared_shadow import normalize_shadow_temperature
+from mesoforge.application.prepared_temperature import _write_prepared_file
 from mesoforge.common.identifiers import Digest
 from mesoforge.storage.postgres.repositories import PostgresUnitOfWork
 from mesoforge.storage.s3 import S3ArtifactObjectStore, content_addressed_key
 from tests.unit.application.test_batch_forecast import FIRST, LAST, OUTSIDE, write_config
+from tests.unit.application.test_prepared_shadow import frame, geographic_frame
 from tests.unit.application.test_prepared_temperature import (
     EXTENDED_HORIZONS,
+    TARGET,
     prepare_fixture_guidance,
 )
 
@@ -214,6 +220,121 @@ def test_persisted_missing_model_is_still_explicit_with_no_weight_change(
         assert hour["temperature"] == {"value": None, "unit": "K"}
         assert hour["missing_reasons"] == ["GFS: prepared guidance file is missing"]
         assert [source["weight"] for source in hour["sources"]] == [0.7, 0.3]
+
+
+def test_selected_model_evidence_and_native_shadows_survive_immutable_batch_readback(
+    prepared_guidance: Path,
+    tmp_path: Path,
+    service: ForecastIssuanceService,
+    migrated_dsn: str,
+    object_store: S3ArtifactObjectStore,
+) -> None:
+    # Generated fields test storage round-tripping, not actual provider availability.
+    original = PreparedPointForecast.from_directory(prepared_guidance).forecast(
+        latitude=FIRST["lat"], longitude=FIRST["lon"]
+    )
+    historical = service.issue(original, batch_run_id=uuid4(), location_index=0)
+    historical_envelope = service.read(historical.issued_forecast_id)
+    directory = tmp_path / "selected-control"
+    shutil.copytree(prepared_guidance, directory)
+    manifest_path = directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    selection = {
+        "status": "selected",
+        "decision_time": "2026-08-30T12:45:00Z",
+        "target_reference_time": "2026-08-30T12:00:00Z",
+        "selected_cycles": {
+            "HRRR": "2026-08-30T12:00:00Z",
+            "GFS": "2026-08-30T06:00:00Z",
+            "RAP": "2026-08-30T12:00:00Z",
+            "IFS": "2026-08-30T12:00:00Z",
+        },
+        "fixture_notice": "Synthetic discovery evidence for persistence testing only",
+    }
+    evidence = {
+        "selection_sha256": str(Digest.of_bytes(json.dumps(selection).encode())),
+        "selection": selection,
+        "object_validation": [
+            {
+                "model": "HRRR",
+                "source_lead_hours": 1,
+                "url": "https://example.test/fixture-only/hrrr-f01.grib2",
+                "etag": '"fixture-object"',
+                "last_modified": "2026-08-30T12:30:00Z",
+                "matched": True,
+            }
+        ],
+    }
+    manifest["current_model_set"] = evidence
+    manifest_path.write_text(json.dumps(manifest))
+    shadows = {}
+    for model, make_frame, leads in (
+        ("RAP", frame, range(1, 37)),
+        ("IFS", geographic_frame, range(3, 37, 3)),
+    ):
+        time = np.datetime64(TARGET.replace(tzinfo=None), "ns")
+        decoded = {
+            lead: make_frame(lead).assign_coords(
+                time=time,
+                step=np.timedelta64(lead, "h"),
+                valid_time=time + np.timedelta64(lead, "h"),
+            )
+            for lead in leads
+        }
+        dataset = normalize_shadow_temperature(decoded, model=model, cycle=TARGET, target=TARGET)
+        dataset.attrs["data_kind"] = "synthetic_demonstration"
+        shadows[model] = tmp_path / model
+        shadows[model].mkdir()
+        _write_prepared_file(shadows[model], model, dataset)
+
+    config = write_config(tmp_path, [FIRST, OUTSIDE, LAST])
+    batches = [
+        run_batch(
+            config,
+            directory,
+            issuer=service,
+            contributor_configuration=IFS_CONFIGURATION,
+            shadow_directories=shadows,
+        )
+        for _ in range(2)
+    ]
+    expected = {}
+    for batch in batches:
+        assert [row["status"] for row in batch["results"]] == ["ok", "error", "ok"]
+        assert "issued" not in batch["results"][1]
+        assert batch["coverage"]["downloaded_bytes"] == 0
+        for row in (batch["results"][0], batch["results"][2]):
+            forecast = row["forecast"]
+            assert forecast["current_model_set"] == evidence
+            assert len(forecast["hours"]) == 36
+            for hour in forecast["hours"]:
+                horizon = hour["horizon_hours"]
+                assert hour["temperature"]["value"] == pytest.approx(282 + horizon, abs=1e-6)
+                assert [source["weight"] for source in hour["sources"]] == [0.7, 0.3]
+                shadow_values = {source["model"]: source for source in hour["shadow_sources"]}
+                assert set(shadow_values) == {"RAP", "IFS"}
+                rap, ifs = shadow_values["RAP"], shadow_values["IFS"]
+                assert rap["weight"] == ifs["weight"] == 0
+                assert rap["temperature"]["value"] is not None
+                assert rap["source_lead_hours"] == horizon
+                if horizon % 3:
+                    assert ifs["temperature"]["value"] is None
+                    assert ifs["missing_reasons"] == ["IFS: no guidance for this valid time"]
+                else:
+                    assert ifs["temperature"]["value"] is not None
+                    assert ifs["source_lead_hours"] == horizon
+            expected[UUID(row["issued"]["issued_forecast_id"])] = forecast
+    assert len(expected) == 4
+    before_read = storage_inventory(migrated_dsn, object_store)
+    assert tuple(len(items) for items in before_read) == (5, 5, 5)
+    reader = ForecastIssuanceService(
+        object_store, lambda: PostgresUnitOfWork(migrated_dsn), code_identity=CODE_IDENTITY
+    )
+    for identifier, forecast in expected.items():
+        assert reader.read(identifier)["forecast"] == forecast
+    assert reader.read(historical.issued_forecast_id) == historical_envelope
+    assert "current_model_set" not in historical_envelope["forecast"]
+    assert storage_inventory(migrated_dsn, object_store) == before_read
 
 
 @pytest.mark.parametrize(
