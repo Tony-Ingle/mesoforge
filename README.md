@@ -10,7 +10,8 @@ is described below. Start with [VISION.md](VISION.md) for release boundaries and
 
 The [on-demand forward run](#run-verification-and-current-issuance-together) produces
 real **36-hour surface forecasts**: temperature, dew point, derived RH, vector
-wind speed/direction, gust and hourly liquid-equivalent precipitation (QPF).
+wind speed/direction, gust, hourly liquid-equivalent precipitation (QPF) and native
+NBM probability of precipitation (PoP).
 Surface issuance builds a small coordinate-derived
 [local baseline grid](#local-surface-baseline-grid) with a larger context domain and
 smaller editable subset, and extracts its exact center point.
@@ -28,6 +29,10 @@ only required geographic inputs; names are optional display metadata.
   hours 1–18 and 60/40 at 19–36, with explicit approved fallbacks. Every amount
   retains exact accumulation bounds; GFS buckets are differenced on native cells
   before extraction. RAP/IFS precipitation is unavailable in this increment.
+- **Probability:** NBM supplies native one-hour PoP for liquid accumulation strictly
+  greater than 0.254 kg/m² (0.01 inch), using its approved weight-1 passthrough.
+  Thresholds, intervals, native percentages, source evidence and missingness are
+  preserved. PoP is separate from HRRR/GFS QPF and does not imply precipitation type.
 - **Shadows:** real RAP and ECMWF IFS values/provenance accompany issuance with zero
   active weight. IFS preserves native three-hourly gaps and has no compatible
   instantaneous gust. Cloud cover is explicitly unavailable without an approved policy.
@@ -57,9 +62,10 @@ integration tests**, with byte-identical replay and unchanged point values; meas
 are [recorded below](#local-surface-baseline-grid). Full acceptance,
 coverage, forecast skill and production reliability are not established by that demonstration.
 The QPF increment adds [real interval/conservation and offline replay evidence](#liquid-precipitation-on-the-local-grid);
-precipitation verification and probabilistic fields remain future work.
+precipitation verification remains future work. The [PoP increment](#probability-of-precipitation-on-the-local-grid)
+adds actual native probabilistic guidance without changing QPF or other surface values.
 
-There is **no PoP, precipitation type, snowfall, deterministic bias correction,
+There is **no precipitation type, snowfall, deterministic bias correction,
 site learning, AI editing, production deployment or scheduling in the V2 path yet**. Bias/AI
 report stages are explicitly unimplemented and final values currently equal the baseline.
 Registration services and delivery also remain future work. The retained Phase 2 station
@@ -72,8 +78,8 @@ numerical, bias-corrected and final fields separate before exact-point interpola
 One-off requests stay untracked. See [VISION.md](VISION.md#intended-coordinate-driven-operation)
 and the [active RFC](docs/rfcs/mesoforge-v2-architecture.md). The first local surface grid
 and nested domains are implemented; the editing lifecycle remains future work. The next
-proposed increment is native probabilistic precipitation guidance with explicit event
-thresholds and intervals, followed separately by precipitation type.
+proposed increment is precipitation type using suitable categorical and/or thermodynamic
+guidance, without inferring type from surface temperature alone.
 
 Local Codex development continues; the Hermes development pipeline is paused. The RFC's
 unresolved implementation choices remain proposed, not blanket approval of the roadmap.
@@ -1681,7 +1687,7 @@ commands from the repository root using the isolated interpreter:
 
 ```text
 python -B -m mesoforge.application.current_model_set --output-dir EXTERNAL_NEW_SELECTION_DIRECTORY
-python -B -m mesoforge.application.selected_forecast --config locations.json --selection EXTERNAL_NEW_SELECTION_DIRECTORY/selection.json --output-dir EXTERNAL_NEW_PREPARED_DIRECTORY
+python -B -m mesoforge.application.selected_forecast --config locations.json --selection EXTERNAL_NEW_SELECTION_DIRECTORY/selection.json --output-dir EXTERNAL_NEW_PREPARED_DIRECTORY --pop-fields
 ```
 
 The locations file still contains only coordinates, for example:
@@ -2005,12 +2011,9 @@ python -B -m pytest tests/integration/application/test_forward_run.py tests/inte
 python -B -m pytest tests/integration/application/test_issued_temperature_verification.py::test_automatic_window_acquires_once_reuses_real_snapshot_and_skips_empty_window tests/integration/application/test_issued_temperature_verification.py::test_automatic_batch_isolates_locations_and_reuses_results_without_changing_issuances -q
 ```
 
-Next proposed: add PoP from actual probabilistic guidance, preserving its native
-event threshold and accumulation interval on this same grid. Retained NBM probability
-support is the first adapter to assess; field weights must have an applicable approved
-policy. Do not infer probability from deterministic QPF. Precipitation type is a
-separate later increment using supported categorical or thermodynamic guidance,
-not surface temperature alone. Bias/AI edits and deployment remain later.
+Next proposed: add precipitation type from supported categorical and/or thermodynamic
+guidance on this same grid, preserving time/support semantics and explicit uncertainty.
+Do not infer type from surface temperature alone. Bias/AI edits and deployment remain later.
 
 ### Local surface baseline grid
 
@@ -2267,7 +2270,120 @@ artifact above was retained/read through the local-grid API, not inserted as a n
 historical issuance. Ruff, formatting, mypy, all nine import contracts, the offline
 locked-dependency check, documentation, hygiene and `git diff --check` passed.
 Full repository acceptance/coverage, precipitation skill and operational resource limits
-remain unverified; no precipitation verification, PoP or type was added.
+remain unverified; that QPF-only increment added no precipitation verification, PoP or type.
+
+### Probability of precipitation on the local grid
+
+The same context/editable grid now includes `probability_of_precipitation_1h`.
+This is **NBM's probability that liquid accumulation strictly exceeds 0.254 kg/m²
+(0.01 inch) during the stated one-hour interval**. The comparator is `>` rather than
+`>=`: the native message uses GRIB probability type 1, [above the upper limit](https://www.nco.ncep.noaa.gov/pmb/docs/grib2/grib2_doc/grib2_table4-9.shtml).
+It is separate from QPF, the expected liquid amount; neither field implies precipitation
+type or a weather-condition label.
+
+The retained Phase 2 NBM inventory selector, semantic/grid decoder, percentage-to-fraction
+conversion and `pop_passthrough` are reused. NBM has its approved PoP-only weight of 1.0;
+it supplies no temperature, wind or QPF contribution in this increment. HRRR/GFS rules
+and RAP/IFS surface shadows are unchanged. Native percentages are retained alongside
+unrounded fractions, source cycles/leads, exact `(start, end]` bounds, threshold/GRIB
+event metadata, raw hashes/URLs, provider identity and availability/acquisition times.
+Reports display percent with its own interval beside the separate QPF amount/interval.
+
+Only the exact native one-hour event is selected. Longer-period probabilities, other
+thresholds and invalid native probability corners are excluded explicitly. Valid zero
+probability remains zero; missing guidance is null with a reason. No period splitting,
+probability summing, clipping or synthesis from deterministic amounts occurs.
+
+Normal `forward_run` automatically discovers/prepares this bounded NBM field once for
+the coordinate collection, before forecasting. It prefers the newest complete compatible
+cycle within the existing NBM age limit; if none is complete, it can retain the freshest
+cycle's available native hours with explicit gaps. It never splices NBM cycles. NBM
+discovery has its own recorded cutoff, separate from the preceding four-model temperature
+decision. An unavailable PoP source does not change surface/QPF calculations.
+For the separate selected-issuance command, opt in with `--pop-fields` as shown above;
+historical prepared snapshots without a PoP attachment retain their original output.
+
+A prepared-run attachment references the existing HRRR/GFS/RAP/IFS directories unchanged.
+Only the new NBM raw messages and spatial views are retained. The existing coordinate
+footprints determine shared views internally; no station, grid or region input is needed.
+The point PoP is read from the exact local-grid center node, and immutable issuance
+stores the complete grid and probability evidence through the existing storage path.
+
+To add PoP to an existing surface/QPF preparation and retain a grid (use new output
+directories for the first two steps):
+
+```powershell
+$python = Join-Path $env:LOCALAPPDATA 'MesoForge/baselines/20260909-8d0983f-d6c8ced2/environment/Scripts/python.exe'
+$qpf = Join-Path $env:LOCALAPPDATA 'MesoForge/forward-runs/qpf-20260911-retained/prepared-replay'
+$pop = Join-Path $env:LOCALAPPDATA 'MesoForge/forward-runs/pop-20260911-retained/prepared'
+$replay = "$pop-replay"
+$config = Join-Path $env:LOCALAPPDATA 'MesoForge/forward-runs/surface-20260911T182732Z/locations.json'
+$grids = Join-Path $env:LOCALAPPDATA 'MesoForge/local-grids/20260911-minneapolis-pop'
+$env:PYTHONPATH = "$PWD/src"
+& $python -B -m mesoforge.application.prepared_pop --prepared-run $qpf --output-dir $pop --config $config
+& $python -B -m mesoforge.application.prepared_pop --prepared-run $pop --output-dir $replay --from-raw
+& $python -B -m mesoforge.application.prepared_local_grid --config $config --prepared-run $replay --output-dir $grids
+& $python -B -m mesoforge.api --data-dir $grids --port 8765
+```
+
+`--nbm-cycle 2026-09-11T18:00:00Z` is an optional reproduction override, not required
+for normal preparation. Offline replay uses retained raw NBM messages without provider
+access and leaves the referenced surface/QPF snapshots unchanged. A raw rebuild records
+its own preparation time; the probabilities and native intervals reproduce. Repeated
+grid builds from identical prepared inputs reproduce the retained artifact bytes.
+
+The bounded Minneapolis demonstration used NBM **2026-09-11 18Z**, native leads
+1–36, for intervals ending **September 11 19Z through September 13 06Z**. It reused
+the prior HRRR/GFS 12Z, RAP 15Z and IFS 06Z surface/QPF inputs. NBM discovery occurred
+at **21:29:59Z**, with acquisition at 21:30Z; this is a later PoP enrichment of a
+retained run, not evidence that these probabilities were available at the earlier
+18:27Z four-model decision. All 108 provider-object identity checks matched.
+
+Only 36 PoP GRIB messages were acquired: **32,317,484 bytes** of raw guidance plus
+455,914 bytes of retained indexes; the preparation downloaded **33,229,312 bytes**
+including discovery/revalidation indexes. The regional NBM file is **10,081,917 bytes**
+(36 × 132 × 132 native values). Existing model data were referenced, not duplicated.
+The unchanged 7×7 / 6 km local geometry contains 9 editable and 40 context-only nodes.
+Its complete surface/QPF/PoP artifact is **83,080,612 bytes**, **11,243,436 compressed**;
+building and retaining it took about **66 seconds** on this Windows workstation.
+
+All **1,764 node-hours** had valid native PoP (858 zero, 906 positive), covering both
+domains with no missing intervals in this sample. Every prior surface/QPF/shadow value
+was exactly unchanged. Point PoP came from the grid center; independent reconstruction
+from retained native percentage corners differed by at most **5.56e-17** as a fraction.
+Five prepared model files were each opened once per build and reused across the grid.
+Raw replay reproduced all native values and intervals; repeated grid builds reproduced
+identical compressed bytes, and two in-process API reads matched the saved grid exactly.
+All replay/build/API checks blocked provider access and made **zero network calls**.
+
+Example point results (unrounded values remain stored):
+
+| UTC interval `(start, end]` | NBM PoP of >0.01 inch | Separate HRRR/GFS QPF |
+| --- | ---: | ---: |
+| Sep 11 18–19Z | 0% | 0 in |
+| Sep 12 03–04Z | 21.438868% | 0.008758743 in |
+| Sep 13 05–06Z | 1% | 0 in |
+
+The full 36-hour report, source evidence, reconstruction proof and logs are retained
+outside Git under `%LOCALAPPDATA%/MesoForge/baselines/20260911-pop/`
+(`minneapolis-pop-hourly-report.md`, `real-grid-proof.json`). Explicit unavailable and
+incompatible-interval cases are covered by focused fixtures rather than manufactured
+in the real demonstration.
+
+Validation for this increment: **324 focused offline tests** passed, including
+probability semantics, zero/missing values, source/time alignment, grid extraction,
+shared loading and replay. The affected selected/prepared tests passed again after
+the replay byte-accounting fix (38 reruns, not additional unique cases). The existing
+surface forward-run PostgreSQL/MinIO integration test also passed with synthetic NBM
+GRIB inputs: both new forecasts read back exactly, older history remained unchanged,
+and an invalid coordinate did not stop issuance. Temporary services were stopped.
+Ruff, mypy, import contracts, the offline lock check, documentation, hygiene and
+`git diff --check` passed. Full storage/application acceptance and PoP calibration/skill
+were not evaluated; temperature remains the only verified/scored field.
+
+The real-data preparation, raw rebuild and grid commands above were exercised through
+their application functions; repeated `/forecast` requests were tested in-process.
+The shown standalone API startup command was not executed for this increment.
 
 ### Automatic current guidance
 

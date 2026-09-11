@@ -11,6 +11,24 @@ from zoneinfo import ZoneInfo
 from mesoforge.catalog.units import convert
 
 _QPF = "liquid_equivalent_precipitation_amount_1h"
+_POP = "probability_of_precipitation_1h"
+
+
+def _display_pop(field: dict[str, Any]) -> dict[str, Any]:
+    """Display the native probability's percentage without changing its event window."""
+    if field["unit"] != "1":
+        raise ValueError("Hourly report requires canonical PoP as a fraction")
+    value = field["value"]
+    if value is not None and (not math.isfinite(value) or not 0 <= value <= 1):
+        raise ValueError("Hourly report requires PoP within [0, 1]")
+    return {
+        "value": None if value is None else value * 100,
+        "unit": "percent",
+        "interval_start": field["interval_start"],
+        "interval_end": field["interval_end"],
+        "interval_closure": field["interval_closure"],
+        "threshold": deepcopy(field["threshold"]),
+    }
 
 
 def _display_qpf(field: dict[str, Any]) -> dict[str, Any]:
@@ -95,6 +113,8 @@ def build_hourly_report(
             hours[-1]["final_surface_fields"] = deepcopy(hour["surface"]["fields"])
             if _QPF in hour["surface"]["fields"]:
                 hours[-1]["display_qpf"] = _display_qpf(hour["surface"]["fields"][_QPF])
+            if _POP in hour["surface"]["fields"]:
+                hours[-1]["display_pop"] = _display_pop(hour["surface"]["fields"][_POP])
     return {
         "latitude": forecast["latitude"],
         "longitude": forecast["longitude"],
@@ -175,6 +195,8 @@ def _surface_value(fields: dict[str, Any], variable: str) -> str:
     value = field["value"]
     if variable == _QPF:
         return f"{_display_qpf(field)['value']:.6g}"
+    if variable == _POP:
+        return f"{_display_pop(field)['value']:.6g}"
     if field["unit"] == "K":
         return _temperature_text(_display_temperature(field))
     if field["unit"] == "m/s":
@@ -202,8 +224,8 @@ def _surface_value(fields: dict[str, Any], variable: str) -> str:
     return f"{value:.1f}"
 
 
-def _qpf_interval_cells(fields: dict[str, Any]) -> list[str]:
-    field = fields.get(_QPF, {})
+def _interval_cells(fields: dict[str, Any], variable: str) -> list[str]:
+    field = fields.get(variable, {})
     return [str(field.get(key) or "unavailable") for key in ("interval_start", "interval_end")]
 
 
@@ -217,11 +239,16 @@ def _render_surface_report(report: dict[str, Any]) -> str:
         "wind_from_direction_10m",
         "wind_gust_10m",
     )
+    surface_columns = columns
     has_qpf = any(_QPF in hour.get("surface", {}).get("fields", {}) for hour in report["hours"])
+    has_pop = any(_POP in hour.get("surface", {}).get("fields", {}) for hour in report["hours"])
     if has_qpf:
         columns += (_QPF,)
+    if has_pop:
+        columns += (_POP,)
     qpf_headers = " QPF in | Accumulation start UTC (exclusive) | End UTC (inclusive) |"
     qpf_separator = " --- | --- | --- |"
+    pop_headers = " Native-period PoP % | PoP start UTC (exclusive) | PoP end UTC (inclusive) |"
     lines = [
         f"Surface forecast at {report['latitude']}, {report['longitude']}",
         "",
@@ -244,9 +271,11 @@ def _render_surface_report(report: dict[str, Any]) -> str:
         "| Hour | UTC valid time | Local/display valid time | T °F | Td °F | RH % | "
         "Wind mph | From | Gust mph |"
         + (qpf_headers if has_qpf else "")
+        + (pop_headers if has_pop else "")
         + " Missing / exclusions |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
         + (qpf_separator if has_qpf else "")
+        + (qpf_separator if has_pop else "")
         + " --- |",
     ]
     if has_qpf:
@@ -259,6 +288,16 @@ def _render_surface_report(report: dict[str, Any]) -> str:
             "19–36 when both are eligible, with explicit approved fallbacks. Small positive "
             "amounts remain positive; zero and unavailable are distinct.",
         )
+    if has_pop:
+        lines.insert(
+            -3,
+            "NBM PoP is the probability of liquid-equivalent accumulation strictly greater "
+            "than 0.254 kg/m² (0.01 inch) over the displayed native (start, end] period. "
+            "The current product has one-hour periods. NBM is the sole probability source "
+            "with weight 1.0; PoP is not derived from deterministic QPF and does not identify "
+            "precipitation type. Missing native periods stay unavailable; no new probability "
+            "windows are synthesized. Percent display retains the original fraction in storage.",
+        )
     reasons: dict[str, list[int]] = {}
     for hour in report["hours"]:
         surface = hour.get("surface", {})
@@ -268,7 +307,7 @@ def _render_surface_report(report: dict[str, Any]) -> str:
             field = fields.get(variable, {})
             if field.get("value") is not None:
                 weights = field.get("weights", {})
-                if len(weights) == 1:
+                if len(weights) == 1 and variable != _POP:
                     issues.append(f"{variable}: {next(iter(weights))}-only fallback")
                 elif field.get("missing_reasons"):
                     issues.append(f"{variable}: contributor exclusions (see below)")
@@ -278,8 +317,9 @@ def _render_surface_report(report: dict[str, Any]) -> str:
             str(hour["horizon_hours"]),
             hour["valid_time_utc"],
             hour["valid_time_local"],
-            *(_surface_value(fields, v) for v in columns),
-            *(_qpf_interval_cells(fields) if has_qpf else []),
+            *(_surface_value(fields, v) for v in surface_columns),
+            *([_surface_value(fields, _QPF), *_interval_cells(fields, _QPF)] if has_qpf else []),
+            *([_surface_value(fields, _POP), *_interval_cells(fields, _POP)] if has_pop else []),
             ("; ".join(issues) if issues else "none") + "; cloud unavailable",
         ]
         lines.append("| " + " | ".join(cells) + " |")
@@ -292,15 +332,31 @@ def _render_surface_report(report: dict[str, Any]) -> str:
             for h in report["hours"]
             if model in h.get("surface", {}).get("contributors", {})
         )
+        probability_only = set(native.get("fields", {})) == {_POP}
+        native_columns = () if probability_only else surface_columns
+        native_qpf = has_qpf and not probability_only
+        native_pop = probability_only
+        native_cycle = (
+            native["fields"][_POP].get("source_cycle", "unavailable")
+            if probability_only
+            else native["cycle"]
+        )
+        native_header = "| Hour | Source lead |"
+        native_separator = "| --- | --- |"
+        if not probability_only:
+            native_header += " T °F | Td °F | RH % | Wind mph | From | Gust mph |"
+            native_separator += " --- | --- | --- | --- | --- | --- |"
         lines.extend(
             [
                 "",
-                f"### {model} native contributor ({native['role']}; cycle {native['cycle']})",
+                f"### {model} native contributor ({native['role']}; cycle {native_cycle})",
                 "",
-                "| Hour | Source lead | T °F | Td °F | RH % | Wind mph | From | Gust mph |"
-                + (qpf_headers if has_qpf else ""),
-                "| --- | --- | --- | --- | --- | --- | --- | --- |"
-                + (qpf_separator if has_qpf else ""),
+                native_header
+                + (qpf_headers if native_qpf else "")
+                + (pop_headers if native_pop else ""),
+                native_separator
+                + (qpf_separator if native_qpf else "")
+                + (qpf_separator if native_pop else ""),
             ]
         )
         for hour in report["hours"]:
@@ -308,9 +364,22 @@ def _render_surface_report(report: dict[str, Any]) -> str:
             fields = source.get("fields", {})
             cells = [
                 str(hour["horizon_hours"]),
-                str(source.get("source_lead_hours") or "unavailable"),
-                *(_surface_value(fields, v) for v in columns),
-                *(_qpf_interval_cells(fields) if has_qpf else []),
+                str(
+                    fields.get(_POP, {}).get("source_lead_hours", "unavailable")
+                    if probability_only
+                    else source.get("source_lead_hours") or "unavailable"
+                ),
+                *(_surface_value(fields, v) for v in native_columns),
+                *(
+                    [_surface_value(fields, _QPF), *_interval_cells(fields, _QPF)]
+                    if native_qpf
+                    else []
+                ),
+                *(
+                    [_surface_value(fields, _POP), *_interval_cells(fields, _POP)]
+                    if native_pop
+                    else []
+                ),
             ]
             lines.append("| " + " | ".join(cells) + " |")
             for variable, field in fields.items():

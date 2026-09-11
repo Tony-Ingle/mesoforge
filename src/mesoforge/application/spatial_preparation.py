@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -82,12 +83,16 @@ def load_prepared(
     *,
     configuration: ContributorConfiguration = DEFAULT_CONFIGURATION,
     shadow_directories: Mapping[str, Path] | None = None,
+    pop_guidance: dict[str, Any] | None = None,
 ) -> PreparedPointForecast | PreparedRegions:
     """Load all shared regions once. This function never prepares or downloads."""
     index = directory / "coverage.json"
     if not index.is_file():
-        return PreparedPointForecast.from_directory(
-            directory, configuration=configuration, shadow_directories=shadow_directories
+        return attach_pop_guidance(
+            PreparedPointForecast.from_directory(
+                directory, configuration=configuration, shadow_directories=shadow_directories
+            ),
+            pop_guidance,
         )
     payload = json.loads(index.read_text())
     regions = []
@@ -108,7 +113,33 @@ def load_prepared(
     if not regions:
         raise ValueError("No prepared regions in coverage index")
     failures = {(row["lat"], row["lon"]): row["message"] for row in payload.get("failures", [])}
-    return PreparedRegions(regions, failures)
+    return attach_pop_guidance(PreparedRegions(regions, failures), pop_guidance)
+
+
+def attach_pop_guidance(
+    prepared: PreparedPointForecast | PreparedRegions,
+    descriptor: dict[str, Any] | None,
+) -> PreparedPointForecast | PreparedRegions:
+    """Load one shared field source before forecasts; never acquire from a grid node."""
+    if descriptor is None:
+        return prepared
+    from mesoforge.application.prepared_pop import load_pop_guidance
+
+    regions = prepared.regions if isinstance(prepared, PreparedRegions) else [prepared]
+    if any(region._surface_configuration is None for region in regions):
+        raise ValueError("Probability guidance requires the existing surface-grid forecast")
+    target = regions[0]._target_reference_time
+    if any(region._target_reference_time != target for region in regions):
+        raise ValueError("Probability attachment requires one shared target reference time")
+    views = load_pop_guidance(descriptor, target_reference_time=target)
+    attached = [
+        replace(region, _pop_views=views, _pop_guidance=deepcopy(descriptor)) for region in regions
+    ]
+    return (
+        PreparedRegions(attached, prepared.failures)
+        if isinstance(prepared, PreparedRegions)
+        else attached[0]
+    )
 
 
 def ensure_coverage(

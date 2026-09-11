@@ -334,18 +334,30 @@ def test_inventory_changed_during_copy_is_revalidated_before_acquisition(
 
 
 @pytest.mark.parametrize(
-    "failure,qpf",
+    "failure,qpf,pop_status",
     [
-        (None, False),
-        (None, True),
-        ("RAP missing hour", False),
-        ("IFS missing hour", False),
-        ("IFS cycle", False),
+        (None, False, None),
+        (None, True, None),
+        (None, True, "prepared"),
+        (None, True, "unavailable"),
+        ("RAP missing hour", False, None),
+        ("IFS missing hour", False, None),
+        ("IFS cycle", False, None),
     ],
 )
 def test_preparation_reuses_one_selected_source_set_and_rejects_partial_shadows(
-    selection, tmp_path, monkeypatch, failure, qpf
+    selection, tmp_path, monkeypatch, failure, qpf, pop_status
 ):
+    from mesoforge.application import prepared_pop
+
+    pop_descriptor = {
+        "status": pop_status,
+        "reason": "Fixture native-hour gaps" if pop_status == "unavailable" else None,
+        "downloaded_bytes": 20,
+        "retained_raw_bytes": 10 if pop_status == "prepared" else 0,
+    }
+    prepare_pop = Mock(return_value=pop_descriptor)
+    monkeypatch.setattr(prepared_pop, "prepare_pop_attachment", prepare_pop)
     selection_path, selection_report = selection
     expected_configuration = IFS_CONFIGURATION
     qpf_acquired = {"HRRR": [], "GFS": []}
@@ -453,6 +465,7 @@ def test_preparation_reuses_one_selected_source_set_and_rejects_partial_shadows(
         "transport": Mock(spec=[]),
         "clock": clock,
         "sleeper": RecordingSleeper(clock),
+        **({"include_pop": True} if pop_status else {}),
     }
     if failure:
         with pytest.raises(ValueError, match="no issuance"):
@@ -466,7 +479,18 @@ def test_preparation_reuses_one_selected_source_set_and_rejects_partial_shadows(
             location_rows, selection_path, output, **arguments
         )
         assert result["current_model_set"]["selection"] == selection_report
-        assert result["downloaded_bytes"] == 120
+        assert result["downloaded_bytes"] == 120 + (20 if pop_status else 0)
+        if pop_status:
+            assert result["pop_guidance"] == pop_descriptor
+            assert result["retained_raw_bytes"] == pop_descriptor["retained_raw_bytes"]
+            assert result["pop_bytes_in_totals"] == {
+                "retained_raw_bytes": pop_descriptor["retained_raw_bytes"]
+            }
+            prepare_pop.assert_called_once()
+            assert prepare_pop.call_args.kwargs["locations"] == location_rows
+            assert prepare_pop.call_args.kwargs["transport"] is arguments["transport"]
+        else:
+            assert "pop_guidance" not in result
         assert set(result["shadow_directories"]) == {"RAP", "IFS"}
         assert json.loads((output / "preparation.json").read_text()) == result
         assert (output / "discovery" / "selection.json").read_bytes() == selection_path.read_bytes()
@@ -474,6 +498,8 @@ def test_preparation_reuses_one_selected_source_set_and_rejects_partial_shadows(
         cover.assert_called_once()
         pinned.assert_complete.assert_called_once()
     pin.assert_called_once()
+    if not pop_status:
+        prepare_pop.assert_not_called()
     assert len(pin.call_args.args[1]) == 120
     acquire.assert_called_once()
     if qpf:

@@ -321,10 +321,13 @@ def prepare_selected(
     transport: HttpTransport | None = None,
     clock: Clock | None = None,
     sleeper: Sleeper | None = None,
+    include_pop: bool = False,
 ) -> dict[str, Any]:
     """Prepare one selected source set and share regional views across the collection."""
     clock, sleeper = clock or SystemClock(), sleeper or SystemSleeper()
     selection, configuration, probes = load_selection(selection_path, clock=clock)
+    if include_pop and not selection.get("surface_fields"):
+        raise ValueError("PoP preparation requires the existing surface-grid forecast")
     selection_bytes = selection_path.read_bytes()
     if json.loads(selection_bytes) != selection:
         raise ValueError("Selection changed after validation; discover again")
@@ -513,6 +516,23 @@ def prepare_selected(
             + qpf_raw_bytes(manifest.get("qpf_inputs", []))
             + sum(row["retained_raw_bytes"] for row in shadows.values()),
         }
+        if include_pop:
+            from mesoforge.application.prepared_pop import prepare_pop_attachment
+
+            descriptor = prepare_pop_attachment(
+                report,
+                output_directory / "NBM",
+                locations=locations,
+                transport=transport,
+                clock=clock,
+                sleeper=sleeper,
+            )
+            report["pop_guidance"] = descriptor
+            report["downloaded_bytes"] += descriptor.get("downloaded_bytes", 0)
+            report["retained_raw_bytes"] += descriptor.get("retained_raw_bytes", 0)
+            report["pop_bytes_in_totals"] = {
+                "retained_raw_bytes": descriptor.get("retained_raw_bytes", 0)
+            }
         _write_bytes(output_directory / "preparation.json", json.dumps(report, indent=2).encode())
         return report
     except Exception as exc:
@@ -538,6 +558,7 @@ def run_selected_batch(
     clock: Clock | None = None,
     sleeper: Sleeper | None = None,
     forecast_report_builder: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    include_pop: bool = False,
 ) -> dict[str, Any]:
     """No manual cycles; existing shared preparation and immutable persistence paths."""
     locations = load_locations(config_path)
@@ -549,6 +570,7 @@ def run_selected_batch(
         transport=transport,
         clock=clock,
         sleeper=sleeper,
+        **({"include_pop": True} if include_pop else {}),
     )
     batch = run_batch(
         config_path,
@@ -562,6 +584,7 @@ def run_selected_batch(
             model: Path(path) for model, path in preparation["shadow_directories"].items()
         },
         forecast_report_builder=forecast_report_builder,
+        **({"pop_guidance": preparation["pop_guidance"]} if "pop_guidance" in preparation else {}),
     )
     return {**batch, "preparation": preparation}
 
@@ -578,9 +601,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--output-dir", type=Path, required=True, help="New prepared directory outside Git"
     )
+    parser.add_argument(
+        "--pop-fields",
+        action="store_true",
+        help="Also prepare native NBM probabilities before issuance",
+    )
     args = parser.parse_args(argv)
     try:
-        result = run_selected_batch(args.config, args.selection, args.output_dir)
+        result = run_selected_batch(
+            args.config,
+            args.selection,
+            args.output_dir,
+            include_pop=args.pop_fields,
+        )
     except Exception as exc:
         print(
             json.dumps({"error": {"code": "selected_batch_failed", "message": str(exc)}}),

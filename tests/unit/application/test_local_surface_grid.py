@@ -34,6 +34,7 @@ from tests.unit.application.test_surface_forecast import (
     DEW,
     DIRECTION,
     GUST,
+    POP,
     QPF,
     RH,
     SPEED,
@@ -43,6 +44,7 @@ from tests.unit.application.test_surface_forecast import (
     V,
     _add_qpf,
     _dataset,
+    _pop_entry,
 )
 
 LATITUDE, LONGITUDE = 44.98859, -93.25557
@@ -468,13 +470,23 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
         dataset.attrs["qpf_metadata_json"] = json.dumps({str(lead): {"parents": [parent]}})
         dataset["qpf_finite_precision_floor_applied"] = xr.zeros_like(dataset[QPF], dtype=np.uint8)
         manifest["qpf_inputs"].append({**parent, "messages": [{"raw_sha256": "f" * 64}]})
-    prepared = replace(prepared_surface, _guidance=datasets, _manifest=manifest, _horizons=(1,))
+    prepared = replace(
+        prepared_surface,
+        _guidance=datasets,
+        _manifest=manifest,
+        _horizons=(1,),
+        _pop_views=[_pop_entry(hours=(1,))],
+        _pop_guidance={"status": "prepared"},
+    )
     result = prepared.forecast(latitude=LATITUDE, longitude=LONGITUDE)
     assert result["hours"][0]["temperature"]["value"] is not None
     center_qpf = result["hours"][0]["surface"]["contributors"]["HRRR"]["fields"][QPF]
     assert center_qpf["value"] == pytest.approx(0.125)
     assert center_qpf["spatial_extraction"]
     assert "finite_precision_floor_at_source_corners" in center_qpf["normalization"]
+    center_pop = result["hours"][0]["surface"]["fields"][POP]
+    assert center_pop["value"] == pytest.approx(0.4)
+    assert center_pop["spatial_extraction"]["native_fraction_at_source_corners"] == [0.4] * 4
     cells = result["local_grid_baseline"]["cells"]
     assert sum(cell["status"] == "unavailable" for cell in cells) == len(cells) - 1
     for cell in cells:
@@ -486,6 +498,7 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
         for field in hour["surface"]["fields"].values():
             assert field["value"] is None and field["missing_reasons"]
             assert field["weights"] == {}
+            assert "spatial_extraction" not in field
         for contributor in hour["surface"]["contributors"].values():
             assert all(field["value"] is None for field in contributor["fields"].values())
             for field in contributor["fields"].values():
@@ -496,6 +509,14 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
         unavailable = hour["surface"]["contributors"]["HRRR"]["fields"][QPF]
         assert unavailable["interval_start"] == center_qpf["interval_start"]
         assert unavailable["provenance"] == center_qpf["provenance"]
+        for field in (
+            hour["surface"]["fields"][POP],
+            hour["surface"]["contributors"]["NBM"]["fields"][POP],
+        ):
+            assert field["source_cycle"] == center_pop["source_cycle"]
+            assert field["interval_start"] == center_pop["interval_start"]
+            assert field["interval_end"] == center_pop["interval_end"]
+            assert field["provenance"] == center_pop["provenance"]
     with pytest.raises(CoverageRequiredError):
         prepared.forecast(latitude=LATITUDE + 0.1, longitude=LONGITUDE)
 
@@ -519,7 +540,18 @@ def test_qpf_spans_both_domains_and_exact_point_replays_with_provenance(prepared
             manifest["qpf_inputs"].append({**parent, "messages": [{"raw_sha256": "f" * 64}]})
         dataset.attrs["qpf_metadata_json"] = json.dumps(metadata)
     prepared = replace(prepared_surface, _guidance=datasets, _manifest=manifest)
-    numerical_before = prepared_surface._forecast_column(latitude=LATITUDE, longitude=LONGITUDE)
+    numerical_before = prepared._forecast_column(latitude=LATITUDE, longitude=LONGITUDE)
+    pop_dataset, pop_crs, pop_manifest = _pop_entry(hours=HOURS)
+    pop_dataset = pop_dataset.assign_coords(x=[-94.0, -92.0], y=[44.0, 46.0])
+    longitude, latitude = np.meshgrid(pop_dataset.x.values, pop_dataset.y.values)
+    pop_dataset[POP].values += 0.02 * _gradient(latitude, longitude)
+    pop_dataset.native_probability_percent.values[:] = pop_dataset[POP].values * 100
+    pop_original = pop_dataset.copy(deep=True)
+    prepared = replace(
+        prepared,
+        _pop_views=[(pop_dataset, pop_crs, pop_manifest)],
+        _pop_guidance={"status": "prepared", "source": "NBM fixture"},
+    )
     calculate = Mock(wraps=prepared._forecast_column)
     with (
         patch("xarray.open_dataset", side_effect=AssertionError("Already loaded guidance")),
@@ -550,6 +582,19 @@ def test_qpf_spans_both_domains_and_exact_point_replays_with_provenance(prepared
                 == str(np.datetime_as_string(end - np.timedelta64(1, "h"), unit="s")) + "Z"
             )
             native = hour["surface"]["contributors"]
+            pop = hour["surface"]["fields"][POP]
+            assert pop["value"] == pytest.approx(0.4 + 0.02 * gradient, abs=1e-12)
+            assert pop["weights"] == {"NBM": 1.0}
+            assert pop["threshold"] == {"value": 0.254, "unit": "kg/m^2", "comparison": "gt"}
+            assert pop["interval_start"] == qpf["interval_start"]
+            assert pop["interval_end"] == qpf["interval_end"]
+            assert native["NBM"]["role"] == "field_source"
+            assert set(native["NBM"]["fields"]) == {POP}
+            assert native["NBM"]["fields"][POP]["value"] == pop["value"]
+            assert (
+                native["NBM"]["fields"][POP]["provenance"]["source_inputs"][0]["raw_sha256"]
+                == "e" * 64
+            )
             for model in ("HRRR", "GFS"):
                 field = native[model]["fields"][QPF]
                 assert field["provenance"]["prepared_sha256"] == "c" * 64
@@ -572,10 +617,12 @@ def test_qpf_spans_both_domains_and_exact_point_replays_with_provenance(prepared
         assert hour["temperature"] == before["temperature"]
         for variable in FIELDS:
             assert hour["surface"]["fields"][variable] == before["surface"]["fields"][variable]
-        for model in hour["surface"]["contributors"]:
+        assert hour["surface"]["fields"][QPF] == before["surface"]["fields"][QPF]
+        for model in before["surface"]["contributors"]:
             for variable in FIELDS:
                 assert (
                     hour["surface"]["contributors"][model]["fields"][variable]
                     == before["surface"]["contributors"][model]["fields"][variable]
                 )
     assert QPF not in prepared_surface._guidance["HRRR"]
+    xr.testing.assert_identical(pop_dataset, pop_original)

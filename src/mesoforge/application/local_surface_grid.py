@@ -156,11 +156,13 @@ def _transformation_identity() -> dict[str, Any]:
         "application/point_forecast.py",
         "application/surface_forecast.py",
         "application/precipitation_forecast.py",
+        "application/probability_forecast.py",
         "forecasting/surface.py",
         "forecasting/scalar_blend.py",
         "forecasting/vector_blend.py",
         "forecasting/gust_blend.py",
         "forecasting/precipitation_blend.py",
+        "forecasting/pop_blend.py",
         "forecasting/baseline.py",
         "forecasting/recipes.py",
         "alignment/spatial.py",
@@ -194,6 +196,7 @@ def _missing_hours(hours: list[dict[str, Any]], reason: str) -> list[dict[str, A
             continue
         for field in surface["fields"].values():
             field.update(value=None, missing_reasons=[reason], status="unavailable", weights={})
+            field.pop("spatial_extraction", None)
             field["row_id"] = field["row_sha256"] = None
             if "final_gust_epsilon_floor_applied" in field:
                 field["final_gust_epsilon_floor_applied"] = False

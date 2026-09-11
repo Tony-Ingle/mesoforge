@@ -19,7 +19,7 @@ forecast operation should not require a human to approve each forecast.
 
 The implemented local V2 path produces a real **36-hour surface forecast** with
 temperature, dew point, derived RH, vector wind speed/direction, gust and interval-aware
-liquid precipitation. It discovers
+liquid precipitation and native NBM probability of precipitation. It discovers
 current model cycles, prepares shared guidance, processes coordinate collections,
 verifies eligible previous temperature forecasts and saves new immutable issuances.
 HRRR/GFS remain active; temperature stays at 70/30 demonstration weights, while the
@@ -31,7 +31,9 @@ Shared prepared files hold native model grids. The local MesoForge surface basel
 uses one coordinate-derived grid covering a larger context domain, with a smaller
 editable subset and an exact forecast-point target. The spot forecast is extracted
 from its center node. QPF retains exact hourly accumulation bounds and approved
-precipitation rows. PoP, precipitation type, snowfall, deterministic bias correction,
+precipitation rows. PoP retains its native one-hour event (>0.01 inch liquid) and
+approved NBM-only passthrough; it is not inferred from deterministic QPF.
+Precipitation type, snowfall, deterministic bias correction,
 site learning, AI editing, delivery and production deployment/scheduling
 are not implemented.
 The existing on-demand forward run and explicit batch history are not a deployed
@@ -41,8 +43,8 @@ results and validation gaps; temperature remains the verified/scored field today
 The Python modular monolith, scientific contracts, provenance and PostgreSQL/S3
 storage reuse accepted [architecture](docs/decisions/0001-python-modular-monolith.md)
 and [storage](docs/decisions/0004-postgresql-and-s3-storage.md) decisions. The retained
-Phase 2 station baseline supplies reused QPF science. Its retained PoP support is a
-technical starting point for a later probabilistic field, not implemented V2 PoP.
+Phase 2 station baseline supplies reused QPF science and the native NBM PoP event,
+normalization and passthrough contract. Other NBM fields are not activated by this step.
 
 The owner-approved long-term direction below guides future design. The
 [V2 RFC](docs/rfcs/mesoforge-v2-architecture.md) remains proposed where implementation
@@ -209,8 +211,8 @@ The release direction remains a private operator-controlled forecast service wit
 useful deterministic output, immutable configured-location history, suitable
 observation matching and bounded performance queries. The implemented local surface
 grid establishes the numerical representation across context and editable domains.
-The next proposed increment is actual probabilistic precipitation guidance on that
-same grid, followed separately by precipitation type or editing stages. Statistical correction, AI,
+The next proposed increment is precipitation type from suitable categorical and/or
+thermodynamic guidance on that same grid. Statistical correction, AI,
 delivery and long-term learning are not prerequisites for that increment.
 
 The exact wider release support matrix, authentication, measured resource limits,

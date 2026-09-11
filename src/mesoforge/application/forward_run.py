@@ -124,6 +124,7 @@ def run_forward(
                 output_directory / "selection/selection.json",
                 output_directory / "prepared",
                 issuer=issuer,
+                include_pop=True,
                 forecast_report_builder=partial(
                     build_hourly_report, display_timezone=display_timezone
                 ),

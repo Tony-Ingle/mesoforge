@@ -302,3 +302,100 @@ def test_historical_report_does_not_invent_qpf(forecast: dict[str, Any]) -> None
     report = build_hourly_report(forecast)
     assert all("display_qpf" not in hour for hour in report["hours"])
     assert "QPF" not in render_hourly_report(report)
+
+
+@pytest.fixture
+def pop_forecast(qpf_forecast: dict[str, Any]) -> dict[str, Any]:
+    for hour in qpf_forecast["hours"]:
+        qpf = hour["surface"]["fields"]["liquid_equivalent_precipitation_amount_1h"]
+        pop = {
+            "value": 0.4,
+            "unit": "1",
+            "temporal_semantics": "probability",
+            "interval_start": qpf["interval_start"],
+            "interval_end": qpf["interval_end"],
+            "interval_closure": "left_open_right_closed",
+            "threshold": {"value": 0.254, "unit": "kg/m^2", "comparison": "gt"},
+            "status": "available",
+            "weights": {"NBM": 1.0},
+            "missing_reasons": [],
+            "provenance": {"raw_sha256": "nbm-fixture-hash"},
+            "source_cycle": "2026-11-01T03:00:00Z",
+            "source_lead_hours": hour["horizon_hours"] + 1,
+        }
+        hour["surface"]["fields"]["probability_of_precipitation_1h"] = pop
+        hour["surface"]["contributors"]["NBM"] = {
+            "fields": {"probability_of_precipitation_1h": deepcopy(pop)},
+            "role": "field_source",
+        }
+    return qpf_forecast
+
+
+@pytest.mark.parametrize(
+    "fraction,percent,text",
+    [
+        (0.0, 0.0, "0"),
+        (0.450001, 45.0001, "45.0001"),
+        (1.0, 100.0, "100"),
+        (None, None, "unavailable"),
+    ],
+)
+def test_pop_percentage_keeps_exact_native_event_and_zero_missing_distinction(
+    pop_forecast, fraction, percent, text
+):
+    field = pop_forecast["hours"][0]["surface"]["fields"]["probability_of_precipitation_1h"]
+    field["value"] = fraction
+    if fraction is None:
+        field["missing_reasons"] = ["No native probability for this exact interval"]
+    report = build_hourly_report(pop_forecast)
+    display = report["hours"][0]["display_pop"]
+    assert display["value"] == (pytest.approx(percent) if percent is not None else None)
+    assert display["unit"] == "percent"
+    assert display["interval_start"] == "2026-11-01T04:00:00Z"
+    assert display["interval_end"] == "2026-11-01T05:00:00Z"
+    assert display["threshold"] == {"value": 0.254, "unit": "kg/m^2", "comparison": "gt"}
+    assert display["interval_closure"] == "left_open_right_closed"
+    rendered = render_hourly_report(report)
+    first = next(line for line in rendered.splitlines() if line.startswith("| 1 |"))
+    assert f"| {text} | 2026-11-01T04:00:00Z | 2026-11-01T05:00:00Z |" in first
+    if fraction is None:
+        assert "No native probability for this exact interval" in rendered
+
+
+def test_pop_report_has_nbm_probability_only_and_preserves_qpf_and_original_evidence(pop_forecast):
+    original = deepcopy(pop_forecast)
+    report = build_hourly_report(pop_forecast)
+    rendered = render_hourly_report(report)
+    assert "strictly greater than 0.254 kg/m² (0.01 inch)" in rendered
+    assert "no new probability windows are synthesized" in rendered
+    assert "NBM-only fallback" not in rendered
+    nbm_table = rendered.split("### NBM native contributor")[1].split("Explicit missingness")[0]
+    assert "Native-period PoP %" in nbm_table
+    assert "cycle 2026-11-01T03:00:00Z" in nbm_table
+    assert "| 1 | 2 | 40 |" in nbm_table
+    assert "T °F" not in nbm_table and "Gust mph" not in nbm_table and "QPF in" not in nbm_table
+    assert len([row for row in nbm_table.splitlines() if row.startswith("| ")]) == 38
+    for saved, hour in zip(original["hours"], report["hours"], strict=True):
+        assert hour["surface"] == saved["surface"]
+        assert hour["final_surface_fields"] == saved["surface"]["fields"]
+        assert hour["display_qpf"]["value"] == 1.0
+    report["hours"][0]["display_pop"]["threshold"]["value"] = 0.5
+    report["hours"][0]["surface"]["contributors"]["NBM"]["fields"][
+        "probability_of_precipitation_1h"
+    ]["provenance"].clear()
+    assert pop_forecast == original
+
+
+def test_historical_qpf_report_does_not_invent_probability(qpf_forecast):
+    report = build_hourly_report(qpf_forecast)
+    assert all("display_pop" not in hour for hour in report["hours"])
+    assert "Native-period PoP %" not in render_hourly_report(report)
+
+
+@pytest.mark.parametrize("unit,value", [("percent", 40), ("1", 1.1), ("1", -0.1)])
+def test_pop_report_rejects_invalid_units_or_probability_range(pop_forecast, unit, value):
+    pop_forecast["hours"][0]["surface"]["fields"]["probability_of_precipitation_1h"].update(
+        unit=unit, value=value
+    )
+    with pytest.raises(ValueError, match="PoP"):
+        build_hourly_report(pop_forecast)

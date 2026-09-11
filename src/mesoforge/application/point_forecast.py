@@ -7,7 +7,7 @@ import json
 import math
 from collections.abc import Mapping
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -18,6 +18,7 @@ import xarray as xr
 
 from mesoforge.alignment.station_frame import StationAlignmentError, align_station_to_model
 from mesoforge.application.prepared_qpf import read_qpf_inputs, required_qpf_leads
+from mesoforge.application.probability_forecast import POP, extract_probability_hour
 from mesoforge.application.spatial_coverage import (
     CoverageRequiredError,
     UnsupportedCoordinateError,
@@ -316,6 +317,8 @@ class PreparedPointForecast:
     _configuration: ContributorConfiguration
     _shadow_views: dict[str, list[_ShadowView]]
     _surface_configuration: Phase2BlendConfiguration | None = None
+    _pop_views: list[tuple[xr.Dataset, pyproj.CRS, dict[str, Any]]] = field(default_factory=list)
+    _pop_guidance: dict[str, Any] | None = None
 
     @property
     def notice(self) -> str:
@@ -576,6 +579,16 @@ class PreparedPointForecast:
                 if view is not None
             }
         )
+        pop_view = next(
+            (
+                entry
+                for entry in self._pop_views
+                if point_in_grid(
+                    latitude, longitude, entry[1], entry[0].x.values, entry[0].y.values
+                )
+            ),
+            None,
+        )
         hours: list[dict[str, Any]] = []
         for horizon in self._horizons:
             valid_time = self._target_reference_time + np.timedelta64(horizon, "h")
@@ -722,6 +735,26 @@ class PreparedPointForecast:
                     configuration=self._surface_configuration,
                     selection=selection,
                 )
+                if self._pop_guidance is not None:
+                    pop, native_pop = extract_probability_hour(
+                        pop_view,
+                        latitude=latitude,
+                        longitude=longitude,
+                        horizon=horizon,
+                        target_reference_time=self._target_reference_time,
+                        policy=self._surface_configuration.pop_policy,
+                        unavailable_reason=(
+                            self._pop_guidance.get("reason")
+                            or "NBM: no prepared probability region covers this coordinate"
+                        ),
+                    )
+                    hours[-1]["surface"]["fields"][POP] = pop
+                    hours[-1]["surface"]["contributors"]["NBM"] = {
+                        "model": "NBM",
+                        "role": "field_source",
+                        "native_supported_fields": [POP],
+                        "fields": {POP: native_pop},
+                    }
         contributor_configuration = (
             with_surface_fields(self._configuration)
             if self._surface_configuration is not None
@@ -740,6 +773,28 @@ class PreparedPointForecast:
         }
         if self._manifest_sha256 is not None:
             result["manifest_sha256"] = self._manifest_sha256
+        if self._pop_guidance is not None:
+            result["pop_guidance"] = {
+                **deepcopy(self._pop_guidance),
+                "source_metadata": [
+                    {
+                        key: deepcopy(manifest.get(key))
+                        for key in (
+                            "manifest_sha256",
+                            "source_metadata",
+                            "selection_evidence",
+                            "created_at",
+                            "code_identity",
+                            "prepared_files",
+                        )
+                    }
+                    for _, _, manifest in self._pop_views
+                ],
+                "note": (
+                    "NBM probability preparation is separate from "
+                    "the four-model temperature decision"
+                ),
+            }
         if self._manifest is not None and self._manifest.get("qpf_fields"):
             result["qpf_preparation"] = {
                 "created_at": self._manifest.get("created_at"),

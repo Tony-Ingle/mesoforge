@@ -12,6 +12,7 @@ import pytest
 import xarray as xr
 
 from mesoforge.application.point_forecast import PreparedPointForecast, prepare_demo_files
+from mesoforge.application.probability_forecast import extract_probability_hour
 from mesoforge.application.surface_forecast import FIELD_UNITS, extract_surface_hour
 from tests.unit.application.test_prepared_temperature import phase2_configuration
 
@@ -20,6 +21,7 @@ T, DEW = "air_temperature_2m", "dew_point_temperature_2m"
 U, V, GUST = "eastward_wind_10m", "northward_wind_10m", "wind_gust_10m"
 RH, SPEED, DIRECTION = "relative_humidity_2m", "wind_speed_10m", "wind_from_direction_10m"
 QPF = "liquid_equivalent_precipitation_amount_1h"
+POP = "probability_of_precipitation_1h"
 CRS = pyproj.CRS.from_epsg(4326)
 
 
@@ -87,6 +89,70 @@ def _add_qpf(dataset, amounts):
     dataset[f"{QPF}_interval_bounds"] = (
         ("source_lead_time", "bounds"),
         np.column_stack((ends - np.timedelta64(1, "h"), ends)),
+    )
+
+
+def _pop_entry(*, hours=(1, 2, 19), age=3, fraction=0.4):
+    dataset = _dataset("GFS", age=age, hours=hours)
+    dataset = dataset.drop_vars(list(dataset.data_vars))
+    values = np.full((len(hours), 2, 2), fraction, dtype=np.float64)
+    dataset[POP] = (
+        ("source_lead_time", "y", "x"),
+        values,
+        {
+            "unit_id": "1",
+            "units": "1",
+            "temporal_semantics": "probability",
+            "interval_closure": "left_open_right_closed",
+            "probability_threshold_kg_m2": 0.254,
+            "probability_comparison": "gt",
+            "probability_type": 1,
+        },
+    )
+    dataset["native_probability_percent"] = (
+        ("source_lead_time", "y", "x"),
+        values * 100,
+    )
+    ends = dataset.source_valid_time.values.astype("datetime64[ns]")
+    dataset[f"{POP}_interval_bounds"] = (
+        ("source_lead_time", "bounds"),
+        np.column_stack((ends - np.timedelta64(1, "h"), ends)),
+    )
+    cycle = str(np.datetime_as_string(dataset.forecast_reference_time.values, unit="s")) + "Z"
+    rows = [
+        {
+            "model": "NBM",
+            "cycle": cycle,
+            "source_lead_hours": horizon + age,
+            "valid_time": str(
+                np.datetime_as_string(TARGET + np.timedelta64(horizon, "h"), unit="s")
+            )
+            + "Z",
+            "raw_sha256": "e" * 64,
+            "index_sha256": "f" * 64,
+            "source_grib_url": f"https://provider.invalid/nbm-f{horizon + age:03}.grib2",
+        }
+        for horizon in hours
+    ]
+    dataset.attrs["pop_metadata_json"] = json.dumps(
+        {str(horizon + age): {"native_unit": "percent", "missing_reasons": []} for horizon in hours}
+    )
+    manifest = {
+        "inputs": rows,
+        "manifest_sha256": "a" * 64,
+        "prepared_files": {"NBM": {"sha256": "b" * 64}},
+    }
+    return dataset, CRS, manifest
+
+
+def _extract_pop(configuration, entry, *, horizon=1):
+    return extract_probability_hour(
+        entry,
+        latitude=44.5,
+        longitude=-93.5,
+        horizon=horizon,
+        target_reference_time=TARGET,
+        policy=configuration.pop_policy,
     )
 
 
@@ -467,3 +533,118 @@ def test_qpf_parent_provenance_survives_repeated_extraction_without_mutation(con
     unavailable = _extract(configuration, datasets, sources, horizon=2)
     assert unavailable["contributors"]["GFS"]["fields"][QPF]["value"] is None
     assert unavailable["fields"][QPF]["weights"] == {"HRRR": 1.0}
+
+
+def test_pop_matches_native_hour_event_and_cycle_then_preserves_passthrough_provenance(
+    configuration,
+):
+    entry = _pop_entry()
+    dataset, _, manifest = entry
+    dataset[POP].values[0] = [[0.1, 0.3], [0.5, 0.7]]
+    dataset.native_probability_percent.values[0] = [[10, 30], [50, 70]]
+    original = dataset.copy(deep=True)
+    original_manifest = deepcopy(manifest)
+    baseline, native = _extract_pop(configuration, entry)
+    assert baseline["value"] == pytest.approx((10 + 30 + 50 + 70) / 400)
+    assert native["value"] == baseline["value"]
+    assert baseline["weights"] == {"NBM": 1.0}
+    assert baseline["policy"] == configuration.pop_policy.model_dump(mode="json")
+    assert baseline["threshold"] == {"value": 0.254, "unit": "kg/m^2", "comparison": "gt"}
+    assert baseline["interval_start"] == "2026-09-11T12:00:00Z"
+    assert baseline["interval_end"] == "2026-09-11T13:00:00Z"
+    assert baseline["source_cycle"] == "2026-09-11T09:00:00Z"
+    assert baseline["source_lead_hours"] == 4
+    assert native["spatial_extraction"]["native_percent_at_source_corners"] == [10, 30, 50, 70]
+    assert native["provenance"]["source_inputs"] == [manifest["inputs"][0]]
+    assert native["provenance"]["prepared_sha256"] == "b" * 64
+    assert native["normalization"]["native_unit"] == "percent"
+    assert (baseline, native) == _extract_pop(configuration, entry)
+    baseline["provenance"]["source_inputs"][0]["raw_sha256"] = "changed"
+    assert native["provenance"]["source_inputs"][0]["raw_sha256"] == "e" * 64
+    assert manifest == original_manifest
+    xr.testing.assert_identical(dataset, original)
+
+
+@pytest.mark.parametrize("compatible", [True, False])
+def test_pop_netcdf_event_attribute_scalars_are_safe_for_immutable_json(configuration, compatible):
+    entry = _pop_entry()
+    entry[0][POP].attrs.update(
+        probability_threshold_kg_m2=np.float64(0.254),
+        probability_type=np.int64(1 if compatible else 4),
+    )
+    baseline, native = _extract_pop(configuration, entry)
+    assert (baseline["value"] is not None) is compatible
+    assert json.loads(json.dumps(baseline, allow_nan=False)) == baseline
+    assert json.loads(json.dumps(native, allow_nan=False)) == native
+    assert type(native["source_event"]["probability_type"]) is int
+
+
+@pytest.mark.parametrize(
+    "attribute,value",
+    [
+        ("probability_threshold_kg_m2", 2.54),
+        ("probability_comparison", "ge"),
+        ("probability_type", 4),
+        ("unit_id", "percent"),
+        ("units", "percent"),
+        ("temporal_semantics", "accumulation"),
+        ("interval_closure", "left_closed_right_open"),
+    ],
+)
+def test_pop_rejects_different_threshold_comparator_units_or_semantics(
+    configuration, attribute, value
+):
+    entry = _pop_entry()
+    entry[0][POP].attrs[attribute] = value
+    baseline, native = _extract_pop(configuration, entry)
+    assert native["value"] is None and native["missing_reasons"]
+    assert baseline["value"] is None and baseline["weights"] == {}
+
+
+@pytest.mark.parametrize("corner", [-0.1, 1.1, np.nan])
+def test_pop_invalid_native_corner_is_not_hidden_by_valid_interpolated_probability(
+    configuration, corner
+):
+    entry = _pop_entry()
+    entry[0][POP].values[0, 0, 0] = corner
+    entry[0].native_probability_percent.values[0, 0, 0] = corner * 100
+    baseline, native = _extract_pop(configuration, entry)
+    assert baseline["value"] is None and baseline["weights"] == {}
+    assert native["missing_reasons"] and "spatial_extraction" not in native
+
+
+@pytest.mark.parametrize("fraction", [0.0, 1.0])
+def test_pop_valid_zero_and_one_are_distinct_from_missing(configuration, fraction):
+    baseline, native = _extract_pop(configuration, _pop_entry(fraction=fraction))
+    assert baseline["value"] == native["value"] == fraction
+    assert baseline["status"] == "available" and baseline["missing_reasons"] == []
+    missing, _ = _extract_pop(configuration, None)
+    assert missing["value"] is None and missing["status"] == "unavailable"
+    assert missing["missing_reasons"]
+
+
+def test_pop_never_splits_or_carries_a_different_native_probability_period(configuration):
+    entry = _pop_entry()
+    entry[0][f"{POP}_interval_bounds"].values[0, 0] -= np.timedelta64(5, "h")
+    baseline, native = _extract_pop(configuration, entry)
+    assert baseline["value"] is None and native["value"] is None
+    assert any("exact native one-hour" in reason for reason in native["missing_reasons"])
+    missing, _ = _extract_pop(configuration, entry, horizon=3)
+    assert missing["value"] is None and missing["missing_reasons"]
+    available, _ = _extract_pop(configuration, entry, horizon=2)
+    assert available["value"] == 0.4
+
+
+@pytest.mark.parametrize("failure", ["percent", "cycle", "lead", "valid_time", "missing_input"])
+def test_pop_rejects_inconsistent_native_percent_or_source_identity(configuration, failure):
+    entry = _pop_entry()
+    dataset, _, manifest = entry
+    if failure == "percent":
+        dataset.native_probability_percent.values[0, 0, 0] = 99
+    elif failure == "missing_input":
+        manifest["inputs"].pop(0)
+    else:
+        key = "source_lead_hours" if failure == "lead" else failure
+        manifest["inputs"][0][key] = 999 if failure == "lead" else "2026-09-11T10:00:00Z"
+    baseline, native = _extract_pop(configuration, entry)
+    assert baseline["value"] is None and native["missing_reasons"]

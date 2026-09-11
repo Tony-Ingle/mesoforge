@@ -64,6 +64,7 @@ def prepare_local_grids(
         shadow_directories={
             model: Path(path) for model, path in preparation["shadow_directories"].items()
         },
+        **({"pop_guidance": preparation["pop_guidance"]} if "pop_guidance" in preparation else {}),
     )
     if prepared.horizon_hours != tuple(range(1, 37)):
         raise ValueError("Local surface grids require prepared hours 1..36")

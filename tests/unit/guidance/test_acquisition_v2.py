@@ -104,6 +104,34 @@ _NBM_SETTINGS = make_nbm_settings()
 
 
 class TestAcquireNbmLead:
+    def test_pop_only_subset_does_not_acquire_deterministic_or_temperature_fields(self) -> None:
+        full = _grib2_message(b"q") + _grib2_message(b"p")
+        index = (
+            b"1:0:d=2026083012:APCP:surface:5-6 hour acc fcst:\n"
+            b"2:100:d=2026083012:APCP:surface:5-6 hour acc fcst:prob >0.254:prob fcst 255/255\n"
+        )
+        transport = _FakeTransport()
+        transport.get_queue["noaa-nbm"] = [
+            _FakeResponse(200, content=index),
+            _range_response(full, 100, 200, 200),
+        ]
+        transport.head_queue["noaa-nbm"] = [_FakeResponse(200, {"Content-Length": "200"})]
+        clock = _FakeClock(datetime(2026, 8, 30, 12, 5, tzinfo=UTC))
+        result = acquire_nbm_lead(
+            _NBM_SETTINGS,
+            transport=transport,
+            clock=clock,
+            sleeper=_FakeSleeper(clock),
+            cycle_date=date(2026, 8, 30),
+            cycle_hour=12,
+            forecast_hour=6,
+            cycle_deadline=clock.now(),
+            canonical_variables=("probability_of_precipitation_1h",),
+        )
+        assert list(result.payloads_by_variable()) == ["probability_of_precipitation_1h"]
+        assert result.selected_messages[0].payload == full[100:]
+        assert [method for method, _ in transport.calls] == ["get", "head", "get"]
+
     def test_happy_path_acquires_index_and_seven_selected_messages(self) -> None:
         segments = [_grib2_message(bytes([i])) for i in range(7)]
         full = b"".join(segments)

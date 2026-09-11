@@ -20,12 +20,14 @@ from mesoforge.application import automatic_verification, batch_forecast, prepar
 from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.point_forecast import PreparedPointForecast
 from mesoforge.application.prepared_ifs import IFS_CONFIGURATION
+from mesoforge.application.prepared_pop import load_pop_guidance, prepare_pop_guidance
 from mesoforge.application.prepared_shadow import normalize_shadow_temperature
 from mesoforge.application.prepared_temperature import (
     _write_prepared_file,
     prepare_temperature_guidance,
 )
 from mesoforge.common.identifiers import ArtifactId, Digest
+from mesoforge.guidance.acquisition_v2 import acquire_nbm_lead
 from mesoforge.storage.postgres.repositories import PostgresUnitOfWork
 from mesoforge.storage.s3 import S3ArtifactObjectStore
 from tests.integration.application import test_batch_issuance as issuance_tests
@@ -36,6 +38,8 @@ from tests.support.phase1_fixture_transports import (
     FixedClock,
     FixtureAviationWeatherTransport,
 )
+from tests.support.phase2_provider_transports import build_nbm_transport
+from tests.support.phase2_source_settings import make_nbm_settings
 from tests.unit.application.test_batch_forecast import FIRST, LAST, OUTSIDE, write_config
 from tests.unit.application.test_prepared_observations import _record
 from tests.unit.application.test_prepared_qpf import QpfFixtureTransport
@@ -392,6 +396,40 @@ def test_surface_forward_run_saves_exact_fields_and_preserves_older_temperature_
     selection, preparation = prepared_current_fixture(
         tmp_path / "surface-guidance", surface_fields=True
     )
+    pop_variable = "probability_of_precipitation_1h"
+    nbm_settings = make_nbm_settings()
+    nbm_transport = build_nbm_transport(
+        nbm_settings, cycle=CURRENT_TARGET, leads=EXTENDED_HORIZONS, base_value=10.0
+    )
+    nbm_inputs = [
+        acquire_nbm_lead(
+            nbm_settings,
+            transport=nbm_transport,
+            clock=FixtureClock(),
+            sleeper=FixtureSleeper(),
+            cycle_date=CURRENT_TARGET.date(),
+            cycle_hour=CURRENT_TARGET.hour,
+            forecast_hour=horizon,
+            cycle_deadline=FixtureClock().now(),
+            canonical_variables=(pop_variable,),
+        )
+        for horizon in EXTENDED_HORIZONS
+    ]
+    assert len(nbm_inputs) == 36
+    assert all(len(row.selected_messages) == 1 for row in nbm_inputs)
+    preparation["pop_guidance"] = prepare_pop_guidance(
+        tmp_path / "nbm-probability",
+        settings=nbm_settings,
+        target_reference_time=CURRENT_TARGET,
+        source_cycle=CURRENT_TARGET,
+        acquired_inputs=nbm_inputs,
+        area=None,
+        clock=FixtureClock(),
+        selection_evidence={"fixture_notice": "Synthetic NBM GRIB inputs; no real discovery claim"},
+    )
+    prepared_nbm = load_pop_guidance(preparation["pop_guidance"], CURRENT_TARGET)[0][0]
+    for index, horizon in enumerate(EXTENDED_HORIZONS):
+        np.testing.assert_allclose(prepared_nbm[pop_variable][index], (20 + horizon) / 100)
 
     def discover(directory: Path) -> dict[str, Any]:
         directory.mkdir()
@@ -410,6 +448,7 @@ def test_surface_forward_run_saves_exact_fields_and_preserves_older_temperature_
     assert result["summary"]["issued"] == 2
     discovery.assert_called_once()
     preparation_call.assert_called_once()
+    assert preparation_call.call_args.kwargs["include_pop"] is True
     assert preparation_call.call_args.args[0] == [
         {**FIRST, "name": "Surface fixture"},
         OUTSIDE,
@@ -449,6 +488,16 @@ def test_surface_forward_run_saves_exact_fields_and_preserves_older_temperature_
                 assert datetime.fromisoformat(qpf["interval_end"]) - datetime.fromisoformat(
                     qpf["interval_start"]
                 ) == timedelta(hours=1)
+                pop = hour["surface"]["fields"][pop_variable]
+                assert pop["value"] == pytest.approx((20 + hour["horizon_hours"]) / 100)
+                assert pop["unit"] == "1" and pop["weights"] == {"NBM": 1.0}
+                assert pop["interval_start"] == qpf["interval_start"]
+                assert pop["interval_end"] == qpf["interval_end"]
+                assert pop["threshold"] == {"value": 0.254, "unit": "kg/m^2", "comparison": "gt"}
+                nbm = hour["surface"]["contributors"]["NBM"]
+                assert nbm["role"] == "field_source"
+                assert set(nbm["fields"]) == {pop_variable}
+                assert nbm["fields"][pop_variable]["value"] == pop["value"]
         center = next(cell for cell in grid["cells"] if cell["is_forecast_point"])
         assert center["hours"] == forecast["hours"]
         assert forecast["local_grid"]["point_extraction"]["method"] == "exact_center_node"
@@ -494,6 +543,13 @@ def test_surface_forward_run_saves_exact_fields_and_preserves_older_temperature_
             assert qpf["weights"] == expected_weights
             assert report["display_qpf"]["value"] == qpf["value"] / 25.4
             assert report["display_qpf"]["interval_start"] == qpf["interval_start"]
+            pop = fields[pop_variable]
+            assert report["display_pop"]["value"] == pytest.approx(20 + horizon)
+            assert report["display_pop"]["interval_end"] == pop["interval_end"]
+            assert pop["provenance"]["prepared_sha256"]
+            assert pop["provenance"]["source_inputs"][0]["raw_sha256"]
+            assert pop["provenance"]["source_inputs"][0]["source_lead_hours"] == horizon
+            assert pop["source_cycle"] == CURRENT_TARGET.isoformat().replace("+00:00", "Z")
             assert fields["cloud_area_fraction"]["value"] is None
             assert fields["cloud_area_fraction"]["missing_reasons"]
             contributors = hour["surface"]["contributors"]
@@ -524,3 +580,6 @@ def test_surface_forward_run_saves_exact_fields_and_preserves_older_temperature_
     assert issuer.read(older_record.issued_forecast_id) == older_saved
     assert complete_storage_inventory(migrated_dsn, object_store) == before_readback
     assert "surface" not in older_saved["forecast"]["hours"][0]
+    report_text = (tmp_path / "surface-forward" / "hourly-report.md").read_text(encoding="utf-8")
+    assert "Native-period PoP %" in report_text
+    assert "NBM native contributor (field_source; cycle" in report_text

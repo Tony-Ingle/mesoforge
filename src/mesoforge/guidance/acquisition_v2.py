@@ -280,10 +280,12 @@ def acquire_nbm_lead(
     cycle_hour: int,
     forecast_hour: int,
     cycle_deadline: datetime,
+    canonical_variables: tuple[str, ...] | None = None,
 ) -> Phase2LeadAcquisition:
     """Acquire one NBM lead's pinned index and every field contract's
     selected message (each field's own byte range, never concatenated
-    -- Section 2.3)."""
+    -- Section 2.3), or an explicit field subset."""
+    contracts = _selected_contracts(settings.field_contracts, canonical_variables)
     index_urls = [
         (
             endpoint,
@@ -309,7 +311,7 @@ def acquire_nbm_lead(
     rows = parse_index_rows(index_fetch.payload.decode("utf-8"))
 
     selected_rows: list[tuple[str, IndexRow]] = []
-    for contract in settings.field_contracts:
+    for contract in contracts:
         selector = nbm_source.build_field_selector(
             contract.canonical_variable_id, forecast_hour=forecast_hour
         )
