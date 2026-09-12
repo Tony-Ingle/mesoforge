@@ -85,16 +85,20 @@ def load_prepared(
     shadow_directories: Mapping[str, Path] | None = None,
     pop_guidance: dict[str, Any] | None = None,
     probability_sources: list[dict[str, Any]] | None = None,
+    ptype_guidance: dict[str, Any] | None = None,
 ) -> PreparedPointForecast | PreparedRegions:
     """Load all shared regions once. This function never prepares or downloads."""
     index = directory / "coverage.json"
     if not index.is_file():
-        return attach_pop_guidance(
-            PreparedPointForecast.from_directory(
-                directory, configuration=configuration, shadow_directories=shadow_directories
+        return attach_type_guidance(
+            attach_pop_guidance(
+                PreparedPointForecast.from_directory(
+                    directory, configuration=configuration, shadow_directories=shadow_directories
+                ),
+                pop_guidance,
+                probability_sources=probability_sources,
             ),
-            pop_guidance,
-            probability_sources=probability_sources,
+            ptype_guidance,
         )
     payload = json.loads(index.read_text())
     regions = []
@@ -115,8 +119,41 @@ def load_prepared(
     if not regions:
         raise ValueError("No prepared regions in coverage index")
     failures = {(row["lat"], row["lon"]): row["message"] for row in payload.get("failures", [])}
-    return attach_pop_guidance(
-        PreparedRegions(regions, failures), pop_guidance, probability_sources=probability_sources
+    return attach_type_guidance(
+        attach_pop_guidance(
+            PreparedRegions(regions, failures),
+            pop_guidance,
+            probability_sources=probability_sources,
+        ),
+        ptype_guidance,
+    )
+
+
+def attach_type_guidance(
+    prepared: PreparedPointForecast | PreparedRegions,
+    descriptor: dict[str, Any] | None,
+) -> PreparedPointForecast | PreparedRegions:
+    """Load shared native categorical views once, before grid construction."""
+    if descriptor is None:
+        return prepared
+    from mesoforge.application.prepared_precipitation_type import load_type_guidance
+
+    regions = prepared.regions if isinstance(prepared, PreparedRegions) else [prepared]
+    target = regions[0]._target_reference_time
+    if any(
+        region._surface_configuration is None or region._target_reference_time != target
+        for region in regions
+    ):
+        raise ValueError("P-type guidance requires one shared surface forecast target")
+    views = load_type_guidance(descriptor, target_reference_time=target)
+    attached = [
+        replace(region, _type_views=views, _type_guidance=deepcopy(descriptor))
+        for region in regions
+    ]
+    return (
+        PreparedRegions(attached, prepared.failures)
+        if isinstance(prepared, PreparedRegions)
+        else attached[0]
     )
 
 

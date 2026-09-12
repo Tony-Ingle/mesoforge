@@ -28,6 +28,7 @@ from mesoforge.application.prepared_ifs import IFS_CONFIGURATION
 from mesoforge.application.spatial_coverage import CoverageRequiredError
 from mesoforge.contracts.serialization import canonical_json_bytes, canonical_json_digest
 from mesoforge.forecasting.recipes import with_surface_fields
+from tests.unit.application.test_precipitation_type import type_view
 from tests.unit.application.test_prepared_temperature import phase2_configuration
 from tests.unit.application.test_probability_contributors import (
     _event as probability_event,
@@ -63,6 +64,32 @@ TEST_GEOMETRY = SurfaceGridGeometry(
 
 def _gradient(latitude, longitude):
     return 1.5 * (latitude - LATITUDE) + 2.0 * (longitude - LONGITUDE)
+
+
+def _type_views():
+    views = []
+    for model in ("HRRR", "GFS"):
+        view = type_view(model)
+        event = view.manifest["events"][0]
+        events = []
+        for hour in HOURS:
+            valid = str(np.datetime_as_string(TARGET + np.timedelta64(hour, "h"), unit="s")) + "Z"
+            events.append(
+                {
+                    **event,
+                    "source_cycle": str(np.datetime_as_string(TARGET, unit="s")) + "Z",
+                    "source_lead_hours": hour,
+                    "valid_time": valid,
+                }
+            )
+        view.manifest["events"] = events
+        dataset = xr.concat(
+            [view.dataset.isel(event=0, drop=True)] * 36, dim="event"
+        ).assign_coords(event=list(range(36)), x=[-94.0, -92.0], y=[44.8, 45.2])
+        dataset.rain.values[:, 1, :] = 0
+        dataset.snow.values[:, 1, :] = 1
+        views.append(replace(view, dataset=dataset))
+    return views
 
 
 def _spatial_dataset(model, *, age=0, hours=HOURS):
@@ -510,6 +537,8 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
         _pop_views=[_pop_entry(hours=(1,))],
         _pop_guidance={"status": "prepared"},
         _probability_views=_spatial_probability_views(end_horizon=1),
+        _type_views=_type_views(),
+        _type_guidance={"status": "prepared"},
     )
     result = prepared.forecast(latitude=LATITUDE, longitude=LONGITUDE)
     assert result["hours"][0]["temperature"]["value"] is not None
@@ -536,7 +565,13 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
         assert cell["missing_reasons"]
         hour = cell["hours"][0]
         assert hour["temperature"]["value"] is None
-        for field in hour["surface"]["fields"].values():
+        for name, field in hour["surface"]["fields"].items():
+            if name == "precipitation_type":
+                assert field["value"] == "unavailable" and field["missing_reasons"]
+                assert field["supported_types"] == []
+                evidence = hour["surface"]["precipitation_type_guidance"]
+                assert all(not row["native_values"] for row in evidence["contributors"])
+                continue
             assert field["value"] is None and field["missing_reasons"]
             assert field["weights"] == {}
             assert "spatial_extraction" not in field
@@ -583,6 +618,35 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
             assert pair["reasons"] == cell["missing_reasons"]
     with pytest.raises(CoverageRequiredError):
         prepared.forecast(latitude=LATITUDE + 0.1, longitude=LONGITUDE)
+
+
+def test_type_spans_both_domains_without_changing_surface_values(prepared_surface, calculated_grid):
+    views = _type_views()
+    prepared = replace(prepared_surface, _type_views=views, _type_guidance={"status": "prepared"})
+    grid = build_local_surface_grid(
+        latitude=LATITUDE,
+        longitude=LONGITUDE,
+        calculate_column=prepared._forecast_column,
+        geometry=TEST_GEOMETRY,
+    )
+    roles = set()
+    for cell, old in zip(grid["cells"], calculated_grid[0]["cells"], strict=True):
+        roles.add(cell["inside_editable_domain"])
+        for hour, prior in zip(cell["hours"], old["hours"], strict=True):
+            ptype = hour["surface"]["fields"]["precipitation_type"]
+            assert ptype["value"] == ("snow" if cell["latitude"] > 45 else "rain")
+            assert ptype["unit"] == "category"
+            unchanged = deepcopy(hour)
+            unchanged["surface"]["fields"].pop("precipitation_type")
+            unchanged["surface"].pop("precipitation_type_guidance")
+            assert unchanged == prior
+    assert roles == {True, False}
+    encoded = canonical_json_bytes(grid)
+    restored = json.loads(encoded)
+    point = extract_grid_point(restored, latitude=LATITUDE, longitude=LONGITUDE)
+    assert point["hours"] == next(c["hours"] for c in grid["cells"] if c["is_forecast_point"])
+    point["hours"][0]["surface"]["fields"]["precipitation_type"]["value"] = "changed"
+    assert canonical_json_bytes(restored) == encoded
 
 
 def test_qpf_spans_both_domains_and_exact_point_replays_with_provenance(prepared_surface):

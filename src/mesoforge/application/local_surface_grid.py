@@ -158,6 +158,7 @@ def _transformation_identity() -> dict[str, Any]:
         "application/precipitation_forecast.py",
         "application/probability_forecast.py",
         "application/probability_contributors.py",
+        "application/precipitation_type.py",
         "forecasting/surface.py",
         "forecasting/scalar_blend.py",
         "forecasting/vector_blend.py",
@@ -213,6 +214,26 @@ def _missing_hours(hours: list[dict[str, Any]], reason: str) -> list[dict[str, A
         for comparison in guidance.get("comparisons", []):
             comparison.update(delta=None, status="unavailable", reasons=[reason])
             comparison["left"]["value"] = comparison["right"]["value"] = None
+        type_guidance = surface.get("precipitation_type_guidance")
+        if type_guidance is not None:
+            type_guidance["field"].update(
+                value="unavailable",
+                status="unavailable",
+                supported_types=[],
+                missing_reasons=[reason],
+                contributor_disagreement=False,
+                disagreement_evidence=[],
+            )
+            surface["fields"]["precipitation_type"] = deepcopy(type_guidance["field"])
+            for contributor in type_guidance["contributors"]:
+                contributor.update(
+                    status="unavailable",
+                    supported_types=[],
+                    native_values={},
+                    missing_reasons=[reason],
+                )
+                contributor.pop("conditional_type_fractions", None)
+                contributor.pop("spatial_extraction", None)
         surface["source_validation"] = {
             model: {"status": "unavailable", "missing_reasons": [reason]}
             for model in surface.get("source_validation", {})

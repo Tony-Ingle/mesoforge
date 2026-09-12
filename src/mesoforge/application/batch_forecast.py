@@ -136,6 +136,7 @@ def run_batch(
     forecast_report_builder: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     pop_guidance: dict[str, Any] | None = None,
     probability_sources: list[dict[str, Any]] | None = None,
+    ptype_guidance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Load guidance once; independently calculate and persist each successful location."""
     locations = load_locations(config_path)
@@ -153,6 +154,10 @@ def run_batch(
         prepared = attach_pop_guidance(
             prepared, pop_guidance, probability_sources=probability_sources
         )
+    if ptype_guidance is not None:
+        from mesoforge.application.spatial_preparation import attach_type_guidance
+
+        prepared = attach_type_guidance(prepared, ptype_guidance)
     if prepared.horizon_hours != tuple(range(1, 37)):
         raise ValueError("Batch forecasts require an existing dataset for hours 1..36.")
 

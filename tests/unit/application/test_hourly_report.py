@@ -7,6 +7,41 @@ from typing import Any
 import pytest
 
 from mesoforge.application.hourly_report import build_hourly_report, render_hourly_report
+from tests.unit.application.test_precipitation_type import run as type_result
+from tests.unit.application.test_precipitation_type import type_view
+
+
+@pytest.mark.parametrize(
+    "right,expected", [(("rain",), "rain"), (("snow",), "ambiguous"), (("rain", "snow"), "mixed")]
+)
+def test_type_report_preserves_native_evidence_and_does_not_present_conditions(
+    forecast, right, expected
+):
+    left = right if expected == "mixed" else ("rain",)
+    evidence = type_result(
+        [
+            type_view(types=left),
+            type_view("GFS", right),
+            type_view(
+                "NBM", values={"rain": 60.0, "snow": 40.0, "freezing_rain": 0.0, "ice_pellets": 0.0}
+            ),
+        ]
+    )
+    for hour in forecast["hours"]:
+        hour["surface"] = {
+            "fields": {"precipitation_type": deepcopy(evidence["field"])},
+            "contributors": {},
+            "precipitation_type_guidance": deepcopy(evidence),
+        }
+    original = deepcopy(forecast)
+    report = build_hourly_report(forecast)
+    rendered = render_hourly_report(report)
+    assert report["hours"][0]["final_surface_fields"]["precipitation_type"]["value"] == expected
+    assert "Native precipitation-type evidence" in rendered
+    assert "conditional on precipitation" in rendered
+    assert "no snowfall/ice amount" in rendered.lower()
+    assert '"rain": 60.0' in rendered and '"snow": 40.0' in rendered
+    assert forecast == original
 
 
 def test_surface_report_preserves_baseline_and_displays_convenient_units(forecast):

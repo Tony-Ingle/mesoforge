@@ -17,6 +17,7 @@ import pyproj
 import xarray as xr
 
 from mesoforge.alignment.station_frame import StationAlignmentError, align_station_to_model
+from mesoforge.application.precipitation_type import PTYPE, TypeView, extract_precipitation_type
 from mesoforge.application.prepared_qpf import read_qpf_inputs, required_qpf_leads
 from mesoforge.application.probability_contributors import (
     ProbabilityView,
@@ -324,6 +325,8 @@ class PreparedPointForecast:
     _pop_views: list[tuple[xr.Dataset, pyproj.CRS, dict[str, Any]]] = field(default_factory=list)
     _pop_guidance: dict[str, Any] | None = None
     _probability_views: list[ProbabilityView] = field(default_factory=list)
+    _type_views: list[TypeView] = field(default_factory=list)
+    _type_guidance: dict[str, Any] | None = None
 
     @property
     def notice(self) -> str:
@@ -770,6 +773,15 @@ class PreparedPointForecast:
                                 active={**pop, "spatial_support": {"kind": "grid_point"}},
                             )
                         )
+                if self._type_guidance is not None:
+                    evidence = extract_precipitation_type(
+                        self._type_views,
+                        latitude=latitude,
+                        longitude=longitude,
+                        valid_time=_iso(valid_time),
+                    )
+                    hours[-1]["surface"]["fields"][PTYPE] = evidence["field"]
+                    hours[-1]["surface"]["precipitation_type_guidance"] = evidence
         contributor_configuration = (
             with_surface_fields(self._configuration)
             if self._surface_configuration is not None
@@ -802,6 +814,8 @@ class PreparedPointForecast:
                 }
                 for view in self._probability_views
             ]
+        if self._type_guidance is not None:
+            result["ptype_guidance"] = deepcopy(self._type_guidance)
         if self._manifest_sha256 is not None:
             result["manifest_sha256"] = self._manifest_sha256
         if self._pop_guidance is not None:

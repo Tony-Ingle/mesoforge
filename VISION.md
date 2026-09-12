@@ -43,7 +43,16 @@ shadows, not interchangeable hourly probabilities or an approved final recipe.
 Deterministic QPF may eventually be a predictor in calibration, but rainfall
 amounts are not probabilities themselves. Final source weights and calibration
 must come from verification evidence, not assumptions or this small demonstration.
-Precipitation type, snowfall, deterministic bias correction,
+An explicit preparation step now adds native precipitation-type evidence from
+HRRR/GFS/RAP categorical flags, IFS native three-hourly categories and NBM
+conditional type probabilities across the same context/editable grid. The temporary
+baseline requires HRRR/GFS agreement; multiple supported types, disagreement,
+unknown and unavailable states remain explicit. The other sources are separate
+evidence, not categorical votes. No type is inferred from surface temperature,
+QPF or PoP. This is not automatic forward-run acquisition or an evaluated final policy.
+Long-term precipitation type, like PoP, should use multiple sources and verification;
+neither the interim pair nor any single model is the permanent architecture.
+Snowfall/ice amounts, deterministic bias correction,
 site learning, AI editing, delivery and production deployment/scheduling
 are not implemented.
 The existing on-demand forward run and explicit batch history are not a deployed
@@ -54,7 +63,8 @@ The Python modular monolith, scientific contracts, provenance and PostgreSQL/S3
 storage reuse accepted [architecture](docs/decisions/0001-python-modular-monolith.md)
 and [storage](docs/decisions/0004-postgresql-and-s3-storage.md) decisions. The retained
 Phase 2 station baseline supplies reused QPF science and the native NBM PoP event,
-normalization and passthrough contract. Other NBM fields are not activated by this step.
+normalization and passthrough contract. NBM conditional type probabilities are now
+retained separately as evidence; they do not change delivered PoP or Phase 2 defaults.
 
 The owner-approved long-term direction below guides future design. The
 [V2 RFC](docs/rfcs/mesoforge-v2-architecture.md) remains proposed where implementation
@@ -221,13 +231,12 @@ The release direction remains a private operator-controlled forecast service wit
 useful deterministic output, immutable configured-location history, suitable
 observation matching and bounded performance queries. The implemented local surface
 grid establishes the numerical representation across context and editable domains.
-Before precipitation type, the next proposed probability increment is one comparable
-six-hour ECMWF ensemble event, using native guidance if available or an explicitly
-defined complete member population. It must preserve the same threshold and period
-as the NBM/GEFS comparison without converting hourly or daily probabilities.
-Precipitation type then requires suitable categorical and/or thermodynamic guidance
-on this same grid. Statistical correction, AI,
-delivery and long-term learning are not prerequisites for that increment.
+Native precipitation-type evidence now uses this same grid. The bounded ECMWF
+six-hour probability assessment remains explicitly incompatible rather than converting
+a daily product or ignoring incompatible spatial support. The next proposed field
+increment is interval-aware native snowfall-water-equivalent evidence. Snowfall depth
+and ice accretion require suitable additional guidance and documented conversion
+semantics; statistical correction, AI, delivery and learning are not prerequisites.
 
 The exact wider release support matrix, authentication, measured resource limits,
 local-grid design and retention promises remain open. Existing approved field and
@@ -236,8 +245,8 @@ does not authorize implementing the roadmap as one task.
 
 ## Future roadmap
 
-Fields should grow from today's temperature, dew point/RH and wind/gust to supported
-cloud, QPF, PoP, precipitation type, snow and other useful forecasts. Conditions must
+Fields should grow from today's surface, QPF, PoP and native type evidence to supported
+cloud, snow/ice amounts and other useful forecasts. Conditions must
 be derived from the underlying fields with explainable rules and explicit missingness,
 not emitted as an unexplained standalone prediction.
 

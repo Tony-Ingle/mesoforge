@@ -36,6 +36,11 @@ only required geographic inputs; names are optional display metadata.
   NBM-only delivery is the current baseline, not the final product. A bounded
   [multi-source probability shadow path](#native-probability-shadows) retains other
   native events without changing delivered PoP.
+- **Precipitation type:** an explicit [native p-type preparation step](#native-precipitation-type-on-the-local-grid)
+  adds HRRR/GFS/RAP flags, native three-hourly IFS categories and NBM conditional
+  type probabilities to that same grid. The temporary baseline requires complete
+  HRRR/GFS agreement; disagreement remains ambiguous and missing evidence stays
+  explicit. This is not yet automatic acquisition in `forward_run` or verified skill.
 - **Shadows:** real RAP and ECMWF IFS values/provenance accompany issuance with zero
   active weight. IFS preserves native three-hourly gaps and has no compatible
   instantaneous gust. Cloud cover is explicitly unavailable without an approved policy.
@@ -68,7 +73,7 @@ The QPF increment adds [real interval/conservation and offline replay evidence](
 precipitation verification remains future work. The [PoP increment](#probability-of-precipitation-on-the-local-grid)
 adds actual native probabilistic guidance without changing QPF or other surface values.
 
-There is **no precipitation type, snowfall, deterministic bias correction,
+There is **no snowfall/ice amount, deterministic bias correction,
 site learning, AI editing, production deployment or scheduling in the V2 path yet**. Bias/AI
 report stages are explicitly unimplemented and final values currently equal the baseline.
 Registration services and delivery also remain future work. The retained Phase 2 station
@@ -80,10 +85,10 @@ Versioned deterministic tools would validate bounded GFE-style AI edit recipes, 
 numerical, bias-corrected and final fields separate before exact-point interpolation.
 One-off requests stay untracked. See [VISION.md](VISION.md#intended-coordinate-driven-operation)
 and the [active RFC](docs/rfcs/mesoforge-v2-architecture.md). The first local surface grid
-and nested domains are implemented; the editing lifecycle remains future work. The next
-proposed increment is a comparable six-hour ECMWF ensemble probability event before
-precipitation type, preserving an explicit event and member population rather than
-converting a daily probability into hourly PoP.
+and nested domains are implemented; the editing lifecycle remains future work. The
+ECMWF six-hour probability assessment remains explicitly incompatible as described
+below. The next proposed field increment is native interval-aware snowfall-water
+equivalent evidence; snowfall depth and ice accretion need their own defensible rules.
 
 Local Codex development continues; the Hermes development pipeline is paused. The RFC's
 unresolved implementation choices remain proposed, not blanket approval of the roadmap.
@@ -2015,10 +2020,9 @@ python -B -m pytest tests/integration/application/test_forward_run.py tests/inte
 python -B -m pytest tests/integration/application/test_issued_temperature_verification.py::test_automatic_window_acquires_once_reuses_real_snapshot_and_skips_empty_window tests/integration/application/test_issued_temperature_verification.py::test_automatic_batch_isolates_locations_and_reuses_results_without_changing_issuances -q
 ```
 
-The current next recommendation is the comparable ensemble probability event described
-under [native probability shadows](#native-probability-shadows). Precipitation type
-requires supported categorical and/or thermodynamic guidance, preserving time/support
-semantics and uncertainty; do not infer it from surface temperature alone.
+Native probability shadows and the subsequent ECMWF compatibility assessment are
+recorded below. [Native precipitation type](#native-precipitation-type-on-the-local-grid)
+now preserves categorical guidance and uncertainty without surface-temperature inference.
 
 ### Local surface baseline grid
 
@@ -2581,7 +2585,7 @@ reads matched exactly with zero provider calls. PostgreSQL/MinIO integration,
 full application acceptance and PoP verification/calibration were not run for
 this follow-up.
 
-Next recommended: **precipitation type from appropriate native categorical and/or
+At that checkpoint, the recommendation was **precipitation type from appropriate native categorical and/or
 thermodynamic guidance**, retaining model/time availability and explicit missingness
 on this same grid. Surface temperature alone is insufficient. Common-support PoP
 normalization/calibration can remain a separate future task; no delivered PoP
@@ -2747,6 +2751,123 @@ worked, and unsupported coordinates returned 422. The listener was confirmed to 
 gate, and the live-provider canary suite were not run. This fixed acquisition does
 not establish operational provider reliability or forecast skill. No dependencies
 or lockfile entries changed for the 36-hour extension.
+
+### Native precipitation type on the local grid
+
+The optional preparation step below adds native type evidence to an existing
+surface/QPF/PoP preparation. It reuses that run's selected cycles and coordinate-derived
+coverage. One acquisition per model/lead supplies all shared regional views; there
+are no per-cell or per-location downloads and no HTTP-time acquisition. The ordinary
+`forward_run` command does not yet acquire this attachment automatically.
+
+| Source | Preserved evidence | Temporal support | Role |
+| --- | --- | --- | --- |
+| HRRR / GFS | Separate instantaneous rain, snow, freezing-rain and ice-pellet flags | Native hourly | Temporary agreement baseline |
+| RAP | Same four native flags | Available native hourly leads | Shadow evidence |
+| ECMWF IFS | Native category, including wet snow, rain/snow and freezing drizzle | Native three-hourly; gaps explicit | Shadow evidence |
+| NBM | Four conditional type probabilities, with original category ranges and percentages | Native valid times | Shadow evidence; no argmax or voting |
+
+Retained Phase 2 explicitly disabled p-type and supplies no active rule to reuse.
+The versioned **temporary-hrrr-gfs-native-type-agreement.v1** baseline requires
+both complete active classifications. Identical nonempty type sets produce the
+named type, or `mixed` for multiple types. Different sets produce `ambiguous`.
+Both zero sets produce `unknown` (no type classified, not an assertion of dry
+weather). A missing/invalid required source produces `unknown`; neither available
+produces `unavailable`. There is no single-source fallback or category weighting.
+Shadow disagreement remains visible even when the active sources agree. This is
+an interim representation, not a verified final multi-source forecast policy.
+
+Categories use deterministic nearest-native-cell extraction; categorical codes
+and flags are never bilinearly averaged or temporally interpolated. The local-grid
+center supplies the exact configured point as before. Each source retains native
+values/units, encoding, selected native cell, cycle, lead, valid time, instantaneous
+semantics (null accumulation bounds), GRIB metadata, raw/index hashes, byte ranges,
+URLs, availability/acquisition times and transformation identity. NBM percentages
+remain conditional on precipitation, separate from PoP; snow includes its native
+snow/wet-snow category range. Native IFS diagnoses are retained even for tiny rates;
+the ECMWF chart's precipitation-rate display mask is not applied.
+
+The implementations follow the [NOAA model inventories](https://www.nco.ncep.noaa.gov/pmb/products/),
+[NBM weather elements](https://vlab.noaa.gov/web/mdl/nbm-weather-elements-v4.1),
+[ECMWF p-type definition](https://codes.ecmwf.int/grib/param-db/260015) and
+[ECMWF category interpretation](https://confluence.ecmwf.int/spaces/FUG/pages/673550833/Section+8.1.10+Types+of+precipitation+-+charts+and+diagrams).
+IFS data retain the existing ECMWF open-data licence and attribution. Model profiles
+could later help diagnose disagreement: lower-tropospheric temperature/moisture and
+pressure/height are needed to resolve melting and refreezing layers. Sparse pressure
+levels can miss shallow layers. No custom profile algorithm, 2-m-temperature type
+rule, snowfall ratio, or ice-accretion calculation is introduced here.
+
+Commands (preparation/replay/grid command functions and in-process HTTP reads were
+exercised locally; this shell sequence and server startup were not executed for this
+increment). Substitute external directories appropriate to your machine:
+
+```sh
+python -B -m mesoforge.application.prepared_precipitation_type --prepared-run EXISTING_SURFACE_POP_RUN --output-dir NEW_TYPE_RUN
+python -B -m mesoforge.application.prepared_precipitation_type --prepared-run NEW_TYPE_RUN --from-raw --output-dir NEW_TYPE_REPLAY
+python -B -m mesoforge.application.prepared_local_grid --config locations.json --prepared-run NEW_TYPE_RUN --output-dir NEW_LOCAL_GRIDS
+python -B -m mesoforge.api --data-dir NEW_LOCAL_GRIDS
+```
+
+Read `http://127.0.0.1:8765/forecast?lat=44.98859&lon=-93.25557` using the existing
+localhost API. Each hour includes `surface.fields.precipitation_type` and
+`surface.precipitation_type_guidance.contributors`. The hourly report adds a 36-hour
+type table and per-source evidence. The saved numerical baseline retains QPF, PoP
+and type independently; no type is required merely because an amount/probability is
+nonzero, and unknown guidance is not filled from temperature.
+
+The bounded real demonstration enriched the retained **2026-09-11 18Z** reference
+forecast (valid 19Z September 11 through 06Z September 13). HRRR/GFS used September
+11 12Z, RAP 15Z, IFS 06Z, and NBM 18Z. HRRR/GFS/RAP/NBM each supplied 36 native valid
+times; IFS supplied 12, with 24 explicit gaps. Acquisition completed September 12;
+this retrospective attachment is not claimed available at the original decision
+time and did not alter earlier issued forecasts.
+
+The 36-hour preparation transferred **175,141,132 bytes** (excluding initial adapter
+probes); it retained **171,920,292 bytes**
+of raw GRIB messages plus **3,517,506 bytes** of indexes outside Git (some initial
+NOAA probe messages were reused). The five compressed native regional datasets total
+**605,742 bytes**. The existing 7 × 7 / 6 km grid has 9 editable and 40 context-only
+cells. Building/retaining it took about **120 seconds** locally; the full baseline
+including all earlier provenance is **169,711,333 bytes**, compressed to **24,415,109
+bytes**. The large JSON representation remains an implementation measurement.
+
+All **49 × 36** existing surface/QPF/PoP cell-hours remained exactly unchanged.
+Each of the 14 prepared files was loaded once. Raw replay reproduced all five native
+datasets and acquisition events; repeated grid builds and two in-process API reads
+matched exactly with zero provider calls. The Minneapolis point has 33 unknown hours
+and 3 ambiguous hours (8–10), rather than manufactured precipitation types.
+
+Validation: **291 focused offline tests passed**, covering native selection/decoding,
+category/probability semantics, missingness, nearest-cell extraction, both domains,
+raw replay, report rendering, existing preparation/batch/storage tests and retained
+surface/QPF/PoP science. Ruff formatting/lint, mypy, all 9 import contracts, existing
+documentation/hygiene checks, offline lock validation and `git diff --check` passed.
+PostgreSQL/MinIO integration, full application acceptance and precipitation-type
+verification/skill scoring were not run for this increment. No package, service,
+Phase 2 default or existing weight changes were needed.
+
+Real native cases at September 11 19Z, sampled from the retained messages:
+
+| Case | HRRR | GFS | RAP evidence | Interim result and reason |
+| --- | --- | --- | --- | --- |
+| 26.31817, -92.99671 (Gulf) | Rain | Rain | Rain | Rain: complete active agreement |
+| 47.98259, -112.75259 (Montana) | Snow | Rain | Rain | Ambiguous: active disagreement |
+| 48.87410, -113.67456 (Montana) | Snow + ice pellets | No type | Rain | Ambiguous: native mixture retained |
+| 47.89070, -112.85033 (Montana) | Rain + snow | Rain | Rain | Ambiguous: mixed evidence is not reduced to rain |
+| Minneapolis, first hour | No type | No type | No type | Unknown: zero flags do not assert dry weather |
+
+Those are model diagnoses, not observed or verified precipitation types. The first
+retained HRRR hour had no freezing-rain flag. A native GFS freezing-rain case outside
+CONUS decoded correctly but is not a supported local forecast demonstration. Focused
+fixtures exercise freezing rain, sleet, agreeing snow/mixed types, missing sources,
+unknown codes and disagreements; this bounded real window does not establish winter
+performance. No extra winter backfill was acquired to force an agreeing case.
+
+Next proposed: retain native **interval-aware snowfall water equivalent** on this
+same grid, with source units/bounds and explicit gaps. Inspect defensible snow-depth
+and ice-accretion guidance before adding those amounts; do not multiply total QPF
+by an instantaneous type flag or assume a universal snow ratio. Derived conditions
+should follow these explicit fields and rules later.
 
 ## References
 

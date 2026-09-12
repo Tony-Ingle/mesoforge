@@ -454,65 +454,12 @@ def acquire_product(
     )
 
 
-def decode_product(
-    payload: bytes,
-    source_id: str,
-    cycle: datetime,
-    start_hour: int,
-    end_hour: int,
-) -> tuple[xr.Dataset, pyproj.CRS, dict[str, Any]]:
-    """Validate one native probability event and normalize percent once, without clipping."""
-    product = _request(source_id, cycle, start_hour, end_hour)
-    validate_grib_message_boundaries(payload, url=source_id, range_header="retained message")
-    decoded = _decode_all(payload, read_keys=_READ_KEYS)
-    fields = [_with_dataset_coords(value, ds) for ds in decoded for value in ds.data_vars.values()]
-    if len(fields) != 1:
-        raise ValueError("Expected exactly one native probability field")
-    field = fields[0]
+def normalized_native_grid(
+    field: xr.DataArray,
+) -> tuple[xr.DataArray, np.ndarray, np.ndarray, pyproj.CRS]:
+    """Reuse validated native axes without interpolating the field values."""
     attrs = field.attrs
-    expected = {
-        **product["expected"],
-        "discipline": 0,
-        "parameterCategory": 1,
-        "typeOfLevel": "surface",
-        "productDefinitionTemplateNumber": 9,
-        "typeOfStatisticalProcessing": 1,
-        "lengthOfTimeRange": end_hour - start_hour,
-        "indicatorOfUnitForTimeRange": 1,
-        "startStep": start_hour,
-        "endStep": end_hour,
-        "stepUnits": 1,
-        "dataDate": int(cycle.strftime("%Y%m%d")),
-        "dataTime": cycle.hour * 100,
-        "numberOfMissingInStatisticalProcess": 0,
-    }
-    for key, value in expected.items():
-        if attrs.get(f"GRIB_{key}") != value:
-            raise ValueError(
-                f"{source_id} GRIB {key} mismatch: expected {value!r}, "
-                f"got {attrs.get(f'GRIB_{key}')!r}"
-            )
-    bound = "Lower" if product["threshold"]["comparison"] == "ge" else "Upper"
-    threshold = float(attrs[f"GRIB_scaledValueOf{bound}Limit"]) / 10 ** int(
-        attrs[f"GRIB_scaleFactorOf{bound}Limit"]
-    )
-    if threshold != product["threshold"]["value"]:
-        raise ValueError("Native probability threshold mismatch")
-    accepted_units = ("%",) if source_id == "ECMWF_ENS_24H" else ("%", "kg m**-2", "kg m-2")
-    if str(attrs.get("GRIB_units", "")).lower() not in accepted_units:
-        raise ValueError("Native probability units are unsupported")
-    start, end = cycle + timedelta(hours=start_hour), cycle + timedelta(hours=end_hour)
-    for name, expected_time in (
-        ("time", np.datetime64(cycle.replace(tzinfo=None), "ns")),
-        ("valid_time", np.datetime64(end.replace(tzinfo=None), "ns")),
-    ):
-        if (
-            name not in field.coords
-            or field[name].ndim != 0
-            or field[name].values[()] != expected_time
-        ):
-            raise ValueError("Native probability decoded cycle/valid time mismatch")
-    if product["expected"]["gridType"] == "regular_ll":
+    if attrs["GRIB_gridType"] == "regular_ll":
         if field.shape != (attrs["GRIB_Nj"], attrs["GRIB_Ni"]):
             raise ValueError("Probability native grid dimensions disagree with decoded array")
         expected_lat = (
@@ -578,6 +525,68 @@ def decode_product(
             )
         ):
             raise ValueError("Probability decoded geographic coordinates disagree with projection")
+    return field, np.asarray(x), np.asarray(y), crs
+
+
+def decode_product(
+    payload: bytes,
+    source_id: str,
+    cycle: datetime,
+    start_hour: int,
+    end_hour: int,
+) -> tuple[xr.Dataset, pyproj.CRS, dict[str, Any]]:
+    """Validate one native probability event and normalize percent once, without clipping."""
+    product = _request(source_id, cycle, start_hour, end_hour)
+    validate_grib_message_boundaries(payload, url=source_id, range_header="retained message")
+    decoded = _decode_all(payload, read_keys=_READ_KEYS)
+    fields = [_with_dataset_coords(value, ds) for ds in decoded for value in ds.data_vars.values()]
+    if len(fields) != 1:
+        raise ValueError("Expected exactly one native probability field")
+    field = fields[0]
+    attrs = field.attrs
+    expected = {
+        **product["expected"],
+        "discipline": 0,
+        "parameterCategory": 1,
+        "typeOfLevel": "surface",
+        "productDefinitionTemplateNumber": 9,
+        "typeOfStatisticalProcessing": 1,
+        "lengthOfTimeRange": end_hour - start_hour,
+        "indicatorOfUnitForTimeRange": 1,
+        "startStep": start_hour,
+        "endStep": end_hour,
+        "stepUnits": 1,
+        "dataDate": int(cycle.strftime("%Y%m%d")),
+        "dataTime": cycle.hour * 100,
+        "numberOfMissingInStatisticalProcess": 0,
+    }
+    for key, value in expected.items():
+        if attrs.get(f"GRIB_{key}") != value:
+            raise ValueError(
+                f"{source_id} GRIB {key} mismatch: expected {value!r}, "
+                f"got {attrs.get(f'GRIB_{key}')!r}"
+            )
+    bound = "Lower" if product["threshold"]["comparison"] == "ge" else "Upper"
+    threshold = float(attrs[f"GRIB_scaledValueOf{bound}Limit"]) / 10 ** int(
+        attrs[f"GRIB_scaleFactorOf{bound}Limit"]
+    )
+    if threshold != product["threshold"]["value"]:
+        raise ValueError("Native probability threshold mismatch")
+    accepted_units = ("%",) if source_id == "ECMWF_ENS_24H" else ("%", "kg m**-2", "kg m-2")
+    if str(attrs.get("GRIB_units", "")).lower() not in accepted_units:
+        raise ValueError("Native probability units are unsupported")
+    start, end = cycle + timedelta(hours=start_hour), cycle + timedelta(hours=end_hour)
+    for name, expected_time in (
+        ("time", np.datetime64(cycle.replace(tzinfo=None), "ns")),
+        ("valid_time", np.datetime64(end.replace(tzinfo=None), "ns")),
+    ):
+        if (
+            name not in field.coords
+            or field[name].ndim != 0
+            or field[name].values[()] != expected_time
+        ):
+            raise ValueError("Native probability decoded cycle/valid time mismatch")
+    field, x, y, crs = normalized_native_grid(field)
     native = np.asarray(field.values, dtype=np.float64)
     if native.shape != (len(y), len(x)) or not np.all(np.diff(x) > 0) or not np.all(np.diff(y) > 0):
         raise ValueError("Probability grid geometry/array shape mismatch")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -513,4 +514,73 @@ def _render_surface_report(report: dict[str, Any]) -> str:
         for reason, hours in reasons.items():
             lines.append(f"- Hours {', '.join(str(h) for h in sorted(set(hours)))}: {reason}")
     lines.extend(_render_probability_shadows(report["hours"]))
+    lines.extend(_render_precipitation_type(report["hours"]))
     return "\n".join(lines) + "\n"
+
+
+def _render_precipitation_type(hours: list[dict[str, Any]]) -> list[str]:
+    if not any("precipitation_type_guidance" in h.get("surface", {}) for h in hours):
+        return []
+    lines = [
+        "",
+        "### Native precipitation-type evidence",
+        "",
+        "Temporary baseline: HRRR/GFS must agree on complete instantaneous native flags. "
+        "Disagreement is ambiguous; multiple asserted types remain mixed. "
+        "Zero flags mean no classified type, not a dry-weather assertion. "
+        "RAP/IFS/NBM evidence stays separate; NBM percentages are conditional on precipitation, "
+        "not PoP and not categorical votes. Native categories use nearest-cell extraction. "
+        "No type is inferred from temperature, QPF or PoP. No snowfall/ice amount is implied.",
+        "",
+        "| Hour | UTC valid time | Interim type | Active supported types | Disagreement | Reason |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for hour in hours:
+        field = hour.get("surface", {}).get("precipitation_type_guidance", {}).get("field", {})
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    str(hour["horizon_hours"]),
+                    hour["valid_time_utc"],
+                    str(field.get("value", "unavailable")),
+                    ", ".join(field.get("supported_types", [])) or "none classified",
+                    "yes; see source evidence"
+                    if field.get("contributor_disagreement")
+                    else "none among available classifications",
+                    "; ".join(field.get("missing_reasons", [])) or "HRRR/GFS agree; temporary rule",
+                ]
+            )
+            + " |"
+        )
+    lines.extend(
+        [
+            "",
+            "| Hour | Source | Status / native types | Native values | Cycle / lead | Reasons |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ]
+    )
+    for hour in hours:
+        for source in (
+            hour.get("surface", {}).get("precipitation_type_guidance", {}).get("contributors", [])
+        ):
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(hour["horizon_hours"]),
+                        f"{source['model']} ({source['role']})",
+                        source["status"]
+                        + ": "
+                        + (", ".join(source["supported_types"]) or "none classified"),
+                        json.dumps(source["native_values"], sort_keys=True)
+                        + " "
+                        + source.get("native_unit", ""),
+                        f"{source.get('source_cycle', 'unavailable')} / "
+                        f"{source.get('source_lead_hours', 'unavailable')}",
+                        "; ".join(source["missing_reasons"]),
+                    ]
+                )
+                + " |"
+            )
+    return lines
