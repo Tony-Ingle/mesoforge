@@ -521,7 +521,121 @@ def _render_surface_report(report: dict[str, Any]) -> str:
     lines.extend(_render_snowfall_amount(report["hours"]))
     lines.extend(_render_cloud_guidance(report["hours"]))
     lines.extend(_render_visibility_guidance(report["hours"]))
+    lines.extend(_render_thunder_guidance(report["hours"]))
     return "\n".join(lines) + "\n"
+
+
+def _thunder_percent(row: dict[str, Any]) -> str:
+    value = row["value"]
+    if row["unit"] != "1" or (
+        value is not None and (not math.isfinite(value) or not 0 <= value <= 1)
+    ):
+        raise ValueError("Thunder report requires finite probabilities within [0, 1]")
+    percent = None if value is None else value * 100
+    if row.get("display_percent") != percent:
+        raise ValueError("Thunder display must reproduce the native probability")
+    return "unavailable" if percent is None else f"{percent:.6g}"
+
+
+def _render_thunder_guidance(hours: list[dict[str, Any]]) -> list[str]:
+    """Preserve each native thunder event rather than inventing hourly probabilities."""
+    if not any("thunder_guidance" in hour.get("surface", {}) for hour in hours):
+        return []
+    lines = [
+        "",
+        "### Native thunder probability",
+        "",
+        "Temporary baseline: the matching native one-hour NBM thunder probability, unchanged. "
+        "Other native periods remain separate zero-weight evidence. Three-hour and six-hour "
+        "events are not converted to hourly probabilities; missing events stay unavailable. "
+        "Source-cell event definitions and spatial support are retained, including any "
+        "unresolved radius or lightning threshold. This is not an exact-point lightning "
+        "probability, severe-weather probability, precipitation probability, or a complete "
+        "weather-condition string. No probability is derived from CAPE, QPF or cloud cover.",
+        "",
+        "| Hour | Active thunder % | Source | Native interval start UTC | "
+        "Native interval end UTC | Interval closure | Status / reason |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    native_rows: list[str] = []
+    excluded: dict[str, list[int]] = {}
+    for hour in hours:
+        guidance = hour.get("surface", {}).get("thunder_guidance")
+        if guidance is None:
+            continue
+        field = guidance["field"]
+        reason = "; ".join(field.get("missing_reasons", []))
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    str(hour["horizon_hours"]),
+                    _thunder_percent(field),
+                    field.get("source_id") or "unavailable",
+                    field.get("interval_start") or "unavailable",
+                    field.get("interval_end") or "unavailable",
+                    field.get("interval_closure") or "unavailable",
+                    field["status"] + (f"; {reason}" if reason else ""),
+                ]
+            )
+            + " |"
+        )
+        for source in guidance["contributors"]:
+            reason = "; ".join(source.get("missing_reasons", []))
+            native_value = source.get("native_value")
+            native_rows.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(hour["horizon_hours"]),
+                        f"{source['source_id']} / {source.get('product', 'unavailable')}",
+                        f"{source.get('source_cycle', 'unavailable')} / "
+                        f"{source.get('source_lead_hours', 'unavailable')}",
+                        source.get("interval_start") or "unavailable",
+                        source.get("interval_end") or "unavailable",
+                        source.get("interval_closure") or "unavailable",
+                        _thunder_percent(source),
+                        "unavailable"
+                        if native_value is None
+                        else f"{native_value:.6g} {source['native_unit']}",
+                        str(source["active_weight"]),
+                        _probability_support_text(source.get("event_definition", "unavailable")),
+                        _probability_support_text(source.get("spatial_support", "unavailable")),
+                        source["status"] + (f"; {reason}" if reason else ""),
+                    ]
+                )
+                + " |"
+            )
+        available = {
+            source["source_id"]
+            for source in guidance["contributors"]
+            if source["value"] is not None
+        }
+        for comparison in guidance["comparisons"]:
+            if comparison["status"] == "incompatible" and set(comparison["source_ids"]).issubset(
+                available
+            ):
+                identity = " versus ".join(comparison["source_ids"])
+                reason = identity + ": " + "; ".join(comparison["missing_reasons"])
+                excluded.setdefault(reason, []).append(hour["horizon_hours"])
+    lines.extend(
+        [
+            "",
+            "Native thunder contributors and event semantics:",
+            "",
+            "| Hour | Source / product | Cycle / source lead h | Native interval start UTC | "
+            "Native interval end UTC | Interval closure | Thunder % | Native value / unit | "
+            "Active weight | Event definition | Spatial support | Status / reason |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            *native_rows,
+        ]
+    )
+    if excluded:
+        lines.extend(["", "Native event comparison exclusions:", ""])
+        lines.extend(
+            f"- Hours {_hour_ranges(indices)}: {reason}" for reason, indices in excluded.items()
+        )
+    return lines
 
 
 def _render_visibility_guidance(hours: list[dict[str, Any]]) -> list[str]:

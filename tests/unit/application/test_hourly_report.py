@@ -13,12 +13,14 @@ from mesoforge.application.snowfall_amount_forecast import (
     extract_snowfall_amount_contributors,
 )
 from mesoforge.application.snowfall_forecast import SNOW, extract_snowfall_contributors
+from mesoforge.application.thunder import extract_thunder_contributors
 from mesoforge.application.visibility import extract_visibility_contributors
 from tests.unit.application.test_cloud_cover import cloud_view
 from tests.unit.application.test_precipitation_type import run as type_result
 from tests.unit.application.test_precipitation_type import type_view
 from tests.unit.application.test_snowfall_amount_forecast import amount_view
 from tests.unit.application.test_snowfall_forecast import snow_view
+from tests.unit.application.test_thunder import thunder_view
 from tests.unit.application.test_visibility import visibility_view
 
 
@@ -488,6 +490,55 @@ def test_visibility_report_preserves_metres_display_miles_missingness_and_prior_
     assert native_probability_forecast == original
     report["hours"][0]["surface"]["visibility_guidance"]["contributors"][0]["unit"] = "mile"
     with pytest.raises(ValueError, match="Visibility report requires finite nonnegative metres"):
+        render_hourly_report(report)
+    assert native_probability_forecast == original
+
+
+@pytest.mark.parametrize("value", [None, 0.0, 0.123456789])
+def test_thunder_report_preserves_native_periods_zero_missing_and_previous_fields(
+    native_probability_forecast, value
+):
+    previous = deepcopy(native_probability_forecast)
+    for hour in native_probability_forecast["hours"]:
+        views = (
+            [] if value is None else [thunder_view("NBM_1H", amount=value, end=hour["valid_time"])]
+        )
+        for source_id, duration, probability in (("NBM_3H", 3, 0.5), ("NBM_6H", 6, 0.7)):
+            if hour["horizon_hours"] % duration == 0:
+                views.append(thunder_view(source_id, amount=probability, end=hour["valid_time"]))
+        evidence = extract_thunder_contributors(
+            views, latitude=44.5, longitude=-93.5, valid_time=hour["valid_time"]
+        )
+        hour["surface"]["fields"]["probability_of_thunder_1h"] = evidence["field"]
+        hour["surface"]["thunder_guidance"] = evidence
+    original = deepcopy(native_probability_forecast)
+    report = build_hourly_report(native_probability_forecast)
+    rendered = render_hourly_report(report)
+    prefix, section = rendered.split("### Native thunder probability")
+    assert prefix.strip() == render_hourly_report(build_hourly_report(previous)).strip()
+    assert "Temporary baseline" in section and "not converted to hourly probabilities" in section
+    assert "not an exact-point lightning probability" in section
+    assert "No probability is derived from CAPE, QPF or cloud cover" in section
+    assert "Native thunder intervals differ; no period conversion is approved" in section
+    assert "physical_threshold=None" in section and "radius_km=None" in section
+    assert "NBM_3H /" in section and "NBM_6H /" in section
+    if value is None:
+        assert "| 36 | unavailable | NBM_1H |" in section
+    else:
+        expected = "0" if value == 0 else "12.3457"
+        assert f"| 36 | {expected} | NBM_1H |" in section
+    for baseline, shown in zip(original["hours"], report["hours"], strict=True):
+        assert shown["surface"] == baseline["surface"]
+        assert shown["final_surface_fields"] == baseline["surface"]["fields"]
+        assert shown["final_surface_fields"]["probability_of_thunder_1h"]["value"] == value
+        expected_weights = {} if value is None else {"NBM": 1.0}
+        assert (
+            shown["final_surface_fields"]["probability_of_thunder_1h"]["weights"]
+            == expected_weights
+        )
+    assert native_probability_forecast == original
+    report["hours"][0]["surface"]["thunder_guidance"]["field"]["unit"] = "percent"
+    with pytest.raises(ValueError, match="Thunder report requires finite probabilities"):
         render_hourly_report(report)
     assert native_probability_forecast == original
 

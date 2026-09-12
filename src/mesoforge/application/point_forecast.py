@@ -40,6 +40,7 @@ from mesoforge.application.spatial_coverage import (
     validate_coordinate,
 )
 from mesoforge.application.surface_forecast import FIELD_UNITS, extract_surface_hour
+from mesoforge.application.thunder import THUNDER, ThunderView, extract_thunder_contributors
 from mesoforge.application.visibility import VisibilityView, extract_visibility_contributors
 from mesoforge.catalog.configuration import Phase2BlendConfiguration, _lists_to_tuples
 from mesoforge.catalog.domains import BoundingBox
@@ -343,6 +344,8 @@ class PreparedPointForecast:
     _cloud_guidance: dict[str, Any] | None = None
     _visibility_views: list[VisibilityView] = field(default_factory=list)
     _visibility_guidance: dict[str, Any] | None = None
+    _thunder_views: list[ThunderView] = field(default_factory=list)
+    _thunder_guidance: dict[str, Any] | None = None
 
     @property
     def notice(self) -> str:
@@ -837,6 +840,16 @@ class PreparedPointForecast:
                     )
                     hours[-1]["surface"]["fields"]["visibility"] = visibility["field"]
                     hours[-1]["surface"]["visibility_guidance"] = visibility
+                if self._thunder_guidance is not None:
+                    thunder = extract_thunder_contributors(
+                        self._thunder_views,
+                        latitude=latitude,
+                        longitude=longitude,
+                        valid_time=_iso(valid_time),
+                        source_status=self._thunder_guidance.get("source_status", {}),
+                    )
+                    hours[-1]["surface"]["fields"][THUNDER] = thunder["field"]
+                    hours[-1]["surface"]["thunder_guidance"] = thunder
         contributor_configuration = (
             with_surface_fields(self._configuration)
             if self._surface_configuration is not None
@@ -879,6 +892,8 @@ class PreparedPointForecast:
             result["cloud_guidance"] = deepcopy(self._cloud_guidance)
         if self._visibility_guidance is not None:
             result["visibility_guidance"] = deepcopy(self._visibility_guidance)
+        if self._thunder_guidance is not None:
+            result["thunder_guidance"] = deepcopy(self._thunder_guidance)
         if self._manifest_sha256 is not None:
             result["manifest_sha256"] = self._manifest_sha256
         if self._pop_guidance is not None:

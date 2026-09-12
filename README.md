@@ -60,6 +60,10 @@ only required geographic inputs; names are optional display metadata.
   IFS open-data visibility is explicitly unsupported. Native metres and per-source
   disagreement are preserved; all contributors have zero active weight and delivered
   visibility stays unavailable pending an approved policy. Visibility does not infer fog.
+- **Thunder potential:** an optional [native thunder step](#native-thunder-potential-on-the-local-grid)
+  adds native NBM hourly probabilities as a temporary baseline, with separate three-
+  and six-hour shadow events. Event/spatial-definition uncertainty is explicit; these
+  are not exact-point lightning probabilities or a calibrated multi-source forecast.
 - **Shadows:** real RAP and ECMWF IFS values/provenance accompany issuance with zero
   active weight. IFS preserves native three-hourly gaps and has no compatible
   instantaneous gust. Native cloud evidence does not introduce a new active policy.
@@ -110,10 +114,10 @@ below. Native interval snowfall-water-equivalent evidence is now implemented.
 Native snowfall amounts and separate Kuchera estimates are now implemented as evidence.
 Native cloud evidence is now implemented separately from an unapproved delivered
 cloud blend; [cloud checks and real replay evidence](#native-cloud-cover-on-the-local-grid)
-are recorded below. Native visibility evidence is now implemented on the same grid;
-the next proposed step is native thunder potential, preserving its probability/event
-definition. Neither visibility nor thunder potential alone establishes a complete
-weather-condition string.
+are recorded below. Native visibility evidence and temporary native NBM hourly
+thunder potential are implemented on the same grid. The next proposed step is native
+ice-accretion/freezing-rain amount evidence, keeping their definitions distinct.
+Neither visibility nor thunder potential alone establishes a complete weather-condition string.
 Native snowfall, NBM SLR and Kuchera remain separately traceable pending sufficient
 verification data; a broad snowfall evaluation campaign is not the next task.
 
@@ -3416,14 +3420,121 @@ lock validation and `git diff --check` passed. No PostgreSQL/MinIO services, ful
 acceptance suite, visibility-observation verification, calibrated visibility blend,
 or forecast-skill assessment were run in this increment.
 
-The smallest proposed next field is **thunder potential**: the inspected NBM core
-inventory includes native one-hour `TSTM` probabilities. Preserve the exact event,
-time interval and spatial support before using them in a forecast; HRRR/RAP lightning
-diagnostics must remain distinct from probabilities. This supplies a broadly useful
-missing ingredient for later conditions. Native NBM FRAM flat ice accumulation is
-the following winter-hazard candidate, separate from liquid freezing-rain amounts
-and radial ice. Neither thunder, ice accretion nor derived conditions is implemented
-in this increment.
+The following thunder increment uses those native probabilities. Ice accretion and
+derived conditions remain future work.
+
+## Native thunder potential on the local grid
+
+The optional [preparation command](src/mesoforge/application/prepared_thunder.py)
+attaches native NBM `TSTM` probabilities to the existing surface preparation. It
+reuses the selected NBM cycle and shared regional views; no downloads happen per
+cell, per domain or inside HTTP requests. The user-approved temporary baseline is
+the native **one-hour** NBM probability. Native three- and six-hour events remain
+zero-weight shadows at their own endpoints; they are never split into hourly
+values, summed, or substituted for missing hourly guidance.
+
+The source retains native percent and normalized fraction, exact interval bounds,
+cycle/lead, generating-process and GRIB event keys, URLs, byte ranges, checksums,
+availability and acquisition times. The provider encodes thunder probability as
+`TSTM`, PDT 8, probability generating-process type 5, with an interval; this is
+not accumulated rainfall despite the GRIB `accum` label. Nearest-native-cell
+sampling retains the published probability and sampled cell coordinates. The
+configured forecast point is still extracted from the local grid's center.
+
+**Definition limitation:** the inspected native NBM messages and current product
+references do not establish a precise lightning-count/type threshold or event
+neighborhood radius. Both remain explicitly unknown in the payload. Native grid
+spacing is not an event radius. This baseline reports the provider-defined NBM
+event, not an exact-point flash probability. Unproven event/spatial equivalence
+blocks cross-source comparisons. See the official [NBM element definitions](https://vlab.noaa.gov/web/mdl/nbm-weather-elements)
+and [native parameter table](https://www.nco.ncep.noaa.gov/pmb/docs/grib2/grib2_doc/grib2_table4-2-0-19.shtml).
+
+The source registry and read path retain distinct probability events rather than
+requiring one permanent model. Inspection also found native GLMP lightning and
+calibrated HREF thunder products, but no independently bound comparable source was
+added here. Retained REFS includes a native probability of its lightning diagnostic
+exceeding 0.08; its threshold units/event support are not established as equivalent
+to NBM thunder, so it stays explicitly incompatible. HRRR/RAP deterministic lightning
+diagnostics are not probabilities. No matching thunder probability was found in the
+inspected GFS/IFS/GEFS feeds; ECMWF's separate lightning-probability chart is not an
+available field in the inspected open-data ensemble probability inventory. These
+are scoped product findings, not claims that the organizations have no thunder products.
+
+```powershell
+python -m mesoforge.application.prepared_thunder --prepared-run EXISTING_PREPARATION --output-dir NEW_THUNDER_PREPARATION
+python -m mesoforge.application.prepared_thunder --prepared-run NEW_THUNDER_PREPARATION --output-dir OFFLINE_THUNDER_REPLAY --from-raw
+python -m mesoforge.application.prepared_local_grid --config locations.json --prepared-run OFFLINE_THUNDER_REPLAY --output-dir NEW_LOCAL_GRID
+```
+
+These placeholder commands were not run verbatim; their module functions were
+exercised with actual retained paths in the locked environment. All generated data
+stays outside Git. The existing API can read `NEW_LOCAL_GRID`; no service was started.
+Later thunder acquisition remains separate from the original forecast decision evidence.
+
+The real demonstration uses Minneapolis **44.98859, -93.25557**, NBM cycle September
+11, 2026 **18Z**, and the unchanged 36-hour grid through September 13 **06Z**. At the
+point, native guidance ending September 12 **06Z / 1 a.m. CDT** is:
+
+| Role/source event | Exact UTC event interval on September 12 | Probability |
+| --- | --- | ---: |
+| Temporary active NBM one-hour | 05Z–06Z | 4% |
+| NBM three-hour shadow | 03Z–06Z | 18% |
+| NBM six-hour shadow | 00Z–06Z | 31% |
+
+The different periods explain why these are not a same-event disagreement or a
+model ranking. No independent, scientifically comparable contributor disagreement
+was demonstrated. The hourly point signal peaks at 7% for 03Z–04Z; this is a real
+model thunder-potential case, not observational confirmation of a thunderstorm.
+Native zero remains zero, while unsupported periods/products have explicit reasons.
+
+The bounded acquisition retained **54 GRIB messages**: 36 hourly, 12 three-hour and
+6 six-hour events. Total transfer was **38,332,503 bytes**, including inventories
+from unavailable period requests; retained GRIB is **37,045,317 bytes**, retained
+successful inventories **728,745 bytes**, and compressed regional arrays **459,317
+bytes**. The three initial probe messages were reused. Raw replay reproduced all
+arrays, events and original acquisition provenance exactly with **zero provider calls**.
+
+All **49 cells × 36 hours** have native hourly probabilities, including 9 editable
+and 40 context-only cells at unchanged 6 km spacing. At the 06Z endpoint above,
+hourly probability varies from 4–5% in both domains; three-hour shadows span 17–19%
+and six-hour shadows 27–33% across the full grid. Exact-point extraction equals the
+retained center cell and direct nearest-native sampling. All **1,764 previous
+cell/hour records match exactly** after removing only the new thunder field/evidence,
+including visibility, cloud and all winter fields. The full grid occupies
+**86,590,898 bytes compressed** and took **316.59 seconds** to build and retain.
+A second complete build reproduced the exact compressed grid and source provenance,
+reused the immutable retained artifact, and made **zero provider calls**.
+
+Validation: **483 focused/retained offline tests passed**: 29 native adapter,
+35 probability/extraction, 6 preparation, 74 report/grid and 339 retained
+application/scientific checks. Focused tests cover bounds, exact event/interval and
+spatial-definition preservation, zero versus missing, no longer-period fallback,
+shared loading, point extraction and immutable in-memory storage/readback. The new
+four-file selection can be run with:
+
+```powershell
+python -m pytest -q tests/unit/guidance/test_thunder.py tests/unit/forecasting/test_thunder.py tests/unit/application/test_thunder.py tests/unit/application/test_prepared_thunder.py
+```
+
+These files were executed in separate focused selections. Ruff, formatting, mypy,
+all nine import contracts, documentation/hygiene checks, offline lock validation and
+`git diff --check` passed. No PostgreSQL/MinIO service checks, full acceptance suite,
+thunder-observation verification, calibration or forecast-skill assessment ran in
+this increment.
+
+Future thunder potential should be evaluated and calibrated from suitable
+multi-source probabilities and matching lightning/thunder observations. CAPE,
+reflectivity, QPF and deterministic convection can later supply supporting context;
+they are not probabilities themselves. No thunder calibration, new meteorological
+weights, derived conditions, or changes to earlier fields are introduced here.
+
+The next smallest field is **native ice-accretion/freezing-rain amount evidence**:
+inspect NBM `FICEAC` (FRAM flat ice) and available native freezing-rain liquid
+accumulations (`FRZR` is present in the retained HRRR/RAP inventories), preserving
+their separate [native definitions and units](https://www.nco.ncep.noaa.gov/pmb/docs/grib2/grib2_doc/grib2_table4-2-0-1.shtml).
+Flat ice,
+radial ice and liquid freezing-rain amount must not be conflated or assigned an
+invented blend. Human-readable conditions should follow that field work.
 
 ## References
 

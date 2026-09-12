@@ -163,10 +163,12 @@ def _transformation_identity() -> dict[str, Any]:
         "application/snowfall_amount_forecast.py",
         "application/cloud_cover.py",
         "application/visibility.py",
+        "application/thunder.py",
         "forecasting/surface.py",
         "forecasting/snowfall_amount.py",
         "forecasting/cloud_cover.py",
         "forecasting/visibility.py",
+        "forecasting/thunder.py",
         "forecasting/scalar_blend.py",
         "forecasting/vector_blend.py",
         "forecasting/gust_blend.py",
@@ -309,6 +311,37 @@ def _missing_hours(hours: list[dict[str, Any]], reason: str) -> list[dict[str, A
                 contributor.pop("spatial_extraction", None)
                 contributor.pop("extraction_coordinate", None)
             for comparison in visibility["comparisons"]:
+                comparison.update(
+                    difference_left_minus_right=None,
+                    status="unavailable",
+                    missing_reasons=[reason],
+                )
+        thunder = surface.get("thunder_guidance")
+        if thunder is not None:
+            thunder["field"].update(
+                value=None,
+                native_value=None,
+                display_percent=None,
+                active_weight=0.0,
+                status="unavailable",
+                missing_reasons=[reason],
+                weights={},
+            )
+            thunder["field"].pop("spatial_extraction", None)
+            thunder["field"].pop("extraction_coordinate", None)
+            surface["fields"]["probability_of_thunder_1h"] = deepcopy(thunder["field"])
+            for contributor in thunder["contributors"]:
+                contributor.update(
+                    value=None,
+                    native_value=None,
+                    display_percent=None,
+                    active_weight=0.0,
+                    status="unavailable",
+                    missing_reasons=[reason],
+                )
+                contributor.pop("spatial_extraction", None)
+                contributor.pop("extraction_coordinate", None)
+            for comparison in thunder["comparisons"]:
                 comparison.update(
                     difference_left_minus_right=None,
                     status="unavailable",

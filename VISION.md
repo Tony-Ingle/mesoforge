@@ -45,6 +45,16 @@ delivered visibility remains unavailable. No arbitrary upper cap is imposed, and
 missing native cells are not replaced by nearby values. Visibility alone never
 determines fog, precipitation type/intensity or complete weather conditions.
 
+An optional thunder attachment now retains native NBM hourly probability as the
+user-approved temporary baseline, with separate three- and six-hour shadow events
+across the same grid. Every value preserves its native event period and provenance;
+unencoded physical thresholds and event footprints remain explicitly unknown. It is
+not an exact-point lightning probability. Other inspected lightning/thunder products
+remain distinct or unavailable until their native events and spatial support are
+bound correctly. NBM-only thunder is not the final architecture: future multi-source
+combination/calibration requires suitable verification evidence. Deterministic CAPE,
+QPF, reflectivity or lightning diagnostics are not probabilities by themselves.
+
 Shared prepared files hold native model grids. The local MesoForge surface baseline
 uses one coordinate-derived grid covering a larger context domain, with a smaller
 editable subset and an exact forecast-point target. The spot forecast is extracted
@@ -285,10 +295,10 @@ a daily product or ignoring incompatible spatial support. Native snowfall water
 equivalent is now retained as unblended evidence on the same grid. Native interval
 snowfall amounts, native model SLR and first profile-based Kuchera estimates are also
 separate evidence. Snow depth on the ground is not newly accumulated snowfall.
-Native total-cloud and visibility evidence are now available on the same grid.
-The next proposed field is native thunder potential with explicit probability-event,
-time and spatial semantics, followed by suitable ice-accretion guidance. Neither
-is implemented yet; complete derived conditions remain future work. Low visibility
+Native total-cloud, visibility and thunder-probability evidence are now available
+on the same grid. The next proposed field is native ice-accretion/freezing-rain amount
+guidance, preserving flat ice, radial ice and liquid amounts as separate concepts.
+Ice amounts and complete derived conditions remain future work. Low visibility
 alone cannot establish fog, precipitation or another cause. Native snowfall, NBM SLR and Kuchera remain
 separately traceable until sufficient suitable verification exists; a broad snowfall/SLR
 campaign is deferred. No constant ratio, native single-source rule or derived method
@@ -304,7 +314,7 @@ does not authorize implementing the roadmap as one task.
 ## Future roadmap
 
 Fields should grow from today's surface, QPF, PoP, native type, SWE, native/derived
-snowfall-amount, cloud and visibility evidence to supported thunder potential,
+snowfall-amount, cloud, visibility and native thunder evidence to
 snow depth on the ground, ice amounts and other useful
 forecasts. Conditions must
 be derived from the underlying fields with explainable rules and explicit missingness,

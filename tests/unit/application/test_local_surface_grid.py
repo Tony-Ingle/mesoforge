@@ -34,6 +34,7 @@ from mesoforge.application.spatial_preparation import (
     attach_cloud_guidance,
     attach_snowfall_amount_guidance,
     attach_snowfall_guidance,
+    attach_thunder_guidance,
     attach_visibility_guidance,
 )
 from mesoforge.contracts.serialization import canonical_json_bytes, canonical_json_digest
@@ -67,6 +68,7 @@ from tests.unit.application.test_surface_forecast import (
     _dataset,
     _pop_entry,
 )
+from tests.unit.application.test_thunder import thunder_view
 from tests.unit.application.test_visibility import visibility_view
 
 LATITUDE, LONGITUDE = 44.98859, -93.25557
@@ -258,6 +260,45 @@ def _visibility_views():
                 dataset=xr.concat(
                     [view.dataset.isel(event=0, drop=True) for view in native], dim="event"
                 ).assign_coords(event=list(range(36))),
+                manifest={
+                    **native[0].manifest,
+                    "events": [view.manifest["events"][0] for view in native],
+                },
+            )
+        )
+    return views
+
+
+def _thunder_views():
+    views = []
+    for source_id, duration, offset in (
+        ("NBM_1H", 1, 0.25),
+        ("NBM_3H", 3, 0.5),
+        ("NBM_6H", 6, 0.7),
+    ):
+        native = []
+        for horizon in HOURS:
+            if horizon % duration:
+                continue
+            valid = (
+                str(np.datetime_as_string(TARGET + np.timedelta64(horizon, "h"), unit="s")) + "Z"
+            )
+            view = thunder_view(source_id, amount=offset + horizon / 1000, end=valid)
+            view.manifest["events"][0].update(
+                source_cycle=str(np.datetime_as_string(TARGET, unit="s")) + "Z",
+                source_lead_hours=horizon,
+            )
+            view.dataset.coords.update({"x": [-94.0, -92.0], "y": [44.0, 46.0]})
+            longitude, latitude = np.meshgrid(view.dataset.x.values, view.dataset.y.values)
+            view.dataset.thunder_probability.values += 0.01 * _gradient(latitude, longitude)
+            view.dataset.native_probability.values += _gradient(latitude, longitude)
+            native.append(view)
+        views.append(
+            replace(
+                native[0],
+                dataset=xr.concat(
+                    [view.dataset.isel(event=0, drop=True) for view in native], dim="event"
+                ).assign_coords(event=list(range(len(native)))),
                 manifest={
                     **native[0].manifest,
                     "events": [view.manifest["events"][0] for view in native],
@@ -688,6 +729,8 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
         _cloud_guidance={"status": "prepared"},
         _visibility_views=_visibility_views(),
         _visibility_guidance={"status": "prepared"},
+        _thunder_views=_thunder_views(),
+        _thunder_guidance={"status": "prepared"},
     )
     result = prepared.forecast(latitude=LATITUDE, longitude=LONGITUDE)
     assert result["hours"][0]["temperature"]["value"] is not None
@@ -702,6 +745,8 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
     center_amounts = result["hours"][0]["surface"]["snowfall_amount_guidance"]
     center_cloud = result["hours"][0]["surface"]["cloud_guidance"]
     center_visibility = result["hours"][0]["surface"]["visibility_guidance"]
+    center_thunder = result["hours"][0]["surface"]["thunder_guidance"]
+    assert center_thunder["field"]["value"] == pytest.approx(0.251 + 0.01 * _gradient(44.0, -94.0))
     assert center_visibility["contributors"][0]["value"] == pytest.approx(
         3001 + 100 * _gradient(44.0, -94.0)
     )
@@ -826,6 +871,26 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
             assert source.get("provenance") == central.get("provenance")
             assert source["valid_time"] == central["valid_time"]
         for pair in visibility["comparisons"]:
+            assert pair["difference_left_minus_right"] is None and pair["status"] == "unavailable"
+        thunder = hour["surface"]["thunder_guidance"]
+        for source, central in zip(
+            [thunder["field"], *thunder["contributors"]],
+            [center_thunder["field"], *center_thunder["contributors"]],
+            strict=True,
+        ):
+            assert source["value"] is None and source["native_value"] is None
+            assert source["display_percent"] is None and source["active_weight"] == 0
+            assert source["missing_reasons"] == cell["missing_reasons"]
+            assert "spatial_extraction" not in source and "extraction_coordinate" not in source
+            for key in (
+                "provenance",
+                "interval_start",
+                "interval_end",
+                "event_definition",
+                "spatial_support",
+            ):
+                assert source.get(key) == central.get(key)
+        for pair in thunder["comparisons"]:
             assert pair["difference_left_minus_right"] is None and pair["status"] == "unavailable"
     with pytest.raises(CoverageRequiredError):
         prepared.forecast(latitude=LATITUDE + 0.1, longitude=LONGITUDE)
@@ -1168,6 +1233,109 @@ def test_visibility_reuses_guidance_preserves_cloud_and_winter_fields_and_replay
         cell["hours"] for cell in grid["cells"] if cell["is_forecast_point"]
     )
     assert point["visibility_guidance"] == descriptor
+    service, factory, objects = memory_service
+    issued = service.issue(point, batch_run_id=uuid4(), location_index=0)
+    before = len(factory.issued_forecasts), len(objects.objects)
+    assert service.read(issued.issued_forecast_id)["forecast"] == point
+    assert (len(factory.issued_forecasts), len(objects.objects)) == before
+
+
+def test_thunder_native_periods_share_guidance_preserve_all_previous_fields_and_replay(
+    prepared_surface, monkeypatch, memory_service
+):
+    views = _thunder_views()
+    originals = [view.dataset.copy(deep=True) for view in views]
+    baseline = replace(
+        prepared_surface,
+        _cloud_views=_cloud_views(),
+        _cloud_guidance={"status": "prepared"},
+        _type_views=_type_views(),
+        _type_guidance={"status": "prepared"},
+        _snow_views=[*_snow_views(), *_snow_views("RAP")],
+        _snow_guidance={"status": "prepared"},
+        _snow_amount_views=_amount_views(),
+        _snow_amount_guidance={"status": "prepared"},
+        _pop_views=[_pop_entry(hours=HOURS)],
+        _pop_guidance={"status": "prepared"},
+        _probability_views=_spatial_probability_views(),
+        _visibility_views=_visibility_views(),
+        _visibility_guidance={"status": "prepared"},
+    )
+    descriptor = {"status": "prepared", "source_status": {}}
+    loader = Mock(return_value=views)
+    monkeypatch.setattr("mesoforge.application.prepared_thunder.load_thunder_guidance", loader)
+    regions = attach_thunder_guidance(PreparedRegions([baseline, baseline], {}), descriptor)
+    loader.assert_called_once_with(descriptor, target_reference_time=TARGET)
+    assert regions.regions[0]._thunder_views is regions.regions[1]._thunder_views
+    assert baseline._thunder_guidance is None
+    with (
+        patch("xarray.open_dataset", side_effect=AssertionError("Guidance already loaded")),
+        patch("requests.Session", side_effect=AssertionError("No provider calls")),
+    ):
+        previous, grid, replay = [
+            build_local_surface_grid(
+                latitude=LATITUDE,
+                longitude=LONGITUDE,
+                calculate_column=prepared._forecast_column,
+                geometry=TEST_GEOMETRY,
+            )
+            for prepared in (baseline, *regions.regions)
+        ]
+    assert canonical_json_bytes(grid) == canonical_json_bytes(replay)
+    roles, sampled = set(), []
+    for cell, old_cell in zip(grid["cells"], previous["cells"], strict=True):
+        roles.add(cell["inside_editable_domain"])
+        assert len(cell["hours"]) == 36
+        latitude = min((44.0, 46.0), key=lambda value: abs(cell["latitude"] - value))
+        longitude = min((-94.0, -92.0), key=lambda value: abs(cell["longitude"] - value))
+        gradient = 0.01 * _gradient(latitude, longitude)
+        for hour, old in zip(cell["hours"], old_cell["hours"], strict=True):
+            evidence = hour["surface"]["thunder_guidance"]
+            field = evidence["field"]
+            expected = 0.25 + hour["horizon_hours"] / 1000 + gradient
+            assert field["value"] == pytest.approx(expected)
+            assert field["unit"] == "1" and field["display_percent"] == pytest.approx(
+                expected * 100
+            )
+            assert field["weights"] == {"NBM": 1.0} and field["policy"]["temporary"]
+            sources = {source["source_id"]: source for source in evidence["contributors"]}
+            for source_id, duration, offset in (
+                ("NBM_1H", 1, 0.25),
+                ("NBM_3H", 3, 0.5),
+                ("NBM_6H", 6, 0.7),
+            ):
+                source = sources[source_id]
+                if hour["horizon_hours"] % duration:
+                    assert source["value"] is None and source["missing_reasons"]
+                    assert source["active_weight"] == 0
+                    continue
+                expected_source = offset + hour["horizon_hours"] / 1000 + gradient
+                assert source["value"] == pytest.approx(expected_source)
+                assert source["native_value"] == pytest.approx(expected_source * 100)
+                assert source["duration_hours"] == duration and source["provenance"]
+                assert source["active_weight"] == (1 if source_id == "NBM_1H" else 0)
+                assert source["spatial_extraction"]["method"] == "nearest_native_grid_cell"
+                assert source["event_definition"]["physical_threshold"] is None
+                assert source["spatial_support"]["radius_km"] is None
+            assert all(
+                pair["difference_left_minus_right"] is None for pair in evidence["comparisons"]
+            )
+            assert all(pair["status"] == "incompatible" for pair in evidence["comparisons"])
+            unchanged = deepcopy(hour)
+            unchanged["surface"].pop("thunder_guidance")
+            unchanged["surface"]["fields"].pop("probability_of_thunder_1h")
+            assert unchanged == old
+        sampled.append(cell["hours"][0]["surface"]["thunder_guidance"]["field"]["value"])
+    assert roles == {True, False} and max(sampled) > min(sampled)
+    for before, view in zip(originals, views, strict=True):
+        xr.testing.assert_identical(before, view.dataset)
+    point = extract_grid_point(
+        json.loads(canonical_json_bytes(grid)), latitude=LATITUDE, longitude=LONGITUDE
+    )
+    assert point["hours"] == next(
+        cell["hours"] for cell in grid["cells"] if cell["is_forecast_point"]
+    )
+    assert point["thunder_guidance"] == descriptor
     service, factory, objects = memory_service
     issued = service.issue(point, batch_run_id=uuid4(), location_index=0)
     before = len(factory.issued_forecasts), len(objects.objects)
