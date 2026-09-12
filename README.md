@@ -55,6 +55,11 @@ only required geographic inputs; names are optional display metadata.
   retains HRRR/GFS/RAP/IFS/NBM total-cloud percentages and per-source sky categories
   across the same grid. All are zero-weight evidence; the delivered cloud field
   remains explicitly unavailable because no approved cloud blend exists.
+- **Visibility:** an optional [native visibility step](#native-visibility-on-the-local-grid)
+  retains HRRR/GFS/RAP/NBM surface horizontal visibility across the same grid.
+  IFS open-data visibility is explicitly unsupported. Native metres and per-source
+  disagreement are preserved; all contributors have zero active weight and delivered
+  visibility stays unavailable pending an approved policy. Visibility does not infer fog.
 - **Shadows:** real RAP and ECMWF IFS values/provenance accompany issuance with zero
   active weight. IFS preserves native three-hourly gaps and has no compatible
   instantaneous gust. Native cloud evidence does not introduce a new active policy.
@@ -105,8 +110,10 @@ below. Native interval snowfall-water-equivalent evidence is now implemented.
 Native snowfall amounts and separate Kuchera estimates are now implemented as evidence.
 Native cloud evidence is now implemented separately from an unapproved delivered
 cloud blend; [cloud checks and real replay evidence](#native-cloud-cover-on-the-local-grid)
-are recorded below. The next proposed step is native visibility evidence on the same grid;
-visibility alone will not establish fog or a complete weather-condition string.
+are recorded below. Native visibility evidence is now implemented on the same grid;
+the next proposed step is native thunder potential, preserving its probability/event
+definition. Neither visibility nor thunder potential alone establishes a complete
+weather-condition string.
 Native snowfall, NBM SLR and Kuchera remain separately traceable pending sufficient
 verification data; a broad snowfall evaluation campaign is not the next task.
 
@@ -3293,13 +3300,130 @@ offline lock validation and `git diff --check` passed. No real PostgreSQL/MinIO
 service, full acceptance suite, cloud-observation verification, calibrated blend,
 or forecast-skill assessment was run in this increment.
 
-The smallest proposed next increment is native **visibility** evidence on this grid:
-the inspected HRRR/GFS/RAP/NBM inventories contain instantaneous surface `VIS`.
-Preserve different definitions and missingness before selecting a delivered rule.
-NBM thunder probabilities and interval ice-accretion guidance are later candidates
-with their own semantics. Visibility is broadly useful to a future conditions product,
-but reduced visibility alone cannot identify fog or its cause. No such fields or
-conditions rules are implemented here.
+Native visibility evidence is now implemented in the following increment; the cloud
+fields and sky categories remain unchanged. Conditions rules remain future work.
+
+## Native visibility on the local grid
+
+The optional `mesoforge.application.prepared_visibility` attachment adds native
+instantaneous surface **horizontal visibility** to the same 49-node, 36-hour grid.
+`surface.visibility_guidance` preserves contributors and descriptive disagreements;
+`surface.fields.visibility` is null with `policy_unavailable` and empty weights.
+No approved retained Phase 2 visibility blend or active-source rule exists.
+Cloud/sky categories and all earlier surface, QPF, PoP, p-type, SWE, snowfall,
+Kuchera and NBM SLR calculations remain unchanged.
+
+| Source | Native evidence | Treatment |
+| --- | --- | --- |
+| HRRR | `wrfsfc` instantaneous `VIS:surface` | Native metres, hourly |
+| GFS | `pgrb2.0p25` instantaneous `VIS:surface` | Native metres, hourly |
+| RAP | `awp130pgrb` instantaneous `VIS:surface` | Native metres at supported cycle leads |
+| NBM | Core deterministic instantaneous `VIS:surface` | Native metres; exclude adjacent probability products |
+| IFS | Absent from the inspected official deterministic open-data product | Explicitly unsupported; no download or reconstruction |
+
+The [NOAA GRIB table](https://www.nco.ncep.noaa.gov/pmb/docs/grib2/grib2_doc/grib2_table4-2-0-19.shtml)
+defines visibility as a distance in metres. Source selection excludes averages,
+probabilities, ceiling and cause-specific products. The inspected [IFS open-data
+catalogue](https://www.ecmwf.int/en/forecasts/datasets/open-data) does not expose this
+field; that is a limitation of the selected feed, not a claim about all ECMWF products.
+
+Each local-grid node samples the nearest native cell, preserving its index, location,
+native coordinate distance/units and weight 1. Exact ties choose the lower stored
+axis index. This avoids smoothing visibility restrictions; [NOAA's field-selected
+NBM algorithms](https://vlab.noaa.gov/documents/6609493/7858320/Description_of_Field-Selected_Algorithms_for_National_Blend_of_Models.pdf)
+also distinguish nearest-neighbor ceiling/visibility from bilinear field interpolation.
+The forecast point comes from the retained local-grid center node. There is no search
+for a different valid neighbor when the selected native value is missing.
+
+Store original unrounded metres, native units/value, cycles/leads, valid times,
+product/model metadata, raw hashes, acquisition time and extraction provenance.
+The report displays statute miles using exactly **1 mile = 1,609.344 metres**.
+Zero remains a valid distance; negative/nonfinite values are unavailable. No arbitrary
+upper cap or observation-reporting limit is imposed. Provider diagnostic/censoring
+notes remain separate: model definitions and native resolution differ, and the
+largest value in an array does not establish a censoring threshold. Comparisons only
+describe compatible same-time horizontal surface visibility; they do not establish
+skill or a delivered blend. Reduced visibility does **not** diagnose fog,
+precipitation type/intensity, or a complete weather condition.
+
+Preparation reuses the existing selected HRRR/GFS/RAP cycles and NBM PoP cycle.
+One native visibility message per model/lead is shared across regions and cells;
+earlier raw/prepared fields remain referenced in place. Run this explicit step before
+local-grid construction; `forward_run` does not yet acquire visibility automatically,
+and HTTP does not download it. Use new directories outside Git:
+
+```powershell
+python -B -m mesoforge.application.prepared_visibility --prepared-run EXISTING_SURFACE_RUN --output-dir NEW_VISIBILITY_RUN
+python -B -m mesoforge.application.prepared_visibility --prepared-run NEW_VISIBILITY_RUN --from-raw --output-dir NEW_VISIBILITY_REPLAY
+python -B -m mesoforge.application.prepared_local_grid --config locations.json --prepared-run NEW_VISIBILITY_REPLAY --output-dir NEW_LOCAL_GRID
+```
+
+These CLI examples use placeholders and were not run verbatim. The module functions
+were exercised with real paths in the locked Python environment. The existing API
+can read the resulting grid with `--data-dir NEW_LOCAL_GRID`; no service was started
+for this increment. Later visibility acquisition is explicitly recorded separately
+from the earlier numerical forecast decision time.
+
+The bounded real demonstration uses Minneapolis **44.98859, -93.25557**, reference
+September 11, 2026 18Z, and 36 valid hours through September 13 06Z. Native values
+at September 11 **19Z / 2 p.m. CDT**, before any display rounding, were:
+
+| Contributor | September 11 source cycle / lead | Native visibility, m |
+| --- | --- | ---: |
+| HRRR | 12Z / 7 h | 61400 |
+| GFS | 12Z / 7 h | 24135.109375 |
+| RAP | 15Z / 4 h | 53703.109375 |
+| NBM | 18Z / 1 h | 16274 |
+| IFS | No native visibility in selected open feed | unavailable |
+
+All four supported sources supplied 36 snapshots. The experiment acquired
+**108,565,957 bytes**, including 105,531,028 bytes of GRIB messages and 3,034,929
+bytes of inventories. Four initial probe messages were reused. Compressed regional
+visibility arrays occupy **1,543,760 bytes**. All raw data remains outside Git.
+Raw replay reproduced arrays, event metadata and original acquisition provenance
+exactly with zero provider calls; all earlier preparation descriptors, including
+cloud, matched unchanged.
+
+All four supported sources are available at all **49 nodes × 36 hours**, including
+9 editable and 40 context-only nodes at the unchanged 6 km spacing. At 19Z, HRRR
+visibility ranges from 58,000–64,000 m inside the editable domain and 52,200–65,100 m
+in context-only nodes; RAP ranges from 50,403.109375–54,703.109375 m and
+45,503.109375–55,403.109375 m respectively. GFS and NBM happen to be spatially
+constant over these nodes at this hour; no variation is fabricated.
+Exact-point extraction equals its retained center node and direct nearest-native
+sampling. Every one of the **1,764 earlier cell/hour records matches exactly**
+after removing only the new visibility field/evidence, including all cloud and
+winter fields. The full retained grid is **75,872,965 bytes compressed**, versus
+70,369,704 bytes before visibility; building/retaining it took **291.99 seconds**.
+These measurements include all prior fields and their detailed provenance.
+A second complete build reproduced the exact retained grid bytes and source
+provenance, reused that immutable artifact, and made zero provider calls.
+
+Validation: **435 focused/retained offline tests passed**: 365 source, science,
+preparation and application checks plus 70 existing/extended report/grid tests.
+These cover native definitions, metre/mile conversion, valid ranges, zero versus
+missing/unsupported values, missing neighbors, corruption, times, shared loading,
+point extraction, unchanged previous fields, replay and immutable memory-storage
+readback. The new visibility modules can be checked with:
+
+```powershell
+python -m pytest -q tests/unit/guidance/test_visibility.py tests/unit/forecasting/test_visibility.py tests/unit/application/test_visibility.py tests/unit/application/test_prepared_visibility.py
+```
+
+The four-file selection was included in the executed 365-test command. Ruff,
+formatting, mypy, all nine import contracts, documentation/hygiene checks, offline
+lock validation and `git diff --check` passed. No PostgreSQL/MinIO services, full
+acceptance suite, visibility-observation verification, calibrated visibility blend,
+or forecast-skill assessment were run in this increment.
+
+The smallest proposed next field is **thunder potential**: the inspected NBM core
+inventory includes native one-hour `TSTM` probabilities. Preserve the exact event,
+time interval and spatial support before using them in a forecast; HRRR/RAP lightning
+diagnostics must remain distinct from probabilities. This supplies a broadly useful
+missing ingredient for later conditions. Native NBM FRAM flat ice accumulation is
+the following winter-hazard candidate, separate from liquid freezing-rain amounts
+and radial ice. Neither thunder, ice accretion nor derived conditions is implemented
+in this increment.
 
 ## References
 

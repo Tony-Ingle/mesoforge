@@ -10,6 +10,7 @@ from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 from mesoforge.catalog.units import convert
+from mesoforge.forecasting.visibility import visibility_miles
 
 _QPF = "liquid_equivalent_precipitation_amount_1h"
 _POP = "probability_of_precipitation_1h"
@@ -519,7 +520,87 @@ def _render_surface_report(report: dict[str, Any]) -> str:
     lines.extend(_render_snowfall(report["hours"]))
     lines.extend(_render_snowfall_amount(report["hours"]))
     lines.extend(_render_cloud_guidance(report["hours"]))
+    lines.extend(_render_visibility_guidance(report["hours"]))
     return "\n".join(lines) + "\n"
+
+
+def _render_visibility_guidance(hours: list[dict[str, Any]]) -> list[str]:
+    """Display native horizontal visibility without inferring a weather phenomenon."""
+    if not any("visibility_guidance" in hour.get("surface", {}) for hour in hours):
+        return []
+    lines = [
+        "",
+        "### Native visibility evidence",
+        "",
+        "All visibility contributors have zero active weight. The active visibility baseline "
+        "is unavailable because no retained blend rule is approved. Values describe native "
+        "model horizontal visibility at the surface. Original unrounded metres, native units "
+        "and source provenance remain stored; statute miles are a display conversion. "
+        "This evidence does not identify fog, precipitation type or intensity, or a complete "
+        "weather-condition string. Missing native times are not filled.",
+        "",
+        "| Hour | Source / product | Cycle / source lead h | UTC valid time | Visibility m | "
+        "Visibility statute mi | Native value / unit | Status / reason |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    differences: list[str] = []
+    for hour in hours:
+        guidance = hour.get("surface", {}).get("visibility_guidance", {})
+        for source in guidance.get("contributors", []):
+            value = source["value"]
+            if source["unit"] != "m" or (
+                value is not None and (not math.isfinite(value) or value < 0)
+            ):
+                raise ValueError("Visibility report requires finite nonnegative metres")
+            miles = None if value is None else visibility_miles(value)
+            if source.get("display_miles") != miles:
+                raise ValueError("Visibility display must reproduce the native metre value")
+            native = source.get("native_value")
+            native_text = (
+                "unavailable" if native is None else f"{native:.6g} {source['native_unit']}"
+            )
+            reasons = "; ".join(source.get("missing_reasons", []))
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(hour["horizon_hours"]),
+                        f"{source['model']} / {source.get('product', 'unavailable')}",
+                        f"{source.get('source_cycle', 'unavailable')} / "
+                        f"{source.get('source_lead_hours', 'unavailable')}",
+                        source["valid_time"],
+                        "unavailable" if value is None else f"{value:.6g}",
+                        "unavailable" if miles is None else f"{miles:.6g}",
+                        native_text,
+                        source["status"] + (f"; {reasons}" if reasons else ""),
+                    ]
+                )
+                + " |"
+            )
+        for comparison in guidance.get("comparisons", []):
+            if comparison["status"] != "comparable":
+                continue
+            difference = comparison["difference_left_minus_right"]
+            if comparison["unit"] != "m" or difference is None or not math.isfinite(difference):
+                raise ValueError("Visibility disagreement requires finite metre differences")
+            differences.append(
+                f"| {hour['horizon_hours']} | {' minus '.join(comparison['models'])} | "
+                f"{difference:+.6g} |"
+            )
+    lines.extend(
+        [
+            "",
+            "Same-valid-time visibility disagreements are descriptive differences, not skill "
+            "scores; native model diagnostics and spatial resolutions remain distinct.",
+            "",
+        ]
+    )
+    lines.extend(
+        ["| Hour | Compared models | Difference m |", "| --- | --- | --- |", *differences]
+        if differences
+        else ["No compatible native visibility pairs are available."]
+    )
+    return lines
 
 
 def _render_cloud_guidance(hours: list[dict[str, Any]]) -> list[str]:

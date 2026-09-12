@@ -90,6 +90,11 @@ def prepare_local_grids(
             if "cloud_guidance" in preparation
             else {}
         ),
+        **(
+            {"visibility_guidance": preparation["visibility_guidance"]}
+            if "visibility_guidance" in preparation
+            else {}
+        ),
     )
     if prepared.horizon_hours != tuple(range(1, 37)):
         raise ValueError("Local surface grids require prepared hours 1..36")

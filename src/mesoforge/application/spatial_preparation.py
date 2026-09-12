@@ -89,6 +89,7 @@ def load_prepared(
     snowfall_guidance: dict[str, Any] | None = None,
     snowfall_amount_guidance: dict[str, Any] | None = None,
     cloud_guidance: dict[str, Any] | None = None,
+    visibility_guidance: dict[str, Any] | None = None,
 ) -> PreparedPointForecast | PreparedRegions:
     """Load all shared regions once. This function never prepares or downloads."""
     index = directory / "coverage.json"
@@ -108,8 +109,11 @@ def load_prepared(
             ),
             snowfall_guidance,
         )
-        return attach_cloud_guidance(
-            attach_snowfall_amount_guidance(prepared, snowfall_amount_guidance), cloud_guidance
+        return attach_visibility_guidance(
+            attach_cloud_guidance(
+                attach_snowfall_amount_guidance(prepared, snowfall_amount_guidance), cloud_guidance
+            ),
+            visibility_guidance,
         )
     payload = json.loads(index.read_text())
     regions = []
@@ -141,8 +145,39 @@ def load_prepared(
         ),
         snowfall_guidance,
     )
-    return attach_cloud_guidance(
-        attach_snowfall_amount_guidance(prepared, snowfall_amount_guidance), cloud_guidance
+    return attach_visibility_guidance(
+        attach_cloud_guidance(
+            attach_snowfall_amount_guidance(prepared, snowfall_amount_guidance), cloud_guidance
+        ),
+        visibility_guidance,
+    )
+
+
+def attach_visibility_guidance(
+    prepared: PreparedPointForecast | PreparedRegions,
+    descriptor: dict[str, Any] | None,
+) -> PreparedPointForecast | PreparedRegions:
+    """Load native visibility once and share the evidence across regions and cells."""
+    if descriptor is None:
+        return prepared
+    from mesoforge.application.prepared_visibility import load_visibility_guidance
+
+    regions = prepared.regions if isinstance(prepared, PreparedRegions) else [prepared]
+    target = regions[0]._target_reference_time
+    if any(
+        region._surface_configuration is None or region._target_reference_time != target
+        for region in regions
+    ):
+        raise ValueError("Visibility guidance requires one shared surface forecast target")
+    views = load_visibility_guidance(descriptor, target_reference_time=target)
+    attached = [
+        replace(region, _visibility_views=views, _visibility_guidance=deepcopy(descriptor))
+        for region in regions
+    ]
+    return (
+        PreparedRegions(attached, prepared.failures)
+        if isinstance(prepared, PreparedRegions)
+        else attached[0]
     )
 
 

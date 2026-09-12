@@ -34,6 +34,7 @@ from mesoforge.application.spatial_preparation import (
     attach_cloud_guidance,
     attach_snowfall_amount_guidance,
     attach_snowfall_guidance,
+    attach_visibility_guidance,
 )
 from mesoforge.contracts.serialization import canonical_json_bytes, canonical_json_digest
 from mesoforge.forecasting.recipes import with_surface_fields
@@ -66,6 +67,7 @@ from tests.unit.application.test_surface_forecast import (
     _dataset,
     _pop_entry,
 )
+from tests.unit.application.test_visibility import visibility_view
 
 LATITUDE, LONGITUDE = 44.98859, -93.25557
 HOURS = tuple(range(1, 37))
@@ -223,6 +225,39 @@ def _cloud_views():
                 dataset=xr.concat(
                     [view.dataset.isel(event=0, drop=True) for view in native], dim="event"
                 ).assign_coords(event=list(range(len(native)))),
+                manifest={
+                    **native[0].manifest,
+                    "events": [view.manifest["events"][0] for view in native],
+                },
+            )
+        )
+    return views
+
+
+def _visibility_views():
+    views = []
+    for model, offset in (("HRRR", 3000), ("GFS", 5000), ("RAP", 7000), ("NBM", 8000)):
+        native = []
+        for horizon in HOURS:
+            valid = (
+                str(np.datetime_as_string(TARGET + np.timedelta64(horizon, "h"), unit="s")) + "Z"
+            )
+            view = visibility_view(model, amount=offset + horizon, end=valid)
+            view.manifest["events"][0].update(
+                source_cycle=str(np.datetime_as_string(TARGET, unit="s")) + "Z",
+                source_lead_hours=horizon,
+            )
+            view.dataset.coords.update({"x": [-94.0, -92.0], "y": [44.0, 46.0]})
+            longitude, latitude = np.meshgrid(view.dataset.x.values, view.dataset.y.values)
+            view.dataset.visibility.values += 100 * _gradient(latitude, longitude)
+            view.dataset.native_visibility.values += 100 * _gradient(latitude, longitude)
+            native.append(view)
+        views.append(
+            replace(
+                native[0],
+                dataset=xr.concat(
+                    [view.dataset.isel(event=0, drop=True) for view in native], dim="event"
+                ).assign_coords(event=list(range(36))),
                 manifest={
                     **native[0].manifest,
                     "events": [view.manifest["events"][0] for view in native],
@@ -651,6 +686,8 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
         _snow_amount_guidance={"status": "prepared"},
         _cloud_views=_cloud_views(),
         _cloud_guidance={"status": "prepared"},
+        _visibility_views=_visibility_views(),
+        _visibility_guidance={"status": "prepared"},
     )
     result = prepared.forecast(latitude=LATITUDE, longitude=LONGITUDE)
     assert result["hours"][0]["temperature"]["value"] is not None
@@ -664,6 +701,10 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
     center_probabilities = result["hours"][0]["surface"]["probability_guidance"]
     center_amounts = result["hours"][0]["surface"]["snowfall_amount_guidance"]
     center_cloud = result["hours"][0]["surface"]["cloud_guidance"]
+    center_visibility = result["hours"][0]["surface"]["visibility_guidance"]
+    assert center_visibility["contributors"][0]["value"] == pytest.approx(
+        3001 + 100 * _gradient(44.0, -94.0)
+    )
     assert center_cloud["contributors"][0]["value"] == pytest.approx(20)
     assert center_amounts["native_contributors"][0]["value"] == pytest.approx(0.01)
     assert center_amounts["derived_contributors"][0]["value"] is not None
@@ -774,6 +815,18 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
         for pair in clouds["comparisons"]:
             assert pair["difference_left_minus_right"] is None
             assert pair["status"] == "unavailable"
+        visibility = hour["surface"]["visibility_guidance"]
+        for source, central in zip(
+            visibility["contributors"], center_visibility["contributors"], strict=True
+        ):
+            assert source["value"] is None and source["native_value"] is None
+            assert source["display_miles"] is None and source["status"] == "unavailable"
+            assert source["missing_reasons"] == cell["missing_reasons"]
+            assert "spatial_extraction" not in source and "extraction_coordinate" not in source
+            assert source.get("provenance") == central.get("provenance")
+            assert source["valid_time"] == central["valid_time"]
+        for pair in visibility["comparisons"]:
+            assert pair["difference_left_minus_right"] is None and pair["status"] == "unavailable"
     with pytest.raises(CoverageRequiredError):
         prepared.forecast(latitude=LATITUDE + 0.1, longitude=LONGITUDE)
 
@@ -1021,6 +1074,100 @@ def test_cloud_evidence_reuses_guidance_across_domains_and_replays_without_chang
         "value"
     ] == pytest.approx(20)
     assert point["hours"][0]["surface"]["fields"]["cloud_area_fraction"]["value"] is None
+    service, factory, objects = memory_service
+    issued = service.issue(point, batch_run_id=uuid4(), location_index=0)
+    before = len(factory.issued_forecasts), len(objects.objects)
+    assert service.read(issued.issued_forecast_id)["forecast"] == point
+    assert (len(factory.issued_forecasts), len(objects.objects)) == before
+
+
+def test_visibility_reuses_guidance_preserves_cloud_and_winter_fields_and_replays(
+    prepared_surface, monkeypatch, memory_service
+):
+    views = _visibility_views()
+    originals = [view.dataset.copy(deep=True) for view in views]
+    baseline = replace(
+        prepared_surface,
+        _cloud_views=_cloud_views(),
+        _cloud_guidance={"status": "prepared"},
+        _type_views=_type_views(),
+        _type_guidance={"status": "prepared"},
+        _snow_views=[*_snow_views(), *_snow_views("RAP")],
+        _snow_guidance={"status": "prepared"},
+        _snow_amount_views=_amount_views(),
+        _snow_amount_guidance={"status": "prepared"},
+        _pop_views=[_pop_entry(hours=HOURS)],
+        _pop_guidance={"status": "prepared"},
+        _probability_views=_spatial_probability_views(),
+    )
+    descriptor = {"status": "prepared", "source_status": {}}
+    loader = Mock(return_value=views)
+    monkeypatch.setattr(
+        "mesoforge.application.prepared_visibility.load_visibility_guidance", loader
+    )
+    regions = attach_visibility_guidance(PreparedRegions([baseline, baseline], {}), descriptor)
+    loader.assert_called_once_with(descriptor, target_reference_time=TARGET)
+    assert regions.regions[0]._visibility_views is regions.regions[1]._visibility_views
+    assert baseline._visibility_guidance is None
+    with (
+        patch("xarray.open_dataset", side_effect=AssertionError("Guidance already loaded")),
+        patch("requests.Session", side_effect=AssertionError("No provider calls")),
+    ):
+        previous, grid, replay = [
+            build_local_surface_grid(
+                latitude=LATITUDE,
+                longitude=LONGITUDE,
+                calculate_column=prepared._forecast_column,
+                geometry=TEST_GEOMETRY,
+            )
+            for prepared in (baseline, *regions.regions)
+        ]
+    assert canonical_json_bytes(grid) == canonical_json_bytes(replay)
+    roles, observed_values = set(), []
+    for cell, old_cell in zip(grid["cells"], previous["cells"], strict=True):
+        roles.add(cell["inside_editable_domain"])
+        assert len(cell["hours"]) == 36
+        # Independently identify the closest source coordinate; visibility uses no smoothing.
+        nearest_latitude = min((44.0, 46.0), key=lambda value: abs(cell["latitude"] - value))
+        nearest_longitude = min((-94.0, -92.0), key=lambda value: abs(cell["longitude"] - value))
+        gradient = 100 * _gradient(nearest_latitude, nearest_longitude)
+        for hour, old in zip(cell["hours"], old_cell["hours"], strict=True):
+            evidence = hour["surface"]["visibility_guidance"]
+            assert evidence["field"]["value"] is None and evidence["field"]["weights"] == {}
+            assert (
+                evidence["field"]["unit"] == "m"
+                and evidence["field"]["status"] == "policy_unavailable"
+            )
+            sources = {source["model"]: source for source in evidence["contributors"]}
+            for model, offset in (("HRRR", 3000), ("GFS", 5000), ("RAP", 7000), ("NBM", 8000)):
+                source = sources[model]
+                expected = offset + hour["horizon_hours"] + gradient
+                assert source["value"] == pytest.approx(expected)
+                assert source["display_miles"] == pytest.approx(expected / 1609.344)
+                assert source["native_value"] == pytest.approx(expected)
+                assert source["unit"] == "m" and source["provenance"]
+                assert source["active_weight"] == 0
+                assert source["spatial_extraction"]["method"] == "nearest_native_grid_cell"
+            assert sources["IFS"]["value"] is None and sources["IFS"]["missing_reasons"]
+            pair = next(row for row in evidence["comparisons"] if row["models"] == ["HRRR", "GFS"])
+            assert pair["difference_left_minus_right"] == pytest.approx(-2000)
+            unchanged = deepcopy(hour)
+            unchanged["surface"].pop("visibility_guidance")
+            unchanged["surface"]["fields"].pop("visibility")
+            assert unchanged == old
+        observed_values.append(
+            cell["hours"][0]["surface"]["visibility_guidance"]["contributors"][0]["value"]
+        )
+    assert roles == {True, False} and max(observed_values) > min(observed_values)
+    for before, view in zip(originals, views, strict=True):
+        xr.testing.assert_identical(before, view.dataset)
+    point = extract_grid_point(
+        json.loads(canonical_json_bytes(grid)), latitude=LATITUDE, longitude=LONGITUDE
+    )
+    assert point["hours"] == next(
+        cell["hours"] for cell in grid["cells"] if cell["is_forecast_point"]
+    )
+    assert point["visibility_guidance"] == descriptor
     service, factory, objects = memory_service
     issued = service.issue(point, batch_run_id=uuid4(), location_index=0)
     before = len(factory.issued_forecasts), len(objects.objects)

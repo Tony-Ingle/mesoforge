@@ -13,11 +13,13 @@ from mesoforge.application.snowfall_amount_forecast import (
     extract_snowfall_amount_contributors,
 )
 from mesoforge.application.snowfall_forecast import SNOW, extract_snowfall_contributors
+from mesoforge.application.visibility import extract_visibility_contributors
 from tests.unit.application.test_cloud_cover import cloud_view
 from tests.unit.application.test_precipitation_type import run as type_result
 from tests.unit.application.test_precipitation_type import type_view
 from tests.unit.application.test_snowfall_amount_forecast import amount_view
 from tests.unit.application.test_snowfall_forecast import snow_view
+from tests.unit.application.test_visibility import visibility_view
 
 
 @pytest.mark.parametrize(
@@ -434,6 +436,60 @@ def test_historical_qpf_report_does_not_invent_probability(qpf_forecast):
     report = build_hourly_report(qpf_forecast)
     assert all("display_pop" not in hour for hour in report["hours"])
     assert "Native-period PoP %" not in render_hourly_report(report)
+
+
+@pytest.mark.parametrize("value", [None, 0.0, 1609.344])
+def test_visibility_report_preserves_metres_display_miles_missingness_and_prior_evidence(
+    native_probability_forecast, value
+):
+    for hour in native_probability_forecast["hours"]:
+        hour["surface"]["cloud_guidance"] = extract_cloud_contributors(
+            [cloud_view("HRRR", amount=25, end=hour["valid_time"])],
+            latitude=44.5,
+            longitude=-93.5,
+            valid_time=hour["valid_time"],
+        )
+    previous = deepcopy(native_probability_forecast)
+    for hour in native_probability_forecast["hours"]:
+        views = (
+            []
+            if value is None
+            else [
+                visibility_view("HRRR", amount=value, end=hour["valid_time"]),
+                visibility_view("GFS", amount=value + 2000, end=hour["valid_time"]),
+            ]
+        )
+        evidence = extract_visibility_contributors(
+            views, latitude=44.5, longitude=-93.5, valid_time=hour["valid_time"]
+        )
+        hour["surface"]["fields"]["visibility"] = evidence["field"]
+        hour["surface"]["visibility_guidance"] = evidence
+    original = deepcopy(native_probability_forecast)
+    report = build_hourly_report(native_probability_forecast)
+    rendered = render_hourly_report(report)
+    prefix, section = rendered.split("### Native visibility evidence")
+    assert prefix.strip() == render_hourly_report(build_hourly_report(previous)).strip()
+    assert "zero active weight" in section and "no retained blend rule is approved" in section
+    assert "does not identify fog, precipitation type or intensity" in section
+    assert "statute miles are a display conversion" in section
+    if value is None:
+        assert "No compatible native visibility pairs" in section
+        assert "HRRR / unavailable" in section
+    else:
+        assert "| 36 | HRRR minus GFS | -2000 |" in section
+        expected = "0 | 0 | 0 m" if value == 0 else "1609.34 | 1 | 1609.34 m"
+        assert expected in section
+        source = report["hours"][0]["surface"]["visibility_guidance"]["contributors"][0]
+        assert source["value"] == value and source["native_value"] == value
+    for baseline, shown in zip(original["hours"], report["hours"], strict=True):
+        assert shown["surface"] == baseline["surface"]
+        assert shown["final_surface_fields"] == baseline["surface"]["fields"]
+        assert shown["final_surface_fields"]["visibility"]["value"] is None
+    assert native_probability_forecast == original
+    report["hours"][0]["surface"]["visibility_guidance"]["contributors"][0]["unit"] = "mile"
+    with pytest.raises(ValueError, match="Visibility report requires finite nonnegative metres"):
+        render_hourly_report(report)
+    assert native_probability_forecast == original
 
 
 @pytest.mark.parametrize("unit,value", [("percent", 40), ("1", 1.1), ("1", -0.1)])

@@ -162,9 +162,11 @@ def _transformation_identity() -> dict[str, Any]:
         "application/snowfall_forecast.py",
         "application/snowfall_amount_forecast.py",
         "application/cloud_cover.py",
+        "application/visibility.py",
         "forecasting/surface.py",
         "forecasting/snowfall_amount.py",
         "forecasting/cloud_cover.py",
+        "forecasting/visibility.py",
         "forecasting/scalar_blend.py",
         "forecasting/vector_blend.py",
         "forecasting/gust_blend.py",
@@ -287,6 +289,26 @@ def _missing_hours(hours: list[dict[str, Any]], reason: str) -> list[dict[str, A
                 contributor.pop("spatial_extraction", None)
                 contributor.pop("extraction_coordinate", None)
             for comparison in cloud["comparisons"]:
+                comparison.update(
+                    difference_left_minus_right=None,
+                    status="unavailable",
+                    missing_reasons=[reason],
+                )
+        visibility = surface.get("visibility_guidance")
+        if visibility is not None:
+            visibility["field"].update(value=None, status="unavailable", missing_reasons=[reason])
+            surface["fields"]["visibility"] = deepcopy(visibility["field"])
+            for contributor in visibility["contributors"]:
+                contributor.update(
+                    value=None,
+                    native_value=None,
+                    display_miles=None,
+                    status="unavailable",
+                    missing_reasons=[reason],
+                )
+                contributor.pop("spatial_extraction", None)
+                contributor.pop("extraction_coordinate", None)
+            for comparison in visibility["comparisons"]:
                 comparison.update(
                     difference_left_minus_right=None,
                     status="unavailable",
