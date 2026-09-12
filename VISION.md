@@ -43,6 +43,12 @@ shadows, not interchangeable hourly probabilities or an approved final recipe.
 Deterministic QPF may eventually be a predictor in calibration, but rainfall
 amounts are not probabilities themselves. Final source weights and calibration
 must come from verification evidence, not assumptions or this small demonstration.
+The multi-source architecture is already implemented as bounded native-event
+attachments; NBM-only describes active delivery, not an architectural restriction.
+Matched NBM/GEFS six-hour events support descriptive comparison today. Their native
+resolutions differ; calibration and observation verification still require a justified
+spatial target. Incompatible REFS neighborhood and ECMWF daily/grid-box events stay
+separate. No final weighting, calibration or automatic shadow collection is implemented.
 An explicit preparation step now adds native precipitation-type evidence from
 HRRR/GFS/RAP categorical flags, IFS native three-hourly categories and NBM
 conditional type probabilities across the same context/editable grid. The temporary
@@ -52,6 +58,12 @@ evidence, not categorical votes. No type is inferred from surface temperature,
 QPF or PoP. This is not automatic forward-run acquisition or an evaluated final policy.
 Long-term precipitation type, like PoP, should use multiple sources and verification;
 neither the interim pair nor any single model is the permanent architecture.
+Precipitation applicability is a separate future assessment from the native type
+classification. Zero type flags do not establish a dry hour. Retained QPF/PoP intervals
+and native type evidence allow a later rule to distinguish no meaningful precipitation
+signal from precipitation with an unresolved type. No meaningful-signal threshold or
+time reconciliation rule is approved yet; applicability is currently not assessed.
+Neither PoP alone nor surface temperature should decide precipitation type.
 Snowfall/ice amounts, deterministic bias correction,
 site learning, AI editing, delivery and production deployment/scheduling
 are not implemented.

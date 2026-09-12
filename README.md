@@ -35,7 +35,9 @@ only required geographic inputs; names are optional display metadata.
   preserved. PoP is separate from HRRR/GFS QPF and does not imply precipitation type.
   NBM-only delivery is the current baseline, not the final product. A bounded
   [multi-source probability shadow path](#native-probability-shadows) retains other
-  native events without changing delivered PoP.
+  native events without changing delivered PoP. This path already supports NBM/GEFS
+  six-hour comparisons and separate REFS/ECMWF events; it was rechecked with the
+  completed p-type grid on September 12 without changing forecast code or policies.
 - **Precipitation type:** an explicit [native p-type preparation step](#native-precipitation-type-on-the-local-grid)
   adds HRRR/GFS/RAP flags, native three-hourly IFS categories and NBM conditional
   type probabilities to that same grid. The temporary baseline requires complete
@@ -2396,19 +2398,58 @@ The shown standalone API startup command was not executed for this increment.
 
 ### Native probability shadows
 
+**September 12 checkpoint:** this architecture was already present when the p-type
+milestone completed. The new check reuses it unchanged, including all four retained
+native probability events. NBM remains the sole active hourly field source. A matched
+native six-hour comparison is available between NBM and GEFS, not between GEFS and
+the one-hour delivered field. Different thresholds, comparators, periods or unresolved
+spatial support remain explicit rather than being converted to hourly PoP.
+
+Current official [NBM](https://www.nco.ncep.noaa.gov/pmb/products/blend/),
+[GEFS six-hour PQPF](https://www.nco.ncep.noaa.gov/pmb/products/gens/),
+[REFS](https://www.nco.ncep.noaa.gov/pmb/products/refs/) and
+[ECMWF open-data](https://www.ecmwf.int/en/forecasts/datasets/open-data) catalogs were
+rechecked. REFS documentation remains preliminary; ECMWF's native `tpg1` event
+remains a 24-hour probability of at least 1 mm. No further compatible registered
+source or new acquisition was needed to reproduce the bounded Minneapolis comparison.
+These catalog checks do not promise availability of every cycle or unacquired period.
+
+Replaying the existing probability attachments from the completed p-type run required
+**zero provider calls and zero new downloads**. All four native arrays and their
+acquisition records reproduced exactly; only the replay preparation identity changed.
+The rebuilt 49-cell grid preserved all **1,764** existing surface/QPF/PoP/p-type
+cell-hours. Each of 14 prepared files was loaded once, the configured point matched
+its grid center, and two in-process API reads were exact. All 49 grid cells retained
+the matching NBM/GEFS event and their own disagreement; unacquired native endpoints
+remained explicitly missing. No new provider, recipe, member-fraction calculation or
+forecast-history path was necessary.
+
+**150 focused offline tests passed** for probability decoding/comparison/preparation,
+p-type, grid/report handling and retained QPF/PoP science. Documentation validation,
+repository hygiene and diff checks passed. PostgreSQL/MinIO integration, full
+acceptance, probability calibration and precipitation-type skill were not run.
+The new replay is outside Git at
+`%LOCALAPPDATA%/MesoForge/forward-runs/pop-recheck-20260912/replay`; the matching API
+data directory is `%LOCALAPPDATA%/MesoForge/local-grids/20260912-minneapolis-pop-recheck`.
+The 36-hour evidence report and replay checks are under
+`%LOCALAPPDATA%/MesoForge/baselines/20260912-pop-recheck/`.
+The existing replay/grid commands below also accept a p-type-enriched prepared run
+and preserve that attachment unchanged. No new command is needed.
+
 **Delivered PoP remains the original NBM hourly field.** NBM-only PoP is the current
 implementation baseline, not the intended final product. Long-term PoP should be a
 measured/calibrated multi-source probabilistic forecast. Deterministic QPF may later
 be a calibration predictor, but rainfall amounts are not probabilities themselves.
 Final source weighting/calibration must be selected from verification evidence.
 
-The new bounded preparation command registers native probability products separately
+The bounded preparation command registers native probability products separately
 from deterministic model contributors. All new products have **zero active weight**.
 Each retains its native percentage and unrounded fraction, threshold/comparator,
 exact accumulation bounds, spatial support, model cycle/lead/version and raw/object
 provenance. No deterministic QPF or ensemble-member fractions are used to manufacture
 these probabilities. Existing HRRR/GFS QPF stays unchanged; this step does not enable
-additional RAP/IFS amount fields or precipitation type.
+additional RAP/IFS amount fields. P-type comes from its separate native-guidance
+attachment, which probability replay preserves unchanged.
 
 The September 11, 2026 source inspection found:
 
@@ -2439,6 +2480,7 @@ forecast decision. The exact source events are:
 
 | Source / source cycle | UTC interval `(start, end]` | Point probability |
 | --- | --- | ---: |
+| Active NBM hourly / Sep 11 18Z | Sep 11 23Z–Sep 12 00Z, >0.254 kg/m² | 0.000000% |
 | NBM native 6h / Sep 11 18Z | Sep 11 18Z–Sep 12 00Z, >0.254 kg/m² | 1.000000% |
 | GEFS native 6h / Sep 11 12Z | Same interval and threshold | 3.246593% |
 | REFS / Sep 11 12Z | Sep 11 18–19Z, neighborhood >12.7 kg/m² | 0% |
@@ -2450,6 +2492,11 @@ All comparisons require identical threshold/comparator, actual interval/closure 
 known spatial support. Incompatible or missing pairs return a null difference with
 reasons. Provider population-related GRIB keys are retained without treating them as
 reconstructed member lists or inventing a denominator. No member fractions were used.
+For these published probabilities, the available member list/count is explicitly
+unknown; GRIB probability-product counts are not ensemble-member counts. A future
+locally computed fraction would need the expected/available/missing member identities,
+qualifying count, denominator and exact threshold/window calculation. That path is
+not needed or implemented for this demonstration.
 
 All four products are sampled over the existing context/editable grid. Native periods
 appear at their own end times in a separate report table; other hours say no retained
@@ -2776,6 +2823,22 @@ weather). A missing/invalid required source produces `unknown`; neither availabl
 produces `unavailable`. There is no single-source fallback or category weighting.
 Shadow disagreement remains visible even when the active sources agree. This is
 an interim representation, not a verified final multi-source forecast policy.
+
+**Dry-hour applicability:** the current payload keeps native `no_type_classified`
+(complete zero flags), missing evidence and contradictory classifications distinct.
+It also retains QPF and PoP as separate fields with their own intervals. This preserves
+the inputs needed for a later applicability assessment without rewriting the original
+type evidence. There is no applicability field or approved meaningful-precipitation
+threshold/time reconciliation rule yet, so applicability is **not assessed**.
+A future separate assessment can distinguish “type not applicable because there is
+no meaningful signal” from “precipitation with an unresolved type.” Neither zero type
+flags nor PoP alone establishes that distinction today; the p-type policy is unchanged.
+In the September 12 replay, hour 1 retained exactly zero QPF, zero hourly PoP and
+zero active type flags with baseline `unknown`. Hour 10 retained 0.22247206611 kg/m²
+QPF over its preceding hour, 21.438868% hourly PoP and native type disagreement
+(`ambiguous`). Those distinct facts survive storage; neither case is automatically
+relabeled by a new dry/wet policy. An accumulation over an hour does not prove
+precipitation is occurring at the instantaneous type valid time.
 
 Categories use deterministic nearest-native-cell extraction; categorical codes
 and flags are never bilinearly averaged or temporally interpolated. The local-grid
