@@ -26,9 +26,14 @@ from mesoforge.application.point_forecast import (
     prepare_demo_files,
 )
 from mesoforge.application.prepared_ifs import IFS_CONFIGURATION
-from mesoforge.application.snowfall_forecast import SNOW
+from mesoforge.application.snowfall_amount_forecast import AMOUNT
+from mesoforge.application.snowfall_forecast import SNOW, extract_snowfall_contributors
 from mesoforge.application.spatial_coverage import CoverageRequiredError
-from mesoforge.application.spatial_preparation import PreparedRegions, attach_snowfall_guidance
+from mesoforge.application.spatial_preparation import (
+    PreparedRegions,
+    attach_snowfall_amount_guidance,
+    attach_snowfall_guidance,
+)
 from mesoforge.contracts.serialization import canonical_json_bytes, canonical_json_digest
 from mesoforge.forecasting.recipes import with_surface_fields
 from tests.unit.application.test_forecast_issuance import memory_service as memory_service
@@ -40,6 +45,7 @@ from tests.unit.application.test_probability_contributors import (
 from tests.unit.application.test_probability_contributors import (
     _view as probability_view,
 )
+from tests.unit.application.test_snowfall_amount_forecast import amount_view
 from tests.unit.application.test_snowfall_forecast import snow_view
 from tests.unit.application.test_surface_forecast import (
     CRS,
@@ -105,11 +111,11 @@ def _spatial_dataset(model, *, age=0, hours=HOURS):
     return dataset
 
 
-def _snow_views():
+def _snow_views(model="HRRR"):
     native = []
     for horizon in HOURS:
         valid = str(np.datetime_as_string(TARGET + np.timedelta64(horizon, "h"), unit="s")) + "Z"
-        view = snow_view(amount=horizon / 10, end=valid)
+        view = snow_view(model, amount=horizon / 10, end=valid)
         view.dataset.coords.update({"x": [-94.0, -92.0], "y": [44.0, 46.0]})
         longitude, latitude = np.meshgrid(view.dataset.x.values, view.dataset.y.values)
         # An independent spatially varying accumulation; both representations agree.
@@ -153,6 +159,32 @@ def _spatial_probability_views(*, end_horizon=6):
         longitude, latitude = np.meshgrid(view.dataset.x.values, view.dataset.y.values)
         view.dataset.probability.values += 0.02 * _gradient(latitude, longitude)
         views.append(view)
+    return views
+
+
+def _amount_views():
+    views = []
+    for model in ("HRRR", "RAP", "NBM"):
+        native = []
+        for horizon in HOURS:
+            valid = (
+                str(np.datetime_as_string(TARGET + np.timedelta64(horizon, "h"), unit="s")) + "Z"
+            )
+            view = amount_view(model, amount=horizon / 100, valid=valid)
+            view.dataset.coords.update({"x": [-94.0, -92.0], "y": [44.0, 46.0]})
+            native.append(view)
+        views.append(
+            replace(
+                native[0],
+                dataset=xr.concat(
+                    [view.dataset.isel(event=0, drop=True) for view in native], dim="event"
+                ).assign_coords(event=list(range(36))),
+                manifest={
+                    **native[0].manifest,
+                    "events": [view.manifest["events"][0] for view in native],
+                },
+            )
+        )
     return views
 
 
@@ -569,8 +601,10 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
         _probability_views=_spatial_probability_views(end_horizon=1),
         _type_views=_type_views(),
         _type_guidance={"status": "prepared"},
-        _snow_views=_snow_views(),
+        _snow_views=[*_snow_views(), *_snow_views("RAP")],
         _snow_guidance={"status": "prepared"},
+        _snow_amount_views=_amount_views(),
+        _snow_amount_guidance={"status": "prepared"},
     )
     result = prepared.forecast(latitude=LATITUDE, longitude=LONGITUDE)
     assert result["hours"][0]["temperature"]["value"] is not None
@@ -582,6 +616,10 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
     assert center_pop["value"] == pytest.approx(0.4)
     assert center_pop["spatial_extraction"]["native_fraction_at_source_corners"] == [0.4] * 4
     center_probabilities = result["hours"][0]["surface"]["probability_guidance"]
+    center_amounts = result["hours"][0]["surface"]["snowfall_amount_guidance"]
+    assert center_amounts["native_contributors"][0]["value"] == pytest.approx(0.01)
+    assert center_amounts["derived_contributors"][0]["value"] is not None
+    assert center_amounts["derived_contributors"][0]["diagnostic_ratio"] is not None
     assert [source["value"] for source in center_probabilities["contributors"]] == pytest.approx(
         [0.4, 0.7, 0.6]
     )
@@ -660,6 +698,19 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
             assert source.get("provenance") == center_source.get("provenance")
             assert source["interval_start"] == center_source["interval_start"]
         for pair in snowfall["comparisons"]:
+            assert pair["difference_left_minus_right"] is None
+            assert pair["status"] == "unavailable"
+        amounts = hour["surface"]["snowfall_amount_guidance"]
+        assert amounts["field"]["value"] is None
+        for group in ("native_contributors", "native_slr", "derived_contributors"):
+            for source, central in zip(amounts[group], center_amounts[group], strict=True):
+                assert source["value"] is None and source["status"] == "unavailable"
+                assert "spatial_extraction" not in source and "diagnostic_ratio" not in source
+                assert "diagnostic_ratio_status" not in source
+                assert "extraction_coordinate" not in source
+                assert source.get("provenance") == central.get("provenance")
+                assert source.get("interval_start") == central.get("interval_start")
+        for pair in amounts["comparisons"]:
             assert pair["difference_left_minus_right"] is None
             assert pair["status"] == "unavailable"
     with pytest.raises(CoverageRequiredError):
@@ -759,6 +810,80 @@ def test_snowfall_spans_both_domains_and_point_without_changing_existing_fields(
     point["hours"][0]["surface"]["snowfall_guidance"]["contributors"][0]["value"] = -999
     assert canonical_json_bytes(restored) == encoded
     assert service.read(issued.issued_forecast_id)["forecast"] != point
+
+
+def test_snowfall_amounts_reuse_swe_across_both_domains_and_preserve_immutable_readback(
+    prepared_surface, calculated_grid, monkeypatch, memory_service
+):
+    swe = _snow_views("RAP")
+    amounts = _amount_views()
+    originals = [view.dataset.copy(deep=True) for view in [*swe, *amounts]]
+    snow_descriptor = {"status": "prepared"}
+    descriptor = {"status": "prepared", "source_status": {}}
+    baseline = replace(prepared_surface, _snow_views=swe, _snow_guidance=snow_descriptor)
+    loader = Mock(return_value=amounts)
+    monkeypatch.setattr(
+        "mesoforge.application.prepared_snowfall_amount.load_snowfall_amount_guidance", loader
+    )
+    regions = attach_snowfall_amount_guidance(PreparedRegions([baseline, baseline], {}), descriptor)
+    loader.assert_called_once_with(descriptor, target_reference_time=TARGET)
+    assert regions.regions[0]._snow_amount_views is regions.regions[1]._snow_amount_views
+    assert all(region._snow_views is swe for region in regions.regions)
+    assert baseline._snow_amount_guidance is None
+    with (
+        patch("xarray.open_dataset", side_effect=AssertionError("Already loaded all guidance")),
+        patch("requests.Session", side_effect=AssertionError("No acquisition per grid cell")),
+    ):
+        grid = build_local_surface_grid(
+            latitude=LATITUDE,
+            longitude=LONGITUDE,
+            calculate_column=regions.regions[0]._forecast_column,
+            geometry=TEST_GEOMETRY,
+        )
+    roles = set()
+    for cell, old_cell in zip(grid["cells"], calculated_grid[0]["cells"], strict=True):
+        roles.add(cell["inside_editable_domain"])
+        for hour, old in zip(cell["hours"], old_cell["hours"], strict=True):
+            evidence = hour["surface"]["snowfall_amount_guidance"]
+            assert evidence["field"]["value"] is None and evidence["field"]["weights"] == {}
+            assert evidence["field"]["unit"] == "m"
+            native = {row["model"]: row for row in evidence["native_contributors"]}
+            for model in ("HRRR", "RAP", "NBM"):
+                assert native[model]["value"] == pytest.approx(hour["horizon_hours"] / 100)
+                assert native[model]["active_weight"] == 0 and native[model]["provenance"]
+            assert evidence["native_slr"][0]["value"] == pytest.approx(12, abs=1e-12)
+            assert evidence["derived_contributors"][0]["value"] is not None
+            assert evidence["derived_contributors"][0]["spatial_extraction"]
+            original_swe = extract_snowfall_contributors(
+                swe,
+                latitude=cell["latitude"],
+                longitude=cell["longitude"],
+                valid_time=hour["valid_time"],
+            )
+            assert hour["surface"]["snowfall_guidance"] == original_swe
+            unchanged = deepcopy(hour)
+            for name in (AMOUNT, SNOW):
+                unchanged["surface"]["fields"].pop(name)
+            for name in ("snowfall_amount_guidance", "snowfall_guidance"):
+                unchanged["surface"].pop(name)
+            assert unchanged == old
+    assert roles == {True, False}
+    for before, view in zip(originals, [*swe, *amounts], strict=True):
+        xr.testing.assert_identical(before, view.dataset)
+    encoded = canonical_json_bytes(grid)
+    restored = json.loads(encoded)
+    point = extract_grid_point(restored, latitude=LATITUDE, longitude=LONGITUDE)
+    assert point["hours"] == next(c["hours"] for c in grid["cells"] if c["is_forecast_point"])
+    assert point["snowfall_guidance"] == snow_descriptor
+    assert point["snowfall_amount_guidance"] == descriptor
+    service, factory, objects = memory_service
+    issued = service.issue(point, batch_run_id=uuid4(), location_index=0)
+    before = len(factory.issued_forecasts), len(objects.objects)
+    assert service.read(issued.issued_forecast_id)["forecast"] == point
+    assert (len(factory.issued_forecasts), len(objects.objects)) == before
+    point["hours"][0]["surface"]["snowfall_amount_guidance"]["native_contributors"][0]["value"] = -1
+    assert service.read(issued.issued_forecast_id)["forecast"] != point
+    assert canonical_json_bytes(restored) == encoded
 
 
 def test_qpf_spans_both_domains_and_exact_point_replays_with_provenance(prepared_surface):

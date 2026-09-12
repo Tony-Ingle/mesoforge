@@ -72,7 +72,17 @@ so its active baseline remains explicitly unavailable. Snowpack water equivalent
 and snowfall depth are not substitutes; QPF and precipitation type are not used to
 manufacture snowfall amounts. Units, intervals, native parents and disagreement
 remain traceable across the same context/editable grid and its exact point.
-Snowfall depth, ice amounts, deterministic bias correction,
+Another optional attachment now retains native **snowfall amount** (new snow depth
+over an interval) from HRRR/RAP/NBM, separate NBM model SLR, and RAP Kuchera-derived
+amounts using vertical air-temperature profiles and matching native SWE. All remain
+zero-weight evidence with no approved active snowfall-amount blend. Native amounts,
+native/model SLR and Kuchera retain their own provenance and definitions; NBM's
+snow/sleet scope is not silently equated with snow-only estimates. Kuchera is the
+first derived method, not unquestioned truth. Fixed 10:1 is not the preferred method
+and is not used. Future snowfall methods and calibration must be chosen from suitable
+verification evidence. The sampled profile and interval-end approximation remain
+explicit limitations, with no derivation when required thermodynamic inputs are missing.
+Snow depth (total snow already on the ground), ice amounts, deterministic bias correction,
 site learning, AI editing, delivery and production deployment/scheduling
 are not implemented.
 The existing on-demand forward run and explicit batch history are not a deployed
@@ -254,11 +264,13 @@ grid establishes the numerical representation across context and editable domain
 Native precipitation-type evidence now uses this same grid. The bounded ECMWF
 six-hour probability assessment remains explicitly incompatible rather than converting
 a daily product or ignoring incompatible spatial support. Native snowfall water
-equivalent is now retained as unblended evidence on the same grid. The next proposed
-field increment is native interval snowfall-depth evidence, kept separate from
-snowpack depth. No constant snow-to-liquid ratio is assumed. A later ratio method
-needs compatible snowfall-depth/water-equivalent intervals, suitable thermodynamic
-guidance and verification, with explicit uncertainty and zero/missing denominators.
+equivalent is now retained as unblended evidence on the same grid. Native interval
+snowfall amounts, native model SLR and first profile-based Kuchera estimates are also
+separate evidence. Snow depth on the ground is not newly accumulated snowfall.
+The next proposed step is interval-aware snowfall/SLR evaluation, with suitable
+observations and explicit hydrometeor/spatial support, before choosing an active
+algorithm. No constant ratio, native single-source rule or derived method is assumed
+to be best; zero/missing water denominators cannot establish an observed SLR.
 Ice accretion requires suitable additional guidance and documented conversion
 semantics; statistical correction, AI, delivery and learning are not prerequisites.
 
@@ -269,8 +281,8 @@ does not authorize implementing the roadmap as one task.
 
 ## Future roadmap
 
-Fields should grow from today's surface, QPF, PoP, native type and snowfall-water-
-equivalent evidence to supported cloud, snowfall depth, ice amounts and other useful
+Fields should grow from today's surface, QPF, PoP, native type, SWE and native/derived
+snowfall-amount evidence to supported cloud, snow depth on the ground, ice amounts and other useful
 forecasts. Conditions must
 be derived from the underlying fields with explainable rules and explicit missingness,
 not emitted as an unexplained standalone prediction.

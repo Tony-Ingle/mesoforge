@@ -174,13 +174,8 @@ def _selected_temperature(
     )
 
 
-def selected_surface_field(
-    payload: bytes, *, canonical_variable_id: str, cycle: datetime, forecast_hour: int
-) -> tuple[tuple[IndexRow, ...], IndexRow]:
-    from mesoforge.guidance.sources.hrrr_phase2 import build_field_selector
-
-    if canonical_variable_id not in SURFACE_FIELD_CONTRACTS:
-        raise ValueError(f"Unsupported RAP surface field {canonical_variable_id!r}")
+def physical_index_rows(payload: bytes) -> tuple[tuple[IndexRow, ...], tuple[IndexRow, ...]]:
+    """Return physical boundaries and native fields without requiring a particular variable."""
     # RAP packs some wind components into one physical GRIB message. wgrib2
     # identifies their fields as e.g. 12.1/12.2 at the same byte offset. Collapse
     # those physical-message boundaries for the shared byte-range engine while
@@ -224,15 +219,26 @@ def selected_surface_field(
     )
     parse_index_rows(projected)
     logical_rows = tuple(row for group in groups for _, row in group)
+    return representatives, logical_rows
+
+
+def selected_surface_field(
+    payload: bytes, *, canonical_variable_id: str, cycle: datetime, forecast_hour: int
+) -> tuple[tuple[IndexRow, ...], IndexRow]:
+    from mesoforge.guidance.sources.hrrr_phase2 import build_field_selector
+
+    if canonical_variable_id not in SURFACE_FIELD_CONTRACTS:
+        raise ValueError(f"Unsupported RAP surface field {canonical_variable_id!r}")
+    representatives, logical_rows = physical_index_rows(payload)
     selector = build_field_selector(canonical_variable_id, forecast_hour=forecast_hour)
     if not any(re.search(selector, row.descriptor) for row in logical_rows):
         raise RapTemperatureUnavailableError(
             f"RAP {canonical_variable_id} selector {selector!r} matched zero rows"
         )
     row = select_field_row(logical_rows, selector)
-    selected_group = groups[row.message_number - 1]
+    selected_group = [r for r in logical_rows if r.message_number == row.message_number]
     if canonical_variable_id == "air_temperature_2m" and (
-        len(selected_group) != 1 or selected_group[0][0] is not None
+        len(selected_group) != 1 or "." in row.line.split(":", 1)[0]
     ):
         raise GribIndexError("Selected RAP temperature must be a standalone physical GRIB message")
     if row.line.split(":")[2] != f"d={cycle:%Y%m%d%H}":

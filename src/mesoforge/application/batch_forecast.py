@@ -138,6 +138,7 @@ def run_batch(
     probability_sources: list[dict[str, Any]] | None = None,
     ptype_guidance: dict[str, Any] | None = None,
     snowfall_guidance: dict[str, Any] | None = None,
+    snowfall_amount_guidance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Load guidance once; independently calculate and persist each successful location."""
     locations = load_locations(config_path)
@@ -163,6 +164,10 @@ def run_batch(
         from mesoforge.application.spatial_preparation import attach_snowfall_guidance
 
         prepared = attach_snowfall_guidance(prepared, snowfall_guidance)
+    if snowfall_amount_guidance is not None:
+        from mesoforge.application.spatial_preparation import attach_snowfall_amount_guidance
+
+        prepared = attach_snowfall_amount_guidance(prepared, snowfall_amount_guidance)
     if prepared.horizon_hours != tuple(range(1, 37)):
         raise ValueError("Batch forecasts require an existing dataset for hours 1..36.")
 

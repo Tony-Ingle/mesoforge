@@ -160,7 +160,9 @@ def _transformation_identity() -> dict[str, Any]:
         "application/probability_contributors.py",
         "application/precipitation_type.py",
         "application/snowfall_forecast.py",
+        "application/snowfall_amount_forecast.py",
         "forecasting/surface.py",
+        "forecasting/snowfall_amount.py",
         "forecasting/scalar_blend.py",
         "forecasting/vector_blend.py",
         "forecasting/gust_blend.py",
@@ -248,6 +250,23 @@ def _missing_hours(hours: list[dict[str, Any]], reason: str) -> list[dict[str, A
                 contributor.pop("spatial_extraction", None)
                 contributor.pop("extraction_coordinate", None)
             for comparison in snowfall["comparisons"]:
+                comparison.update(
+                    difference_left_minus_right=None,
+                    status="unavailable",
+                    missing_reasons=[reason],
+                )
+        amounts = surface.get("snowfall_amount_guidance")
+        if amounts is not None:
+            amounts["field"].update(value=None, status="unavailable", missing_reasons=[reason])
+            surface["fields"]["snowfall_amount"] = deepcopy(amounts["field"])
+            for group in ("native_contributors", "native_slr", "derived_contributors"):
+                for contributor in amounts[group]:
+                    contributor.update(value=None, status="unavailable", missing_reasons=[reason])
+                    contributor.pop("spatial_extraction", None)
+                    contributor.pop("diagnostic_ratio", None)
+                    contributor.pop("diagnostic_ratio_status", None)
+                    contributor.pop("extraction_coordinate", None)
+            for comparison in amounts["comparisons"]:
                 comparison.update(
                     difference_left_minus_right=None,
                     status="unavailable",

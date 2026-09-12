@@ -7,9 +7,14 @@ from typing import Any
 import pytest
 
 from mesoforge.application.hourly_report import build_hourly_report, render_hourly_report
+from mesoforge.application.snowfall_amount_forecast import (
+    AMOUNT,
+    extract_snowfall_amount_contributors,
+)
 from mesoforge.application.snowfall_forecast import SNOW, extract_snowfall_contributors
 from tests.unit.application.test_precipitation_type import run as type_result
 from tests.unit.application.test_precipitation_type import type_view
+from tests.unit.application.test_snowfall_amount_forecast import amount_view
 from tests.unit.application.test_snowfall_forecast import snow_view
 
 
@@ -581,5 +586,67 @@ def test_snowfall_report_preserves_native_intervals_zero_missing_and_water_units
     assert native_probability_forecast == original
     report["hours"][0]["surface"]["snowfall_guidance"]["contributors"][0]["value"] = -1
     with pytest.raises(ValueError, match="Snowfall report"):
+        render_hourly_report(report)
+    assert native_probability_forecast == original
+
+
+@pytest.mark.parametrize("value", [0.0, 0.0254, None])
+def test_snowfall_amount_report_keeps_native_derived_ratio_and_swe_separate(
+    native_probability_forecast, value
+):
+    for hour in native_probability_forecast["hours"]:
+        views = (
+            []
+            if value is None
+            else [
+                amount_view(
+                    model,
+                    amount=value,
+                    valid=hour["valid_time"],
+                    profile_temperature=280 if value == 0 else 271.16,
+                )
+                for model in ("HRRR", "RAP", "NBM")
+            ]
+        )
+        swe = (
+            []
+            if value is None
+            else [snow_view("RAP", amount=0 if value == 0 else 1, end=hour["valid_time"])]
+        )
+        evidence = extract_snowfall_amount_contributors(
+            views, swe_views=swe, latitude=44.5, longitude=-93.5, valid_time=hour["valid_time"]
+        )
+        swe_evidence = extract_snowfall_contributors(
+            swe, latitude=44.5, longitude=-93.5, valid_time=hour["valid_time"]
+        )
+        hour["surface"]["fields"][AMOUNT] = evidence["field"]
+        hour["surface"]["snowfall_amount_guidance"] = evidence
+        hour["surface"]["fields"][SNOW] = swe_evidence["field"]
+        hour["surface"]["snowfall_guidance"] = swe_evidence
+    original = deepcopy(native_probability_forecast)
+    report = build_hourly_report(native_probability_forecast)
+    rendered = render_hourly_report(report)
+    section = rendered.split("### Native and derived snowfall amounts")[1]
+    assert "snow depth already on the ground" in section
+    assert "no blend rule or weights are approved" in section
+    assert "Native snow-to-liquid ratio (instantaneous supporting guidance)" in section
+    expected = "unavailable" if value is None else "0" if value == 0 else "1"
+    assert f"| 36 | Native amount | HRRR | {expected} |" in section
+    assert "| 36 | Kuchera derived amount | RAP |" in section
+    if value is not None:
+        assert "| NBM | 12:1 |" in section
+        assert "2026-11-01T04:00:00+00:00 | 2026-11-01T05:00:00+00:00" in section
+    if value == 0:
+        assert "| 36 | Kuchera derived amount | RAP | 0 |" in section
+        assert "inapplicable to positive SWE" in section
+    for baseline, shown in zip(original["hours"], report["hours"], strict=True):
+        assert shown["surface"] == baseline["surface"]
+        assert shown["final_surface_fields"][AMOUNT]["value"] is None
+        assert shown["final_surface_fields"][SNOW] == baseline["surface"]["fields"][SNOW]
+    assert native_probability_forecast == original
+    report["hours"][0]["surface"]["snowfall_amount_guidance"]["native_contributors"][0]["unit"] = (
+        "kg/m^2"
+    )
+    with pytest.raises(ValueError, match="metres of snow"):
         render_hourly_report(report)
     assert native_probability_forecast == original

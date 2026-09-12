@@ -516,6 +516,7 @@ def _render_surface_report(report: dict[str, Any]) -> str:
     lines.extend(_render_probability_shadows(report["hours"]))
     lines.extend(_render_precipitation_type(report["hours"]))
     lines.extend(_render_snowfall(report["hours"]))
+    lines.extend(_render_snowfall_amount(report["hours"]))
     return "\n".join(lines) + "\n"
 
 
@@ -651,4 +652,104 @@ def _render_snowfall(hours: list[dict[str, Any]]) -> list[str]:
                 )
                 + " |"
             )
+    return lines
+
+
+def _render_snowfall_amount(hours: list[dict[str, Any]]) -> list[str]:
+    if not any("snowfall_amount_guidance" in hour.get("surface", {}) for hour in hours):
+        return []
+    lines = [
+        "",
+        "### Native and derived snowfall amounts",
+        "",
+        "Snowfall amount is newly accumulated snow over the stated interval, separate from "
+        "SWE and from snow depth already on the ground. The active snowfall-amount baseline "
+        "is unavailable because no blend rule or weights are approved. Native model amounts "
+        "and the derived Kuchera candidate remain separate zero-weight evidence. Native SLR "
+        "is supporting guidance, not a new amount or an active weight. Native accumulation "
+        "periods are not split into invented hourly amounts. No snowpack or ice accretion "
+        "forecast is delivered. The shown Kuchera ratio is diagnostic; native-cell ratios "
+        "multiply native-cell SWE before spatial extraction, not the final point SWE.",
+        "",
+        "| Hour | Evidence | Source | Snowfall amount in | Diagnostic SLR | "
+        "UTC start (exclusive) | UTC end (inclusive) | Cycle / lead | Status / reasons |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    ratios = []
+    for hour in hours:
+        guidance = hour.get("surface", {}).get("snowfall_amount_guidance", {})
+        for group, label in (
+            ("native_contributors", "Native amount"),
+            ("derived_contributors", "Kuchera derived amount"),
+        ):
+            for source in guidance.get(group, []):
+                value = source.get("value")
+                if (
+                    source.get("unit") != "m"
+                    or value is not None
+                    and (not math.isfinite(value) or value < 0)
+                ):
+                    raise ValueError("Snowfall amount report requires nonnegative metres of snow")
+                ratio = source.get("diagnostic_ratio")
+                if ratio is not None and not math.isfinite(ratio):
+                    raise ValueError("Snowfall amount report requires a finite diagnostic ratio")
+                lines.append(
+                    "| "
+                    + " | ".join(
+                        [
+                            str(hour["horizon_hours"]),
+                            label,
+                            source["model"],
+                            "unavailable" if value is None else f"{value / 0.0254:.6g}",
+                            "not applicable"
+                            if ratio is None
+                            else f"{ratio:.6g}:1"
+                            + (" (inapplicable to positive SWE)" if ratio <= 0 else ""),
+                            source.get("interval_start") or "unavailable",
+                            source.get("interval_end") or "unavailable",
+                            f"{source.get('source_cycle', 'unavailable')} / "
+                            f"{source.get('source_lead_hours', 'unavailable')}",
+                            source.get("status", "unavailable")
+                            + (": " if source.get("missing_reasons") else "")
+                            + "; ".join(source.get("missing_reasons", [])),
+                        ]
+                    )
+                    + " |"
+                )
+        for source in guidance.get("native_slr", []):
+            value = source.get("value")
+            if (
+                source.get("unit") != "1"
+                or value is not None
+                and (not math.isfinite(value) or value < 0)
+            ):
+                raise ValueError("Snowfall ratio report requires a nonnegative dimensionless ratio")
+            ratios.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(hour["horizon_hours"]),
+                        source["model"],
+                        "unavailable" if value is None else f"{value:.6g}:1",
+                        source.get("valid_time") or hour["valid_time_utc"],
+                        f"{source.get('source_cycle', 'unavailable')} / "
+                        f"{source.get('source_lead_hours', 'unavailable')}",
+                        source.get("status", "unavailable")
+                        + (": " if source.get("missing_reasons") else "")
+                        + "; ".join(source.get("missing_reasons", [])),
+                    ]
+                )
+                + " |"
+            )
+    if ratios:
+        lines.extend(
+            [
+                "",
+                "Native snow-to-liquid ratio (instantaneous supporting guidance):",
+                "",
+                "| Hour | Source | Native SLR | UTC valid time | Cycle / lead | Status / reasons |",
+                "| --- | --- | --- | --- | --- | --- |",
+                *ratios,
+            ]
+        )
     return lines

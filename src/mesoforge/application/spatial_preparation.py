@@ -87,11 +87,12 @@ def load_prepared(
     probability_sources: list[dict[str, Any]] | None = None,
     ptype_guidance: dict[str, Any] | None = None,
     snowfall_guidance: dict[str, Any] | None = None,
+    snowfall_amount_guidance: dict[str, Any] | None = None,
 ) -> PreparedPointForecast | PreparedRegions:
     """Load all shared regions once. This function never prepares or downloads."""
     index = directory / "coverage.json"
     if not index.is_file():
-        return attach_snowfall_guidance(
+        prepared = attach_snowfall_guidance(
             attach_type_guidance(
                 attach_pop_guidance(
                     PreparedPointForecast.from_directory(
@@ -106,6 +107,7 @@ def load_prepared(
             ),
             snowfall_guidance,
         )
+        return attach_snowfall_amount_guidance(prepared, snowfall_amount_guidance)
     payload = json.loads(index.read_text())
     regions = []
     for row in {item["directory"]: item for item in payload["regions"]}.values():
@@ -125,7 +127,7 @@ def load_prepared(
     if not regions:
         raise ValueError("No prepared regions in coverage index")
     failures = {(row["lat"], row["lon"]): row["message"] for row in payload.get("failures", [])}
-    return attach_snowfall_guidance(
+    prepared = attach_snowfall_guidance(
         attach_type_guidance(
             attach_pop_guidance(
                 PreparedRegions(regions, failures),
@@ -135,6 +137,35 @@ def load_prepared(
             ptype_guidance,
         ),
         snowfall_guidance,
+    )
+    return attach_snowfall_amount_guidance(prepared, snowfall_amount_guidance)
+
+
+def attach_snowfall_amount_guidance(
+    prepared: PreparedPointForecast | PreparedRegions,
+    descriptor: dict[str, Any] | None,
+) -> PreparedPointForecast | PreparedRegions:
+    """Load native amount/ratio/profile views once beside the existing SWE attachment."""
+    if descriptor is None:
+        return prepared
+    from mesoforge.application.prepared_snowfall_amount import load_snowfall_amount_guidance
+
+    regions = prepared.regions if isinstance(prepared, PreparedRegions) else [prepared]
+    target = regions[0]._target_reference_time
+    if any(
+        region._surface_configuration is None or region._target_reference_time != target
+        for region in regions
+    ):
+        raise ValueError("Snowfall amounts require one shared surface forecast target")
+    views = load_snowfall_amount_guidance(descriptor, target_reference_time=target)
+    attached = [
+        replace(region, _snow_amount_views=views, _snow_amount_guidance=deepcopy(descriptor))
+        for region in regions
+    ]
+    return (
+        PreparedRegions(attached, prepared.failures)
+        if isinstance(prepared, PreparedRegions)
+        else attached[0]
     )
 
 

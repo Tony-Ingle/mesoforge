@@ -24,6 +24,11 @@ from mesoforge.application.probability_contributors import (
     extract_probability_contributors,
 )
 from mesoforge.application.probability_forecast import POP, extract_probability_hour
+from mesoforge.application.snowfall_amount_forecast import (
+    AMOUNT,
+    AmountView,
+    extract_snowfall_amount_contributors,
+)
 from mesoforge.application.snowfall_forecast import SNOW, SnowView, extract_snowfall_contributors
 from mesoforge.application.spatial_coverage import (
     CoverageRequiredError,
@@ -330,6 +335,8 @@ class PreparedPointForecast:
     _type_guidance: dict[str, Any] | None = None
     _snow_views: list[SnowView] = field(default_factory=list)
     _snow_guidance: dict[str, Any] | None = None
+    _snow_amount_views: list[AmountView] = field(default_factory=list)
+    _snow_amount_guidance: dict[str, Any] | None = None
 
     @property
     def notice(self) -> str:
@@ -795,6 +802,17 @@ class PreparedPointForecast:
                     )
                     hours[-1]["surface"]["fields"][SNOW] = snowfall["field"]
                     hours[-1]["surface"]["snowfall_guidance"] = snowfall
+                if self._snow_amount_guidance is not None:
+                    amounts = extract_snowfall_amount_contributors(
+                        self._snow_amount_views,
+                        swe_views=self._snow_views,
+                        latitude=latitude,
+                        longitude=longitude,
+                        valid_time=_iso(valid_time),
+                        source_status=self._snow_amount_guidance.get("source_status", {}),
+                    )
+                    hours[-1]["surface"]["fields"][AMOUNT] = amounts["field"]
+                    hours[-1]["surface"]["snowfall_amount_guidance"] = amounts
         contributor_configuration = (
             with_surface_fields(self._configuration)
             if self._surface_configuration is not None
@@ -831,6 +849,8 @@ class PreparedPointForecast:
             result["ptype_guidance"] = deepcopy(self._type_guidance)
         if self._snow_guidance is not None:
             result["snowfall_guidance"] = deepcopy(self._snow_guidance)
+        if self._snow_amount_guidance is not None:
+            result["snowfall_amount_guidance"] = deepcopy(self._snow_amount_guidance)
         if self._manifest_sha256 is not None:
             result["manifest_sha256"] = self._manifest_sha256
         if self._pop_guidance is not None:

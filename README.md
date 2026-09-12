@@ -47,6 +47,10 @@ only required geographic inputs; names are optional display metadata.
   retains HRRR/RAP hourly amounts and IFS three-hour increments across the same grid.
   These remain zero-weight evidence; the active field is explicitly unavailable
   because no snowfall blend rule is approved. Existing QPF, PoP and p-type are unchanged.
+- **Snowfall amount:** an optional [snowfall-amount step](#native-and-kuchera-snowfall-amounts)
+  retains HRRR/RAP/NBM native new-snow accumulations, separate NBM model SLR, and
+  RAP Kuchera estimates using retained vertical profiles and matching SWE. All remain
+  zero-weight evidence; no active snowfall-amount blend or fixed 10:1 rule is introduced.
 - **Shadows:** real RAP and ECMWF IFS values/provenance accompany issuance with zero
   active weight. IFS preserves native three-hourly gaps and has no compatible
   instantaneous gust. Cloud cover is explicitly unavailable without an approved policy.
@@ -79,7 +83,7 @@ The QPF increment adds [real interval/conservation and offline replay evidence](
 precipitation verification remains future work. The [PoP increment](#probability-of-precipitation-on-the-local-grid)
 adds actual native probabilistic guidance without changing QPF or other surface values.
 
-There is **no active snowfall blend, snowfall depth, ice amount, deterministic bias correction,
+There is **no active snowfall blend, delivered snow depth on the ground, ice amount, deterministic bias correction,
 site learning, AI editing, production deployment or scheduling in the V2 path yet**. Bias/AI
 report stages are explicitly unimplemented and final values currently equal the baseline.
 Registration services and delivery also remain future work. The retained Phase 2 station
@@ -94,8 +98,9 @@ and the [active RFC](docs/rfcs/mesoforge-v2-architecture.md). The first local su
 and nested domains are implemented; the editing lifecycle remains future work. The
 ECMWF six-hour probability assessment remains explicitly incompatible as described
 below. Native interval snowfall-water-equivalent evidence is now implemented.
-The next proposed field increment is native snowfall-depth evidence, with explicit
-source assumptions and intervals; no fixed snow ratio or ice-accretion rule is approved.
+Native snowfall amounts and separate Kuchera estimates are now implemented as evidence.
+The next proposed step is snowfall/SLR evaluation using suitable interval observations,
+before selecting an active snowfall rule; no ice-accretion rule is approved.
 
 Local Codex development continues; the Hermes development pipeline is paused. The RFC's
 unresolved implementation choices remain proposed, not blanket approval of the roadmap.
@@ -2932,8 +2937,8 @@ unknown codes and disagreements; this bounded real window does not establish win
 performance. No extra winter backfill was acquired to force an agreeing case.
 
 Native **interval-aware snowfall water equivalent** is now retained as described
-below. Snowfall-depth guidance is the next proposed field increment. Inspect native
-depth and ice-accretion products before adding those amounts; do not multiply total QPF
+below, followed by separate native and Kuchera-derived snowfall amounts. Inspect native
+snowpack and ice-accretion products before adding those fields; do not multiply total QPF
 by an instantaneous type flag or assume a universal snow ratio. Derived conditions
 should follow these explicit fields and rules later.
 
@@ -2953,7 +2958,7 @@ evidence in `surface.snowfall_guidance`; no delivered field or existing policy c
 | RAP | Native accumulated `WEASD`, kg/m² | Exact preceding-hour accumulation; source lead limits remain explicit |
 | IFS | Native `sf`; metres of water equivalent in the demonstrated feed | Difference compatible cumulative endpoints on native cells, then multiply by 1000 to kg/m²; preserve native three-hour intervals |
 | GFS | Unavailable in the inspected `pgrb2.0p25` product | Instantaneous snowpack `WEASD`/`SNOD` is not snowfall accumulation |
-| NBM | Unavailable for SWE in the inspected core product | `ASNOW` is snowfall depth; no assumed snow ratio converts it to SWE |
+| NBM | Unavailable for SWE in the inspected core product | `ASNOW` is newly accumulated snowfall amount; no assumed snow ratio converts it to SWE |
 
 Source definitions follow the [NOAA moisture parameter table](https://www.nco.ncep.noaa.gov/pmb/docs/grib2/grib2_doc/grib2_table4-2-0-1.shtml),
 [model inventories](https://www.nco.ncep.noaa.gov/pmb/products/),
@@ -3029,12 +3034,143 @@ guidance and reports remain outside Git. No precipitation verification, winter
 skill claim or full PostgreSQL/MinIO
 acceptance run is included in this increment.
 
-Next proposed: native interval snowfall-depth evidence on this same grid, with
-snowpack depth explicitly separate. Inspect native HRRR/NBM/other supported depth
-products and retain source assumptions; do not derive depth using fixed 10:1.
-Later snow-to-liquid-ratio work requires compatible snowfall-depth/SWE intervals,
-thermodynamic guidance and verification, explicit uncertainty and unavailable
-ratios for zero/missing denominators. Ice accretion remains a later field.
+The following increment adds native snowfall amounts and profile-based Kuchera
+estimates without changing this SWE path. Snow depth on the ground remains separate.
+
+## Native and Kuchera snowfall amounts
+
+The optional `mesoforge.application.prepared_snowfall_amount` attachment reuses the
+selected cycles, retained SWE and coordinate-derived coverage. It acquires shared
+native messages once, outside HTTP, and supplies the existing context/editable grid
+and exact center point. These are three distinct quantities:
+
+- **SWE:** liquid-equivalent water associated with snowfall, in kg/m².
+- **Snowfall amount:** newly accumulated snowfall depth over an explicit interval,
+  stored unrounded in metres and also reported in inches.
+- **Snow depth:** total snow already on the ground, such as instantaneous `SNOD`.
+  It is not acquired or delivered by this attachment.
+
+`surface.snowfall_amount_guidance` preserves `native_contributors`, `native_slr`
+and `derived_contributors` separately. The active `surface.fields.snowfall_amount`
+is null with `policy_unavailable` and no weights: **no approved amount blend exists**.
+Existing surface, QPF, PoP, p-type and SWE behavior remains unchanged.
+
+| Source | Evidence retained | Meaning and limitations |
+| --- | --- | --- |
+| HRRR/RAP | Native `ASNOW`, metres | Compatible cycle-total endpoints are differenced on native cells to obtain hourly new-snow amounts; this is the model's native variable-density diagnostic, not Kuchera |
+| NBM | Native one-hour `ASNOW`, metres | New snow/sleet amount under the provider's winter definition; distinct hydrometeor scope from HRRR/RAP snow-only guidance |
+| NBM | Native `SNOWLR` | Separate instantaneous model ratio with its own valid time and GRIB metadata; not applied to another source's SWE |
+| RAP | Kuchera estimate | Derived hourly amount from same-cycle, same-grid SWE and the interval-end air-temperature profile; zero active weight |
+| GFS/IFS | Explicitly unavailable for native amount in the inspected feeds | GFS `SNOD`/instantaneous `WEASD`, IFS `sd`/`rsn` are snowpack state; IFS `sf` remains SWE, not new-snow depth |
+
+Native definitions follow the [NOAA moisture table](https://www.nco.ncep.noaa.gov/pmb/docs/grib2/grib2_doc/grib2_table4-2-0-1.shtml),
+[NOAA's HRRR/RAP winter diagnostics](https://repository.library.noaa.gov/view/noaa/72271/noaa_72271_DS1.pdf)
+and [NBM winter guidance](https://vlab.noaa.gov/documents/6609493/7858320/Blend_Winter_v5.0-Configuration_and_Technical_Details.pdf).
+Comparisons require matching intervals, units and hydrometeor scope. NBM snow/sleet
+and snow-only estimates are displayed separately with an incompatibility reason.
+No daily accumulation is treated as hourly: exact compatible native endpoints are
+differenced, including inventories expressing 24 hours as one day. Negative or
+nonfinite amounts/parents remain missing, never clipped to zero.
+
+Kuchera is the first derived method, **not an approved delivered forecast or an
+assumed truth**. Following the [NOAA Forecast Operations Guide](https://vlab.noaa.gov/web/forecast-guide/fog?page=numerical-methods-for-determining-snow-accumulation),
+it uses maximum air temperature from the surface through 500 hPa: SLR is
+`12 + 2*(271.16 - Tmax_K)` above 271.16 K, otherwise `12 + (271.16 - Tmax_K)`.
+This implementation retains RAP's 21 pressure levels at 25 hPa spacing from
+500–1000 hPa, 2 m air temperature and surface pressure. Below-ground levels are
+excluded; every required above-ground sample must be finite. The interval-end
+profile represents the preceding one-hour SWE interval, an explicit approximation
+that cannot resolve subhourly evolution or warm layers between sampled levels.
+
+Kuchera is calculated at each native corner, then its snowfall amounts are
+interpolated to the MesoForge grid. Stored evidence includes the profile, mask,
+maximum temperature, raw ratio, SWE and derived amount at each corner. The separately
+interpolated ratio is diagnostic: multiplying it by interpolated SWE need not
+reproduce the interpolated amount. Positive SWE with a nonpositive Kuchera ratio
+is unavailable. Complete valid profiles with zero SWE can yield exactly zero amount;
+any nonpositive raw ratio is explicitly inapplicable, not clipped or used as a
+physical SLR. Missing profiles never receive a surface-only or fixed-ratio fallback.
+**Fixed 10:1 is not the preferred method and is not used here.**
+
+Raw ASNOW, SNOWLR and profile messages remain outside Git, with URLs, object
+identities, byte ranges, hashes, acquisition times, native GRIB definitions,
+cycles/leads and exact accumulation bounds. Native amount, model ratio and Kuchera
+remain independently traceable. Native snowfall and SLR must eventually be evaluated
+against suitable observations before choosing or calibrating a delivered algorithm.
+
+Use a preparation containing the completed SWE attachment. These placeholder commands
+were not executed verbatim; their preparation/replay/grid functions were exercised
+with the fixed real case below, using the existing locked local environment:
+
+```sh
+python -B -m mesoforge.application.prepared_snowfall_amount --prepared-run EXISTING_SWE_RUN --output-dir NEW_AMOUNT_RUN
+python -B -m mesoforge.application.prepared_snowfall_amount --prepared-run NEW_AMOUNT_RUN --from-raw --output-dir NEW_AMOUNT_REPLAY
+python -B -m mesoforge.application.prepared_local_grid --config locations.json --prepared-run NEW_AMOUNT_REPLAY --output-dir NEW_LOCAL_GRIDS
+python -B -m mesoforge.api --data-dir NEW_LOCAL_GRIDS
+```
+
+This explicit attachment is not automatic `forward_run` acquisition. New evidence
+acquired retrospectively does not claim availability at the original model-set decision.
+
+The bounded real case reuses the **September 11, 2026 18Z** reference and existing
+SWE: HRRR 12Z, RAP 15Z and NBM 18Z. Native amount endpoints cover all 36 requested
+hours. The Montana point is **47.9825874173, -112.7525884903**; Minneapolis uses
+**44.98859, -93.25557**. Both use the existing nested 7×7 grid at 6 km spacing, with
+9 editable and 40 context-only cells. These remain demonstration geometry defaults.
+
+| Montana, September 11 18–19Z | Native snowfall amount, m | Matching native SWE, kg/m² | Kuchera amount, m |
+| --- | --- | --- | --- |
+| HRRR | 0.00384400039670 | 0.605799972576 | Unavailable: no complete retained HRRR profile in this increment |
+| RAP | 0.00000678985685 | 0.001312864207 | 0.00000360277296 |
+| NBM | 0 | Unavailable for this product | Not calculated |
+
+RAP native and Kuchera snowfall differ without changing either source. The point's
+Kuchera diagnostic ratio is about 1.31748, with complete corner profiles and ratios
+retained; it is not a ratio to multiply by the displayed interpolated SWE. NBM's
+separate native SLR is about 4.66328 at 19Z, with instantaneous semantics. GFS/IFS
+native new-snow amount remains explicitly unsupported in these feeds. The active
+snowfall amount remains unavailable. This is real model evidence, not an observed
+snowfall validation or a winter-skill ranking.
+
+At that point HRRR has 35 usable native hourly amounts, RAP 34, and NBM 36.
+Three intervals have a decreasing native cumulative value at a required corner:
+RAP ending September 12 01Z/10Z and HRRR ending 02Z. They remain unavailable rather
+than becoming zero or being renormalized across the other corners. Their original
+parents are retained; no cause for the decrease is assumed. RAP Kuchera has 36
+calculable amounts from its separate SWE/profile evidence, including genuine zero
+water intervals. A valid Kuchera value does not repair missing native ASNOW.
+
+New unique raw messages total **75,384,450 bytes**, and inventories **1,581,795 bytes**.
+Total network transfer was **76,996,905 bytes**, including the initial inventory
+probes and the two corrected 24-hour ASNOW selections. Existing SWE/surface data
+was reused. Retained raw messages generated both regional preparations offline;
+compressed prepared native arrays total **2,790,625 bytes** for Montana and
+**1,450,798 bytes** for Minneapolis. Raw/profile replay reproduced the arrays,
+intervals and original acquisition provenance with zero provider calls; replay
+preparation timestamps and code identity are separately recorded.
+
+For each real grid, all **1,764 existing cell/hour payloads** exactly match the saved
+SWE-milestone baseline after removing only the new snowfall-amount field/evidence.
+Both exact point forecasts match the native amount/profile extraction for every hour.
+Montana's first six hourly HRRR amounts sum to **0.00412600114676 m**, and RAP to
+**0.00000678985685 m**, matching independently extracted cumulative endpoint
+differences within 1e-12 m. The complete retained grids occupy **62,968,931 bytes**
+(Montana) and **64,216,757 bytes** (Minneapolis) compressed; build-and-retain times
+were about **212 s** and **233 s** on this machine. These artifacts include all
+previous fields and detailed source/profile evidence, not just snowfall arrays.
+Both complete grids then rebuilt **byte-identically with zero provider calls**;
+the retained immutable artifacts were reused rather than overwritten.
+
+Validation: **601 focused and retained offline tests passed** (509 scientific,
+preparation/grid/report and retained-path checks, plus 92 API/issuance checks),
+including 110 new provider/profile/extraction/preparation tests. Tests cover
+interval and day/hour alignment, independent Kuchera values, units, zero/missing
+amounts, missing profiles, native versus derived disagreement, source corruption,
+shared loading, point extraction, replay and immutable memory-storage readback.
+Ruff/formatting, mypy, all nine import contracts, documentation/hygiene checks,
+the offline lock check and `git diff --check` passed. No real database/MinIO or
+full acceptance run, snowfall observations, snowfall verification or calibrated
+blend is included in this increment.
 
 ## References
 
