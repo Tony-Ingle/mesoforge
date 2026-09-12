@@ -86,19 +86,25 @@ def load_prepared(
     pop_guidance: dict[str, Any] | None = None,
     probability_sources: list[dict[str, Any]] | None = None,
     ptype_guidance: dict[str, Any] | None = None,
+    snowfall_guidance: dict[str, Any] | None = None,
 ) -> PreparedPointForecast | PreparedRegions:
     """Load all shared regions once. This function never prepares or downloads."""
     index = directory / "coverage.json"
     if not index.is_file():
-        return attach_type_guidance(
-            attach_pop_guidance(
-                PreparedPointForecast.from_directory(
-                    directory, configuration=configuration, shadow_directories=shadow_directories
+        return attach_snowfall_guidance(
+            attach_type_guidance(
+                attach_pop_guidance(
+                    PreparedPointForecast.from_directory(
+                        directory,
+                        configuration=configuration,
+                        shadow_directories=shadow_directories,
+                    ),
+                    pop_guidance,
+                    probability_sources=probability_sources,
                 ),
-                pop_guidance,
-                probability_sources=probability_sources,
+                ptype_guidance,
             ),
-            ptype_guidance,
+            snowfall_guidance,
         )
     payload = json.loads(index.read_text())
     regions = []
@@ -119,13 +125,44 @@ def load_prepared(
     if not regions:
         raise ValueError("No prepared regions in coverage index")
     failures = {(row["lat"], row["lon"]): row["message"] for row in payload.get("failures", [])}
-    return attach_type_guidance(
-        attach_pop_guidance(
-            PreparedRegions(regions, failures),
-            pop_guidance,
-            probability_sources=probability_sources,
+    return attach_snowfall_guidance(
+        attach_type_guidance(
+            attach_pop_guidance(
+                PreparedRegions(regions, failures),
+                pop_guidance,
+                probability_sources=probability_sources,
+            ),
+            ptype_guidance,
         ),
-        ptype_guidance,
+        snowfall_guidance,
+    )
+
+
+def attach_snowfall_guidance(
+    prepared: PreparedPointForecast | PreparedRegions,
+    descriptor: dict[str, Any] | None,
+) -> PreparedPointForecast | PreparedRegions:
+    """Load native accumulation views once, shared by every coordinate/grid cell."""
+    if descriptor is None:
+        return prepared
+    from mesoforge.application.prepared_snowfall import load_snowfall_guidance
+
+    regions = prepared.regions if isinstance(prepared, PreparedRegions) else [prepared]
+    target = regions[0]._target_reference_time
+    if any(
+        region._surface_configuration is None or region._target_reference_time != target
+        for region in regions
+    ):
+        raise ValueError("Snowfall guidance requires one shared surface forecast target")
+    views = load_snowfall_guidance(descriptor, target_reference_time=target)
+    attached = [
+        replace(region, _snow_views=views, _snow_guidance=deepcopy(descriptor))
+        for region in regions
+    ]
+    return (
+        PreparedRegions(attached, prepared.failures)
+        if isinstance(prepared, PreparedRegions)
+        else attached[0]
     )
 
 

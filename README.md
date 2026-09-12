@@ -43,6 +43,10 @@ only required geographic inputs; names are optional display metadata.
   type probabilities to that same grid. The temporary baseline requires complete
   HRRR/GFS agreement; disagreement remains ambiguous and missing evidence stays
   explicit. This is not yet automatic acquisition in `forward_run` or verified skill.
+- **Snowfall water equivalent:** an optional [native accumulation step](#native-snowfall-water-equivalent)
+  retains HRRR/RAP hourly amounts and IFS three-hour increments across the same grid.
+  These remain zero-weight evidence; the active field is explicitly unavailable
+  because no snowfall blend rule is approved. Existing QPF, PoP and p-type are unchanged.
 - **Shadows:** real RAP and ECMWF IFS values/provenance accompany issuance with zero
   active weight. IFS preserves native three-hourly gaps and has no compatible
   instantaneous gust. Cloud cover is explicitly unavailable without an approved policy.
@@ -75,7 +79,7 @@ The QPF increment adds [real interval/conservation and offline replay evidence](
 precipitation verification remains future work. The [PoP increment](#probability-of-precipitation-on-the-local-grid)
 adds actual native probabilistic guidance without changing QPF or other surface values.
 
-There is **no snowfall/ice amount, deterministic bias correction,
+There is **no active snowfall blend, snowfall depth, ice amount, deterministic bias correction,
 site learning, AI editing, production deployment or scheduling in the V2 path yet**. Bias/AI
 report stages are explicitly unimplemented and final values currently equal the baseline.
 Registration services and delivery also remain future work. The retained Phase 2 station
@@ -89,8 +93,9 @@ One-off requests stay untracked. See [VISION.md](VISION.md#intended-coordinate-d
 and the [active RFC](docs/rfcs/mesoforge-v2-architecture.md). The first local surface grid
 and nested domains are implemented; the editing lifecycle remains future work. The
 ECMWF six-hour probability assessment remains explicitly incompatible as described
-below. The next proposed field increment is native interval-aware snowfall-water
-equivalent evidence; snowfall depth and ice accretion need their own defensible rules.
+below. Native interval snowfall-water-equivalent evidence is now implemented.
+The next proposed field increment is native snowfall-depth evidence, with explicit
+source assumptions and intervals; no fixed snow ratio or ice-accretion rule is approved.
 
 Local Codex development continues; the Hermes development pipeline is paused. The RFC's
 unresolved implementation choices remain proposed, not blanket approval of the roadmap.
@@ -2926,11 +2931,110 @@ fixtures exercise freezing rain, sleet, agreeing snow/mixed types, missing sourc
 unknown codes and disagreements; this bounded real window does not establish winter
 performance. No extra winter backfill was acquired to force an agreeing case.
 
-Next proposed: retain native **interval-aware snowfall water equivalent** on this
-same grid, with source units/bounds and explicit gaps. Inspect defensible snow-depth
-and ice-accretion guidance before adding those amounts; do not multiply total QPF
+Native **interval-aware snowfall water equivalent** is now retained as described
+below. Snowfall-depth guidance is the next proposed field increment. Inspect native
+depth and ice-accretion products before adding those amounts; do not multiply total QPF
 by an instantaneous type flag or assume a universal snow ratio. Derived conditions
 should follow these explicit fields and rules later.
+
+## Native snowfall water equivalent
+
+The optional `mesoforge.application.prepared_snowfall` step adds native snowfall
+water equivalent to the existing surface preparation and context/editable grid.
+This is an interval accumulation, separate from total liquid QPF, PoP, p-type,
+snowpack and snowfall depth. **No approved snowfall-water-equivalent blend rule
+exists:** `surface.fields.snowfall_water_equivalent_amount` is null with
+`policy_unavailable` and no weights. Native contributors remain zero-weight
+evidence in `surface.snowfall_guidance`; no delivered field or existing policy changes.
+
+| Source | Retained SWE evidence | Interval treatment |
+| --- | --- | --- |
+| HRRR | Native accumulated `WEASD`, kg/m² | Exact preceding-hour accumulation; instantaneous snowpack and cycle-total duplicates excluded |
+| RAP | Native accumulated `WEASD`, kg/m² | Exact preceding-hour accumulation; source lead limits remain explicit |
+| IFS | Native `sf`; metres of water equivalent in the demonstrated feed | Difference compatible cumulative endpoints on native cells, then multiply by 1000 to kg/m²; preserve native three-hour intervals |
+| GFS | Unavailable in the inspected `pgrb2.0p25` product | Instantaneous snowpack `WEASD`/`SNOD` is not snowfall accumulation |
+| NBM | Unavailable for SWE in the inspected core product | `ASNOW` is snowfall depth; no assumed snow ratio converts it to SWE |
+
+Source definitions follow the [NOAA moisture parameter table](https://www.nco.ncep.noaa.gov/pmb/docs/grib2/grib2_doc/grib2_table4-2-0-1.shtml),
+[model inventories](https://www.nco.ncep.noaa.gov/pmb/products/),
+[NBM elements](https://vlab.noaa.gov/web/mdl/nbm-weather-elements-v4.1) and
+[ECMWF snowfall definition](https://codes.ecmwf.int/grib/param-db/144).
+IFS retains its ECMWF attribution and CC-BY-4.0 metadata. Prepared records retain
+native units and amounts, exact parent bounds, cycle/lead, provider/product, URLs,
+byte ranges, hashes, acquisition/availability times, GRIB version/packing metadata
+and transformation identity. IFS parent differencing requires matching native
+origin, cycle, grid, units and model identity. Negative/nonfinite parents or increments
+remain missing; there is no rounding-to-zero, clipping or hourly interpolation.
+HRRR/RAP hourly and IFS three-hour amounts cannot be compared as the same event.
+`aggregate_snowfall_intervals` accepts only complete, contiguous, nonoverlapping
+periods from one source/cycle/coordinate, preserving component provenance.
+
+Preparation uses the already-selected cycles and coordinate-derived coverage from
+an existing surface run. Each native message is acquired once, then shared among
+its regional views and all grid cells. This is an explicit attachment, not automatic
+`forward_run` snowfall acquisition. Replay verifies retained raw/index checksums
+and does not instantiate a provider transport. The exact point is extracted from
+the existing local grid; its report separates native SWE amounts and intervals
+from the unavailable active baseline, with optional inches of **water equivalent**.
+
+The preparation, replay and grid functions were exercised locally. These shell
+examples use placeholders and were not executed verbatim; use the existing locked
+environment and new output directories outside Git:
+
+```sh
+python -B -m mesoforge.application.prepared_snowfall --prepared-run EXISTING_SURFACE_RUN --output-dir NEW_SNOW_RUN
+python -B -m mesoforge.application.prepared_snowfall --prepared-run NEW_SNOW_RUN --from-raw --output-dir NEW_SNOW_REPLAY
+python -B -m mesoforge.application.prepared_local_grid --config locations.json --prepared-run NEW_SNOW_REPLAY --output-dir NEW_LOCAL_GRIDS
+python -B -m mesoforge.api --data-dir NEW_LOCAL_GRIDS
+```
+
+The bounded real experiment reused the **September 11, 2026 18Z** target reference,
+with HRRR 12Z, RAP 15Z and IFS 06Z. It acquired 36 hourly HRRR messages, 36 hourly RAP
+messages and 13 IFS cumulative endpoints, yielding 12 native three-hour increments
+within the 36-hour forecast. Acquisition happened September 12; this is a
+retrospective attachment, not a claim that SWE was available at the original decision.
+Raw messages total **4,000,217 bytes**, inventories **1,618,777 bytes**; approximately
+**5.63 MB** was downloaded including a small retried probe. All are retained outside Git.
+
+A snow-producing Montana point (**47.9825874173, -112.7525884903**) used coordinate-
+derived coverage rebuilt from retained surface/QPF guidance with zero downloads.
+Minneapolis used its existing prepared coverage. Both retain the current 7×7,
+6 km context grid, 9 editable cells and 40 context-only cells, with 36 forecast hours.
+These measurements remain implementation defaults, not permanent geographic policy.
+
+| Montana accumulation (UTC) | HRRR SWE, kg/m² | RAP SWE, kg/m² | IFS SWE, kg/m² |
+| --- | --- | --- | --- |
+| September 11, 18–19Z | 0.605799972576 | 0.001312864207 | Unavailable: no native hourly event |
+| September 11, 18–21Z | 0.621219972226, sum of three hourly periods | 0.001312864207, sum of three hourly periods | 0, compatible native-parent difference |
+| September 11 18Z–September 12 00Z | 0.643719971236, sum of six hourly periods | 0.001312864207, sum of six hourly periods | 0, sum of two three-hour periods |
+
+This is preserved model disagreement, not evidence of which model is correct.
+Minneapolis has valid zero SWE at the demonstrated hour; GFS/NBM remain missing,
+and IFS retains 24 hourly gaps rather than invented zero values.
+
+Validation: **81 focused snowfall tests passed**, covering source selection,
+unit/window validation, zero versus missing, negative increments, conservation,
+disagreement, provenance and raw replay. Existing preparation/batch/API selection
+passed **166 tests**; grid/hourly-report selection passed **58 tests**, including
+all-cell old-field regression, point extraction, shared loading and immutable
+memory-storage readback. Relevant surface/QPF/PoP/p-type tests also passed.
+Real raw replay reproduced arrays and native parent provenance with provider access
+disabled; new preparation timestamps remain separate from original acquisition times.
+Both complete real grids also rebuilt byte-identically with zero provider calls.
+Every Minneapolis cell/hour retained exactly the previous surface, QPF, PoP and
+p-type payload after removing the new SWE field/evidence. The exact Montana point
+matched native contributor extraction for all 36 hours. Retained compressed grids
+are approximately 30.02 MB (Minneapolis) and 28.53 MB (Montana); all raw/prepared
+guidance and reports remain outside Git. No precipitation verification, winter
+skill claim or full PostgreSQL/MinIO
+acceptance run is included in this increment.
+
+Next proposed: native interval snowfall-depth evidence on this same grid, with
+snowpack depth explicitly separate. Inspect native HRRR/NBM/other supported depth
+products and retain source assumptions; do not derive depth using fixed 10:1.
+Later snow-to-liquid-ratio work requires compatible snowfall-depth/SWE intervals,
+thermodynamic guidance and verification, explicit uncertainty and unavailable
+ratios for zero/missing denominators. Ice accretion remains a later field.
 
 ## References
 

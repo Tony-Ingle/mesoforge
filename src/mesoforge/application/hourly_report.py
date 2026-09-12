@@ -515,6 +515,7 @@ def _render_surface_report(report: dict[str, Any]) -> str:
             lines.append(f"- Hours {', '.join(str(h) for h in sorted(set(hours)))}: {reason}")
     lines.extend(_render_probability_shadows(report["hours"]))
     lines.extend(_render_precipitation_type(report["hours"]))
+    lines.extend(_render_snowfall(report["hours"]))
     return "\n".join(lines) + "\n"
 
 
@@ -579,6 +580,73 @@ def _render_precipitation_type(hours: list[dict[str, Any]]) -> list[str]:
                         f"{source.get('source_cycle', 'unavailable')} / "
                         f"{source.get('source_lead_hours', 'unavailable')}",
                         "; ".join(source["missing_reasons"]),
+                    ]
+                )
+                + " |"
+            )
+    return lines
+
+
+def _render_snowfall(hours: list[dict[str, Any]]) -> list[str]:
+    if not any("snowfall_guidance" in hour.get("surface", {}) for hour in hours):
+        return []
+    lines = [
+        "",
+        "### Native snowfall water equivalent evidence",
+        "",
+        "The active snowfall-water-equivalent baseline is unavailable: no approved blend "
+        "rule or weights exist. Native contributors have zero active weight. Amounts below "
+        "are the liquid-water equivalent of snowfall, not snowfall depth, snowpack depth "
+        "or ice accretion. Each row retains its actual accumulation interval (start, end]; "
+        "a multi-hour amount is not an hourly amount. No ratio, surface-temperature split "
+        "or conversion from precipitation type is applied.",
+        "",
+        "| Hour | Source | SWE kg/m² | Water equivalent in | UTC start (exclusive) | "
+        "UTC end (inclusive) | Cycle / lead | Status / reasons |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for hour in hours:
+        guidance = hour.get("surface", {}).get("snowfall_guidance", {})
+        field = guidance.get("field", {})
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    str(hour["horizon_hours"]),
+                    "Active baseline",
+                    "unavailable",
+                    "unavailable",
+                    "not applied",
+                    "not applied",
+                    "none",
+                    field.get("status", "unavailable")
+                    + ": "
+                    + "; ".join(field.get("missing_reasons", [])),
+                ]
+            )
+            + " |"
+        )
+        for source in guidance.get("contributors", []):
+            if source.get("unit") != "kg/m^2":
+                raise ValueError("Snowfall report requires water equivalent in kg/m^2")
+            value = source.get("value")
+            if value is not None and (not math.isfinite(value) or value < 0):
+                raise ValueError("Snowfall report requires nonnegative finite water equivalent")
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(hour["horizon_hours"]),
+                        f"{source['model']} ({source['role']})",
+                        "unavailable" if value is None else f"{value:.6g}",
+                        "unavailable" if value is None else f"{value / 25.4:.6g}",
+                        source.get("interval_start") or "unavailable",
+                        source.get("interval_end") or "unavailable",
+                        f"{source.get('source_cycle', 'unavailable')} / "
+                        f"{source.get('source_lead_hours', 'unavailable')}",
+                        source.get("status", "unavailable")
+                        + (": " if source.get("missing_reasons") else "")
+                        + "; ".join(source.get("missing_reasons", [])),
                     ]
                 )
                 + " |"

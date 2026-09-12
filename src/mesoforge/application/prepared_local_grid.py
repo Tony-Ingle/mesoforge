@@ -75,6 +75,11 @@ def prepare_local_grids(
             if "ptype_guidance" in preparation
             else {}
         ),
+        **(
+            {"snowfall_guidance": preparation["snowfall_guidance"]}
+            if "snowfall_guidance" in preparation
+            else {}
+        ),
     )
     if prepared.horizon_hours != tuple(range(1, 37)):
         raise ValueError("Local surface grids require prepared hours 1..36")

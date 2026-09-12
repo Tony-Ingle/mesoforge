@@ -7,8 +7,10 @@ from typing import Any
 import pytest
 
 from mesoforge.application.hourly_report import build_hourly_report, render_hourly_report
+from mesoforge.application.snowfall_forecast import SNOW, extract_snowfall_contributors
 from tests.unit.application.test_precipitation_type import run as type_result
 from tests.unit.application.test_precipitation_type import type_view
+from tests.unit.application.test_snowfall_forecast import snow_view
 
 
 @pytest.mark.parametrize(
@@ -549,3 +551,35 @@ def test_native_shadow_probability_report_does_not_mislabel_invalid_values(
     source.update(unit=unit, value=value)
     with pytest.raises(ValueError, match="PoP"):
         render_hourly_report(build_hourly_report(native_probability_forecast))
+
+
+@pytest.mark.parametrize("value", [0.0, 25.4, None])
+def test_snowfall_report_preserves_native_intervals_zero_missing_and_water_units(
+    native_probability_forecast, value
+):
+    for hour in native_probability_forecast["hours"]:
+        views = [] if value is None else [snow_view(amount=value, end=hour["valid_time"])]
+        evidence = extract_snowfall_contributors(
+            views, latitude=44.5, longitude=-93.5, valid_time=hour["valid_time"]
+        )
+        hour["surface"]["fields"][SNOW] = evidence["field"]
+        hour["surface"]["snowfall_guidance"] = evidence
+    original = deepcopy(native_probability_forecast)
+    report = build_hourly_report(native_probability_forecast)
+    rendered = render_hourly_report(report)
+    section = rendered.split("### Native snowfall water equivalent evidence")[1]
+    assert "not snowfall depth, snowpack depth or ice accretion" in section
+    assert "no approved blend rule or weights exist" in section
+    assert "| 36 | Active baseline | unavailable |" in section
+    text = "unavailable | unavailable" if value is None else "0 | 0" if value == 0 else "25.4 | 1"
+    assert f"| 1 | HRRR (shadow) | {text} |" in section
+    if value is not None:
+        assert "2026-11-01T04:00:00+00:00 | 2026-11-01T05:00:00+00:00" in section
+    for stored, shown in zip(original["hours"], report["hours"], strict=True):
+        assert shown["surface"] == stored["surface"]
+        assert shown["final_surface_fields"][SNOW]["value"] is None
+    assert native_probability_forecast == original
+    report["hours"][0]["surface"]["snowfall_guidance"]["contributors"][0]["value"] = -1
+    with pytest.raises(ValueError, match="Snowfall report"):
+        render_hourly_report(report)
+    assert native_probability_forecast == original

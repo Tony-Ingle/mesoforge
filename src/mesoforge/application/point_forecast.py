@@ -24,6 +24,7 @@ from mesoforge.application.probability_contributors import (
     extract_probability_contributors,
 )
 from mesoforge.application.probability_forecast import POP, extract_probability_hour
+from mesoforge.application.snowfall_forecast import SNOW, SnowView, extract_snowfall_contributors
 from mesoforge.application.spatial_coverage import (
     CoverageRequiredError,
     UnsupportedCoordinateError,
@@ -327,6 +328,8 @@ class PreparedPointForecast:
     _probability_views: list[ProbabilityView] = field(default_factory=list)
     _type_views: list[TypeView] = field(default_factory=list)
     _type_guidance: dict[str, Any] | None = None
+    _snow_views: list[SnowView] = field(default_factory=list)
+    _snow_guidance: dict[str, Any] | None = None
 
     @property
     def notice(self) -> str:
@@ -782,6 +785,16 @@ class PreparedPointForecast:
                     )
                     hours[-1]["surface"]["fields"][PTYPE] = evidence["field"]
                     hours[-1]["surface"]["precipitation_type_guidance"] = evidence
+                if self._snow_guidance is not None:
+                    snowfall = extract_snowfall_contributors(
+                        self._snow_views,
+                        latitude=latitude,
+                        longitude=longitude,
+                        valid_time=_iso(valid_time),
+                        source_status=self._snow_guidance.get("source_status", {}),
+                    )
+                    hours[-1]["surface"]["fields"][SNOW] = snowfall["field"]
+                    hours[-1]["surface"]["snowfall_guidance"] = snowfall
         contributor_configuration = (
             with_surface_fields(self._configuration)
             if self._surface_configuration is not None
@@ -816,6 +829,8 @@ class PreparedPointForecast:
             ]
         if self._type_guidance is not None:
             result["ptype_guidance"] = deepcopy(self._type_guidance)
+        if self._snow_guidance is not None:
+            result["snowfall_guidance"] = deepcopy(self._snow_guidance)
         if self._manifest_sha256 is not None:
             result["manifest_sha256"] = self._manifest_sha256
         if self._pop_guidance is not None:

@@ -64,7 +64,15 @@ and native type evidence allow a later rule to distinguish no meaningful precipi
 signal from precipitation with an unresolved type. No meaningful-signal threshold or
 time reconciliation rule is approved yet; applicability is currently not assessed.
 Neither PoP alone nor surface temperature should decide precipitation type.
-Snowfall/ice amounts, deterministic bias correction,
+An optional preparation step now retains native interval-aware snowfall water
+equivalent from HRRR/RAP hourly accumulations and compatible IFS cumulative
+endpoints. Native three-hour IFS increments remain three-hour amounts. All are
+zero-weight evidence: there is no approved snowfall-water-equivalent blend rule,
+so its active baseline remains explicitly unavailable. Snowpack water equivalent
+and snowfall depth are not substitutes; QPF and precipitation type are not used to
+manufacture snowfall amounts. Units, intervals, native parents and disagreement
+remain traceable across the same context/editable grid and its exact point.
+Snowfall depth, ice amounts, deterministic bias correction,
 site learning, AI editing, delivery and production deployment/scheduling
 are not implemented.
 The existing on-demand forward run and explicit batch history are not a deployed
@@ -245,9 +253,13 @@ observation matching and bounded performance queries. The implemented local surf
 grid establishes the numerical representation across context and editable domains.
 Native precipitation-type evidence now uses this same grid. The bounded ECMWF
 six-hour probability assessment remains explicitly incompatible rather than converting
-a daily product or ignoring incompatible spatial support. The next proposed field
-increment is interval-aware native snowfall-water-equivalent evidence. Snowfall depth
-and ice accretion require suitable additional guidance and documented conversion
+a daily product or ignoring incompatible spatial support. Native snowfall water
+equivalent is now retained as unblended evidence on the same grid. The next proposed
+field increment is native interval snowfall-depth evidence, kept separate from
+snowpack depth. No constant snow-to-liquid ratio is assumed. A later ratio method
+needs compatible snowfall-depth/water-equivalent intervals, suitable thermodynamic
+guidance and verification, with explicit uncertainty and zero/missing denominators.
+Ice accretion requires suitable additional guidance and documented conversion
 semantics; statistical correction, AI, delivery and learning are not prerequisites.
 
 The exact wider release support matrix, authentication, measured resource limits,
@@ -257,8 +269,9 @@ does not authorize implementing the roadmap as one task.
 
 ## Future roadmap
 
-Fields should grow from today's surface, QPF, PoP and native type evidence to supported
-cloud, snow/ice amounts and other useful forecasts. Conditions must
+Fields should grow from today's surface, QPF, PoP, native type and snowfall-water-
+equivalent evidence to supported cloud, snowfall depth, ice amounts and other useful
+forecasts. Conditions must
 be derived from the underlying fields with explainable rules and explicit missingness,
 not emitted as an unexplained standalone prediction.
 

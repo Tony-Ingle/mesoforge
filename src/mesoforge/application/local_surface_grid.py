@@ -159,6 +159,7 @@ def _transformation_identity() -> dict[str, Any]:
         "application/probability_forecast.py",
         "application/probability_contributors.py",
         "application/precipitation_type.py",
+        "application/snowfall_forecast.py",
         "forecasting/surface.py",
         "forecasting/scalar_blend.py",
         "forecasting/vector_blend.py",
@@ -238,6 +239,20 @@ def _missing_hours(hours: list[dict[str, Any]], reason: str) -> list[dict[str, A
             model: {"status": "unavailable", "missing_reasons": [reason]}
             for model in surface.get("source_validation", {})
         }
+        snowfall = surface.get("snowfall_guidance")
+        if snowfall is not None:
+            snowfall["field"].update(value=None, status="unavailable", missing_reasons=[reason])
+            surface["fields"]["snowfall_water_equivalent_amount"] = deepcopy(snowfall["field"])
+            for contributor in snowfall["contributors"]:
+                contributor.update(value=None, status="unavailable", missing_reasons=[reason])
+                contributor.pop("spatial_extraction", None)
+                contributor.pop("extraction_coordinate", None)
+            for comparison in snowfall["comparisons"]:
+                comparison.update(
+                    difference_left_minus_right=None,
+                    status="unavailable",
+                    missing_reasons=[reason],
+                )
     return result
 
 
