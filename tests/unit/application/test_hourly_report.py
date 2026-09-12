@@ -6,12 +6,14 @@ from typing import Any
 
 import pytest
 
+from mesoforge.application.cloud_cover import extract_cloud_contributors
 from mesoforge.application.hourly_report import build_hourly_report, render_hourly_report
 from mesoforge.application.snowfall_amount_forecast import (
     AMOUNT,
     extract_snowfall_amount_contributors,
 )
 from mesoforge.application.snowfall_forecast import SNOW, extract_snowfall_contributors
+from tests.unit.application.test_cloud_cover import cloud_view
 from tests.unit.application.test_precipitation_type import run as type_result
 from tests.unit.application.test_precipitation_type import type_view
 from tests.unit.application.test_snowfall_amount_forecast import amount_view
@@ -543,6 +545,52 @@ def test_probability_shadows_keep_native_periods_and_only_display_comparable_dif
         assert shown["display_pop"]["value"] == 40
         assert shown["display_qpf"]["value"] == 1
     report["hours"][5]["surface"]["probability_guidance"]["contributors"][0]["provenance"].clear()
+    assert native_probability_forecast == original
+
+
+@pytest.mark.parametrize("value", [None, 0.0, 25.123456789])
+def test_cloud_report_retains_native_percentages_categories_and_missingness(
+    native_probability_forecast, value
+):
+    for hour in native_probability_forecast["hours"]:
+        views = (
+            []
+            if value is None
+            else [
+                cloud_view("HRRR", amount=value, end=hour["valid_time"]),
+                cloud_view("GFS", amount=value + 20, end=hour["valid_time"]),
+            ]
+        )
+        hour["surface"]["cloud_guidance"] = extract_cloud_contributors(
+            views, latitude=44.5, longitude=-93.5, valid_time=hour["valid_time"]
+        )
+    original = deepcopy(native_probability_forecast)
+    report = build_hourly_report(native_probability_forecast)
+    rendered = render_hourly_report(report)
+    section = rendered.split("### Native cloud-cover evidence")[1]
+    assert "zero active weight" in section and "no retained blend rule is approved" in section
+    assert "not a complete weather-condition string" in section
+    assert (
+        "HRRR / native-total-cloud-cover" in section
+        if value is not None
+        else "HRRR / unavailable" in section
+    )
+    if value is None:
+        assert "No compatible native cloud pairs" in section
+        assert "No retained native total cloud-cover guidance" in section
+    else:
+        assert "| 36 | HRRR minus GFS | -20 |" in section
+        expected = "0 | clear" if value == 0 else "25.1235 | partly cloudy"
+        assert expected in section
+        assert report["hours"][0]["surface"]["cloud_guidance"]["contributors"][0]["value"] == value
+    for baseline, shown in zip(original["hours"], report["hours"], strict=True):
+        assert shown["surface"] == baseline["surface"]
+        assert shown["final_surface_fields"] == baseline["surface"]["fields"]
+        assert "cloud_area_fraction" not in shown["final_surface_fields"]
+    assert native_probability_forecast == original
+    report["hours"][0]["surface"]["cloud_guidance"]["contributors"][0]["unit"] = "1"
+    with pytest.raises(ValueError, match="Cloud report requires finite percentages"):
+        render_hourly_report(report)
     assert native_probability_forecast == original
 
 

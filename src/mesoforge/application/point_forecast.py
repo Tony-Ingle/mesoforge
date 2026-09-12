@@ -17,6 +17,7 @@ import pyproj
 import xarray as xr
 
 from mesoforge.alignment.station_frame import StationAlignmentError, align_station_to_model
+from mesoforge.application.cloud_cover import CloudView, extract_cloud_contributors
 from mesoforge.application.precipitation_type import PTYPE, TypeView, extract_precipitation_type
 from mesoforge.application.prepared_qpf import read_qpf_inputs, required_qpf_leads
 from mesoforge.application.probability_contributors import (
@@ -337,6 +338,8 @@ class PreparedPointForecast:
     _snow_guidance: dict[str, Any] | None = None
     _snow_amount_views: list[AmountView] = field(default_factory=list)
     _snow_amount_guidance: dict[str, Any] | None = None
+    _cloud_views: list[CloudView] = field(default_factory=list)
+    _cloud_guidance: dict[str, Any] | None = None
 
     @property
     def notice(self) -> str:
@@ -813,6 +816,14 @@ class PreparedPointForecast:
                     )
                     hours[-1]["surface"]["fields"][AMOUNT] = amounts["field"]
                     hours[-1]["surface"]["snowfall_amount_guidance"] = amounts
+                if self._cloud_guidance is not None:
+                    hours[-1]["surface"]["cloud_guidance"] = extract_cloud_contributors(
+                        self._cloud_views,
+                        latitude=latitude,
+                        longitude=longitude,
+                        valid_time=_iso(valid_time),
+                        source_status=self._cloud_guidance.get("source_status", {}),
+                    )
         contributor_configuration = (
             with_surface_fields(self._configuration)
             if self._surface_configuration is not None
@@ -851,6 +862,8 @@ class PreparedPointForecast:
             result["snowfall_guidance"] = deepcopy(self._snow_guidance)
         if self._snow_amount_guidance is not None:
             result["snowfall_amount_guidance"] = deepcopy(self._snow_amount_guidance)
+        if self._cloud_guidance is not None:
+            result["cloud_guidance"] = deepcopy(self._cloud_guidance)
         if self._manifest_sha256 is not None:
             result["manifest_sha256"] = self._manifest_sha256
         if self._pop_guidance is not None:

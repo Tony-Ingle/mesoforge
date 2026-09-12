@@ -31,11 +31,13 @@ from mesoforge.application.snowfall_forecast import SNOW, extract_snowfall_contr
 from mesoforge.application.spatial_coverage import CoverageRequiredError
 from mesoforge.application.spatial_preparation import (
     PreparedRegions,
+    attach_cloud_guidance,
     attach_snowfall_amount_guidance,
     attach_snowfall_guidance,
 )
 from mesoforge.contracts.serialization import canonical_json_bytes, canonical_json_digest
 from mesoforge.forecasting.recipes import with_surface_fields
+from tests.unit.application.test_cloud_cover import cloud_view
 from tests.unit.application.test_forecast_issuance import memory_service as memory_service
 from tests.unit.application.test_precipitation_type import type_view
 from tests.unit.application.test_prepared_temperature import phase2_configuration
@@ -179,6 +181,48 @@ def _amount_views():
                 dataset=xr.concat(
                     [view.dataset.isel(event=0, drop=True) for view in native], dim="event"
                 ).assign_coords(event=list(range(36))),
+                manifest={
+                    **native[0].manifest,
+                    "events": [view.manifest["events"][0] for view in native],
+                },
+            )
+        )
+    return views
+
+
+def _cloud_views():
+    views = []
+    for model, offset in (("HRRR", 20), ("GFS", 40), ("RAP", 50), ("IFS", 60), ("NBM", 70)):
+        native = []
+        for horizon in HOURS:
+            if model == "IFS" and horizon % 3:
+                continue
+            valid = (
+                str(np.datetime_as_string(TARGET + np.timedelta64(horizon, "h"), unit="s")) + "Z"
+            )
+            factor = 100 if model == "IFS" else 1
+            view = cloud_view(
+                model,
+                amount=offset,
+                end=valid,
+                native_unit="1" if model == "IFS" else "percent",
+                factor=factor,
+            )
+            view.manifest["events"][0].update(
+                source_cycle=str(np.datetime_as_string(TARGET, unit="s")) + "Z",
+                source_lead_hours=horizon,
+            )
+            view.dataset.coords.update({"x": [-94.0, -92.0], "y": [44.0, 46.0]})
+            longitude, latitude = np.meshgrid(view.dataset.x.values, view.dataset.y.values)
+            view.dataset.cloud_cover.values += _gradient(latitude, longitude)
+            view.dataset.native_cloud_cover.values += _gradient(latitude, longitude) / factor
+            native.append(view)
+        views.append(
+            replace(
+                native[0],
+                dataset=xr.concat(
+                    [view.dataset.isel(event=0, drop=True) for view in native], dim="event"
+                ).assign_coords(event=list(range(len(native)))),
                 manifest={
                     **native[0].manifest,
                     "events": [view.manifest["events"][0] for view in native],
@@ -605,6 +649,8 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
         _snow_guidance={"status": "prepared"},
         _snow_amount_views=_amount_views(),
         _snow_amount_guidance={"status": "prepared"},
+        _cloud_views=_cloud_views(),
+        _cloud_guidance={"status": "prepared"},
     )
     result = prepared.forecast(latitude=LATITUDE, longitude=LONGITUDE)
     assert result["hours"][0]["temperature"]["value"] is not None
@@ -617,6 +663,8 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
     assert center_pop["spatial_extraction"]["native_fraction_at_source_corners"] == [0.4] * 4
     center_probabilities = result["hours"][0]["surface"]["probability_guidance"]
     center_amounts = result["hours"][0]["surface"]["snowfall_amount_guidance"]
+    center_cloud = result["hours"][0]["surface"]["cloud_guidance"]
+    assert center_cloud["contributors"][0]["value"] == pytest.approx(20)
     assert center_amounts["native_contributors"][0]["value"] == pytest.approx(0.01)
     assert center_amounts["derived_contributors"][0]["value"] is not None
     assert center_amounts["derived_contributors"][0]["diagnostic_ratio"] is not None
@@ -711,6 +759,19 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
                 assert source.get("provenance") == central.get("provenance")
                 assert source.get("interval_start") == central.get("interval_start")
         for pair in amounts["comparisons"]:
+            assert pair["difference_left_minus_right"] is None
+            assert pair["status"] == "unavailable"
+        clouds = hour["surface"]["cloud_guidance"]
+        for source, central in zip(
+            clouds["contributors"], center_cloud["contributors"], strict=True
+        ):
+            assert source["value"] is None and source["native_value"] is None
+            assert source["sky_category"] is None and source["status"] == "unavailable"
+            assert source["missing_reasons"] == cell["missing_reasons"]
+            assert "spatial_extraction" not in source and "extraction_coordinate" not in source
+            assert source.get("provenance") == central.get("provenance")
+            assert source["valid_time"] == central["valid_time"]
+        for pair in clouds["comparisons"]:
             assert pair["difference_left_minus_right"] is None
             assert pair["status"] == "unavailable"
     with pytest.raises(CoverageRequiredError):
@@ -884,6 +945,87 @@ def test_snowfall_amounts_reuse_swe_across_both_domains_and_preserve_immutable_r
     point["hours"][0]["surface"]["snowfall_amount_guidance"]["native_contributors"][0]["value"] = -1
     assert service.read(issued.issued_forecast_id)["forecast"] != point
     assert canonical_json_bytes(restored) == encoded
+
+
+def test_cloud_evidence_reuses_guidance_across_domains_and_replays_without_changing_fields(
+    prepared_surface, calculated_grid, monkeypatch, memory_service
+):
+    views = _cloud_views()
+    originals = [view.dataset.copy(deep=True) for view in views]
+    descriptor = {"status": "prepared", "source_status": {}}
+    loader = Mock(return_value=views)
+    monkeypatch.setattr("mesoforge.application.prepared_cloud.load_cloud_guidance", loader)
+    regions = attach_cloud_guidance(
+        PreparedRegions([prepared_surface, prepared_surface], {}), descriptor
+    )
+    loader.assert_called_once_with(descriptor, target_reference_time=TARGET)
+    assert regions.regions[0]._cloud_views is regions.regions[1]._cloud_views
+    assert prepared_surface._cloud_guidance is None
+    with (
+        patch("xarray.open_dataset", side_effect=AssertionError("Guidance already loaded")),
+        patch("requests.Session", side_effect=AssertionError("No provider calls")),
+    ):
+        grid = build_local_surface_grid(
+            latitude=LATITUDE,
+            longitude=LONGITUDE,
+            calculate_column=regions.regions[0]._forecast_column,
+            geometry=TEST_GEOMETRY,
+        )
+        replay = build_local_surface_grid(
+            latitude=LATITUDE,
+            longitude=LONGITUDE,
+            calculate_column=regions.regions[1]._forecast_column,
+            geometry=TEST_GEOMETRY,
+        )
+    assert canonical_json_bytes(grid) == canonical_json_bytes(replay)
+    roles, observed_cloud = set(), []
+    for cell, old_cell in zip(grid["cells"], calculated_grid[0]["cells"], strict=True):
+        roles.add(cell["inside_editable_domain"])
+        assert len(cell["hours"]) == 36
+        gradient = _gradient(cell["latitude"], cell["longitude"])
+        for hour, old in zip(cell["hours"], old_cell["hours"], strict=True):
+            evidence = hour["surface"]["cloud_guidance"]
+            sources = {source["model"]: source for source in evidence["contributors"]}
+            for model, offset in (("HRRR", 20), ("GFS", 40), ("RAP", 50), ("NBM", 70)):
+                source = sources[model]
+                assert source["value"] == pytest.approx(offset + gradient)
+                assert source["unit"] == "percent" and source["provenance"]
+                assert source["active_weight"] == 0
+                assert source["spatial_extraction"] and source["sky_category"]
+            if hour["horizon_hours"] % 3:
+                assert sources["IFS"]["value"] is None and sources["IFS"]["missing_reasons"]
+            else:
+                assert sources["IFS"]["value"] == pytest.approx(60 + gradient)
+            control_pair = next(
+                row for row in evidence["comparisons"] if row["models"] == ["HRRR", "GFS"]
+            )
+            assert control_pair["difference_left_minus_right"] == pytest.approx(-20)
+            assert evidence["active_policy"] == "no-approved-cloud-blend-policy"
+            old_fields = deepcopy(hour)
+            old_fields["surface"].pop("cloud_guidance")
+            assert old_fields == old
+        observed_cloud.append(
+            cell["hours"][0]["surface"]["cloud_guidance"]["contributors"][0]["value"]
+        )
+    assert roles == {True, False} and max(observed_cloud) > min(observed_cloud)
+    for before, view in zip(originals, views, strict=True):
+        xr.testing.assert_identical(before, view.dataset)
+    point = extract_grid_point(
+        json.loads(canonical_json_bytes(grid)), latitude=LATITUDE, longitude=LONGITUDE
+    )
+    assert point["hours"] == next(
+        cell["hours"] for cell in grid["cells"] if cell["is_forecast_point"]
+    )
+    assert point["cloud_guidance"] == descriptor
+    assert point["hours"][0]["surface"]["cloud_guidance"]["contributors"][0][
+        "value"
+    ] == pytest.approx(20)
+    assert point["hours"][0]["surface"]["fields"]["cloud_area_fraction"]["value"] is None
+    service, factory, objects = memory_service
+    issued = service.issue(point, batch_run_id=uuid4(), location_index=0)
+    before = len(factory.issued_forecasts), len(objects.objects)
+    assert service.read(issued.issued_forecast_id)["forecast"] == point
+    assert (len(factory.issued_forecasts), len(objects.objects)) == before
 
 
 def test_qpf_spans_both_domains_and_exact_point_replays_with_provenance(prepared_surface):

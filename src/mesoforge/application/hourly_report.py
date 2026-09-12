@@ -385,7 +385,8 @@ def _render_surface_report(report: dict[str, Any]) -> str:
         "AI forecast-desk stage not implemented yet. Final surface fields equal the "
         "numerical baseline. Delivery has not run. New issued hours are not_yet_verified; "
         "verification of previous versions is separate.",
-        "Cloud cover: unavailable because no approved retained cloud blend policy exists. "
+        "Active cloud cover: unavailable because no approved retained cloud blend policy exists. "
+        "Separate native cloud evidence is shown below when prepared. "
         "IFS instantaneous gust: unavailable because its published gust is an interval maximum. "
         "Native three-hourly IFS gaps are preserved. Stored Kelvin, m/s, degree and percent "
         "values are unrounded, with source cycles, leads, raw hashes, rules and exclusion reasons.",
@@ -517,7 +518,88 @@ def _render_surface_report(report: dict[str, Any]) -> str:
     lines.extend(_render_precipitation_type(report["hours"]))
     lines.extend(_render_snowfall(report["hours"]))
     lines.extend(_render_snowfall_amount(report["hours"]))
+    lines.extend(_render_cloud_guidance(report["hours"]))
     return "\n".join(lines) + "\n"
+
+
+def _render_cloud_guidance(hours: list[dict[str, Any]]) -> list[str]:
+    """Present native cloud evidence without choosing an unapproved delivered value."""
+    if not any("cloud_guidance" in hour.get("surface", {}) for hour in hours):
+        return []
+    lines = [
+        "",
+        "### Native cloud-cover evidence",
+        "",
+        "All cloud contributors have zero active weight. The active cloud baseline remains "
+        "unavailable because no retained blend rule is approved. Each percentage represents "
+        "native total cloud cover, not a sum or substitution of cloud layers. Native intervals "
+        "and missing times are preserved. Categories describe each unrounded native percentage; "
+        "they are not a complete weather-condition string or an observed opaque-sky amount.",
+        "",
+        "| Hour | Source / product | Cycle / source lead h | UTC valid time | Definition / "
+        "vertical extent | Cloud % | Sky category | Native value / unit | Status / reason |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    differences: list[str] = []
+    for hour in hours:
+        guidance = hour.get("surface", {}).get("cloud_guidance", {})
+        for source in guidance.get("contributors", []):
+            value = source["value"]
+            if source["unit"] != "percent" or (
+                value is not None and (not math.isfinite(value) or not 0 <= value <= 100)
+            ):
+                raise ValueError("Cloud report requires finite percentages within [0, 100]")
+            native = source.get("native_value")
+            native_text = (
+                "unavailable" if native is None else f"{native:.6g} {source['native_unit']}"
+            )
+            reasons = "; ".join(source.get("missing_reasons", []))
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(hour["horizon_hours"]),
+                        f"{source['model']} / {source.get('product', 'unavailable')}",
+                        f"{source.get('source_cycle', 'unavailable')} / "
+                        f"{source.get('source_lead_hours', 'unavailable')}",
+                        source["valid_time"],
+                        f"{source['cloud_definition']} / {source['vertical_extent']}",
+                        "unavailable" if value is None else f"{value:.6g}",
+                        (source.get("sky_category") or "unavailable").replace("_", " "),
+                        native_text,
+                        source["status"] + (f"; {reasons}" if reasons else ""),
+                    ]
+                )
+                + " |"
+            )
+        for comparison in guidance.get("comparisons", []):
+            if comparison["status"] != "comparable":
+                continue
+            difference = comparison["difference_left_minus_right"]
+            if (
+                comparison["unit"] != "percentage_point"
+                or difference is None
+                or not math.isfinite(difference)
+            ):
+                raise ValueError("Cloud disagreement requires finite percentage-point differences")
+            differences.append(
+                f"| {hour['horizon_hours']} | {' minus '.join(comparison['models'])} | "
+                f"{difference:+.6g} |"
+            )
+    lines.extend(
+        [
+            "",
+            "Same-valid-time cloud disagreements are descriptive percentage-point differences, "
+            "not skill scores; model cloud parameterizations and native resolution differ.",
+            "",
+        ]
+    )
+    lines.extend(
+        ["| Hour | Compared models | Difference pp |", "| --- | --- | --- |", *differences]
+        if differences
+        else ["No compatible native cloud pairs are available."]
+    )
+    return lines
 
 
 def _render_precipitation_type(hours: list[dict[str, Any]]) -> list[str]:

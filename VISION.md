@@ -25,7 +25,15 @@ verifies eligible previous temperature forecasts and saves new immutable issuanc
 HRRR/GFS remain active; temperature stays at 70/30 demonstration weights, while the
 added fields use applicable retained Phase 2 rules. RAP and IFS are real zero-weight
 shadows; IFS keeps native three-hourly gaps and has no compatible instantaneous gust.
-Cloud cover is explicitly unavailable without an approved blend policy.
+The delivered cloud field remains explicitly unavailable without an approved blend
+policy. An optional attachment now retains native HRRR/GFS/RAP/IFS/NBM total cloud
+cover across the same context/editable grid, with exact-point extraction. Percentages,
+original units, products, cycles, native times and missingness remain traceable;
+layer-specific and time-averaged clouds are not substituted for instantaneous total
+cover. IFS retains its native three-hourly gaps. Contributors remain zero-weight
+evidence with descriptive disagreements, not a new active blend. Deterministic
+per-source sky categories use the unrounded numerical percentage; they are neither
+opaque-sky observations nor complete weather-condition descriptions.
 
 Shared prepared files hold native model grids. The local MesoForge surface baseline
 uses one coordinate-derived grid covering a larger context domain, with a smaller
@@ -267,10 +275,13 @@ a daily product or ignoring incompatible spatial support. Native snowfall water
 equivalent is now retained as unblended evidence on the same grid. Native interval
 snowfall amounts, native model SLR and first profile-based Kuchera estimates are also
 separate evidence. Snow depth on the ground is not newly accumulated snowfall.
-The next proposed step is interval-aware snowfall/SLR evaluation, with suitable
-observations and explicit hydrometeor/spatial support, before choosing an active
-algorithm. No constant ratio, native single-source rule or derived method is assumed
-to be best; zero/missing water denominators cannot establish an observed SLR.
+Native total-cloud evidence is now available on the same grid. The next proposed
+step is native visibility evidence, with source semantics and explicit missingness,
+before attempting complete derived conditions. Low visibility alone cannot establish
+fog, precipitation or another cause. Native snowfall, NBM SLR and Kuchera remain
+separately traceable until sufficient suitable verification exists; a broad snowfall/SLR
+campaign is deferred. No constant ratio, native single-source rule or derived method
+is assumed to be best; zero/missing water denominators cannot establish an observed SLR.
 Ice accretion requires suitable additional guidance and documented conversion
 semantics; statistical correction, AI, delivery and learning are not prerequisites.
 
@@ -281,8 +292,9 @@ does not authorize implementing the roadmap as one task.
 
 ## Future roadmap
 
-Fields should grow from today's surface, QPF, PoP, native type, SWE and native/derived
-snowfall-amount evidence to supported cloud, snow depth on the ground, ice amounts and other useful
+Fields should grow from today's surface, QPF, PoP, native type, SWE, native/derived
+snowfall-amount and cloud evidence to supported visibility, snow depth on the ground,
+ice amounts and other useful
 forecasts. Conditions must
 be derived from the underlying fields with explainable rules and explicit missingness,
 not emitted as an unexplained standalone prediction.

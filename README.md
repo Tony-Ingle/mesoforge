@@ -51,9 +51,13 @@ only required geographic inputs; names are optional display metadata.
   retains HRRR/RAP/NBM native new-snow accumulations, separate NBM model SLR, and
   RAP Kuchera estimates using retained vertical profiles and matching SWE. All remain
   zero-weight evidence; no active snowfall-amount blend or fixed 10:1 rule is introduced.
+- **Cloud cover:** an optional [native cloud step](#native-cloud-cover-on-the-local-grid)
+  retains HRRR/GFS/RAP/IFS/NBM total-cloud percentages and per-source sky categories
+  across the same grid. All are zero-weight evidence; the delivered cloud field
+  remains explicitly unavailable because no approved cloud blend exists.
 - **Shadows:** real RAP and ECMWF IFS values/provenance accompany issuance with zero
   active weight. IFS preserves native three-hourly gaps and has no compatible
-  instantaneous gust. Cloud cover is explicitly unavailable without an approved policy.
+  instantaneous gust. Native cloud evidence does not introduce a new active policy.
 - **Shared inputs:** [current four-model discovery](#discover-the-current-four-model-set)
   and [selected preparation/issuance](#prepare-and-issue-the-exact-selected-model-set)
   preserve actual provider availability, identities, cycles/leads and acquisition times.
@@ -99,8 +103,12 @@ and nested domains are implemented; the editing lifecycle remains future work. T
 ECMWF six-hour probability assessment remains explicitly incompatible as described
 below. Native interval snowfall-water-equivalent evidence is now implemented.
 Native snowfall amounts and separate Kuchera estimates are now implemented as evidence.
-The next proposed step is snowfall/SLR evaluation using suitable interval observations,
-before selecting an active snowfall rule; no ice-accretion rule is approved.
+Native cloud evidence is now implemented separately from an unapproved delivered
+cloud blend; [cloud checks and real replay evidence](#native-cloud-cover-on-the-local-grid)
+are recorded below. The next proposed step is native visibility evidence on the same grid;
+visibility alone will not establish fog or a complete weather-condition string.
+Native snowfall, NBM SLR and Kuchera remain separately traceable pending sufficient
+verification data; a broad snowfall evaluation campaign is not the next task.
 
 Local Codex development continues; the Hermes development pipeline is paused. The RFC's
 unresolved implementation choices remain proposed, not blanket approval of the roadmap.
@@ -3171,6 +3179,127 @@ Ruff/formatting, mypy, all nine import contracts, documentation/hygiene checks,
 the offline lock check and `git diff --check` passed. No real database/MinIO or
 full acceptance run, snowfall observations, snowfall verification or calibrated
 blend is included in this increment.
+
+## Native cloud cover on the local grid
+
+The optional `mesoforge.application.prepared_cloud` attachment retains native
+instantaneous **total cloud cover** from five sources. It does not change the
+existing active `surface.fields.cloud_area_fraction`: no approved Phase 2 cloud
+blend exists, so that field remains null with its existing missing-policy reason.
+`surface.cloud_guidance` holds each native contributor, unrounded percentage,
+original unit/value, sky category, product, source cycle/lead, valid time, raw
+hashes and extraction corners/weights. Every contributor has zero active weight.
+Existing surface, QPF, PoP, p-type, SWE, native snowfall, NBM SLR and Kuchera
+values and policies remain unchanged.
+
+| Source | Selected native product | Treatment |
+| --- | --- | --- |
+| HRRR / RAP | `TCDC:entire atmosphere`, instantaneous forecast | Native percent; retain hourly snapshots |
+| GFS | `pgrb2.0p25` instantaneous entire-atmosphere `TCDC` | Exclude averaged and layer-specific clouds |
+| NBM | Core deterministic `TCDC:surface` total sky cover | Exclude ensemble spread and low/mid/high cloud fields |
+| IFS | Official deterministic `tcc`, parameter 164 | Native fraction converted to percent; preserve three-hourly gaps |
+
+Total and layer clouds have distinct [NOAA parameter definitions](https://www.nco.ncep.noaa.gov/pmb/docs/grib2/grib2_doc/grib2_table4-2-0-6.shtml).
+The [NBM inventory](https://www.nco.ncep.noaa.gov/pmb/products/blend/conus/00/blend.t00z.core.f001.co.grib2.shtml)
+distinguishes total sky cover from layers and spread. [IFS total cloud cover](https://codes.ecmwf.int/grib/param-db/164)
+retains ECMWF open-data attribution/licence metadata in every available contributor
+(CC-BY-4.0): this service is based on data and products of the European Centre for
+Medium-Range Weather Forecasts (ECMWF). Cloud guidance is extracted and converted
+to percent; no temporal interpolation is applied.
+Native grids, resolutions and cloud parameterizations remain distinct. Comparisons
+are descriptive percentage-point disagreements at the same location and valid time,
+not evidence of relative skill. Total cloud is never reconstructed by summing layers.
+
+Sky display policy `native-cloud-percentage-display.v1` uses the **unrounded**
+percentage: clear 0–5; mostly clear >5–25; partly cloudy >25–50; mostly cloudy
+>50–87; cloudy >87–100. These explicit MesoForge presentation boundaries follow
+a [NWS forecast wording reference](https://www.weather.gov/media/pah/ServiceGuide/A-forecast.pdf).
+They describe each model's numerical total cover, not an observed opaque-sky amount
+or a complete weather-condition string. Zero is clear; missing or out-of-range data
+is unavailable, never converted to clear or clipped into range.
+
+Run preparation before building the local grid; it reuses the selected HRRR/GFS/RAP/IFS
+cycles and the retained NBM PoP cycle. Each native message is acquired once, then
+shared across all regions/cells. Existing prepared meteorological inputs remain
+referenced in place. This explicit attachment is not automatic cloud acquisition in
+`forward_run`, and HTTP does not acquire guidance. All output directories must be
+new and outside Git. Preparation, replay and grid operations were exercised through
+these modules' Python functions in the locked environment. These CLI examples were
+not run verbatim; uppercase names are placeholders:
+
+```powershell
+python -B -m mesoforge.application.prepared_cloud --prepared-run EXISTING_SURFACE_RUN --output-dir NEW_CLOUD_RUN
+python -B -m mesoforge.application.prepared_cloud --prepared-run NEW_CLOUD_RUN --from-raw --output-dir NEW_CLOUD_REPLAY
+python -B -m mesoforge.application.prepared_local_grid --config locations.json --prepared-run NEW_CLOUD_REPLAY --output-dir NEW_LOCAL_GRID
+```
+
+The existing API can read `NEW_LOCAL_GRID` using its documented `--data-dir`
+option; no API service was started for this increment. Replay checks retained raw
+and index hashes, decodes again and preserves original acquisition metadata.
+Original guidance availability and this later cloud acquisition time remain separate;
+adding evidence does not claim it was available at the original forecast decision.
+
+The September 12, 2026 bounded acquisition used Minneapolis **44.98859, -93.25557**,
+reference September 11 18Z and the existing 36-hour window through September 13 06Z.
+An actual same-valid-time point sample on September 11 **21Z / 4 p.m. CDT** was:
+
+| Contributor | Source cycle / lead | Cloud percent, rounded here | Category |
+| --- | --- | ---: | --- |
+| HRRR | September 11 12Z / 9 h | 100 | cloudy |
+| GFS | September 11 12Z / 9 h | 100 | cloudy |
+| RAP | September 11 15Z / 6 h | 91.404223 | cloudy |
+| IFS | September 11 06Z / 15 h | 73.027897 | mostly cloudy |
+| NBM | September 11 18Z / 3 h | 43.049961 | partly cloudy |
+
+HRRR/GFS/RAP/NBM each supplied all 36 hours. IFS supplied this one native snapshot;
+11 other native leads returned HTTP 503 and 24 intervening hourly times are outside
+the native temporal resolution. Both kinds of missingness are retained separately,
+without interpolation or substitution. The active cloud field stays unavailable.
+
+Acquisition transferred **134,379,464 bytes**: 131,304,322 bytes of raw GRIB messages
+and 3,075,142 bytes of inventories, retained outside Git. Five initial probe messages
+were reused in the full preparation. Compressed regional cloud arrays occupy
+**2,004,216 bytes**. Raw replay reproduced arrays, events, hashes and original source
+provenance exactly, with zero provider calls; all earlier prepared descriptors matched.
+
+The retained grid is still 7×7 nodes at 6 km spacing, with 9 editable and 40
+context-only nodes. At 21Z, HRRR varies from 42.269564–100% across this grid, GFS
+97.727262–100%, RAP 70.231422–100%, IFS 67.213306–92.301922%, and NBM
+24.546602–48.254519%. All four hourly sources are available at all 49 nodes over
+36 hours; IFS is available at all 49 nodes for its one acquired native time.
+The exact point equals the retained center node and direct native extraction.
+Every one of the **1,764 previous cell/hour records matches exactly** after removing
+only the new cloud evidence. The completed snowfall and other fields are unchanged.
+This full grid, including all prior fields/provenance, occupies **70,369,704 bytes
+compressed**, versus 64,216,757 bytes before cloud evidence; building/retaining it
+took **260.51 seconds** on this machine. This is an implementation measurement,
+not a resource guarantee or a new geometry decision. A second complete build
+reused the identical retained grid artifact: byte-for-byte equality and zero
+provider calls, with the same original contributor provenance.
+
+Validation: **80 focused cloud tests passed**, including units/ranges, exact category
+boundaries, incompatible definitions, native times, missing products, shared loading,
+disagreement, provenance, extraction, offline replay and immutable memory-storage
+readback. A **488-test retained selection also passed**, covering the affected grid,
+report, preparation and batch paths plus surface/winter/precipitation calculations;
+these selections overlap and are not additive. The focused command was:
+
+```powershell
+python -m pytest -q tests/unit/application/test_cloud_cover.py tests/unit/application/test_prepared_cloud.py tests/unit/forecasting/test_cloud_cover.py tests/unit/guidance/test_cloud.py tests/unit/application/test_local_surface_grid.py tests/unit/application/test_hourly_report.py -k "cloud or missing_peripheral"
+```
+
+Ruff, formatting, mypy, all nine import contracts, documentation/hygiene checks,
+offline lock validation and `git diff --check` passed. No real PostgreSQL/MinIO
+service, full acceptance suite, cloud-observation verification, calibrated blend,
+or forecast-skill assessment was run in this increment.
+
+The smallest proposed next increment is native **visibility** evidence on this grid:
+the inspected HRRR/GFS/RAP/NBM inventories contain instantaneous surface `VIS`.
+Preserve different definitions and missingness before selecting a delivered rule.
+NBM thunder probabilities and interval ice-accretion guidance are later candidates
+with their own semantics. Visibility is broadly useful to a future conditions product,
+but reduced visibility alone cannot identify fog or its cause. No such fields or
+conditions rules are implemented here.
 
 ## References
 

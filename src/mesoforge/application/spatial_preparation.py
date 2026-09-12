@@ -88,6 +88,7 @@ def load_prepared(
     ptype_guidance: dict[str, Any] | None = None,
     snowfall_guidance: dict[str, Any] | None = None,
     snowfall_amount_guidance: dict[str, Any] | None = None,
+    cloud_guidance: dict[str, Any] | None = None,
 ) -> PreparedPointForecast | PreparedRegions:
     """Load all shared regions once. This function never prepares or downloads."""
     index = directory / "coverage.json"
@@ -107,7 +108,9 @@ def load_prepared(
             ),
             snowfall_guidance,
         )
-        return attach_snowfall_amount_guidance(prepared, snowfall_amount_guidance)
+        return attach_cloud_guidance(
+            attach_snowfall_amount_guidance(prepared, snowfall_amount_guidance), cloud_guidance
+        )
     payload = json.loads(index.read_text())
     regions = []
     for row in {item["directory"]: item for item in payload["regions"]}.values():
@@ -138,7 +141,37 @@ def load_prepared(
         ),
         snowfall_guidance,
     )
-    return attach_snowfall_amount_guidance(prepared, snowfall_amount_guidance)
+    return attach_cloud_guidance(
+        attach_snowfall_amount_guidance(prepared, snowfall_amount_guidance), cloud_guidance
+    )
+
+
+def attach_cloud_guidance(
+    prepared: PreparedPointForecast | PreparedRegions,
+    descriptor: dict[str, Any] | None,
+) -> PreparedPointForecast | PreparedRegions:
+    """Load native cloud evidence once and share it across regions and grid cells."""
+    if descriptor is None:
+        return prepared
+    from mesoforge.application.prepared_cloud import load_cloud_guidance
+
+    regions = prepared.regions if isinstance(prepared, PreparedRegions) else [prepared]
+    target = regions[0]._target_reference_time
+    if any(
+        region._surface_configuration is None or region._target_reference_time != target
+        for region in regions
+    ):
+        raise ValueError("Cloud guidance requires one shared surface forecast target")
+    views = load_cloud_guidance(descriptor, target_reference_time=target)
+    attached = [
+        replace(region, _cloud_views=views, _cloud_guidance=deepcopy(descriptor))
+        for region in regions
+    ]
+    return (
+        PreparedRegions(attached, prepared.failures)
+        if isinstance(prepared, PreparedRegions)
+        else attached[0]
+    )
 
 
 def attach_snowfall_amount_guidance(
