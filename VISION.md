@@ -307,10 +307,14 @@ snowfall amounts, native model SLR and first profile-based Kuchera estimates are
 separate evidence. Snow depth on the ground is not newly accumulated snowfall.
 Native total-cloud, visibility and thunder-probability evidence are now available
 on the same grid, together with native flat-ice and freezing-rain liquid evidence.
-The next proposed step is to inventory the forecast canvas and design deterministic
-weather-condition rules that respect delivered versus evidence-only fields, policy
-gaps, event definitions and missingness. Complete derived conditions remain future
-work. Low visibility alone cannot establish fog, precipitation or another cause.
+The [forecast-canvas inventory and condition-layer design](docs/rfcs/mesoforge-v2-architecture.md#67-forecast-canvas-and-deterministic-conditions)
+now distinguish delivered fields from native evidence and unresolved active policies.
+The proposed next slice is a read-only preview from one exact saved forecast: show
+numeric precipitation probability and amount with their own intervals, and native
+p-type as a separate endpoint state. It must not imply a type-specific interval
+probability or promote cloud, visibility or winter-amount evidence. Complete derived
+conditions remain future work. Low visibility alone cannot establish fog,
+precipitation or another cause.
 Native snowfall, NBM SLR and Kuchera remain
 separately traceable until sufficient suitable verification exists; a broad snowfall/SLR
 campaign is deferred. No constant ratio, native single-source rule or derived method
@@ -327,10 +331,14 @@ does not authorize implementing the roadmap as one task.
 
 Fields should grow from today's surface, QPF, PoP, native type, SWE, native/derived
 snowfall-amount, cloud, visibility, native thunder and distinct ice/freezing-rain
-evidence to other useful forecasts after the canvas inventory. Snow depth on the
-ground and locally derived accretion remain future work. Conditions must
-be derived from the underlying fields with explainable rules and explicit missingness,
-not emitted as an unexplained standalone prediction.
+evidence to other useful forecasts as separately approved. Snow depth on the
+ground and locally derived accretion remain future work. Conditions should first be
+structured sky, precipitation, thunder, visibility/cause, wind and transition
+components, then deterministic text from a versioned renderer. They must preserve
+each component's time/event meaning, evidence and distinct unknown, ambiguous,
+unavailable and not-applicable states. No field is promoted just to complete a phrase.
+Future accepted AI field edits would produce a separately identified field stage;
+the condition rules would still derive the final text from those saved fields.
 
 Future AI tools may apply a regional/time-window delta, taper changes spatially or
 temporally, anchor a value and blend around it, smooth an artifact, shift or retime

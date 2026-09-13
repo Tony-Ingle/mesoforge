@@ -91,10 +91,10 @@ credential boundary. It is not public SaaS identity or tenancy.
 The long-term field direction includes temperature, dew point/RH, wind/gust,
 clouds, QPF, PoP, precipitation type, snow, and other useful fields as their
 scientific contracts are implemented. Conditions derive from underlying forecast
-fields rather than an unexplained standalone prediction. The smallest proposed
-next milestone is precipitation type from suitable categorical and/or thermodynamic
-guidance on the existing local grid, covering both context and editable domains
-(section 13).
+fields rather than an unexplained standalone prediction. The code-grounded canvas
+inventory and proposed deterministic condition layer are in section 6.7. Precipitation
+type and subsequent native evidence increments are complete; the next proposed slice
+is a conservative condition preview, not another meteorological field.
 
 **Owner model direction, 2026-09-10:** the long-term model mix includes HRRR,
 RAP, NAM 3 km, NAM, GFS, RRFS / REFS, and NBM, with useful deterministic and
@@ -103,7 +103,8 @@ These are planned integrations, not completed support or one implementation task
 The retained Phase 2 HRRR/NBM/GFS station pipeline includes QPF/PoP; it remains a
 technical reference, not evidence of precipitation support in the V2 coordinate path.
 
-**Implemented local status, 2026-09-11:** the on-demand forward run provides real
+**Implemented core status, with the full 2026-09-13 inventory in section 6.7:**
+the on-demand forward run provides real
 36-hour temperature, dew point, derived RH, vector wind and gust. HRRR/GFS are
 active: temperature retains the fixed 70/30 demonstration recipe throughout;
 added dew-point and U/V/gust fields use the retained Phase 2 70/30 row for hours
@@ -114,9 +115,10 @@ Automatic current-cycle discovery, coordinate-derived shared preparation, local
 batch/forward runs, immutable PostgreSQL/MinIO issuance, temperature verification,
 and model comparison exist. A coordinate-derived local surface grid covers the
 context domain and its smaller editable subset; the exact center-node forecast is
-extracted from those fields. Cloud cover is explicitly unavailable. There is no
-deterministic bias correction, AI editing, V2 precipitation type, production deployment
-or scheduling yet. Detailed commands, evidence and limits
+extracted from those fields. Delivered cloud cover remains unavailable, while optional
+attachments now retain cloud and other surface/winter evidence. Temporary native
+p-type agreement is implemented. There is no deterministic bias correction, AI editing,
+complete weather-condition engine, production deployment or scheduling yet. Detailed commands, evidence and limits
 belong in [README.md](../../README.md).
 
 HRRR/GFS liquid precipitation now uses retained interval normalization and QPF rows
@@ -562,6 +564,414 @@ API requests remain outside registration/tracking and this recurring lifecycle u
 the operator explicitly configures the location. AI and delivery are later roadmap
 stages, not prerequisites for numerical issuance or first-release acceptance.
 
+### 6.7 Forecast canvas and deterministic conditions
+
+**Inventory as of `49656edfadd53601f40356a4c4dee4b4d6c59347`, 2026-09-13.**
+This section records inspected code, then proposes a condition-layer design. The
+owner has approved the guardrails and this design exercise, not new source weights,
+weather thresholds, a condition engine or field promotion. No runtime/schema change
+is made by this documentation milestone. It supersedes older field-status and
+next-field descriptions elsewhere in this RFC, not the remaining proposed architecture.
+
+#### 6.7.1 What the saved canvas actually contains
+
+[`build_local_surface_grid` and `extract_grid_point`](../../src/mesoforge/application/local_surface_grid.py)
+store `mesoforge.local-surface-baseline.v2`: `geometry`, transformation/code identity,
+shared `forecast_context`, and `cells[].hours[]`. The measured default is 7×7 nodes
+at 6 km spacing, context bounds ±18 km, editable 3×3 nodes within ±6 km, and an exact
+center node. Domain membership and signed distance to the editable boundary are
+explicit; no taper or adjustment is applied. These are implementation defaults,
+not permanent geometry policy. A different exact point gets its own coordinate-derived
+grid from shared guidance; arbitrary off-node interpolation is not implemented.
+
+Each cell/hour preserves the same numerical fields and evidence structure as the
+point column. Below, `F` abbreviates `hours[].surface.fields`, and `S` abbreviates
+`hours[].surface`, relative to the forecast object. In a retained full grid use
+`cells[].hours[]`; in an issued JSON artifact the forecast is under `/forecast`.
+`hours[].temperature` and `F.air_temperature_2m` are the same baseline temperature,
+not two independent predictions. Optional attachments can be absent from older
+issuances or preparations. The inventory describes supported representations,
+not guaranteed availability in every 36-hour run.
+
+[`ForecastIssuanceService.issue/read`](../../src/mesoforge/application/issuance.py)
+stores the complete immutable `issued-forecast.v1` payload, including the original
+grid, in MinIO, with PostgreSQL issuance/location/time/content-digest metadata.
+The reader verifies saved bytes; it does not regenerate forecasts. The point retains
+`local_grid.sha256`, geometry and `exact_center_node` extraction metadata.
+[`build_hourly_report`](../../src/mesoforge/application/hourly_report.py) copies the
+baseline into final display fields, labels bias `not_implemented`, AI `not_run`, and
+delivery `not_delivered`. In this inventory **delivered baseline** means the active
+numerical output eligible for presentation, not evidence that external delivery ran.
+
+#### 6.7.2 Complete field and evidence inventory
+
+Time notation: **I** = instantaneous sample at `valid_time`; **A** = accumulation
+over explicit `(start,end]`; **P** = probability of a defined event over explicit
+`(start,end]`; **C/I** = categorical/state evidence at an instant. An hour number is
+an index, not a license to replace native intervals or model source leads. Original
+units and native supports remain attached even where canonical/display units differ.
+
+| Field / payload key | Physical meaning | Canonical units; temporal semantics | Actual contributor products / supporting data |
+|---|---|---|---|
+| Temperature — `F.air_temperature_2m`, `hours[].temperature` | 2-m air temperature | K; I; °F display | HRRR `wrfsfc`, GFS `pgrb2.0p25`, RAP `awp130pgrb` TMP; IFS open-data `2t` |
+| Dew point — `F.dew_point_temperature_2m` | 2-m dew-point temperature | K; I | HRRR/GFS/RAP DPT; IFS `2d` |
+| RH — `F.relative_humidity_2m` | Relative humidity with respect to **liquid water**, also below freezing | Baseline `%`, contributor `percent`; I diagnostic | Derived from the corresponding baseline or each contributor's T/Td, not a separately blended native RH field |
+| U — `F.eastward_wind_10m` | Earth-relative eastward wind component | m/s; I | HRRR/GFS/RAP UGRD, IFS `10u`; native grid-relative vectors rotated before use |
+| V — `F.northward_wind_10m` | Earth-relative northward wind component | m/s; I | HRRR/GFS/RAP VGRD, IFS `10v` |
+| Wind speed — `F.wind_speed_10m` | Magnitude of the resulting 10-m vector | m/s; I; mph display | Derived from blended U/V; each contributor also retains its own diagnostic |
+| Wind direction — `F.wind_from_direction_10m` | Meteorological direction **from** which the wind blows | degree; I diagnostic | Derived from U/V; never an average of compass directions; exactly calm has no direction |
+| Gust — `F.wind_gust_10m` | Near-surface model gust under the current instantaneous contract; native level retained | m/s; I; mph display | HRRR/GFS/RAP GUST. IFS interval-maximum gust is incompatible with this contract |
+| QPF — `F.liquid_equivalent_precipitation_amount_1h` | Total liquid-equivalent precipitation amount, irrespective of type | kg/m²; A, 1 h; 1 kg/m² = 1 mm water; inches display | HRRR APCP hourly amount; GFS APCP from compatible native bucket parents. RAP/IFS QPF is disabled in this path |
+| PoP — `F.probability_of_precipitation_1h` | P(liquid accumulation **>0.254 kg/m²**), not P(any nonzero precipitation) | Fraction `1`; P, 1 h; native/display percent retained | NBM core native one-hour APCP probability, separately from deterministic QPF |
+| Other PoP events — `S.probability_guidance.contributors` | Each row's exact exceedance event | Fraction `1`; P, native 1/6/24 h | NBM/GEFS/REFS/ECMWF products in the event table below |
+| P-type — `F.precipitation_type`, `S.precipitation_type_guidance.contributors` | Native supported hydrometeor types; type is not occurrence | `category`; C/I; null accumulation bounds | HRRR/GFS/RAP CRAIN/CSNOW/CFRZR/CICEP flags; IFS `ptype` codes; NBM conditional type percentages |
+| SWE — `F.snowfall_water_equivalent_amount`, `S.snowfall_guidance.contributors` | Liquid-equivalent water associated with **new snowfall**, not snowpack SWE | kg/m²; A, HRRR/RAP hourly, IFS native 3 h | HRRR/RAP accumulated WEASD bindings, IFS `sf`; exact parents/intervals retained |
+| Native snowfall amount — `F.snowfall_amount`, `S.snowfall_amount_guidance.native_contributors` | Newly accumulated snow depth over an interval, not total depth on the ground | m; A, hourly normalized/native intervals; inches display | HRRR/RAP ASNOW snow; NBM ASNOW **snow and sleet**. These hydrometeor definitions are not identical |
+| Kuchera snowfall — `S.snowfall_amount_guidance.derived_contributors` | Derived new-snow amount from compatible SWE and profile-derived SLR | m; A, 1 h in current RAP path | RAP SWE and native-corner thermodynamics; amount calculated before spatial interpolation |
+| Kuchera SLR — retained within each derived contributor's profile/spatial evidence | Ratio used to turn that SWE into derived new-snow amount | Dimensionless `1`; interval-end I diagnostic applied to the recorded SWE interval | `kuchera_surface_to_500hpa_25hpa_profile.v1`; not native model SLR or a delivered ratio |
+| Native SLR — `S.snowfall_amount_guidance.native_slr` | Provider model snow-to-liquid ratio | Dimensionless `1`; **I**, not interval-average SLR | NBM SNOWLR, retained separately from ASNOW and Kuchera |
+| Cloud — `F.cloud_area_fraction`; `S.cloud_guidance.contributors` | Entire-column total cloud / provider total sky cover; not individual layers | Active placeholder fraction `1`; evidence `percent`; I | HRRR/GFS/RAP TCDC entire atmosphere; NBM deterministic total sky TCDC; IFS `tcc` fraction converted to percent |
+| Sky category — per native cloud contributor `sky_category` | Deterministic display category of that contributor's total cloud percentage | Category; C/I diagnostic | Existing `native-cloud-percentage-display.v1`, not a separate active sky forecast |
+| Visibility — `F.visibility`, `S.visibility_guidance.contributors` | Native horizontal surface visibility, not ceiling, slant range or cause | m; I; miles display | HRRR/GFS/RAP/NBM VIS; no compatible visibility in the inspected IFS open feed |
+| Thunder — `F.probability_of_thunder_1h`, `S.thunder_guidance.contributors` | Provider-defined native thunder potential; not exact-point lightning certainty | Fraction `1`; P, separate 1/3/6 h; native/display percent | NBM TSTM. Physical flash threshold/event geometry are not encoded; retain that uncertainty |
+| Freezing-rain liquid — `F.freezing_rain_liquid_equivalent_amount`, corresponding `S.ice_guidance.contributors` | Liquid-equivalent freezing-rain precipitation | kg/m²; A, hourly differences of cumulative parents | HRRR/RAP FRZR; no liquid-to-ice conversion |
+| Flat ice — `F.flat_ice_accretion_mass_equivalent`, corresponding `S.ice_guidance.contributors` | Native elevated flat-surface accreted ice in the provider's mass-equivalent encoding | kg/m²; A, separate native 1/6 h | NBM FICEAC / provider FRAM. Not geometric thickness, radial ice, road icing or freezing-rain liquid |
+
+Probability events stay separate even when attached to the same hourly cell:
+
+| Source ID | Native event and spatial meaning | Current relationship |
+|---|---|---|
+| Active hourly NBM | >0.254 kg/m² over 1 h; native grid probability sampled bilinearly | Sole delivered PoP source; no QPF-derived occurrence probability |
+| `NBM_6H`, `GEFS_6H` | >0.254 kg/m² over 6 h; registered grid-point support; GEFS native bias-corrected ensemble PQPF | Zero-weight shadows; comparable only for identical actual bounds/threshold/support |
+| `REFS_1H` | >12.7 kg/m² over 1 h; heavy-rain neighborhood, radius unencoded | Zero-weight, distinct event; cannot substitute for hourly NBM PoP |
+| `ECMWF_ENS_24H` | ≥1 kg/m² over 24 h; grid-box mean, effective event footprint unencoded | Zero-weight, incompatible event; no 24→6/1 h conversion or six-hour replacement |
+| Thunder `NBM_1H` | Native one-hour TSTM; physical threshold and event footprint unencoded | Temporary active passthrough `nbm-native-hourly-thunder-baseline.v1`; retain provider-qualified meaning |
+| Thunder `NBM_3H`, `NBM_6H` | Corresponding separate native TSTM periods | Zero-weight evidence; never rescaled to hourly probabilities |
+
+No ensemble-member fraction calculation or calibrated multi-source PoP/thunder blend
+is implemented here. Native member/population metadata is retained where supplied;
+missing member identities or neighborhood definitions must not be invented. REFS/RRFS,
+HREF and ECMWF thunder/lightning candidates are not active substitutes: inspected
+unbound/unsupported products and deterministic lightning diagnostics stay explicit.
+
+Additional data present in code, but **not additional delivered weather fields**:
+
+- RAP thermodynamic support for Kuchera: 2-m T, surface pressure (Pa), and temperatures
+  (K) on 500–1000 hPa levels every 25 hPa. Complete required above-ground inputs are
+  checked; below-ground levels are excluded. Profiles, maximum temperature, native
+  corner SLR/SWE/amounts and provenance remain attached. The interval-end profile is
+  an explicit one-hour approximation, not proof of the interval's complete evolution.
+- P-type evidence also preserves IFS `wet_snow` and `freezing_drizzle`, NBM conditional
+  type probabilities, multi-type sets and zero/no-classification flags. These are
+  evidence distinctions; they do not add delivered freezing-drizzle or wet-snow rules.
+- GFS six-hour QPF buckets and native cumulative snow/ice parents are normalization
+  inputs, not a delivered `qpf_6h` field. Interval aggregates are separate derivations.
+- SNOD, GFS snowpack WEASD and IFS snowpack `sd`/`rsn` are explicitly excluded from
+  the new-snow amount path. Total snow depth, snowpack water and density have different
+  meanings; no ground-snow-depth field is emitted on this canvas. A constant 10:1
+  benchmark and locally derived accretion are not implemented active fields.
+- `temperature_equal_v1` / `blend_50_50` is a comparison recipe evaluated from saved
+  contributors, not a second delivered grid field. Observation values, errors,
+  MAE/bias/RMSE, verification status and sample counts belong to verification/evaluation,
+  not the forecast-condition input canvas. No future observation may rewrite as-issued
+  conditions. Report bias/AI deltas of zero mean stages did not run, not computed corrections.
+
+#### 6.7.3 Delivered versus evidence-only policy matrix
+
+The classes overlap: an active diagnostic can also be derived; an evidence field can
+have a null active placeholder. **B** = delivered multi-source baseline, **S** = active
+single-source, **E** = zero-weight evidence/shadow, **P** = no approved active policy,
+**D** = derived, **U** = unsupported/unavailable input. Status refers to the actual
+field, not merely the model's global registration. NBM rows in the retained Phase 2
+configuration do not activate NBM in the current HRRR/GFS surface or QPF composition.
+
+Verification key: **issued** = current exact-version temperature observation matching,
+persisted error and contributor/recipe comparison; **P2 only** = separate retained
+Phase 2 station-path scientific verification support, not wired to these issued grid
+fields; **none** = no current verification for this field/condition. No new verification
+capability is approved or implemented by this design.
+
+| Field(s) | Class and current blend/source policy | Missingness / exclusions | Suitable for conditions today; remaining gap | Verification |
+|---|---|---|---|---|
+| Temperature | B; `temperature_control_v1`, HRRR/GFS 70/30 for all 36 h; RAP/IFS E | `require_all`: missing active contributor → null, no redistributed weights | Numeric context; never determines p-type/fog/ice alone | issued |
+| Dew point | B; applicable Phase 2 scalar/vector HRRR/GFS rows, 70/30 h1–18, 60/40 h19–36 | Approved eligible sole-source row only; source and final dew-point consistency required; invalid → null | Moisture context; no fog inference by itself | P2 only |
+| RH | B+D; Bolton liquid-water diagnostic from baseline T/Td; per-model diagnostics E | Missing/invalid T/Td or RH outside 0–100 → null; no supersaturation clipping | Numeric moisture context; not a fog detector | none |
+| U/V, speed/direction | B; U/V blended as vectors with coupled eligible gust set and same Phase 2 rows; speed/direction D | Eligible sole-source rows explicit; invalid coupled source excluded; calm speed 0, direction null with reason | Numeric wind is usable; breezy/windy thresholds and duration meaning unapproved; calm-direction can be not applicable | P2 only |
+| Gust | B; same U/V contributor set/row; RAP E; IFS U | Existing approved ≤0.1 m/s source shortfall floor and ≤1e−6 m/s final floor recorded; incompatible IFS interval maximum stays missing | Numeric gust usable; sustained descriptors must not use gust interchangeably | P2 only |
+| Hourly QPF | B; Phase 2 precipitation HRRR/GFS rows 70/30 h1–18, 60/40 h19–36; eligible sole-source fallback | Exact hourly intervals and finite corners required; native GFS bucket/reset/tolerance contract retained; zero ≠ missing; RAP/IFS U | State amount and period; not PoP, instant occurrence or observed intensity. Amount/intensity-class thresholds need policy | P2 only |
+| Hourly PoP | S; NBM-only weight-1 passthrough | Exact >0.254 kg/m² event and 1-h bounds; missing/invalid → null; no longer-period fallback | Numeric event probability is usable with its period/threshold; qualitative bands and type-specific event combination unapproved | P2 only |
+| Other precipitation probabilities | E; no delivered weights or calibration | Exact threshold/comparator/window/spatial support required for comparison; native gaps explicit | Supporting diagnostics only; neither substitute nor extra vote for delivered PoP | none |
+| P-type | Temporary B categorical agreement, no scalar weights; RAP/IFS/NBM E | Complete HRRR/GFS flag sets must agree; equal multi-type set → mixed; disagreement → ambiguous; zero flags → unknown, not dry; no one-source fallback | Report the exact endpoint state, including mixed/unknown. Joint occurrence/type and interval interpretation still need policy | none |
+| SWE | E+P; no approved blend; active value null | HRRR/RAP hourly and IFS native 3-h bounds stay separate; GFS snowpack WEASD and absent NBM SWE unsupported; no QPF/type conversion | Evidence-only; cannot make delivered snow occurrence or amount | none |
+| Native snowfall amount | E+P; no approved blend; active value null | Native parents/windows required; NBM snow-and-sleet not silently equated to HRRR/RAP snow; GFS/IFS new-depth U | Evidence-only; no inference of occurrence/type from positive snowfall alone | none |
+| Kuchera snowfall / SLR | E+D+P for delivered amount; versioned RAP method | Missing required profile/SWE → missing; no constant-ratio fallback; preserve interval-end approximation and native-corner calculation | Evidence-only; no automatic promotion over native guidance | none |
+| Native NBM SLR | E; separate instantaneous SNOWLR | Missing/invalid remains unavailable; no unapproved cross-model or interval-average use | Supporting evidence only, not a condition | none |
+| Cloud / per-source sky category | E+P; active `cloud_area_fraction` remains null; categories D on each native source | Incompatible layers/averages rejected; IFS native 3-h gaps explicit; zero cloud valid | Delivered sky clause blocked by missing active source/blend, not by lack of a category function | none |
+| Visibility | E+P; active visibility null; HRRR/GFS/RAP/NBM E, IFS U | Native finite nonnegative horizontal visibility required; no invented cap or filling | Reduced-visibility clause blocked by active-policy gap; fog additionally requires suitable causal evidence and a validated rule | none |
+| Hourly thunder | Temporary S; NBM hourly native passthrough | Missing/invalid → null; no 3/6-h replacement; unencoded threshold/footprint remain unknown | Qualified native probability display only; unqualified point thunder/“likely” wording needs event-support and phrase policy | none |
+| Longer-period thunder / other lightning products | E or U; no combined source policy | Unlike events/periods/support are incompatible; deterministic diagnostics not probabilities | Evidence-only; cannot determine a delivered thunder clause | none |
+| Freezing-rain liquid | E+P; HRRR/RAP FRZR; no active blend | Same-cycle cumulative parent differencing; negative/nonfinite increments missing, not zero; unsupported sources explicit | Evidence-only amount; does not establish occurrence or accreted ice | none |
+| Native flat ice | E+P; NBM FICEAC native 1/6 h; no active blend | Retain kg/m² native meaning; no density/thickness/period conversion; GFS/IFS U | Evidence-only hazard amount; not a road-icing diagnosis or a substitute for p-type | none |
+
+Across every row, original cycles, **model source leads versus target horizons**, valid
+times, interval bounds, field/recipe identities, raw/prepared hashes, spatial extraction,
+units, exclusions and applied weights remain inspectable. Optional-field absence in
+an old record is `unavailable`, not zero. Surface table code can report `fallback`
+even for a selected two-source row: inspect the applied weights/row and exclusions,
+not the status string alone. Report rounding is never input to a condition decision.
+
+Code anchors for these inventory facts:
+
+- [`extract_surface_hour`](../../src/mesoforge/application/surface_forecast.py),
+  [`blend_surface` / `relative_humidity_percent`](../../src/mesoforge/forecasting/surface.py),
+  [named recipes](../../src/mesoforge/forecasting/recipes.py), and
+  [applicable retained rows](../../configs/phase2-grasston.yaml).
+- [`extract_precipitation_hour`](../../src/mesoforge/application/precipitation_forecast.py),
+  [`extract_probability_hour`](../../src/mesoforge/application/probability_forecast.py),
+  [probability compatibility](../../src/mesoforge/application/probability_contributors.py),
+  [native probability products](../../src/mesoforge/guidance/sources/probabilistic.py),
+  and [`resolve_type_evidence`](../../src/mesoforge/application/precipitation_type.py).
+- [SWE extraction/aggregation](../../src/mesoforge/application/snowfall_forecast.py),
+  [snowfall/SLR extraction](../../src/mesoforge/application/snowfall_amount_forecast.py),
+  [Kuchera calculation](../../src/mesoforge/forecasting/snowfall_amount.py), and
+  [native snow definitions](../../src/mesoforge/guidance/sources/snowfall_amount.py).
+- [Cloud extraction](../../src/mesoforge/application/cloud_cover.py) and
+  [`sky_category`](../../src/mesoforge/forecasting/cloud_cover.py),
+  [visibility](../../src/mesoforge/application/visibility.py),
+  [thunder policy/events](../../src/mesoforge/forecasting/thunder.py),
+  [ice extraction](../../src/mesoforge/application/ice.py) and
+  [native ice definitions](../../src/mesoforge/guidance/sources/ice.py).
+- [Issued temperature verification](../../src/mesoforge/application/issued_temperature_verification.py),
+  [saved-model comparison](../../src/mesoforge/verification/model_comparison.py),
+  and separate retained [Phase 2 metrics](../../src/mesoforge/verification/metrics.py)
+  / [QPF-PoP metrics](../../src/mesoforge/verification/qpf_pop_metrics.py).
+
+#### 6.7.4 Proposed structured condition object
+
+Use one pure, versioned derivation over the chosen **saved field stage** for each
+cell/hour. Produce structured components first; a separate deterministic renderer
+turns eligible components into text. It must not acquire guidance/observations, choose
+new blends, re-run extraction/blending, consult an LLM or alter the input fields.
+The same function serves the whole grid; the point copies its center result rather
+than running a different condition algorithm. Do not interpolate categorical labels.
+
+Proposed component contract (a design sketch, not a new executable schema):
+
+| Property | Meaning |
+|---|---|
+| `state` | `known`, `unknown`, `ambiguous`, `unavailable`, or `not_applicable` |
+| `value`, `unit` | Typed value/set/probability, or null; probability always fraction with separate event definition |
+| `valid_time`, `temporal_semantics`, `interval` | Component's own instant or exact event/accumulation bounds and closure; not inherited blindly from its hourly container |
+| `event`, `spatial_support` | Threshold, comparator, hydrometeor scope, point/grid/neighborhood meaning and any unknown definition metadata |
+| `source_policy`, `rule_id` | Applied saved-field policy and condition rule identity; never silently substitute current configuration for the issuance snapshot |
+| `evidence_refs`, `reasons`, `excluded_evidence` | Exact immutable field/native/provenance pointers, structured reason codes, and why a source cannot support a delivered clause |
+
+Component states have different meanings. `unknown` means valid evidence does not
+resolve the concept (for example zero p-type flags); `ambiguous` means conflicting
+eligible evidence or unresolved alternatives, not proven simultaneous mixed
+precipitation. `unavailable` includes missing/unsupported data, invalid semantics,
+unimplemented derivation or an unapproved policy. `not_applicable` requires a rule
+that positively establishes irrelevance, such as direction for exactly calm wind;
+it is never a default for an absent field. Agreed multiple native types are a known
+`mixed` set, not collapsed into disagreement.
+
+The object includes these independent components:
+
+- `sky`: numerical total cloud and eligible sky category.
+- `precipitation`: **separate** occurrence assessment, event probability, type set,
+  liquid amount and optional amount/intensity class. No component stands in for another.
+- `thunder`: exact native event probability, plus a separately gated categorical/phrase
+  assessment; no assumed point-lightning meaning.
+- `visibility`: distance/restriction descriptor and **separate** fog/cause assessment.
+- `wind`: U/V, speed, direction, gust and separately gated descriptors.
+- `transitions`: source/target states, supporting sample times and transition window;
+  no exact transition minute fabricated between samples.
+- `assessment`: overall availability, unresolved tensions, missing prerequisites and
+  uncalibrated confidence. A probability of precipitation is not confidence in the whole
+  condition. No sample-count-based, agreement-based or LLM confidence percentage is invented.
+
+Illustrative preview shape, using hypothetical values, not a real issuance. All JSON
+pointers below are relative to the saved issued payload. Omitted components in this
+short example follow the same contract; a full implementation would emit their states.
+
+```json
+{
+  "schema_version": "mesoforge.weather-condition-preview.v1",
+  "ruleset_id": "condition-preview.draft.1",
+  "input": {
+    "issued_forecast_id": "00000000-0000-0000-0000-000000000000",
+    "issued_payload_digest": "sha256:<saved-issued-payload-digest>",
+    "grid_digest": "sha256:<saved-local-grid-digest>",
+    "field_stage": "numerical_baseline",
+    "cell": {"x_index": 3, "y_index": 3},
+    "horizon_hours": 1
+  },
+  "valid_time": "2026-09-12T19:00:00Z",
+  "components": {
+    "sky": {"state": "unavailable", "value": null, "reasons": ["active_cloud_policy_missing"]},
+    "precipitation": {
+      "occurrence": {"state": "unavailable", "value": null, "reasons": ["no_categorical_occurrence_rule"]},
+      "probability": {
+        "state": "known", "value": 0.4, "unit": "1",
+        "temporal_semantics": "interval_probability",
+        "interval": {"start": "2026-09-12T18:00:00Z", "end": "2026-09-12T19:00:00Z", "closure": "left_open_right_closed"},
+        "event": {"quantity": "liquid_equivalent_precipitation_amount", "comparison": "gt", "threshold": 0.254, "threshold_unit": "kg/m^2"},
+        "evidence_refs": ["/forecast/hours/0/surface/fields/probability_of_precipitation_1h"]
+      },
+      "type": {
+        "state": "known", "value": ["rain"], "unit": "category",
+        "temporal_semantics": "instantaneous", "valid_time": "2026-09-12T19:00:00Z", "interval": null,
+        "source_policy": "temporary-hrrr-gfs-native-type-agreement.v1",
+        "evidence_refs": ["/forecast/hours/0/surface/fields/precipitation_type"],
+        "reasons": ["endpoint_state_only_not_joint_rain_probability"]
+      },
+      "intensity_class": {"state": "unavailable", "value": null, "reasons": ["intensity_policy_not_approved"]}
+    }
+  },
+  "assessment": {"availability": "partial", "confidence": {"value": null, "status": "not_calibrated"}},
+  "rendering": {
+    "template_version": "condition-preview-text.draft.1", "locale": "en", "timezone": "UTC",
+    "text": "Precipitation chance 40% for 18–19 UTC (>0.01 inch liquid). Model precipitation type at 19 UTC: rain."
+  }
+}
+```
+
+This example does **not** assert a 40% probability of rain at the exact point, rain
+throughout the hour, or dry weather for the remaining 60%. Actual output must include
+the saved event/spatial metadata and policy references omitted from the abbreviated
+example, with hashes/code identity for the derivation and renderer. IDs, digests and
+draft versions above are illustrative, not registered artifacts or approved policies.
+
+#### 6.7.5 Proposed deterministic rule hierarchy
+
+1. **Identify and validate the input.** Read one exact saved forecast/grid version,
+   chosen field-stage digest, coordinate/cell and target horizon. Validate units,
+   statuses, finite ranges, event definitions and temporal/spatial support. No current
+   model substitution, retrospective observation input or implicit field correction.
+2. **Admit only the permitted field role.** Active baseline/single-source fields can
+   support delivered components under their existing policy. Evidence-only inputs can
+   explain disagreement/exclusion, never become a fallback or vote. A future recipe
+   needs explicit activation; conditions do not make that decision. Preserve actual
+   fallback rows and quality flags. Invalid data cannot produce a default “clear/dry.”
+3. **Align semantics, not just timestamps.** An interval ends at its stored endpoint;
+   instantaneous T/wind/type retain that instant. Identical endpoints alone do not
+   make hourly QPF, six-hour PoP and instantaneous p-type a joint event. Do not split
+   accumulated fields/probabilities, fill IFS gaps, multiply PoP by conditional type
+   percentages, or assume independence. Exact compatible accumulation sums may use
+   existing helpers, but an average liquid rate is not instantaneous intensity.
+4. **Translate component state without losing meaning.** Preserve p-type mixed versus
+   ambiguous/unknown, invalid/missing probabilities versus true zero, and calm direction
+   versus absent wind. PoP zero only describes its thresholded event; QPF zero and zero
+   type flags do not prove no trace/drizzle/snow. No currently approved dry classifier
+   makes precipitation type `not_applicable`; retain its raw state for now.
+5. **Derive components using versioned, explicit rules.** Reuse existing numerical
+   diagnostics and sky categories where their active inputs qualify. Every later
+   probability band, intensity class, wind threshold, persistence window and boundary
+   comparator must be explicit in the condition ruleset. Never round before classification.
+   Unsupported rules remain unavailable, rather than silently choosing familiar thresholds.
+6. **Gate combinations and flag tensions.** QPF and PoP disagreements are descriptive
+   tension, not instructions to repair either field. Reuse applicable logic from
+   [`check_probability_deterministic_tension`](../../src/mesoforge/forecasting/consistency.py)
+   only after checking threshold, comparator and window. That scalar helper flags
+   PoP zero with QPF **≥0.254**, whereas current NBM's event is **>0.254**; it does
+   not itself check metadata. Do not treat its boundary as the same event. Reuse
+   requires an explicitly named applicable tension rule; otherwise report the
+   semantic mismatch without applying it.
+   Missing sky does not block a precipitation component, but missing type blocks a
+   specific rain/snow claim. Missing snow/ice amount does not inherently block an
+   otherwise justified type/occurrence claim. Never infer fog from visibility alone.
+7. **Derive transitions only from eligible adjacent results.** Use one issuance/stage,
+   consecutive samples and explicit windows; unknown/gaps break the sequence. Initially
+   report endpoint type changes as endpoint changes. “Rain changing to snow” later
+   requires approved occurrence/type temporal linkage. Do not invent a transition time
+   or carry one source's type through its missing hours.
+8. **Render deterministically.** Render eligible structured components in a stable
+   order (sky, precipitation, thunder, visibility/cause, wind, transitions/qualifiers),
+   with a versioned locale/template and explicit timezone. Preserve combinations rather
+   than selecting a single weather-code winner. Do not let a thunder phrase erase
+   freezing-rain or visibility information. Missing nonessential components can be
+   omitted from text but remain explicit in the object; if nothing supports a statement,
+   render “Weather conditions unavailable,” not a forced condition or confidence claim.
+9. **Retain reproducibility and keep AI outside the renderer.** Numerical, later
+   bias-corrected and accepted edited fields have separate identities. The same pure
+   rules derive conditions from whichever explicitly selected stage is saved. An AI
+   proposal does not supply final condition text or a probability/confidence shortcut.
+   Re-rendering an issued version uses its saved ruleset/inputs; newer rules produce
+   a separately identified reinterpretation, not a silent rewrite of issued wording.
+
+Specific phrase families and prerequisites:
+
+| Concept | Eligible derivation / constraint |
+|---|---|
+| Clear → cloudy | Approved active total-cloud input plus existing unrounded upper-inclusive 5/25/50/87/100% display categories. Current per-source categories are not delivered sky. No total from summed cloud layers |
+| Rain/snow; chance/likely variants | Approved occurrence assessment plus resolved compatible type; qualitative probability bands need approval. For now expose numeric thresholded PoP and endpoint type separately, not a calibrated type-specific probability |
+| Mixed precipitation | Known supported multi-type set plus appropriate occurrence semantics; disagreement alone remains ambiguous, with alternatives shown rather than false certainty |
+| Freezing rain possible | Eligible occurrence/type linkage and actual freezing-rain type evidence; temperature below freezing, positive FRZR/FICEAC, or surface QPF alone cannot establish it |
+| Thunderstorms / likely | Native probabilistic event, acceptable support and a defined phrase policy; current NBM probability can be quoted with its provider-defined qualification, not asserted as point lightning or unqualified categorical thunder |
+| Reduced visibility / fog | Active compatible visibility plus approved restriction bins for the former; additional suitable fog evidence/validated causal diagnostic for the latter. Low visibility, high RH, small T−Td, snow or rain independently are insufficient |
+| Breezy / windy | Approved sustained-wind threshold and duration policy; gust remains a separate modifier. No silently adopted Beaufort/NWS threshold or instantaneous-to-hourly averaging assumption |
+| Snow with wind | Both separately eligible components at compatible support. “Snow; windy” need not imply **blowing snow**, which needs additional suitable blowing-snow evidence/validated rule |
+| Mostly cloudy with chance of rain | Both sky and typed occurrence gates must pass. A missing active cloud policy cannot be filled from an arbitrary shadow just to complete the sentence |
+
+#### 6.7.6 Which gaps block which behavior
+
+| Gap / decision | What it blocks | Conservative treatment without changing current forecast policies |
+|---|---|---|
+| Cloud has no approved active source/blend | Delivered sky words and sky-plus-precipitation combinations | Sky unavailable; preserve native sky evidence. Does not block an honest precipitation-only preview |
+| Visibility has no approved active policy; fog has no validated cause rule | Reduced-visibility descriptors and fog | Both unavailable. Retain evidence without inferring fog, rain intensity or blowing snow |
+| SWE/snowfall/SLR/ice have no approved active amount policy | Delivered winter amounts, amount classes and accretion/road-ice claims | Keep E/P fields excluded. Does not block future snow/freezing-rain type wording if independent occurrence/type rules qualify |
+| Temporary p-type agreement; no dry/not-applicable or interval-occurrence linkage | Confident typed interval phrases, transitions and dry/type suppression | Keep endpoint type/state and disagreement; zero flags do not mean dry. Agreement policy remains unchanged |
+| NBM sole-source hourly PoP; no calibrated multi-source policy | Claims of optimized/multi-source/type-specific probability | Existing native event may be displayed numerically; more probability sources/calibration are not prerequisites for that limited use |
+| NBM thunder event threshold/footprint not fully established; no phrase bands | Exact-point thunder claims and unqualified “thunderstorms likely” | Provider-qualified native probability only, or unavailable clause. No new product or deterministic proxy substitution |
+| Occurrence wording, probability bands, amount/intensity thresholds, wind descriptors and transitions not approved | The full condition renderer's qualitative claims | First slice uses numeric event/amount/wind and distinct endpoint type. Proposed values/bands must be reviewed before enabling these descriptors |
+| Condition verification/calibrated confidence absent | Skill claims, calibrated whole-condition confidence and automatic rule promotion | `confidence: not_calibrated`; independent behavioral tests are not forecast-skill evidence |
+
+The **minimum decision before the first implementation** is approval of the bounded
+preview contract below: exact numeric event/amount and endpoint type remain separate;
+unknown/ambiguous/unavailable are explicit; no qualitative probability, dry, intensity,
+wind or fog thresholds are invented. Choose its actual ruleset/template version when
+implemented. No cloud, visibility, snow, ice or production-weight decision is needed
+for that preview. Conversely, a first release that must already say “mostly cloudy
+with rain likely” needs an active cloud policy and explicit occurrence/type/phrase
+rules before implementation. This RFC does not approve them by describing them.
+
+#### 6.7.7 Smallest proposed implementation slice and checks
+
+Add a **read-only condition preview for one saved issued forecast ID**. Reuse the
+existing verified storage reader and one pure cell/hour function over its saved local
+grid, then extract the center's 36 structured results and render them. First scope:
+native active hourly PoP with exact threshold/window, active hourly liquid amount,
+and separately qualified instantaneous p-type/state; numeric wind may be displayed
+without qualitative descriptors. Other components are explicitly unavailable/excluded
+under the matrix above. Do not acquire data, fill missing attachments, add a new field,
+promote a shadow, change p-type/blend rules or create new history rows/objects.
+
+Likely code seams, **proposed, not files added now**: a small pure
+`forecasting/conditions.py` for components/rules, an application read/preview command
+using `ForecastIssuanceService.read`, and an additive renderer in `hourly_report.py`.
+Use the existing canonical serialization/types when implementing the contract; no
+parallel forecast-history system or new observation/framework layer. An illustrative
+CLI shape is `python -m mesoforge.application.weather_conditions --issued-forecast-id ID`;
+that command does not exist yet. Saved legacy point-only or missing-grid records
+return a clear unsupported-preview reason rather than regenerating a grid.
+
+Acceptance should use existing real retained Minneapolis/Glacier issued/grid fixtures
+where available, with zero provider calls. Independently test zero versus missing,
+unknown versus mixed/ambiguous, calm direction, identical versus mismatched intervals,
+no promotion of evidence-only inputs, p-type endpoint semantics, absent optional fields,
+QPF/PoP tension without repair, exact grid-center extraction, deterministic bytes/text,
+and unchanged issued payload digest/database/object counts. Reuse existing storage
+fixtures; do not create a duplicate suite or claim condition skill from those tests.
+If a retained grid was never issued, use it for pure preview tests and a controlled
+existing issuance fixture for readback; do not invent a historical issuance ID.
+
+Later, separately approved integration can build an additive condition layer before
+new point extraction/issuance, linked to its baseline/stage grid digest. Store that
+layer's schema, rule/config/code and renderer identities through existing artifact/
+issuance infrastructure. Keep the original baseline grid and historical issued JSON
+unchanged; any persisted reinterpretation of an old issuance must be a separately
+linked immutable derivation. First preview deliberately needs no new persistence.
+
 ## 7. Representative benchmark and admission
 
 Before finalizing API support and cache packaging, benchmark the intended host using the
@@ -778,13 +1188,10 @@ These are sensible review units, not a mandatory seven-PR sequence. Adjacent sli
 combined/split for reviewability. The first slice has no dependency on learning, AI, email,
 accounts, long-term retention, or public SLOs.
 
-The local grid now represents temperature, dew point/RH, vector wind, gust and
-interval-aware liquid precipitation and native NBM PoP across one context domain and
-its smaller editable subset. The next proposed milestone is precipitation type from
-supported categorical and/or thermodynamic guidance, not surface temperature alone.
-Preserve native time/support semantics, source provenance and explicit missingness;
-any reconciliation rule must be applicable and approved. This remains a recommendation
-for separate implementation approval, before bias correction or AI editing.
+The full inspected canvas, including completed p-type and subsequent native evidence,
+is inventoried in section 6.7. The next proposed slice is its conservative read-only
+condition preview from an exact saved forecast, with no new fields or active policies.
+The final engine, richer phrases and any field promotion require separate approval.
 
 File/module/table/code/test/change-size estimates are non-binding planning aids per slice.
 Material overrun triggers review when it reveals changed design, not because of a line

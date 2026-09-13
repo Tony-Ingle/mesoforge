@@ -120,8 +120,10 @@ Native cloud evidence is now implemented separately from an unapproved delivered
 cloud blend; [cloud checks and real replay evidence](#native-cloud-cover-on-the-local-grid)
 are recorded below. Native visibility evidence and temporary native NBM hourly
 thunder potential and separate native ice/freezing-rain liquid evidence are implemented
-on the same grid. The next proposed step is to inventory the forecast canvas and
-design deterministic human-readable conditions, including policy gaps and missingness.
+on the same grid. The [complete canvas inventory and proposed condition design](docs/rfcs/mesoforge-v2-architecture.md#67-forecast-canvas-and-deterministic-conditions)
+now record actual field policies, missingness and verification limits. No condition
+engine is implemented. The next proposed slice is a read-only saved-forecast preview
+of numeric PoP/QPF intervals and the separately timed p-type state, without promoting evidence.
 Neither visibility nor thunder potential alone establishes a complete weather-condition string.
 Native snowfall, NBM SLR and Kuchera remain separately traceable pending sufficient
 verification data; a broad snowfall evaluation campaign is not the next task.
@@ -3650,10 +3652,9 @@ calibration or forecast-skill assessment ran in this increment.
 A future derived accretion method needs a validated meteorological algorithm and
 suitable thermodynamic, precipitation-rate and wind inputs. FRAM may be evaluated
 later; a surface-temperature rule or simple liquid conversion is insufficient.
-The next proposed milestone is **inventorying the entire forecast canvas and designing
-the deterministic weather-condition field**: identify which fields are delivered,
-evidence-only, unavailable or incompatible before defining traceable condition rules.
-No further field, derived conditions or accretion algorithm is added here.
+The [canvas inventory and proposed condition preview](docs/rfcs/mesoforge-v2-architecture.md#67-forecast-canvas-and-deterministic-conditions)
+are documented. The preview remains unimplemented; this documentation change adds no
+field, runtime schema, condition engine or accretion algorithm.
 
 ## References
 
