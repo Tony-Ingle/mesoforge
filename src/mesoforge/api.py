@@ -28,7 +28,9 @@ from mesoforge.application.point_forecast import (
 from mesoforge.application.prepared_local_grid import PreparedLocalGrids
 from mesoforge.application.spatial_coverage import CoverageRequiredError, UnsupportedCoordinateError
 from mesoforge.application.spatial_preparation import PreparedRegions, load_prepared
+from mesoforge.application.weather_conditions import preview_weather_conditions
 from mesoforge.common.errors import NotFound
+from mesoforge.forecasting.conditions import ConditionsPreviewUnavailableError
 
 
 def _error(
@@ -170,6 +172,48 @@ def create_app(directory: Path) -> FastAPI:
                     "error": {
                         "code": "issued_forecast_read_failed",
                         "message": "Could not read and verify the saved issued forecast.",
+                    }
+                },
+            )
+
+    @app.get("/issued-forecasts/{issued_forecast_id}/conditions", response_model=None)
+    def weather_conditions(issued_forecast_id: str) -> dict[str, Any] | JSONResponse:
+        try:
+            identifier = UUID(issued_forecast_id)
+        except ValueError:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": {
+                        "code": "invalid_issued_forecast_id",
+                        "message": "Provide an issued-forecast ID in UUID format.",
+                    }
+                },
+            )
+        try:
+            return preview_weather_conditions(identifier)
+        except NotFound:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": {
+                        "code": "issued_forecast_not_found",
+                        "message": "No saved issued forecast exists for this ID.",
+                    }
+                },
+            )
+        except ConditionsPreviewUnavailableError as exc:
+            return JSONResponse(
+                status_code=409,
+                content={"error": {"code": "conditions_preview_unavailable", "message": str(exc)}},
+            )
+        except Exception:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": {
+                        "code": "conditions_preview_failed",
+                        "message": "Could not read and verify the saved condition-preview inputs.",
                     }
                 },
             )

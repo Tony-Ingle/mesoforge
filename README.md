@@ -121,15 +121,80 @@ cloud blend; [cloud checks and real replay evidence](#native-cloud-cover-on-the-
 are recorded below. Native visibility evidence and temporary native NBM hourly
 thunder potential and separate native ice/freezing-rain liquid evidence are implemented
 on the same grid. The [complete canvas inventory and proposed condition design](docs/rfcs/mesoforge-v2-architecture.md#67-forecast-canvas-and-deterministic-conditions)
-now record actual field policies, missingness and verification limits. No condition
-engine is implemented. The next proposed slice is a read-only saved-forecast preview
-of numeric PoP/QPF intervals and the separately timed p-type state, without promoting evidence.
+record actual field policies, missingness and verification limits. A [read-only
+structured preview](#read-only-structured-condition-preview) now describes approved
+saved fields across the grid and its 36-hour center column. The full qualitative
+condition engine remains future work; no evidence-only field has been promoted.
 Neither visibility nor thunder potential alone establishes a complete weather-condition string.
 Native snowfall, NBM SLR and Kuchera remain separately traceable pending sufficient
 verification data; a broad snowfall evaluation campaign is not the next task.
 
 Local Codex development continues; the Hermes development pipeline is paused. The RFC's
 unresolved implementation choices remain proposed, not blanket approval of the roadmap.
+
+## Read-only structured condition preview
+
+Using the existing PostgreSQL/MinIO settings, provide the ID of an issuance that
+already contains `local_grid_baseline`:
+
+```bash
+python -B -m mesoforge.application.weather_conditions --issued-forecast-id SAVED_GRID_ISSUANCE_ID > preview.json
+curl "http://127.0.0.1:8765/issued-forecasts/SAVED_GRID_ISSUANCE_ID/conditions"
+```
+
+The CLI and GET return `cells[].hours[]` for the complete saved grid and
+`center_point.hours[]` for all 36 center hours, including minimal `rendering.text`.
+The existing API startup command/settings apply. This endpoint reads an immutable
+version; `/forecast` continues to serve the separate prepared calculation/grid path.
+Neither the preview nor its renderer prepares data, recalculates fields or writes
+forecast/verification history. Missing/older point-only grids return HTTP 409
+`conditions_preview_unavailable` (CLI exit 2); unknown IDs return 404.
+
+Components retain their state, unrounded value/units, original policy/weights,
+instant or exact interval, probability threshold/event definition, missing reasons
+and pointers into the checksummed saved payload. The preview/renderer source hashes
+are recorded separately from the saved forecast's code identity. Numeric surface fields, QPF,
+hourly PoP, endpoint p-type and qualified native NBM thunder are eligible. Cloud,
+visibility/fog and winter amounts remain unavailable for wording, with evidence
+references retained. There are no new dry, likely, intensity, windy or transition
+thresholds. Unknown, ambiguous, unavailable and not-applicable remain distinct;
+exactly calm saved wind can make direction not applicable.
+
+The real retained Minneapolis **unissued grid export** replayed as 49 × 36 results
+with identical bytes on repeat and zero provider calls. Its hour 10 illustrates
+the separately timed components (abbreviated, not a saved-ID response):
+
+```json
+{
+  "valid_time": "2026-09-12T04:00:00Z",
+  "qpf": {"state": "known", "value": 0.22247206610999942, "unit": "kg/m^2"},
+  "pop": {"state": "known", "value": 0.2143886821646931, "unit": "1"},
+  "precipitation_type": {"state": "ambiguous", "value": "ambiguous", "interval": null},
+  "thunder": {"state": "known", "value": 0.07, "unit": "1"}
+}
+```
+
+QPF/PoP/thunder each retain `(03:00Z,04:00Z]`; PoP means liquid **>0.254 kg/m²**,
+while p-type is the state at 04:00Z. Thunder retains its provider-defined event and
+unencoded footprint, not an exact-point lightning claim. Hour 1 had QPF/PoP zero,
+p-type unknown and thunder 1%; this does not establish a dry-weather classifier.
+
+Validation: **148 focused tests passed** (conditions, API/readback, hourly report,
+retained surface/thunder); the affected API regression selection also passed.
+Successful saved-ID/36-hour preview tests use explicitly synthetic in-memory
+issuances. The actual real Minneapolis ID `9588a3d3-41a8-42fa-851f-936079c83743`
+predates grids and correctly returned unavailable. Read-only checks against its
+retained PostgreSQL/MinIO setup left all table contents and all **21 issuances / 135
+objects** unchanged; temporary services were stopped. No real full-grid issuance
+was available, and none was created to manufacture the demonstration. External
+replay, 36-hour report and storage snapshots are under
+`%LOCALAPPDATA%/MesoForge/baselines/20260913-conditions-preview/`. Full application
+acceptance and condition-skill verification were not run.
+
+Next proposed policy step: choose and validate an explicit active **total-cloud /
+sky-cover policy**, then reuse the existing numerical sky categories. This would
+make ordinary-hour descriptions useful without inventing visibility/fog causality
+or changing precipitation wording thresholds.
 
 ## Existing forecast path
 
@@ -3653,8 +3718,9 @@ A future derived accretion method needs a validated meteorological algorithm and
 suitable thermodynamic, precipitation-rate and wind inputs. FRAM may be evaluated
 later; a surface-temperature rule or simple liquid conversion is insufficient.
 The [canvas inventory and proposed condition preview](docs/rfcs/mesoforge-v2-architecture.md#67-forecast-canvas-and-deterministic-conditions)
-are documented. The preview remains unimplemented; this documentation change adds no
-field, runtime schema, condition engine or accretion algorithm.
+are documented; the [read-only structured preview](#read-only-structured-condition-preview)
+now implements the bounded saved-field description. The full qualitative engine
+and derived accretion remain future work.
 
 ## References
 
