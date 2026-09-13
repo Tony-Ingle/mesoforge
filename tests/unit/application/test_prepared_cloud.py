@@ -140,8 +140,12 @@ def test_shared_regions_native_hours_and_complete_offline_replay(tmp_path, monke
             valid_time="2026-09-11T15:00:00Z",
         )
         assert all(row["status"] == "available" for row in result["contributors"])
-        assert all(row["active_weight"] == 0 for row in result["contributors"])
-        assert "field" not in result
+        assert all(
+            row["active_weight"] == (1.0 if row["model"] == "NBM" else 0.0)
+            for row in result["contributors"]
+        )
+        assert result["field"]["weights"] == {"NBM": 1.0}
+        assert result["field"]["cloud_percentage"] is not None
     ifs = next(view for view in views if view.manifest["model"] == "IFS")
     assert np.isnan(ifs.dataset.cloud_cover.values[:2]).all()
     assert np.isfinite(ifs.dataset.cloud_cover.values[2]).all()
@@ -167,6 +171,29 @@ def test_shared_regions_native_hours_and_complete_offline_replay(tmp_path, monke
         assert before.manifest["inputs"] == after.manifest["inputs"]
         assert before.manifest["events"] == after.manifest["events"]
         assert before.manifest["request_failures"] == after.manifest["request_failures"]
+
+
+def test_historical_preparation_contract_loads_and_replays_without_rewriting_it(
+    tmp_path, monkeypatch, source
+):
+    root, _, _ = source
+    # Produce the exact historical contract, then use the current reader/preparer.
+    with monkeypatch.context() as historical:
+        historical.setattr(prepared, "POLICY", prepared.LEGACY_POLICY)
+        old = build(root, tmp_path / "historical")
+    before = {path: path.read_bytes() for path in (tmp_path / "historical").rglob("manifest.json")}
+    views = prepared.load_cloud_guidance(old["cloud_guidance"], target_reference_time=TARGET)
+    assert views
+    replay = prepared.prepare_cloud_run(
+        tmp_path / "historical", tmp_path / "current", from_raw=True
+    )
+    assert replay["cloud_guidance"]["downloaded_bytes"] == 0
+    assert replay["cloud_guidance"]["policy"] == prepared.POLICY
+    current = prepared.load_cloud_guidance(replay["cloud_guidance"], target_reference_time=TARGET)
+    for previous, rebuilt in zip(views, current, strict=True):
+        xr.testing.assert_identical(previous.dataset, rebuilt.dataset)
+        assert previous.manifest["events"] == rebuilt.manifest["events"]
+    assert all(path.read_bytes() == payload for path, payload in before.items())
 
 
 def test_missing_provider_field_keeps_hour_axis_and_does_not_fabricate_clear_sky(

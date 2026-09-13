@@ -18,22 +18,31 @@ from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.point_forecast import PreparedPointForecast
 from mesoforge.common.errors import IntegrityError, NotFound
 from mesoforge.contracts.serialization import canonical_json_bytes
-from mesoforge.forecasting import conditions
+from mesoforge.forecasting import cloud_cover, conditions
 from mesoforge.forecasting.conditions import (
     ConditionsPreviewUnavailableError,
     build_conditions_preview,
 )
 from tests.support.in_memory_uow import InMemoryObjectStore, InMemoryUnitOfWork
 from tests.unit.application.test_forecast_issuance import memory_service as memory_service
-from tests.unit.forecasting.test_conditions import saved_forecast
+from tests.unit.forecasting.test_conditions import (
+    active_sky_field,
+    center_hour,
+    refresh_saved_grid,
+    saved_forecast,
+)
 from tests.unit.test_issued_forecast_api import prepared_guidance as prepared_guidance
 
 
 @pytest.fixture()
 def condition_versions(memory_service):
     service, factory, objects = memory_service
-    forecast = saved_forecast()["forecast"]
-    records = [service.issue(forecast, batch_run_id=uuid4(), location_index=0) for _ in range(2)]
+    saved = saved_forecast()
+    records = [service.issue(saved["forecast"], batch_run_id=uuid4(), location_index=0)]
+    hour = center_hour(saved)
+    hour["surface"]["fields"][cloud_cover.CLOUD] = active_sky_field(80.0, hour["valid_time"])
+    refresh_saved_grid(saved)
+    records.append(service.issue(saved["forecast"], batch_run_id=uuid4(), location_index=0))
     return service, factory, objects, records
 
 
@@ -72,6 +81,9 @@ def _expected_derivation():
             "forecasting/conditions.py": hashlib.sha256(
                 Path(conditions.__file__).read_bytes()
             ).hexdigest(),
+            "forecasting/cloud_cover.py": hashlib.sha256(
+                Path(cloud_cover.__file__).read_bytes()
+            ).hexdigest(),
             "application/weather_conditions.py": hashlib.sha256(
                 Path(weather_conditions.__file__).read_bytes()
             ).hexdigest(),
@@ -85,7 +97,7 @@ def test_preview_reuses_exact_versions_and_center_without_writes(
     service, factory, objects, records = condition_versions
     before = dict(objects.objects)
     original_rows = dict(factory.issued_forecasts)
-    for record in records:
+    for index, record in enumerate(records):
         saved = json.loads(before[record.content_digest])
         response = preview_client.get(_url(record.issued_forecast_id))
         repeated = preview_client.get(_url(record.issued_forecast_id))
@@ -102,6 +114,12 @@ def test_preview_reuses_exact_versions_and_center_without_writes(
         assert all(len(cell["hours"]) == 36 for cell in result["cells"])
         center = next(cell for cell in result["cells"] if cell["is_forecast_point"])
         assert result["center_point"]["hours"] == center["hours"]
+        sky = center["hours"][0]["components"]["sky"]
+        assert sky["state"] == ("unavailable" if index == 0 else "known")
+        if index == 1:
+            assert sky["sky_category"] == "mostly_cloudy" and sky[
+                "cloud_percentage"
+            ] == pytest.approx(80.0)
         assert [hour["horizon_hours"] for hour in center["hours"]] == list(range(1, 37))
         assert all(hour["rendering"]["text"] and hour["components"] for hour in center["hours"])
         assert service.read(record.issued_forecast_id) == saved

@@ -39,6 +39,7 @@ from mesoforge.application.spatial_preparation import (
     attach_visibility_guidance,
 )
 from mesoforge.contracts.serialization import canonical_json_bytes, canonical_json_digest
+from mesoforge.forecasting.cloud_cover import CLOUD, CLOUD_ACTIVE_POLICY
 from mesoforge.forecasting.ice import FLAT_ICE, FRZR
 from mesoforge.forecasting.recipes import with_surface_fields
 from tests.unit.application.test_cloud_cover import cloud_view
@@ -801,6 +802,8 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
         3001 + 100 * _gradient(44.0, -94.0)
     )
     assert center_cloud["contributors"][0]["value"] == pytest.approx(20)
+    assert center_cloud["field"]["value"] == pytest.approx(0.7)
+    assert center_cloud["field"]["cloud_percentage"] == pytest.approx(70)
     assert center_amounts["native_contributors"][0]["value"] == pytest.approx(0.01)
     assert center_amounts["derived_contributors"][0]["value"] is not None
     assert center_amounts["derived_contributors"][0]["diagnostic_ratio"] is not None
@@ -898,11 +901,18 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
             assert pair["difference_left_minus_right"] is None
             assert pair["status"] == "unavailable"
         clouds = hour["surface"]["cloud_guidance"]
+        assert clouds["field"] == hour["surface"]["fields"][CLOUD]
+        assert clouds["field"]["native_value"] is None
+        assert clouds["field"]["cloud_percentage"] is None
+        assert clouds["field"]["sky_category"] is None
+        assert clouds["field"]["active_weight"] == 0
+        assert clouds["field"]["provenance"] == center_cloud["field"]["provenance"]
         for source, central in zip(
             clouds["contributors"], center_cloud["contributors"], strict=True
         ):
             assert source["value"] is None and source["native_value"] is None
             assert source["sky_category"] is None and source["status"] == "unavailable"
+            assert source["active_weight"] == 0
             assert source["missing_reasons"] == cell["missing_reasons"]
             assert "spatial_extraction" not in source and "extraction_coordinate" not in source
             assert source.get("provenance") == central.get("provenance")
@@ -1130,7 +1140,7 @@ def test_snowfall_amounts_reuse_swe_across_both_domains_and_preserve_immutable_r
     assert canonical_json_bytes(restored) == encoded
 
 
-def test_cloud_evidence_reuses_guidance_across_domains_and_replays_without_changing_fields(
+def test_nbm_cloud_baseline_reuses_guidance_and_preserves_every_other_field(
     prepared_surface, calculated_grid, monkeypatch, memory_service
 ):
     views = _cloud_views()
@@ -1173,7 +1183,7 @@ def test_cloud_evidence_reuses_guidance_across_domains_and_replays_without_chang
                 source = sources[model]
                 assert source["value"] == pytest.approx(offset + gradient)
                 assert source["unit"] == "percent" and source["provenance"]
-                assert source["active_weight"] == 0
+                assert source["active_weight"] == (1 if model == "NBM" else 0)
                 assert source["spatial_extraction"] and source["sky_category"]
             if hour["horizon_hours"] % 3:
                 assert sources["IFS"]["value"] is None and sources["IFS"]["missing_reasons"]
@@ -1183,9 +1193,17 @@ def test_cloud_evidence_reuses_guidance_across_domains_and_replays_without_chang
                 row for row in evidence["comparisons"] if row["models"] == ["HRRR", "GFS"]
             )
             assert control_pair["difference_left_minus_right"] == pytest.approx(-20)
-            assert evidence["active_policy"] == "no-approved-cloud-blend-policy"
+            assert evidence["active_policy"] == CLOUD_ACTIVE_POLICY
+            active = hour["surface"]["fields"][CLOUD]
+            assert active == evidence["field"]
+            assert active["value"] == sources["NBM"]["value"] / 100
+            assert active["cloud_percentage"] == sources["NBM"]["value"]
+            assert active["weights"] == {"NBM": 1.0} and active["unit"] == "1"
+            assert active["provenance"] == sources["NBM"]["provenance"]
+            assert active["sky_category"] == sources["NBM"]["sky_category"]
             old_fields = deepcopy(hour)
             old_fields["surface"].pop("cloud_guidance")
+            old_fields["surface"]["fields"][CLOUD] = deepcopy(old["surface"]["fields"][CLOUD])
             assert old_fields == old
         observed_cloud.append(
             cell["hours"][0]["surface"]["cloud_guidance"]["contributors"][0]["value"]
@@ -1203,7 +1221,8 @@ def test_cloud_evidence_reuses_guidance_across_domains_and_replays_without_chang
     assert point["hours"][0]["surface"]["cloud_guidance"]["contributors"][0][
         "value"
     ] == pytest.approx(20)
-    assert point["hours"][0]["surface"]["fields"]["cloud_area_fraction"]["value"] is None
+    assert point["hours"][0]["surface"]["fields"][CLOUD]["value"] == pytest.approx(0.7)
+    assert point["hours"][0]["surface"]["fields"][CLOUD]["cloud_percentage"] == pytest.approx(70)
     service, factory, objects = memory_service
     issued = service.issue(point, batch_run_id=uuid4(), location_index=0)
     before = len(factory.issued_forecasts), len(objects.objects)

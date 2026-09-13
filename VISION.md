@@ -25,15 +25,20 @@ verifies eligible previous temperature forecasts and saves new immutable issuanc
 HRRR/GFS remain active; temperature stays at 70/30 demonstration weights, while the
 added fields use applicable retained Phase 2 rules. RAP and IFS are real zero-weight
 shadows; IFS keeps native three-hourly gaps and has no compatible instantaneous gust.
-The delivered cloud field remains explicitly unavailable without an approved blend
-policy. An optional attachment now retains native HRRR/GFS/RAP/IFS/NBM total cloud
+Native NBM total sky cover is now the explicitly approved **temporary delivered
+cloud baseline**. An optional attachment retains HRRR/GFS/RAP/IFS/NBM total cloud
 cover across the same context/editable grid, with exact-point extraction. Percentages,
 original units, products, cycles, native times and missingness remain traceable;
 layer-specific and time-averaged clouds are not substituted for instantaneous total
-cover. IFS retains its native three-hourly gaps. Contributors remain zero-weight
-evidence with descriptive disagreements, not a new active blend. Deterministic
-per-source sky categories use the unrounded numerical percentage; they are neither
+cover. IFS retains its native three-hourly gaps. HRRR/GFS/RAP/IFS remain zero-weight
+comparison evidence with descriptive disagreements; missing active NBM has no
+substitute. The conditions preview may now derive sky from that active NBM field,
+using the same existing categories and unrounded percentage. The categories are neither
 opaque-sky observations nor complete weather-condition descriptions.
+NBM-only cloud is an interim baseline, not the permanent enterprise architecture.
+This decision enables useful deterministic sky conditions while the broader cloud
+skill problem remains open. Future cloud blending/calibration must be selected
+from suitable verification evidence, rather than copying temperature weights.
 
 An optional native visibility attachment now retains HRRR/GFS/RAP/NBM instantaneous
 horizontal surface visibility across that grid, using nearest native cells and
@@ -309,10 +314,12 @@ Native total-cloud, visibility and thunder-probability evidence are now availabl
 on the same grid, together with native flat-ice and freezing-rain liquid evidence.
 The [forecast-canvas inventory and condition-layer design](docs/rfcs/mesoforge-v2-architecture.md#67-forecast-canvas-and-deterministic-conditions)
 now distinguish delivered fields from native evidence and unresolved active policies.
-The proposed next slice is a read-only preview from one exact saved forecast: show
+The implemented read-only preview from one exact saved forecast shows
 numeric precipitation probability and amount with their own intervals, and native
-p-type as a separate endpoint state. It must not imply a type-specific interval
-probability or promote cloud, visibility or winter-amount evidence. Complete derived
+p-type as a separate endpoint state, plus sky from the temporary active NBM field.
+It does not imply a type-specific interval probability or promote shadow cloud,
+visibility or winter-amount evidence. Explicit wording thresholds and precedence
+for precipitation, wind and thunder are the next policy gap. Complete derived
 conditions remain future work. Low visibility alone cannot establish fog,
 precipitation or another cause.
 Native snowfall, NBM SLR and Kuchera remain

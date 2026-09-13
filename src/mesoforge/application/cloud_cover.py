@@ -1,4 +1,4 @@
-"""Native total-cloud evidence on the shared grid, without an active cloud blend."""
+"""Native total-cloud contributors and the temporary NBM-only active baseline."""
 
 from __future__ import annotations
 
@@ -19,10 +19,12 @@ from mesoforge.alignment.spatial import (
 )
 from mesoforge.application.spatial_coverage import point_in_grid, validate_coordinate
 from mesoforge.forecasting.cloud_cover import (
+    CLOUD_ACTIVE_POLICY,
     NATIVE_PERCENT_FACTORS,
     SKY_CATEGORY_POLICY,
     cloud_percentage,
     sky_category,
+    validate_active_cloud_field,
 )
 
 UNIT = "percent"
@@ -244,7 +246,7 @@ def extract_cloud_contributors(
     valid_time: str,
     source_status: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Read same-valid-time native evidence without generating an unapproved baseline."""
+    """Retain all native evidence, activating only eligible same-time NBM total cloud."""
     validate_coordinate(latitude, longitude)
     _time(valid_time)
     grouped: dict[str, list[CloudView]] = {}
@@ -287,9 +289,55 @@ def extract_cloud_contributors(
             ]
         row["extraction_coordinate"] = {"latitude": latitude, "longitude": longitude}
         contributors.append(row)
+    active = _active_field(contributors, valid_time)
     return {
+        "field": active,
         "contributors": contributors,
         "comparisons": _comparisons(contributors),
         "sky_category_policy": deepcopy(SKY_CATEGORY_POLICY),
-        "active_policy": "no-approved-cloud-blend-policy",
+        "active_policy": deepcopy(CLOUD_ACTIVE_POLICY),
     }
+
+
+def _active_field(contributors: list[dict[str, Any]], valid_time: str) -> dict[str, Any]:
+    """Convert eligible NBM percent to the existing fraction field; never select a fallback."""
+    nbm = next((row for row in contributors if row["model"] == "NBM"), None)
+    if nbm is None:
+        nbm = _base_row("NBM", valid_time)
+        nbm["missing_reasons"] = ["No retained contributor has the required NBM identity"]
+    field = deepcopy(nbm)
+    field.update(
+        value=None,
+        cloud_percentage=None,
+        unit="1",
+        weights={},
+        policy=deepcopy(CLOUD_ACTIVE_POLICY),
+        role="temporary_active_baseline",
+        active_weight=0.0,
+        sky_category_policy=deepcopy(SKY_CATEGORY_POLICY),
+    )
+    if nbm["status"] != "available":
+        return field
+    field.update(
+        value=nbm["value"] / 100,
+        cloud_percentage=nbm["value"],
+        weights={"NBM": 1.0},
+        active_weight=1.0,
+    )
+    try:
+        validate_active_cloud_field(field, valid_time=valid_time)
+    except ValueError as exc:
+        field.update(
+            value=None,
+            cloud_percentage=None,
+            native_value=None,
+            sky_category=None,
+            status="unavailable",
+            weights={},
+            active_weight=0.0,
+            missing_reasons=[f"Active NBM total-cloud baseline unavailable: {exc}"],
+        )
+        field.pop("spatial_extraction", None)
+    else:
+        nbm.update(role="active", active_weight=1.0)
+    return field

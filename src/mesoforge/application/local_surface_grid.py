@@ -282,11 +282,26 @@ def _missing_hours(hours: list[dict[str, Any]], reason: str) -> list[dict[str, A
                 )
         cloud = surface.get("cloud_guidance")
         if cloud is not None:
+            if "field" in cloud:
+                cloud["field"].update(
+                    value=None,
+                    native_value=None,
+                    cloud_percentage=None,
+                    sky_category=None,
+                    status="unavailable",
+                    missing_reasons=[reason],
+                    weights={},
+                    active_weight=0.0,
+                )
+                cloud["field"].pop("spatial_extraction", None)
+                cloud["field"].pop("extraction_coordinate", None)
+                surface["fields"]["cloud_area_fraction"] = deepcopy(cloud["field"])
             for contributor in cloud["contributors"]:
                 contributor.update(
                     value=None,
                     native_value=None,
                     sky_category=None,
+                    active_weight=0.0,
                     status="unavailable",
                     missing_reasons=[reason],
                 )

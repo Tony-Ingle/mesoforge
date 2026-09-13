@@ -13,11 +13,12 @@ from typing import Any
 
 from mesoforge.common.errors import IntegrityError
 from mesoforge.contracts.serialization import canonical_json_digest
+from mesoforge.forecasting.cloud_cover import CLOUD, sky_category, validate_active_cloud_field
 from mesoforge.forecasting.thunder import ACTIVE_POLICY, validate_thunder_event
 
-RULESET_ID = "saved-active-fields-condition-preview.v1"
+RULESET_ID = "saved-active-fields-condition-preview.v2"
 SCHEMA_VERSION = "mesoforge.weather-condition-preview.v1"
-TEMPLATE_VERSION = "numeric-separate-events-text.v1"
+TEMPLATE_VERSION = "numeric-separate-events-text.v2"
 _SURFACE_POLICY = "phase2-scalar-vector-fallback.v1"
 _QPF_POLICY = "phase2-qpf-fallback.v1"
 _RH_POLICY = "bolton-1980-relative-humidity-liquid-water.v1"
@@ -25,6 +26,7 @@ _TYPE_POLICY = "temporary-hrrr-gfs-native-type-agreement.v1"
 
 # Bounds are the retained scientific contracts, not weather-word thresholds.
 _FIELDS = {
+    "sky": (CLOUD, "1", 0.0, 1.0),
     "temperature": ("air_temperature_2m", "K", 150.0, 340.0),
     "dew_point": ("dew_point_temperature_2m", "K", 150.0, 340.0),
     "relative_humidity": ("relative_humidity_2m", "%", 0.0, 100.0),
@@ -39,7 +41,6 @@ _FIELDS = {
     "thunder": ("probability_of_thunder_1h", "1", 0.0, 1.0),
 }
 _EXCLUDED = {
-    "sky": ("cloud_area_fraction", "cloud_guidance", "active_cloud_policy_missing"),
     "visibility": ("visibility", "visibility_guidance", "active_visibility_policy_missing"),
     "swe": ("snowfall_water_equivalent_amount", "snowfall_guidance", "active_swe_policy_missing"),
     "snowfall": ("snowfall_amount", "snowfall_amount_guidance", "active_snowfall_policy_missing"),
@@ -218,6 +219,34 @@ def _component(
         "evidence_refs": [pointer],
         **{key: deepcopy(field[key]) for key in _METADATA if key in field},
     }
+    if name == "sky":
+        component.update(cloud_percentage=None, sky_category=None)
+        for key in (
+            "sky_category_policy",
+            "cloud_definition",
+            "vertical_extent",
+            "native_parameter",
+            "native_vertical_binding",
+            "native_unit",
+            "native_value",
+            "native_step_hours",
+            "model_version",
+            "provenance",
+            "manifest_sha256",
+            "prepared_file",
+        ):
+            if key in field:
+                component[key] = deepcopy(field[key])
+        try:
+            validate_active_cloud_field(field, valid_time=hour["valid_time"])
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            _reject(component, f"ineligible_saved_active_cloud: {exc}")
+            return component
+        component.update(
+            cloud_percentage=field["cloud_percentage"],
+            sky_category=sky_category(field["cloud_percentage"]),
+        )
+        return component
     if not _policy_allowed(name, field, hour["horizon_hours"]):
         _reject(component, "saved_active_policy_unavailable_or_not_supported")
         return component
@@ -316,6 +345,8 @@ def _describe_hour(
         for name in _FIELDS:
             _reject(components[name], "saved_grid_cell_unavailable")
             components[name]["reasons"].extend(cell_reasons)
+        if "cloud_percentage" in components["sky"]:
+            components["sky"].update(cloud_percentage=None, sky_category=None)
     result = {
         "horizon_hours": hour["horizon_hours"],
         "valid_time": hour["valid_time"],
@@ -344,6 +375,12 @@ def render_condition_hour(hour: dict[str, Any]) -> str:
     """Minimal numeric display; saved unrounded values remain in each component."""
     components = hour["components"]
     parts = []
+    sky = components["sky"]
+    if sky["state"] == "known":
+        parts.append(
+            f"Sky {sky['sky_category'].replace('_', ' ')} "
+            f"({sky['cloud_percentage']:.6g}% total cloud) at {sky['valid_time']}"
+        )
     for name, label in (
         ("temperature", "Temperature"),
         ("dew_point", "Dew point"),

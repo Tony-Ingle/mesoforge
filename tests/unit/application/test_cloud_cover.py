@@ -9,6 +9,8 @@ import pytest
 import xarray as xr
 
 from mesoforge.application.cloud_cover import CloudView, extract_cloud_contributors
+from mesoforge.forecasting.cloud_cover import CLOUD_ACTIVE_POLICY, validate_active_cloud_field
+from mesoforge.guidance.sources.cloud import SOURCES
 
 CYCLE = "2026-09-11T12:00:00Z"
 VALID = "2026-09-11T15:00:00Z"
@@ -17,6 +19,7 @@ VALID = "2026-09-11T15:00:00Z"
 def cloud_view(model="HRRR", amount=20.0, *, end=VALID, native_unit="percent", factor=1.0):
     values = np.broadcast_to(np.asarray(amount, dtype=float), (1, 2, 2)).copy()
     event = {
+        **deepcopy(SOURCES[model]),
         "source_cycle": CYCLE,
         "source_lead_hours": (
             datetime.fromisoformat(end) - datetime.fromisoformat(CYCLE)
@@ -33,8 +36,6 @@ def cloud_view(model="HRRR", amount=20.0, *, end=VALID, native_unit="percent", f
         "native_factor_to_percent": factor,
         "missing_reasons": [],
         "provenance": {"raw_sha256": "a" * 64, "url": "https://example.test/cloud"},
-        "provider": "retained-test-provider",
-        "product": "native-total-cloud-cover",
         "spatial_support": "native model grid-cell total cloud fraction",
         "model_version": "test-version",
     }
@@ -99,15 +100,16 @@ def test_native_fraction_and_percentage_are_individually_preserved():
     ]
 
 
-def test_contributor_disagreement_does_not_create_a_baseline_or_change_weights():
+def test_contributor_disagreement_cannot_replace_missing_required_nbm():
     result = run([cloud_view(amount=10), cloud_view("GFS", amount=90)])
     comparison = result["comparisons"][0]
     assert comparison["models"] == ["HRRR", "GFS"]
     assert comparison["status"] == "comparable"
     assert comparison["difference_left_minus_right"] == -80.0
     assert comparison["unit"] == "percentage_point"
-    assert "field" not in result
-    assert result["active_policy"] == "no-approved-cloud-blend-policy"
+    assert result["field"]["value"] is None and result["field"]["weights"] == {}
+    assert result["field"]["missing_reasons"]
+    assert result["active_policy"] == CLOUD_ACTIVE_POLICY
     assert all(
         item["role"] == "shadow" and item["active_weight"] == 0 for item in result["contributors"]
     )
@@ -250,3 +252,124 @@ def test_regional_reuse_spatial_variation_and_offline_replay_are_read_only(monke
     xr.testing.assert_identical(before_ds, view.dataset)
     assert view.manifest == before_manifest
     assert "coverage" in row(outside)["missing_reasons"][0]
+
+
+def test_native_nbm_is_the_only_active_cloud_with_fraction_percent_and_provenance():
+    views = [cloud_view("HRRR", 10), cloud_view("GFS", 90), cloud_view("NBM", 37.123456789)]
+    original = [deepcopy(view.manifest) for view in views]
+    before = run(views[:2])
+    result = run(views)
+    field = result["field"]
+    assert field["value"] == 37.123456789 / 100 and field["unit"] == "1"
+    assert field["cloud_percentage"] == field["native_value"] == 37.123456789
+    assert field["sky_category"] == "partly_cloudy" and field["weights"] == {"NBM": 1.0}
+    assert field["policy"] == CLOUD_ACTIVE_POLICY and field["policy"]["temporary"]
+    assert field["source_cycle"] == CYCLE and field["source_lead_hours"] == 3
+    assert field["interval_start"] is None and field["interval_end"] is None
+    assert field["provenance"] == views[-1].manifest["events"][0]["provenance"]
+    assert field["manifest_sha256"] == "b" * 64 and field["prepared_file"]["sha256"] == "c" * 64
+    assert result["contributors"][:4] == before["contributors"][:4]
+    assert result["comparisons"][0] == before["comparisons"][0]
+    nbm = result["contributors"][4]
+    assert nbm["value"] == field["cloud_percentage"] and nbm["unit"] == "percent"
+    assert nbm["role"] == "active" and nbm["active_weight"] == 1
+    validate_active_cloud_field(field, valid_time=VALID)
+    assert [view.manifest for view in views] == original
+
+
+@pytest.mark.parametrize(
+    "percent,category",
+    [
+        (0, "clear"),
+        (5, "clear"),
+        (5.000001, "mostly_clear"),
+        (25, "mostly_clear"),
+        (25.000001, "partly_cloudy"),
+        (50, "partly_cloudy"),
+        (50.000001, "mostly_cloudy"),
+        (87, "mostly_cloudy"),
+        (87.000001, "cloudy"),
+        (100, "cloudy"),
+    ],
+)
+def test_active_category_uses_unrounded_nbm_percent(percent, category):
+    field = run([cloud_view("NBM", percent)])["field"]
+    assert field["value"] == percent / 100 and field["cloud_percentage"] == percent
+    assert field["sky_category"] == category
+    validate_active_cloud_field(field, valid_time=VALID)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"cloud_definition": "low_cloud_cover"},
+        {"vertical_extent": "low_layer"},
+        {"temporal_semantics": "average"},
+        {"interval_start": CYCLE},
+        {"native_step_hours": 3},
+        {"native_vertical_binding": "atmosphere"},
+        {"native_parameter": "LCDC"},
+        {"provider": "another_provider"},
+        {"model": "another_model"},
+        {"product": "total_cloud_standard_deviation"},
+    ],
+)
+def test_incompatible_nbm_cannot_be_replaced_by_other_native_models(change):
+    nbm = cloud_view("NBM", 80)
+    nbm.manifest["events"][0].update(change)
+    result = run([cloud_view("HRRR", 40), cloud_view("GFS", 60), nbm])
+    assert result["field"]["value"] is None and result["field"]["sky_category"] is None
+    assert result["field"]["status"] == "unavailable" and result["field"]["weights"] == {}
+    assert result["field"]["missing_reasons"]
+    assert all(r["active_weight"] == 0 for r in result["contributors"])
+    assert [r["value"] for r in result["contributors"][:2]] == [40, 60]
+
+
+def test_missing_invalid_or_unmatched_nbm_is_unavailable_while_other_models_remain_traceable():
+    invalid = cloud_view("NBM", [[-0.01, 50], [50, 50]])
+    result = run([cloud_view("HRRR", 20), invalid])
+    assert result["field"]["value"] is None and result["field"]["native_value"] is None
+    assert result["contributors"][0]["value"] == 20
+    gap = run([cloud_view("NBM", 80)], valid="2026-09-11T14:00:00Z")["field"]
+    assert gap["value"] is None and "no temporal interpolation" in gap["missing_reasons"][0]
+    with pytest.raises(ValueError):
+        validate_active_cloud_field(gap, valid_time="2026-09-11T14:00:00Z")
+
+
+def test_active_cloud_replay_uses_only_retained_data_and_does_not_modify_native_arrays(monkeypatch):
+    import socket
+
+    monkeypatch.setattr(
+        socket, "create_connection", lambda *a, **kw: pytest.fail("No provider calls")
+    )
+    view = cloud_view("NBM", [[0, 20], [60, 100]])
+    native = view.dataset.copy(deep=True)
+    first = run([view])
+    assert first == run([view])
+    assert first["field"]["value"] == 0.45 and first["field"]["cloud_percentage"] == 45
+    assert first["field"]["spatial_extraction"] == first["contributors"][4]["spatial_extraction"]
+    xr.testing.assert_identical(view.dataset, native)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"value": 0.81},
+        {"cloud_percentage": 81},
+        {"native_value": 81},
+        {"sky_category": "clear"},
+        {"weights": {"HRRR": 0.7, "GFS": 0.3}},
+        {"policy": {"policy_id": "unapproved-cloud-rule"}},
+        {"source_cycle": "2026-09-11T11:00:00Z"},
+        {"valid_time": "2026-09-11T14:00:00Z"},
+        {"source_lead_hours": True},
+        {"missing_reasons": ["Required NBM guidance unavailable"]},
+    ],
+)
+def test_saved_active_cloud_validator_rejects_semantic_or_value_drift_without_mutation(change):
+    field = run([cloud_view("NBM", 80)])["field"]
+    field.update(change)
+    original = deepcopy(field)
+    with pytest.raises(ValueError):
+        validate_active_cloud_field(field, valid_time=VALID)
+    assert field == original

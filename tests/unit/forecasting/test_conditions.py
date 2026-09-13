@@ -6,6 +6,7 @@ from functools import lru_cache
 
 import pytest
 
+from mesoforge.application.cloud_cover import extract_cloud_contributors
 from mesoforge.application.local_surface_grid import (
     SurfaceGridGeometry,
     build_local_surface_grid,
@@ -13,6 +14,7 @@ from mesoforge.application.local_surface_grid import (
 )
 from mesoforge.application.precipitation_type import POLICY as TYPE_POLICY
 from mesoforge.common.errors import IntegrityError
+from mesoforge.forecasting.cloud_cover import CLOUD, CLOUD_ACTIVE_POLICY, SKY_CATEGORY_POLICY
 from mesoforge.forecasting.conditions import (
     ConditionsPreviewUnavailableError,
     build_conditions_preview,
@@ -20,6 +22,7 @@ from mesoforge.forecasting.conditions import (
 from mesoforge.forecasting.thunder import ACTIVE_POLICY as THUNDER_POLICY
 from mesoforge.guidance.sources.thunder import SOURCES as THUNDER_SOURCES
 from mesoforge.storage.json import CanonicalJsonSerializer
+from tests.unit.application.test_cloud_cover import cloud_view
 
 LATITUDE, LONGITUDE = 44.98859, -93.25557
 TARGET = "2026-09-11T12:00:00Z"
@@ -214,6 +217,128 @@ def refresh_saved_grid(saved):
 
 def preview_hour(saved, index=0):
     return build_conditions_preview(saved)["center_point"]["hours"][index]
+
+
+def active_sky_field(percentage, valid_time, *, latitude=LATITUDE, longitude=LONGITUDE):
+    """Reuse native cloud evidence fixtures and the approved active-field construction."""
+    view = cloud_view("NBM", amount=percentage, end=valid_time)
+    view.dataset.coords.update({"x": [-94.0, -92.0], "y": [44.0, 46.0]})
+    return extract_cloud_contributors(
+        [view], latitude=latitude, longitude=longitude, valid_time=valid_time
+    )["field"]
+
+
+@pytest.mark.parametrize(
+    "percentage,category",
+    [(0.0, "clear"), (25.0, "mostly_clear"), (25.0000001, "partly_cloudy"), (87.0000001, "cloudy")],
+)
+def test_active_sky_uses_unrounded_nbm_percentage_and_existing_categories(percentage, category):
+    saved = saved_forecast()
+    hour = center_hour(saved)
+    field = active_sky_field(percentage, hour["valid_time"])
+    hour["surface"]["fields"][CLOUD] = field
+    refresh_saved_grid(saved)
+    output = preview_hour(saved)
+    sky = output["components"]["sky"]
+    assert sky["state"] == "known" and sky["value"] == field["value"]
+    assert sky["value"] == pytest.approx(percentage / 100)
+    assert sky["unit"] == "1" and sky["cloud_percentage"] == field["cloud_percentage"]
+    assert sky["sky_category"] == category and sky["sky_category_policy"] == SKY_CATEGORY_POLICY
+    assert sky["source_policy"] == CLOUD_ACTIVE_POLICY and sky["weights"] == {"NBM": 1.0}
+    for key in (
+        "provenance",
+        "manifest_sha256",
+        "prepared_file",
+        "source_cycle",
+        "source_lead_hours",
+        "spatial_extraction",
+    ):
+        assert sky[key] == field[key]
+    assert sky["evidence_refs"][0].endswith("/surface/fields/cloud_area_fraction")
+    assert output["rendering"]["text"].startswith(f"Sky {category.replace('_', ' ')} ")
+    assert output["components"]["occurrence"]["state"] == "unavailable"
+    assert "dry" not in output["rendering"]["text"].lower()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"status": "unavailable", "missing_reasons": ["NBM guidance missing"]},
+        {"model": "HRRR"},
+        {"weights": {"NBM": 0.5, "HRRR": 0.5}},
+        {"unit": "percent"},
+        {"cloud_definition": "low_cloud_cover"},
+        {"valid_time": "2026-09-11T14:00:00Z"},
+        {"sky_category": "clear"},
+    ],
+)
+def test_ineligible_active_sky_never_falls_back_to_native_shadow_evidence(change):
+    saved = saved_forecast()
+    hour = center_hour(saved)
+    field = active_sky_field(80.0, hour["valid_time"])
+    field.update(change)
+    hour["surface"]["fields"][CLOUD] = field
+    hour["surface"]["cloud_guidance"] = {
+        "contributors": [
+            {
+                "model": "HRRR",
+                "value": 0.0,
+                "unit": "percent",
+                "sky_category": "clear",
+                "status": "available",
+                "active_weight": 0.0,
+            }
+        ]
+    }
+    refresh_saved_grid(saved)
+    output = preview_hour(saved)
+    sky = output["components"]["sky"]
+    assert sky["state"] == "unavailable" and sky["value"] is None
+    assert sky["cloud_percentage"] is None and sky["sky_category"] is None
+    assert sky["reasons"] and sky["evidence_refs"]
+    assert "Sky " not in output["rendering"]["text"]
+
+
+def test_active_sky_spans_saved_grid_and_preserves_other_components_and_original_payload():
+    saved = saved_forecast()
+    previous = build_conditions_preview(saved)
+    for cell in saved["forecast"]["local_grid_baseline"]["cells"]:
+        for hour in cell["hours"]:
+            percentage = float(
+                (7 * cell["x_index"] + 11 * cell["y_index"] + 3 * hour["horizon_hours"]) % 101
+            )
+            hour["surface"]["fields"][CLOUD] = active_sky_field(
+                percentage,
+                hour["valid_time"],
+                latitude=cell["latitude"],
+                longitude=cell["longitude"],
+            )
+    refresh_saved_grid(saved)
+    original = JSON.serialize(saved)
+    output = build_conditions_preview(saved)
+    assert JSON.serialize(output) == JSON.serialize(
+        build_conditions_preview(JSON.deserialize(original))
+    )
+    assert JSON.serialize(saved) == original
+    assert {cell["context_only"] for cell in output["cells"]} == {False, True}
+    for cell, old in zip(output["cells"], previous["cells"], strict=True):
+        assert len(cell["hours"]) == 36
+        for hour, old_hour in zip(cell["hours"], old["hours"], strict=True):
+            assert hour["components"]["sky"]["state"] == "known"
+            for name, component in old_hour["components"].items():
+                if name != "sky":
+                    assert hour["components"][name] == component
+            assert hour["rendering"]["text"].split("; ", 1)[1] == old_hour["rendering"]["text"]
+    center = next(cell for cell in output["cells"] if cell["is_forecast_point"])
+    assert output["center_point"]["hours"] == center["hours"]
+    unavailable = saved["forecast"]["local_grid_baseline"]["cells"][0]
+    unavailable.update(status="unavailable", missing_reasons=["No spatial coverage"])
+    refresh_saved_grid(saved)
+    missing = build_conditions_preview(saved)["cells"][0]["hours"][0]
+    assert missing["components"]["sky"]["state"] == "unavailable"
+    assert missing["components"]["sky"]["sky_category"] is None
+    assert missing["components"]["sky"]["cloud_percentage"] is None
+    assert missing["rendering"]["text"] == "Weather conditions unavailable."
 
 
 def test_active_numerical_fields_and_exact_native_event_metadata_are_preserved():

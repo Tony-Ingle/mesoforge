@@ -1,4 +1,4 @@
-"""Attach shared native total-cloud evidence without changing an active forecast policy."""
+"""Retain shared native cloud inputs; new forecasts apply the approved NBM sky policy."""
 
 from __future__ import annotations
 
@@ -38,10 +38,18 @@ from mesoforge.guidance.sources.cloud import (
     decode_cloud_lead,
 )
 
-POLICY = {
+# Historical preparation metadata remains readable. It described the policy at
+# acquisition time, not a restriction on using those native inputs in a new issue.
+LEGACY_POLICY = {
     "status": "unavailable",
     "weights": {},
     "reason": "No approved cloud-cover blend; native contributors remain zero-weight evidence",
+}
+POLICY = {
+    "id": "native-total-cloud-preparation.v1",
+    "status": "native_evidence",
+    "weights": {},
+    "reason": "Retain native contributors separately; issuance applies its versioned sky policy",
 }
 RetainedInput = tuple[dict[str, Any], dict[str, bytes], bytes]
 
@@ -146,7 +154,7 @@ def prepare_cloud_run(
                     old_manifest["model"] != model
                     or old_manifest["source_cycle"] != _iso(cycle)
                     or old_manifest["target_reference_time"] != _iso(target)
-                    or old_manifest["policy"] != POLICY
+                    or old_manifest["policy"] not in (POLICY, LEGACY_POLICY)
                 ):
                     raise ValueError("Retained cloud source/cycle/target/policy mismatch")
                 for record in old_manifest["inputs"]:
@@ -333,8 +341,8 @@ def prepare_cloud_run(
 def load_cloud_guidance(
     descriptor: dict[str, Any], *, target_reference_time: np.datetime64
 ) -> list[CloudView]:
-    if descriptor["policy"] != POLICY:
-        raise ValueError("No active cloud-cover blend policy is approved")
+    if descriptor["policy"] not in (POLICY, LEGACY_POLICY):
+        raise ValueError("Unsupported native cloud preparation policy")
     result, seen = [], set()
     for source in descriptor["sources"]:
         model = source["model"]
@@ -345,7 +353,7 @@ def load_cloud_guidance(
         manifest = json.loads(_checked_file(directory, "manifest.json", source["manifest_sha256"]))
         if (
             manifest["model"] != model
-            or manifest["policy"] != POLICY
+            or manifest["policy"] not in (POLICY, LEGACY_POLICY)
             or np.datetime64(manifest["target_reference_time"].removesuffix("Z"), "ns")
             != target_reference_time
         ):

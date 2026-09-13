@@ -130,6 +130,89 @@ def forbid_retrieval_writes_and_calculation(monkeypatch: pytest.MonkeyPatch) -> 
     return forbidden
 
 
+def test_fresh_full_grid_nbm_sky_issuance_and_conditions_are_exact_and_read_only(
+    prepared_guidance: Path,
+    migrated_dsn: str,
+    service: ForecastIssuanceService,
+    object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mesoforge.application.cloud_cover import extract_cloud_contributors
+    from mesoforge.application.local_surface_grid import (
+        build_local_surface_grid,
+        extract_grid_point,
+    )
+    from mesoforge.forecasting.cloud_cover import CLOUD, CLOUD_ACTIVE_POLICY
+    from mesoforge.forecasting.conditions import build_conditions_preview
+    from tests.support.observation_preview import complete_storage_inventory
+    from tests.unit.application.test_cloud_cover import cloud_view
+    from tests.unit.forecasting.test_conditions import LATITUDE, LONGITUDE, TARGET, _hour
+
+    # A legitimate older point-only issuance must stay point-only after the new policy.
+    old_forecast = PreparedPointForecast.from_directory(prepared_guidance).forecast(
+        latitude=FIRST["lat"], longitude=FIRST["lon"]
+    )
+    old_forecast.pop("local_grid_baseline", None)
+    old = service.issue(old_forecast, batch_run_id=uuid4(), location_index=0)
+    old_saved = service.read(old.issued_forecast_id)
+
+    def column(*, latitude, longitude):
+        hours = []
+        for horizon in range(1, 37):
+            hour = _hour(horizon)
+            views = [cloud_view("HRRR", 100, end=hour["valid_time"])]
+            if horizon != 2:
+                views.append(cloud_view("NBM", [[0, 20], [60, 100]], end=hour["valid_time"]))
+            for view in views:
+                view.dataset.coords.update({"x": [-96.0, -90.0], "y": [42.0, 48.0]})
+            evidence = extract_cloud_contributors(
+                views, latitude=latitude, longitude=longitude, valid_time=hour["valid_time"]
+            )
+            hour["surface"]["cloud_guidance"] = evidence
+            hour["surface"]["fields"][CLOUD] = evidence["field"]
+            hours.append(hour)
+        return {
+            "latitude": latitude,
+            "longitude": longitude,
+            "target_reference_time": TARGET,
+            "data_kind": "synthetic_demonstration",
+            "notice": "Generated integration fixture; no provider calls",
+            "hours": hours,
+        }
+
+    grid = build_local_surface_grid(latitude=LATITUDE, longitude=LONGITUDE, calculate_column=column)
+    forecast = extract_grid_point(grid, latitude=LATITUDE, longitude=LONGITUDE)
+    assert len(grid["cells"]) == 49
+    issued = service.issue(forecast, batch_run_id=uuid4(), location_index=0)
+    saved = service.read(issued.issued_forecast_id)
+    assert saved["forecast"] == forecast
+    expected = build_conditions_preview(saved)
+    before = complete_storage_inventory(migrated_dsn, object_store)
+    forbidden = forbid_retrieval_writes_and_calculation(monkeypatch)
+    with TestClient(api.create_app(prepared_guidance)) as client:
+        first = client.get(f"/issued-forecasts/{issued.issued_forecast_id}/conditions")
+        repeat = client.get(f"/issued-forecasts/{issued.issued_forecast_id}/conditions")
+        assert first.status_code == repeat.status_code == 200
+        assert first.content == repeat.content
+        preview = first.json()
+        assert preview["cells"] == expected["cells"]
+        assert len(preview["cells"]) == 49
+        for cell in preview["cells"]:
+            assert len(cell["hours"]) == 36
+            sky = cell["hours"][0]["components"]["sky"]
+            assert sky["state"] == "known" and sky["cloud_percentage"] > 0
+            assert sky["source_policy"] == CLOUD_ACTIVE_POLICY and sky["evidence_refs"]
+            missing = cell["hours"][1]["components"]["sky"]
+            assert missing["state"] == "unavailable" and missing["value"] is None
+        old_response = client.get(f"/issued-forecasts/{old.issued_forecast_id}/conditions")
+        assert old_response.status_code == 409
+    forbidden.assert_not_called()
+    assert service.read(issued.issued_forecast_id) == saved
+    assert service.read(old.issued_forecast_id) == old_saved
+    assert complete_storage_inventory(migrated_dsn, object_store) == before
+
+
 def test_two_batch_runs_keep_both_versions_and_one_off_api_does_not_issue(
     tmp_path: Path,
     prepared_guidance: Path,

@@ -115,8 +115,9 @@ Automatic current-cycle discovery, coordinate-derived shared preparation, local
 batch/forward runs, immutable PostgreSQL/MinIO issuance, temperature verification,
 and model comparison exist. A coordinate-derived local surface grid covers the
 context domain and its smaller editable subset; the exact center-node forecast is
-extracted from those fields. Delivered cloud cover remains unavailable, while optional
-attachments now retain cloud and other surface/winter evidence. Temporary native
+extracted from those fields. Native NBM total cloud is a temporary delivered sky
+baseline, with HRRR/GFS/RAP/IFS comparison evidence; missing NBM has no substitute.
+Optional attachments retain other surface/winter evidence. Temporary native
 p-type agreement is implemented. There is no deterministic bias correction, AI editing,
 complete weather-condition engine, production deployment or scheduling yet. Detailed commands, evidence and limits
 belong in [README.md](../../README.md).
@@ -630,8 +631,8 @@ units and native supports remain attached even where canonical/display units dif
 | Kuchera snowfall — `S.snowfall_amount_guidance.derived_contributors` | Derived new-snow amount from compatible SWE and profile-derived SLR | m; A, 1 h in current RAP path | RAP SWE and native-corner thermodynamics; amount calculated before spatial interpolation |
 | Kuchera SLR — retained within each derived contributor's profile/spatial evidence | Ratio used to turn that SWE into derived new-snow amount | Dimensionless `1`; interval-end I diagnostic applied to the recorded SWE interval | `kuchera_surface_to_500hpa_25hpa_profile.v1`; not native model SLR or a delivered ratio |
 | Native SLR — `S.snowfall_amount_guidance.native_slr` | Provider model snow-to-liquid ratio | Dimensionless `1`; **I**, not interval-average SLR | NBM SNOWLR, retained separately from ASNOW and Kuchera |
-| Cloud — `F.cloud_area_fraction`; `S.cloud_guidance.contributors` | Entire-column total cloud / provider total sky cover; not individual layers | Active placeholder fraction `1`; evidence `percent`; I | HRRR/GFS/RAP TCDC entire atmosphere; NBM deterministic total sky TCDC; IFS `tcc` fraction converted to percent |
-| Sky category — per native cloud contributor `sky_category` | Deterministic display category of that contributor's total cloud percentage | Category; C/I diagnostic | Existing `native-cloud-percentage-display.v1`, not a separate active sky forecast |
+| Cloud — `F.cloud_area_fraction`; `S.cloud_guidance.contributors` | Entire-column total cloud / provider total sky cover; not individual layers | Active fraction `1` plus unrounded percentage; evidence `percent`; I | Temporary native NBM deterministic total sky TCDC baseline; separate HRRR/GFS/RAP TCDC and native three-hourly IFS `tcc` evidence |
+| Sky category — active field and per native contributor `sky_category` | Deterministic category of unrounded total cloud percentage | Category; C/I diagnostic | Existing `native-cloud-percentage-display.v1`; delivered sky uses only the approved active NBM field |
 | Visibility — `F.visibility`, `S.visibility_guidance.contributors` | Native horizontal surface visibility, not ceiling, slant range or cause | m; I; miles display | HRRR/GFS/RAP/NBM VIS; no compatible visibility in the inspected IFS open feed |
 | Thunder — `F.probability_of_thunder_1h`, `S.thunder_guidance.contributors` | Provider-defined native thunder potential; not exact-point lightning certainty | Fraction `1`; P, separate 1/3/6 h; native/display percent | NBM TSTM. Physical flash threshold/event geometry are not encoded; retain that uncertainty |
 | Freezing-rain liquid — `F.freezing_rain_liquid_equivalent_amount`, corresponding `S.ice_guidance.contributors` | Liquid-equivalent freezing-rain precipitation | kg/m²; A, hourly differences of cumulative parents | HRRR/RAP FRZR; no liquid-to-ice conversion |
@@ -706,7 +707,7 @@ capability is approved or implemented by this design.
 | Native snowfall amount | E+P; no approved blend; active value null | Native parents/windows required; NBM snow-and-sleet not silently equated to HRRR/RAP snow; GFS/IFS new-depth U | Evidence-only; no inference of occurrence/type from positive snowfall alone | none |
 | Kuchera snowfall / SLR | E+D+P for delivered amount; versioned RAP method | Missing required profile/SWE → missing; no constant-ratio fallback; preserve interval-end approximation and native-corner calculation | Evidence-only; no automatic promotion over native guidance | none |
 | Native NBM SLR | E; separate instantaneous SNOWLR | Missing/invalid remains unavailable; no unapproved cross-model or interval-average use | Supporting evidence only, not a condition | none |
-| Cloud / per-source sky category | E+P; active `cloud_area_fraction` remains null; categories D on each native source | Incompatible layers/averages rejected; IFS native 3-h gaps explicit; zero cloud valid | Delivered sky clause blocked by missing active source/blend, not by lack of a category function | none |
+| Cloud / per-source sky category | Active temporary NBM under `nbm-native-total-cloud-baseline.v1`; HRRR/GFS/RAP/IFS E; categories D | Incompatible layers/averages rejected; IFS native 3-h gaps explicit; zero cloud valid; missing NBM has no fallback | Eligible for sky using saved active percentage/category. Multi-source cloud weighting/calibration remains open and requires verification evidence | none |
 | Visibility | E+P; active visibility null; HRRR/GFS/RAP/NBM E, IFS U | Native finite nonnegative horizontal visibility required; no invented cap or filling | Reduced-visibility clause blocked by active-policy gap; fog additionally requires suitable causal evidence and a validated rule | none |
 | Hourly thunder | Temporary S; NBM hourly native passthrough | Missing/invalid → null; no 3/6-h replacement; unencoded threshold/footprint remain unknown | Qualified native probability display only; unqualified point thunder/“likely” wording needs event-support and phrase policy | none |
 | Longer-period thunder / other lightning products | E or U; no combined source policy | Unlike events/periods/support are incompatible; deterministic diagnostics not probabilities | Evidence-only; cannot determine a delivered thunder clause | none |
@@ -808,7 +809,7 @@ short example follow the same contract; a full implementation would emit their s
   },
   "valid_time": "2026-09-12T19:00:00Z",
   "components": {
-    "sky": {"state": "unavailable", "value": null, "reasons": ["active_cloud_policy_missing"]},
+    "sky": {"state": "unavailable", "value": null, "reasons": ["active_nbm_cloud_guidance_unavailable"]},
     "precipitation": {
       "occurrence": {"state": "unavailable", "value": null, "reasons": ["no_categorical_occurrence_rule"]},
       "probability": {
@@ -903,7 +904,7 @@ Specific phrase families and prerequisites:
 
 | Concept | Eligible derivation / constraint |
 |---|---|
-| Clear → cloudy | Approved active total-cloud input plus existing unrounded upper-inclusive 5/25/50/87/100% display categories. Current per-source categories are not delivered sky. No total from summed cloud layers |
+| Clear → cloudy | Temporary active native NBM total-cloud input plus existing unrounded upper-inclusive 5/25/50/87/100% categories. Shadow categories cannot replace missing active sky. No total from summed cloud layers |
 | Rain/snow; chance/likely variants | Approved occurrence assessment plus resolved compatible type; qualitative probability bands need approval. For now expose numeric thresholded PoP and endpoint type separately, not a calibrated type-specific probability |
 | Mixed precipitation | Known supported multi-type set plus appropriate occurrence semantics; disagreement alone remains ambiguous, with alternatives shown rather than false certainty |
 | Freezing rain possible | Eligible occurrence/type linkage and actual freezing-rain type evidence; temperature below freezing, positive FRZR/FICEAC, or surface QPF alone cannot establish it |
@@ -917,7 +918,7 @@ Specific phrase families and prerequisites:
 
 | Gap / decision | What it blocks | Conservative treatment without changing current forecast policies |
 |---|---|---|
-| Cloud has no approved active source/blend | Delivered sky words and sky-plus-precipitation combinations | Sky unavailable; preserve native sky evidence. Does not block an honest precipitation-only preview |
+| Cloud multi-source skill/calibration remains open | Claims of optimized or permanent multi-source sky delivery | Native NBM is the explicitly approved interim sky baseline; other models remain comparison evidence. Missing NBM yields unavailable sky. No temperature-weight copying |
 | Visibility has no approved active policy; fog has no validated cause rule | Reduced-visibility descriptors and fog | Both unavailable. Retain evidence without inferring fog, rain intensity or blowing snow |
 | SWE/snowfall/SLR/ice have no approved active amount policy | Delivered winter amounts, amount classes and accretion/road-ice claims | Keep E/P fields excluded. Does not block future snow/freezing-rain type wording if independent occurrence/type rules qualify |
 | Temporary p-type agreement; no dry/not-applicable or interval-occurrence linkage | Confident typed interval phrases, transitions and dry/type suppression | Keep endpoint type/state and disagreement; zero flags do not mean dry. Agreement policy remains unchanged |
@@ -936,6 +937,16 @@ with rain likely” needs an active cloud policy and explicit occurrence/type/ph
 rules before implementation. This RFC does not approve them by describing them.
 
 #### 6.7.7 Smallest proposed implementation slice and checks
+
+Implementation status (September 13, 2026): the saved-ID read-only preview below
+is implemented in `forecasting/conditions.py` and `application/weather_conditions.py`.
+The owner then approved native NBM instantaneous total cloud as a temporary active
+sky source, using the existing category mapping. Preview/template v2 adds that sky
+component without changing other condition policies or historical forecasts.
+NBM-only cloud enables deterministic sky wording while the broader measured
+multi-source architecture remains the intended direction. Explicit precipitation,
+wind and thunder wording/precedence is the next policy milestone; fog remains gated.
+The following original slice description is retained as design context.
 
 Add a **read-only condition preview for one saved issued forecast ID**. Reuse the
 existing verified storage reader and one pure cell/hour function over its saved local

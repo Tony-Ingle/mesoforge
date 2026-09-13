@@ -16,6 +16,7 @@ from mesoforge.application.snowfall_amount_forecast import (
 from mesoforge.application.snowfall_forecast import SNOW, extract_snowfall_contributors
 from mesoforge.application.thunder import extract_thunder_contributors
 from mesoforge.application.visibility import extract_visibility_contributors
+from mesoforge.forecasting.cloud_cover import CLOUD
 from tests.unit.application.test_cloud_cover import cloud_view
 from tests.unit.application.test_ice import ice_view
 from tests.unit.application.test_precipitation_type import run as type_result
@@ -747,12 +748,11 @@ def test_cloud_report_retains_native_percentages_categories_and_missingness(
     report = build_hourly_report(native_probability_forecast)
     rendered = render_hourly_report(report)
     section = rendered.split("### Native cloud-cover evidence")[1]
-    assert "zero active weight" in section and "no retained blend rule is approved" in section
+    assert "zero active weight" in section and "cannot replace missing NBM" in section
+    assert "without an approved saved active field remains evidence only" in section
     assert "not a complete weather-condition string" in section
     assert (
-        "HRRR / native-total-cloud-cover" in section
-        if value is not None
-        else "HRRR / unavailable" in section
+        "HRRR / wrfsfc CONUS" in section if value is not None else "HRRR / unavailable" in section
     )
     if value is None:
         assert "No compatible native cloud pairs" in section
@@ -770,6 +770,73 @@ def test_cloud_report_retains_native_percentages_categories_and_missingness(
     report["hours"][0]["surface"]["cloud_guidance"]["contributors"][0]["unit"] = "1"
     with pytest.raises(ValueError, match="Cloud report requires finite percentages"):
         render_hourly_report(report)
+    assert native_probability_forecast == original
+
+
+@pytest.mark.parametrize(
+    "percent,category", [(0.0, "clear"), (25.0000001, "partly cloudy"), (100.0, "cloudy")]
+)
+def test_active_cloud_report_displays_saved_nbm_without_changing_other_fields(
+    native_probability_forecast, percent, category
+):
+    previous = deepcopy(native_probability_forecast)
+    for hour in native_probability_forecast["hours"]:
+        evidence = extract_cloud_contributors(
+            [
+                cloud_view("NBM", amount=percent, end=hour["valid_time"]),
+                cloud_view("HRRR", amount=10.0, end=hour["valid_time"]),
+            ],
+            latitude=44.5,
+            longitude=-93.5,
+            valid_time=hour["valid_time"],
+        )
+        hour["surface"]["fields"][CLOUD] = evidence["field"]
+        hour["surface"]["cloud_guidance"] = evidence
+    original = deepcopy(native_probability_forecast)
+    report = build_hourly_report(native_probability_forecast)
+    rendered = render_hourly_report(report)
+    main_table = rendered.split("###")[0]
+    assert "NBM cloud % | Sky category" in main_table
+    assert "no shadow fallback" in main_table
+    for original_hour, old_hour, shown in zip(
+        original["hours"], previous["hours"], report["hours"], strict=True
+    ):
+        row = next(
+            line
+            for line in main_table.splitlines()
+            if line.startswith(f"| {shown['horizon_hours']} |")
+        )
+        assert f"| {percent:.6g} | {category} |" in row
+        assert "cloud unavailable" not in row
+        assert shown["surface"] == original_hour["surface"]
+        assert shown["final_surface_fields"][CLOUD]["cloud_percentage"] == percent
+        assert {
+            key: value for key, value in shown["final_surface_fields"].items() if key != CLOUD
+        } == old_hour["surface"]["fields"]
+    assert native_probability_forecast == original
+
+
+@pytest.mark.parametrize("bad_active", [False, True])
+def test_cloud_report_keeps_missing_or_invalid_nbm_unavailable_despite_shadows(
+    native_probability_forecast, bad_active
+):
+    hour = native_probability_forecast["hours"][0]
+    views = [cloud_view("HRRR", amount=0.0, end=hour["valid_time"])]
+    if bad_active:
+        views.append(cloud_view("NBM", amount=80.0, end=hour["valid_time"]))
+    evidence = extract_cloud_contributors(
+        views, latitude=44.5, longitude=-93.5, valid_time=hour["valid_time"]
+    )
+    if bad_active:
+        evidence["field"]["weights"] = {"NBM": 0.5, "HRRR": 0.5}
+    hour["surface"]["fields"][CLOUD] = evidence["field"]
+    hour["surface"]["cloud_guidance"] = evidence
+    original = deepcopy(native_probability_forecast)
+    rendered = render_hourly_report(build_hourly_report(native_probability_forecast))
+    row = next(line for line in rendered.splitlines() if line.startswith("| 1 |"))
+    assert "| unavailable | unavailable |" in row and "cloud unavailable" in row
+    assert "Active NBM cloud unavailable" in rendered
+    assert "| 0 | clear |" in rendered  # Retained HRRR evidence is still separately visible.
     assert native_probability_forecast == original
 
 

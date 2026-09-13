@@ -825,14 +825,16 @@ class PreparedPointForecast:
                     )
                     hours[-1]["surface"]["fields"][AMOUNT] = amounts["field"]
                     hours[-1]["surface"]["snowfall_amount_guidance"] = amounts
+                cloud = extract_cloud_contributors(
+                    self._cloud_views,
+                    latitude=latitude,
+                    longitude=longitude,
+                    valid_time=_iso(valid_time),
+                    source_status=(self._cloud_guidance or {}).get("source_status", {}),
+                )
+                hours[-1]["surface"]["fields"]["cloud_area_fraction"] = cloud["field"]
                 if self._cloud_guidance is not None:
-                    hours[-1]["surface"]["cloud_guidance"] = extract_cloud_contributors(
-                        self._cloud_views,
-                        latitude=latitude,
-                        longitude=longitude,
-                        valid_time=_iso(valid_time),
-                        source_status=self._cloud_guidance.get("source_status", {}),
-                    )
+                    hours[-1]["surface"]["cloud_guidance"] = cloud
                 if self._visibility_guidance is not None:
                     visibility = extract_visibility_contributors(
                         self._visibility_views,

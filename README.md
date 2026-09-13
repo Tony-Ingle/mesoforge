@@ -53,8 +53,9 @@ only required geographic inputs; names are optional display metadata.
   zero-weight evidence; no active snowfall-amount blend or fixed 10:1 rule is introduced.
 - **Cloud cover:** an optional [native cloud step](#native-cloud-cover-on-the-local-grid)
   retains HRRR/GFS/RAP/IFS/NBM total-cloud percentages and per-source sky categories
-  across the same grid. All are zero-weight evidence; the delivered cloud field
-  remains explicitly unavailable because no approved cloud blend exists.
+  across the same grid. Native NBM total cloud is now the temporary delivered sky
+  baseline; HRRR/GFS/RAP/IFS remain separate zero-weight comparison evidence.
+  Missing NBM stays unavailable, with no substitute or invented cloud weights.
 - **Visibility:** an optional [native visibility step](#native-visibility-on-the-local-grid)
   retains HRRR/GFS/RAP/NBM surface horizontal visibility across the same grid.
   IFS open-data visibility is explicitly unsupported. Native metres and per-source
@@ -70,7 +71,7 @@ only required geographic inputs; names are optional display metadata.
   an approved policy. No liquid-to-ice or ice-thickness conversion is applied.
 - **Shadows:** real RAP and ECMWF IFS values/provenance accompany issuance with zero
   active weight. IFS preserves native three-hourly gaps and has no compatible
-  instantaneous gust. Native cloud evidence does not introduce a new active policy.
+  instantaneous gust. The temporary NBM cloud policy does not change their blend weights.
 - **Shared inputs:** [current four-model discovery](#discover-the-current-four-model-set)
   and [selected preparation/issuance](#prepare-and-issue-the-exact-selected-model-set)
   preserve actual provider availability, identities, cycles/leads and acquisition times.
@@ -116,15 +117,16 @@ and nested domains are implemented; the editing lifecycle remains future work. T
 ECMWF six-hour probability assessment remains explicitly incompatible as described
 below. Native interval snowfall-water-equivalent evidence is now implemented.
 Native snowfall amounts and separate Kuchera estimates are now implemented as evidence.
-Native cloud evidence is now implemented separately from an unapproved delivered
-cloud blend; [cloud checks and real replay evidence](#native-cloud-cover-on-the-local-grid)
+Native cloud evidence now accompanies an explicit temporary NBM sky baseline;
+[cloud checks and real replay evidence](#native-cloud-cover-on-the-local-grid)
 are recorded below. Native visibility evidence and temporary native NBM hourly
 thunder potential and separate native ice/freezing-rain liquid evidence are implemented
 on the same grid. The [complete canvas inventory and proposed condition design](docs/rfcs/mesoforge-v2-architecture.md#67-forecast-canvas-and-deterministic-conditions)
 record actual field policies, missingness and verification limits. A [read-only
 structured preview](#read-only-structured-condition-preview) now describes approved
 saved fields across the grid and its 36-hour center column. The full qualitative
-condition engine remains future work; no evidence-only field has been promoted.
+condition engine remains future work; only the explicitly approved NBM cloud field
+has been enabled for deterministic sky wording.
 Neither visibility nor thunder potential alone establishes a complete weather-condition string.
 Native snowfall, NBM SLR and Kuchera remain separately traceable pending sufficient
 verification data; a broad snowfall evaluation campaign is not the next task.
@@ -154,13 +156,16 @@ Components retain their state, unrounded value/units, original policy/weights,
 instant or exact interval, probability threshold/event definition, missing reasons
 and pointers into the checksummed saved payload. The preview/renderer source hashes
 are recorded separately from the saved forecast's code identity. Numeric surface fields, QPF,
-hourly PoP, endpoint p-type and qualified native NBM thunder are eligible. Cloud,
-visibility/fog and winter amounts remain unavailable for wording, with evidence
+hourly PoP, endpoint p-type, qualified native NBM thunder and the temporary active
+NBM cloud field are eligible. Sky preserves the saved fraction, unrounded percentage,
+category and source policy, using the existing category boundaries. Missing NBM
+remains unavailable even when another cloud contributor exists. Visibility/fog
+and winter amounts remain unavailable for wording, with evidence
 references retained. There are no new dry, likely, intensity, windy or transition
 thresholds. Unknown, ambiguous, unavailable and not-applicable remain distinct;
 exactly calm saved wind can make direction not applicable.
 
-The real retained Minneapolis **unissued grid export** replayed as 49 × 36 results
+In the earlier preview milestone, the retained Minneapolis **unissued grid export** replayed as 49 × 36 results
 with identical bytes on repeat and zero provider calls. Its hour 10 illustrates
 the separately timed components (abbreviated, not a saved-ID response):
 
@@ -179,7 +184,7 @@ while p-type is the state at 04:00Z. Thunder retains its provider-defined event 
 unencoded footprint, not an exact-point lightning claim. Hour 1 had QPF/PoP zero,
 p-type unknown and thunder 1%; this does not establish a dry-weather classifier.
 
-Validation: **148 focused tests passed** (conditions, API/readback, hourly report,
+Earlier preview validation: **148 focused tests passed** (conditions, API/readback, hourly report,
 retained surface/thunder); the affected API regression selection also passed.
 Successful saved-ID/36-hour preview tests use explicitly synthetic in-memory
 issuances. The actual real Minneapolis ID `9588a3d3-41a8-42fa-851f-936079c83743`
@@ -191,10 +196,72 @@ replay, 36-hour report and storage snapshots are under
 `%LOCALAPPDATA%/MesoForge/baselines/20260913-conditions-preview/`. Full application
 acceptance and condition-skill verification were not run.
 
-Next proposed policy step: choose and validate an explicit active **total-cloud /
-sky-cover policy**, then reuse the existing numerical sky categories. This would
-make ordinary-hour descriptions useful without inventing visibility/fog causality
-or changing precipitation wording thresholds.
+The sky-policy increment uses `nbm-native-total-cloud-baseline.v1`, with the existing
+`native-cloud-percentage-display.v1` categories. Preview and minimal-renderer versions
+advance to v2; older saved fields are never retroactively given the new active policy.
+NBM-only cloud is an interim delivered baseline, not the intended enterprise cloud
+architecture. It enables deterministic ordinary-hour sky descriptions while cloud
+skill remains an open evaluation problem. Future multi-source cloud blending or
+calibration must follow verification evidence, not temperature weights.
+
+Sky-policy validation: **328 focused/retained offline tests and 18 PostgreSQL/MinIO
+integration tests passed**, covering active/shadow gating, native units/times,
+missing NBM without substitution, unchanged other fields, grid/point replay and
+fresh full-grid issuance/read-only conditions. Ruff, formatting, mypy, import
+contracts, locked-dependency consistency, documentation/hygiene and `git diff --check`
+also passed. Full application acceptance, cloud-observation skill and calibrated
+condition wording were not tested.
+
+Fresh real full-grid demonstration: Minneapolis **44.98859, -93.25557**, issued
+`3bd4cada-d4c3-4f1e-94d8-2d5182c61991` at **2026-09-13 23:22:23Z**. Normal
+`run_batch` issuance saved the complete calculated **49 × 36** grid through
+PostgreSQL/MinIO, after separate current-model preparation and native attachments.
+HRRR/GFS 18Z, RAP 21Z and IFS 12Z were selected automatically; reference 23Z gives
+valid times September 14 00Z through September 15 11Z. Native NBM **22Z** used the
+existing explicit preparation override after actual 23Z AWS404/NOMADS403 and 22Z
+AWS200 evidence. No provider defaults were changed. Automatic NBM fallback through
+that 403 remains a limitation, not a claim of fully automatic rich-field acquisition.
+
+The actual localhost request was:
+
+```text
+GET /issued-forecasts/3bd4cada-d4c3-4f1e-94d8-2d5182c61991/conditions
+```
+
+At September 14 **00Z**, sky is `known`, fraction **0.02**, cloud percentage **2**,
+category `clear`, policy `nbm-native-total-cloud-baseline.v1`, NBM source lead **2**.
+QPF/PoP are zero; endpoint p-type remains `unknown`. At **15Z**, sky is mostly cloudy
+(87%) with **0.08296196207611876 kg/m²** QPF over `(14Z,15Z]` and ambiguous endpoint
+p-type. At **17Z**, cloud is **92.06306327559248%**, QPF is **1.1699372979056493 kg/m²**
+over `(16Z,17Z]`, PoP is **43.39143650808219%** for liquid >0.254 kg/m² over that same
+hour, and instantaneous p-type is rain. These are separate timed components, not a
+new qualitative occurrence rule.
+
+Sky is available at all 49 cells for hours **1–35**. Hour **36** stays unavailable:
+the retained cloud adapter stops at NBM source lead 36, whereas this hour needs 37.
+Other cloud models do not replace it. PoP has all 36 native hours; hourly thunder
+has the same final-hour adapter gap. Unrequested visibility/winter/probability-shadow
+attachments were not borrowed from an older run.
+
+Both real HTTP conditions responses were byte-identical, with calculation/acquisition
+and write entry points forbidden and PostgreSQL transactions read-only. All table
+contents and MinIO key/ETag/size identities stayed unchanged during retrieval:
+**22 issued versions / 136 objects**. Issuance added exactly one version/object;
+all older rows/objects remained intact, and the older point-only ID still returned
+409. API and temporary PostgreSQL/MinIO services were stopped afterward.
+
+Acquisition retained **901,192,329 bytes**, plus 3,112,478 discovery/availability
+metadata bytes, outside Git. Existing 120 p-type and 120 cloud lead records were
+reused without downloading again. The saved forecast payload is **308,944,233 bytes**;
+its grid export compresses to **40,931,549 bytes**. The complete 36-hour center table,
+exact JSON, storage snapshots and exercised scripts are under
+`%LOCALAPPDATA%/MesoForge/baselines/20260913-nbm-sky-validation/`; preparation/evidence
+is under `MesoForge/forward-runs/nbm-sky-current-20260913T230001Z/` and
+`MesoForge/baselines/20260913-nbm-sky-current/` beneath the same local-data root.
+
+Next proposed policy step: approve explicit wording thresholds and precedence for
+precipitation, wind and thunder, including how instantaneous p-type qualifies an
+interval phrase. Visibility/fog needs separate causal evidence and policy afterward.
 
 ## Existing forecast path
 
@@ -1973,8 +2040,10 @@ Surface policy and availability:
   Its published gust is an interval maximum, so it is explicitly unavailable under
   this instantaneous-gust contract. [ECMWF attribution](#prepare-ecmwf-ifs-temperature-in-shadow-mode)
   and source/licence metadata remain attached.
-- **Cloud cover:** null with an explicit missing-policy reason; no cloud product is
-  acquired. Weather-condition labels, bias correction and AI are absent.
+- **Cloud cover:** this core surface step does not acquire it. The separate
+  [native cloud attachment](#native-cloud-cover-on-the-local-grid) now enables the
+  temporary NBM sky baseline; without it, cloud remains explicitly unavailable.
+  Bias correction and AI are absent.
 - **Liquid amounts:** [interval-aware QPF](#liquid-precipitation-on-the-local-grid)
   now follows the same grid and issuance path. Amounts do not imply probability or type.
 
@@ -3266,12 +3335,18 @@ blend is included in this increment.
 ## Native cloud cover on the local grid
 
 The optional `mesoforge.application.prepared_cloud` attachment retains native
-instantaneous **total cloud cover** from five sources. It does not change the
-existing active `surface.fields.cloud_area_fraction`: no approved Phase 2 cloud
-blend exists, so that field remains null with its existing missing-policy reason.
+instantaneous **total cloud cover** from five sources. New V2 surface issuances use
+native NBM total sky cover as the temporary active `surface.fields.cloud_area_fraction`
+under `nbm-native-total-cloud-baseline.v1`. The canonical fraction (`1`), original
+unrounded percentage, category and native provenance are all retained. Only an
+eligible NBM value receives weight 1; no alternate source fills an unavailable hour.
+This is an explicitly approved interim source policy, not a Phase 2 cloud blend;
+retained Phase 2 defaults stay unchanged.
 `surface.cloud_guidance` holds each native contributor, unrounded percentage,
 original unit/value, sky category, product, source cycle/lead, valid time, raw
-hashes and extraction corners/weights. Every contributor has zero active weight.
+hashes and extraction corners/weights. HRRR/GFS/RAP/IFS retain zero active weight
+and their descriptive disagreements. Future cloud blending/calibration requires
+verification evidence; temperature weights do not apply.
 Existing surface, QPF, PoP, p-type, SWE, native snowfall, NBM SLR and Kuchera
 values and policies remain unchanged.
 
@@ -3322,7 +3397,8 @@ and index hashes, decodes again and preserves original acquisition metadata.
 Original guidance availability and this later cloud acquisition time remain separate;
 adding evidence does not claim it was available at the original forecast decision.
 
-The September 12, 2026 bounded acquisition used Minneapolis **44.98859, -93.25557**,
+Historical evidence-only demonstration (before the temporary active NBM decision):
+the September 12, 2026 bounded acquisition used Minneapolis **44.98859, -93.25557**,
 reference September 11 18Z and the existing 36-hour window through September 13 06Z.
 An actual same-valid-time point sample on September 11 **21Z / 4 p.m. CDT** was:
 

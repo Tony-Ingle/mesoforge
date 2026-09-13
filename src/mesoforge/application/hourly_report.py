@@ -10,6 +10,7 @@ from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 from mesoforge.catalog.units import convert
+from mesoforge.forecasting.cloud_cover import CLOUD, sky_category, validate_active_cloud_field
 from mesoforge.forecasting.visibility import visibility_miles
 
 _QPF = "liquid_equivalent_precipitation_amount_1h"
@@ -231,6 +232,21 @@ def _interval_cells(fields: dict[str, Any], variable: str) -> list[str]:
     return [str(field.get(key) or "unavailable") for key in ("interval_start", "interval_end")]
 
 
+def _cloud_cells(field: dict[str, Any] | None, valid_time: str) -> tuple[list[str], list[str]]:
+    """Present only the approved saved active cloud field, without promoting evidence."""
+    if field is None:
+        return ["unavailable", "unavailable"], ["Active cloud field was not saved"]
+    try:
+        validate_active_cloud_field(field, valid_time=valid_time)
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        return ["unavailable", "unavailable"], [
+            *field.get("missing_reasons", []),
+            f"Active NBM cloud unavailable: {exc}",
+        ]
+    percent = field["cloud_percentage"]
+    return [f"{percent:.6g}", sky_category(percent).replace("_", " ")], []
+
+
 def _hour_ranges(hours: list[int]) -> str:
     """Keep repeated native-period gaps readable without hiding which hours lack data."""
     values = sorted(set(hours))
@@ -365,6 +381,7 @@ def _render_surface_report(report: dict[str, Any]) -> str:
     surface_columns = columns
     has_qpf = any(_QPF in hour.get("surface", {}).get("fields", {}) for hour in report["hours"])
     has_pop = any(_POP in hour.get("surface", {}).get("fields", {}) for hour in report["hours"])
+    has_cloud = any(CLOUD in hour.get("surface", {}).get("fields", {}) for hour in report["hours"])
     if has_qpf:
         columns += (_QPF,)
     if has_pop:
@@ -386,7 +403,8 @@ def _render_surface_report(report: dict[str, Any]) -> str:
         "AI forecast-desk stage not implemented yet. Final surface fields equal the "
         "numerical baseline. Delivery has not run. New issued hours are not_yet_verified; "
         "verification of previous versions is separate.",
-        "Active cloud cover: unavailable because no approved retained cloud blend policy exists. "
+        "Active cloud cover uses the approved temporary native NBM total-cloud baseline when "
+        "the saved field is eligible. Missing or invalid NBM guidance has no shadow fallback. "
         "Separate native cloud evidence is shown below when prepared. "
         "IFS instantaneous gust: unavailable because its published gust is an interval maximum. "
         "Native three-hourly IFS gaps are preserved. Stored Kelvin, m/s, degree and percent "
@@ -396,10 +414,12 @@ def _render_surface_report(report: dict[str, Any]) -> str:
         "Wind mph | From | Gust mph |"
         + (qpf_headers if has_qpf else "")
         + (pop_headers if has_pop else "")
+        + (" NBM cloud % | Sky category |" if has_cloud else "")
         + " Missing / exclusions |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
         + (qpf_separator if has_qpf else "")
         + (qpf_separator if has_pop else "")
+        + (" --- | --- |" if has_cloud else "")
         + " --- |",
     ]
     if has_qpf:
@@ -437,6 +457,10 @@ def _render_surface_report(report: dict[str, Any]) -> str:
                     issues.append(f"{variable}: contributor exclusions (see below)")
             for reason in field.get("missing_reasons", []):
                 reasons.setdefault(f"{variable}: {reason}", []).append(hour["horizon_hours"])
+        cloud_cells, cloud_reasons = _cloud_cells(fields.get(CLOUD), hour["valid_time_utc"])
+        if has_cloud:
+            for reason in cloud_reasons:
+                reasons.setdefault(f"{CLOUD}: {reason}", []).append(hour["horizon_hours"])
         cells = [
             str(hour["horizon_hours"]),
             hour["valid_time_utc"],
@@ -444,7 +468,9 @@ def _render_surface_report(report: dict[str, Any]) -> str:
             *(_surface_value(fields, v) for v in surface_columns),
             *([_surface_value(fields, _QPF), *_interval_cells(fields, _QPF)] if has_qpf else []),
             *([_surface_value(fields, _POP), *_interval_cells(fields, _POP)] if has_pop else []),
-            ("; ".join(issues) if issues else "none") + "; cloud unavailable",
+            *(cloud_cells if has_cloud else []),
+            ("; ".join(issues) if issues else "none")
+            + ("; cloud unavailable" if cloud_reasons else ""),
         ]
         lines.append("| " + " | ".join(cells) + " |")
     models = sorted(
@@ -820,15 +846,17 @@ def _render_visibility_guidance(hours: list[dict[str, Any]]) -> list[str]:
 
 
 def _render_cloud_guidance(hours: list[dict[str, Any]]) -> list[str]:
-    """Present native cloud evidence without choosing an unapproved delivered value."""
+    """Keep each native contributor distinct from the validated active NBM field."""
     if not any("cloud_guidance" in hour.get("surface", {}) for hour in hours):
         return []
     lines = [
         "",
         "### Native cloud-cover evidence",
         "",
-        "All cloud contributors have zero active weight. The active cloud baseline remains "
-        "unavailable because no retained blend rule is approved. Each percentage represents "
+        "The approved temporary active baseline uses only eligible saved NBM total-cloud "
+        "guidance. Other models retain zero active weight; they cannot replace missing NBM. "
+        "Historical evidence without an approved saved active field remains evidence only. "
+        "Each percentage represents "
         "native total cloud cover, not a sum or substitution of cloud layers. Native intervals "
         "and missing times are preserved. Categories describe each unrounded native percentage; "
         "they are not a complete weather-condition string or an observed opaque-sky amount.",
