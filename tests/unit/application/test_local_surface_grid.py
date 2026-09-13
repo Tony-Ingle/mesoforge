@@ -32,15 +32,18 @@ from mesoforge.application.spatial_coverage import CoverageRequiredError
 from mesoforge.application.spatial_preparation import (
     PreparedRegions,
     attach_cloud_guidance,
+    attach_ice_guidance,
     attach_snowfall_amount_guidance,
     attach_snowfall_guidance,
     attach_thunder_guidance,
     attach_visibility_guidance,
 )
 from mesoforge.contracts.serialization import canonical_json_bytes, canonical_json_digest
+from mesoforge.forecasting.ice import FLAT_ICE, FRZR
 from mesoforge.forecasting.recipes import with_surface_fields
 from tests.unit.application.test_cloud_cover import cloud_view
 from tests.unit.application.test_forecast_issuance import memory_service as memory_service
+from tests.unit.application.test_ice import ice_view
 from tests.unit.application.test_precipitation_type import type_view
 from tests.unit.application.test_prepared_temperature import phase2_configuration
 from tests.unit.application.test_probability_contributors import (
@@ -292,6 +295,47 @@ def _thunder_views():
             longitude, latitude = np.meshgrid(view.dataset.x.values, view.dataset.y.values)
             view.dataset.thunder_probability.values += 0.01 * _gradient(latitude, longitude)
             view.dataset.native_probability.values += _gradient(latitude, longitude)
+            native.append(view)
+        views.append(
+            replace(
+                native[0],
+                dataset=xr.concat(
+                    [view.dataset.isel(event=0, drop=True) for view in native], dim="event"
+                ).assign_coords(event=list(range(len(native)))),
+                manifest={
+                    **native[0].manifest,
+                    "events": [view.manifest["events"][0] for view in native],
+                },
+            )
+        )
+    return views
+
+
+def _ice_views():
+    views = []
+    for source_id, duration, offset in (
+        ("NBM_FICEAC_1H", 1, 0.5),
+        ("NBM_FICEAC_6H", 6, 1.5),
+        ("HRRR_FRZR", 1, 1.0),
+        ("RAP_FRZR", 1, 1.25),
+    ):
+        native = []
+        for horizon in HOURS:
+            if horizon % duration:
+                continue
+            valid = (
+                str(np.datetime_as_string(TARGET + np.timedelta64(horizon, "h"), unit="s")) + "Z"
+            )
+            view = ice_view(source_id, amount=offset + horizon / 100, end=valid)
+            view.dataset.coords.update({"x": [-94.0, -92.0], "y": [44.0, 46.0]})
+            longitude, latitude = np.meshgrid(view.dataset.x.values, view.dataset.y.values)
+            view.dataset.native_end_amount.values += 0.01 * _gradient(latitude, longitude)
+            parent = (
+                view.dataset.native_start_amount.values
+                if "native_start_amount" in view.dataset
+                else 0.0
+            )
+            view.dataset.amount.values[:] = view.dataset.native_end_amount.values - parent
             native.append(view)
         views.append(
             replace(
@@ -731,6 +775,8 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
         _visibility_guidance={"status": "prepared"},
         _thunder_views=_thunder_views(),
         _thunder_guidance={"status": "prepared"},
+        _ice_views=_ice_views(),
+        _ice_guidance={"status": "prepared"},
     )
     result = prepared.forecast(latitude=LATITUDE, longitude=LONGITUDE)
     assert result["hours"][0]["temperature"]["value"] is not None
@@ -746,6 +792,10 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
     center_cloud = result["hours"][0]["surface"]["cloud_guidance"]
     center_visibility = result["hours"][0]["surface"]["visibility_guidance"]
     center_thunder = result["hours"][0]["surface"]["thunder_guidance"]
+    center_ice = result["hours"][0]["surface"]["ice_guidance"]
+    assert center_ice["contributors"][0]["value"] == pytest.approx(
+        0.51 + 0.01 * _gradient(44.0, -94.0)
+    )
     assert center_thunder["field"]["value"] == pytest.approx(0.251 + 0.01 * _gradient(44.0, -94.0))
     assert center_visibility["contributors"][0]["value"] == pytest.approx(
         3001 + 100 * _gradient(44.0, -94.0)
@@ -891,6 +941,21 @@ def test_missing_peripheral_coverage_does_not_borrow_center_values_or_fail_cente
             ):
                 assert source.get(key) == central.get(key)
         for pair in thunder["comparisons"]:
+            assert pair["difference_left_minus_right"] is None and pair["status"] == "unavailable"
+        ice = hour["surface"]["ice_guidance"]
+        for field in ice["fields"].values():
+            assert field["value"] is None and field["status"] == "unavailable"
+            assert field["missing_reasons"] == cell["missing_reasons"] and field["weights"] == {}
+        for source, central in zip(ice["contributors"], center_ice["contributors"], strict=True):
+            assert source["value"] is None and source["native_value"] is None
+            assert (
+                source["active_weight"] == 0
+                and source["missing_reasons"] == cell["missing_reasons"]
+            )
+            assert "spatial_extraction" not in source and "extraction_coordinate" not in source
+            for key in ("provenance", "quantity_kind", "interval_start", "interval_end"):
+                assert source.get(key) == central.get(key)
+        for pair in ice["comparisons"]:
             assert pair["difference_left_minus_right"] is None and pair["status"] == "unavailable"
     with pytest.raises(CoverageRequiredError):
         prepared.forecast(latitude=LATITUDE + 0.1, longitude=LONGITUDE)
@@ -1336,6 +1401,141 @@ def test_thunder_native_periods_share_guidance_preserve_all_previous_fields_and_
         cell["hours"] for cell in grid["cells"] if cell["is_forecast_point"]
     )
     assert point["thunder_guidance"] == descriptor
+    service, factory, objects = memory_service
+    issued = service.issue(point, batch_run_id=uuid4(), location_index=0)
+    before = len(factory.issued_forecasts), len(objects.objects)
+    assert service.read(issued.issued_forecast_id)["forecast"] == point
+    assert (len(factory.issued_forecasts), len(objects.objects)) == before
+
+
+def test_ice_guidance_shares_native_intervals_preserves_all_previous_fields_and_replays(
+    prepared_surface, monkeypatch, memory_service
+):
+    views = _ice_views()
+    originals = [view.dataset.copy(deep=True) for view in views]
+    datasets = {
+        model: source.copy(deep=True) for model, source in prepared_surface._guidance.items()
+    }
+    manifest = deepcopy(prepared_surface._manifest)
+    manifest["qpf_inputs"] = []
+    for model, dataset in datasets.items():
+        _add_qpf(dataset, [horizon / 10 for horizon in HOURS])
+        metadata = {}
+        for lead_time in dataset.source_lead_time.values:
+            lead = int(lead_time / np.timedelta64(1, "h"))
+            parent = {"model": model, "source_lead_hours": lead, "raw_sha256": "f" * 64}
+            metadata[str(lead)] = {"parents": [parent]}
+            manifest["qpf_inputs"].append({**parent, "messages": [{"raw_sha256": "f" * 64}]})
+        dataset.attrs["qpf_metadata_json"] = json.dumps(metadata)
+    baseline = replace(
+        prepared_surface,
+        _guidance=datasets,
+        _manifest=manifest,
+        _cloud_views=_cloud_views(),
+        _cloud_guidance={"status": "prepared"},
+        _type_views=_type_views(),
+        _type_guidance={"status": "prepared"},
+        _snow_views=[*_snow_views(), *_snow_views("RAP")],
+        _snow_guidance={"status": "prepared"},
+        _snow_amount_views=_amount_views(),
+        _snow_amount_guidance={"status": "prepared"},
+        _pop_views=[_pop_entry(hours=HOURS)],
+        _pop_guidance={"status": "prepared"},
+        _probability_views=_spatial_probability_views(),
+        _visibility_views=_visibility_views(),
+        _visibility_guidance={"status": "prepared"},
+        _thunder_views=_thunder_views(),
+        _thunder_guidance={"status": "prepared"},
+    )
+    descriptor = {"status": "prepared", "source_status": {}}
+    loader = Mock(return_value=views)
+    monkeypatch.setattr("mesoforge.application.prepared_ice.load_ice_guidance", loader)
+    regions = attach_ice_guidance(PreparedRegions([baseline, baseline], {}), descriptor)
+    loader.assert_called_once_with(descriptor, target_reference_time=TARGET)
+    assert regions.regions[0]._ice_views is regions.regions[1]._ice_views
+    assert baseline._ice_guidance is None
+    with (
+        patch("xarray.open_dataset", side_effect=AssertionError("Guidance already loaded")),
+        patch("requests.Session", side_effect=AssertionError("No provider calls")),
+    ):
+        previous, grid, replay = [
+            build_local_surface_grid(
+                latitude=LATITUDE,
+                longitude=LONGITUDE,
+                calculate_column=prepared._forecast_column,
+                geometry=TEST_GEOMETRY,
+            )
+            for prepared in (baseline, *regions.regions)
+        ]
+    assert canonical_json_bytes(grid) == canonical_json_bytes(replay)
+    roles, sampled = set(), []
+    for cell, old_cell in zip(grid["cells"], previous["cells"], strict=True):
+        roles.add(cell["inside_editable_domain"])
+        assert len(cell["hours"]) == 36
+        latitude = min((44.0, 46.0), key=lambda value: abs(cell["latitude"] - value))
+        longitude = min((-94.0, -92.0), key=lambda value: abs(cell["longitude"] - value))
+        gradient = 0.01 * _gradient(latitude, longitude)
+        for hour, old in zip(cell["hours"], old_cell["hours"], strict=True):
+            evidence = hour["surface"]["ice_guidance"]
+            assert set(evidence["fields"]) == {FLAT_ICE, FRZR}
+            for field in evidence["fields"].values():
+                assert field["value"] is None and field["weights"] == {}
+                assert field["unit"] == "kg/m^2" and field["status"] == "policy_unavailable"
+            sources = {source["source_id"]: source for source in evidence["contributors"]}
+            for source_id, duration, offset in (
+                ("NBM_FICEAC_1H", 1, 0.5),
+                ("NBM_FICEAC_6H", 6, 1.5),
+                ("HRRR_FRZR", 1, 1.0),
+                ("RAP_FRZR", 1, 1.25),
+            ):
+                source = sources[source_id]
+                if hour["horizon_hours"] % duration:
+                    assert source["value"] is None and source["missing_reasons"]
+                    continue
+                expected = offset + hour["horizon_hours"] / 100 + gradient
+                assert source["value"] == pytest.approx(expected)
+                assert source["native_value"] == pytest.approx(expected)
+                assert source["duration_hours"] == duration and source["provenance"]
+                assert source["active_weight"] == 0
+                assert source["spatial_extraction"]["method"] == "nearest_native_grid_cell"
+                assert "display_inches" not in source
+            liquid = sources["HRRR_FRZR"]
+            assert liquid["quantity_kind"] != sources["NBM_FICEAC_1H"]["quantity_kind"]
+            if hour["horizon_hours"] > 1:
+                assert liquid["spatial_extraction"]["native_start_amount"] == 2
+                assert liquid["spatial_extraction"]["native_end_amount"] - 2 == liquid["value"]
+            pair = next(
+                row
+                for row in evidence["comparisons"]
+                if row["source_ids"] == ["HRRR_FRZR", "RAP_FRZR"]
+            )
+            assert pair["difference_left_minus_right"] == pytest.approx(-0.25)
+            unrelated = next(
+                row
+                for row in evidence["comparisons"]
+                if row["source_ids"] == ["NBM_FICEAC_1H", "HRRR_FRZR"]
+            )
+            assert (
+                unrelated["status"] == "incompatible"
+                and unrelated["difference_left_minus_right"] is None
+            )
+            assert old["surface"]["fields"][QPF]["value"] is not None
+            unchanged = deepcopy(hour)
+            unchanged["surface"].pop("ice_guidance")
+            for name in (FLAT_ICE, FRZR):
+                unchanged["surface"]["fields"].pop(name)
+            assert unchanged == old
+        sampled.append(cell["hours"][0]["surface"]["ice_guidance"]["contributors"][0]["value"])
+    assert roles == {True, False} and max(sampled) > min(sampled)
+    for before, view in zip(originals, views, strict=True):
+        xr.testing.assert_identical(before, view.dataset)
+    point = extract_grid_point(
+        json.loads(canonical_json_bytes(grid)), latitude=LATITUDE, longitude=LONGITUDE
+    )
+    assert point["hours"] == next(
+        cell["hours"] for cell in grid["cells"] if cell["is_forecast_point"]
+    )
+    assert point["ice_guidance"] == descriptor
     service, factory, objects = memory_service
     issued = service.issue(point, batch_run_id=uuid4(), location_index=0)
     before = len(factory.issued_forecasts), len(objects.objects)

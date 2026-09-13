@@ -522,7 +522,109 @@ def _render_surface_report(report: dict[str, Any]) -> str:
     lines.extend(_render_cloud_guidance(report["hours"]))
     lines.extend(_render_visibility_guidance(report["hours"]))
     lines.extend(_render_thunder_guidance(report["hours"]))
+    lines.extend(_render_ice_guidance(report["hours"]))
     return "\n".join(lines) + "\n"
+
+
+def _render_ice_guidance(hours: list[dict[str, Any]]) -> list[str]:
+    """Keep accreted-ice mass and freezing-rain liquid distinct in their native intervals."""
+    if not any("ice_guidance" in hour.get("surface", {}) for hour in hours):
+        return []
+    lines = [
+        "",
+        "### Native ice and freezing-rain-liquid evidence",
+        "",
+        "Both active fields remain unavailable: no ice-accretion or freezing-rain-liquid "
+        "blend policy is approved. All native contributors have zero active weight. FICEAC "
+        "is elevated flat-surface ice-accretion mass equivalent in kg/m², not geometric or "
+        "radial ice thickness, ground ice or road icing. "
+        "FRZR is freezing-rain liquid equivalent in kg/m², not the amount of ice that accretes. "
+        "No 1:1 liquid-to-ice conversion, assumed ice density, or new ice-accretion algorithm "
+        "is applied. These quantities remain separate from total QPF, precipitation type and "
+        "snowfall. Native intervals and source accumulation parents remain traceable; "
+        "a six-hour amount is not relabeled as an hourly amount.",
+        "",
+        "| Hour | Source / product | Quantity | Native interval kg/m² | Native value / unit | "
+        "Cycle / source lead h | Native interval start UTC | Native interval end UTC | "
+        "Interval closure | Status / reason |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    exclusions: dict[str, list[int]] = {}
+    differences: list[str] = []
+    for hour in hours:
+        guidance = hour.get("surface", {}).get("ice_guidance", {})
+        for source in guidance.get("contributors", []):
+            value = source["value"]
+            if source["unit"] != "kg/m^2" or (
+                value is not None and (not math.isfinite(value) or value < 0)
+            ):
+                raise ValueError(
+                    "Ice report requires finite nonnegative mass equivalents in kg/m^2"
+                )
+            native = source.get("native_value")
+            reason = "; ".join(source.get("missing_reasons", []))
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(hour["horizon_hours"]),
+                        f"{source['source_id']} / {source.get('product', 'unavailable')}",
+                        source["quantity_kind"],
+                        "unavailable" if value is None else f"{value:.6g}",
+                        "unavailable"
+                        if native is None
+                        else f"{native:.6g} {source['native_unit']}",
+                        f"{source.get('source_cycle', 'unavailable')} / "
+                        f"{source.get('source_lead_hours', 'unavailable')}",
+                        source.get("interval_start") or "unavailable",
+                        source.get("interval_end") or "unavailable",
+                        source.get("interval_closure") or "unavailable",
+                        source["status"] + (f"; {reason}" if reason else ""),
+                    ]
+                )
+                + " |"
+            )
+        available = {
+            source["source_id"]
+            for source in guidance.get("contributors", [])
+            if source["value"] is not None
+        }
+        for comparison in guidance.get("comparisons", []):
+            if comparison["status"] == "comparable":
+                difference = comparison["difference_left_minus_right"]
+                if (
+                    comparison["unit"] != "kg/m^2"
+                    or difference is None
+                    or not math.isfinite(difference)
+                ):
+                    raise ValueError("Ice comparison requires a finite mass-equivalent difference")
+                differences.append(
+                    f"| {hour['horizon_hours']} | {' minus '.join(comparison['source_ids'])} | "
+                    f"{difference:+.6g} |"
+                )
+            if comparison["status"] == "incompatible" and set(comparison["source_ids"]).issubset(
+                available
+            ):
+                identity = " versus ".join(comparison["source_ids"])
+                reason = identity + ": " + "; ".join(comparison["missing_reasons"])
+                exclusions.setdefault(reason, []).append(hour["horizon_hours"])
+    if differences:
+        lines.extend(
+            [
+                "",
+                "Matching native quantity/interval differences are descriptive, not skill scores:",
+                "",
+                "| Hour | Compared sources | Difference kg/m² |",
+                "| --- | --- | --- |",
+                *differences,
+            ]
+        )
+    if exclusions:
+        lines.extend(["", "Native quantity/interval comparison exclusions:", ""])
+        lines.extend(
+            f"- Hours {_hour_ranges(indices)}: {reason}" for reason, indices in exclusions.items()
+        )
+    return lines
 
 
 def _thunder_percent(row: dict[str, Any]) -> str:

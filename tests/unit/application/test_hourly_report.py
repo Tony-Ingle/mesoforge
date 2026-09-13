@@ -8,6 +8,7 @@ import pytest
 
 from mesoforge.application.cloud_cover import extract_cloud_contributors
 from mesoforge.application.hourly_report import build_hourly_report, render_hourly_report
+from mesoforge.application.ice import extract_ice_contributors
 from mesoforge.application.snowfall_amount_forecast import (
     AMOUNT,
     extract_snowfall_amount_contributors,
@@ -16,6 +17,7 @@ from mesoforge.application.snowfall_forecast import SNOW, extract_snowfall_contr
 from mesoforge.application.thunder import extract_thunder_contributors
 from mesoforge.application.visibility import extract_visibility_contributors
 from tests.unit.application.test_cloud_cover import cloud_view
+from tests.unit.application.test_ice import ice_view
 from tests.unit.application.test_precipitation_type import run as type_result
 from tests.unit.application.test_precipitation_type import type_view
 from tests.unit.application.test_snowfall_amount_forecast import amount_view
@@ -539,6 +541,76 @@ def test_thunder_report_preserves_native_periods_zero_missing_and_previous_field
     assert native_probability_forecast == original
     report["hours"][0]["surface"]["thunder_guidance"]["field"]["unit"] = "percent"
     with pytest.raises(ValueError, match="Thunder report requires finite probabilities"):
+        render_hourly_report(report)
+    assert native_probability_forecast == original
+
+
+@pytest.mark.parametrize("value", [None, 0.0, 0.123456789])
+def test_native_ice_report_keeps_liquid_and_accretion_distinct_without_thickness_conversion(
+    native_probability_forecast, value
+):
+    for hour in native_probability_forecast["hours"]:
+        thunder = extract_thunder_contributors(
+            [thunder_view(amount=0.2, end=hour["valid_time"])],
+            latitude=44.5,
+            longitude=-93.5,
+            valid_time=hour["valid_time"],
+        )
+        hour["surface"]["fields"]["probability_of_thunder_1h"] = thunder["field"]
+        hour["surface"]["thunder_guidance"] = thunder
+    previous = deepcopy(native_probability_forecast)
+    for hour in native_probability_forecast["hours"]:
+        views = []
+        if value is not None:
+            views = [
+                ice_view(amount=value, end=hour["valid_time"]),
+                ice_view("HRRR_FRZR", amount=0 if value == 0 else 0.75, end=hour["valid_time"]),
+                ice_view("RAP_FRZR", amount=0 if value == 0 else 1.0, end=hour["valid_time"]),
+            ]
+            if hour["horizon_hours"] % 6 == 0:
+                views.append(
+                    ice_view(
+                        "NBM_FICEAC_6H", amount=0 if value == 0 else 1.25, end=hour["valid_time"]
+                    )
+                )
+        evidence = extract_ice_contributors(
+            views, latitude=44.5, longitude=-93.5, valid_time=hour["valid_time"]
+        )
+        hour["surface"]["fields"].update(evidence["fields"])
+        hour["surface"]["ice_guidance"] = evidence
+    original = deepcopy(native_probability_forecast)
+    report = build_hourly_report(native_probability_forecast)
+    prefix, section = render_hourly_report(report).split(
+        "### Native ice and freezing-rain-liquid evidence"
+    )
+    assert prefix.strip() == render_hourly_report(build_hourly_report(previous)).strip()
+    assert "elevated flat-surface ice-accretion mass equivalent in kg/m²" in section
+    assert "FRZR is freezing-rain liquid equivalent in kg/m²" in section
+    assert "No 1:1 liquid-to-ice conversion" in section
+    assert "not geometric or radial ice thickness, ground ice or road icing" in section
+    assert "a six-hour amount is not relabeled as an hourly amount" in section
+    if value is not None:
+        expected = "0" if value == 0 else "0.123457"
+        assert f"flat_ice_accretion_mass_equivalent | {expected} |" in section
+        difference = "+0" if value == 0 else "-0.25"
+        assert f"| 36 | HRRR_FRZR minus RAP_FRZR | {difference} |" in section
+        assert (
+            "Flat-ice accretion mass and freezing-rain liquid are different quantities" in section
+        )
+        assert "Accumulation intervals differ; no period conversion or filling" in section
+        source = report["hours"][0]["surface"]["ice_guidance"]["contributors"][0]
+        assert source["value"] == value and source["native_value"] == value
+    else:
+        assert "No retained native ice/freezing-rain interval" in section
+    for baseline, shown in zip(original["hours"], report["hours"], strict=True):
+        assert shown["surface"] == baseline["surface"]
+        assert shown["final_surface_fields"] == baseline["surface"]["fields"]
+        for name, field in shown["surface"]["ice_guidance"]["fields"].items():
+            assert shown["final_surface_fields"][name] == field
+            assert field["value"] is None and field["weights"] == {}
+    assert native_probability_forecast == original
+    report["hours"][0]["surface"]["ice_guidance"]["contributors"][0]["unit"] = "m"
+    with pytest.raises(ValueError, match="Ice report requires finite nonnegative mass equivalents"):
         render_hourly_report(report)
     assert native_probability_forecast == original
 

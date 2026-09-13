@@ -64,6 +64,10 @@ only required geographic inputs; names are optional display metadata.
   adds native NBM hourly probabilities as a temporary baseline, with separate three-
   and six-hour shadow events. Event/spatial-definition uncertainty is explicit; these
   are not exact-point lightning probabilities or a calibrated multi-source forecast.
+- **Ice/freezing rain:** an optional [native ice step](#native-ice-and-freezing-rain-liquid-on-the-local-grid)
+  retains NBM flat-ice mass-equivalent accumulation and HRRR/RAP freezing-rain liquid
+  separately. Both are zero-weight evidence; delivered fields stay unavailable without
+  an approved policy. No liquid-to-ice or ice-thickness conversion is applied.
 - **Shadows:** real RAP and ECMWF IFS values/provenance accompany issuance with zero
   active weight. IFS preserves native three-hourly gaps and has no compatible
   instantaneous gust. Native cloud evidence does not introduce a new active policy.
@@ -96,7 +100,7 @@ The QPF increment adds [real interval/conservation and offline replay evidence](
 precipitation verification remains future work. The [PoP increment](#probability-of-precipitation-on-the-local-grid)
 adds actual native probabilistic guidance without changing QPF or other surface values.
 
-There is **no active snowfall blend, delivered snow depth on the ground, ice amount, deterministic bias correction,
+There is **no active snowfall/ice blend, delivered snow depth on the ground, deterministic bias correction,
 site learning, AI editing, production deployment or scheduling in the V2 path yet**. Bias/AI
 report stages are explicitly unimplemented and final values currently equal the baseline.
 Registration services and delivery also remain future work. The retained Phase 2 station
@@ -115,8 +119,9 @@ Native snowfall amounts and separate Kuchera estimates are now implemented as ev
 Native cloud evidence is now implemented separately from an unapproved delivered
 cloud blend; [cloud checks and real replay evidence](#native-cloud-cover-on-the-local-grid)
 are recorded below. Native visibility evidence and temporary native NBM hourly
-thunder potential are implemented on the same grid. The next proposed step is native
-ice-accretion/freezing-rain amount evidence, keeping their definitions distinct.
+thunder potential and separate native ice/freezing-rain liquid evidence are implemented
+on the same grid. The next proposed step is to inventory the forecast canvas and
+design deterministic human-readable conditions, including policy gaps and missingness.
 Neither visibility nor thunder potential alone establishes a complete weather-condition string.
 Native snowfall, NBM SLR and Kuchera remain separately traceable pending sufficient
 verification data; a broad snowfall evaluation campaign is not the next task.
@@ -3528,13 +3533,127 @@ reflectivity, QPF and deterministic convection can later supply supporting conte
 they are not probabilities themselves. No thunder calibration, new meteorological
 weights, derived conditions, or changes to earlier fields are introduced here.
 
-The next smallest field is **native ice-accretion/freezing-rain amount evidence**:
-inspect NBM `FICEAC` (FRAM flat ice) and available native freezing-rain liquid
-accumulations (`FRZR` is present in the retained HRRR/RAP inventories), preserving
-their separate [native definitions and units](https://www.nco.ncep.noaa.gov/pmb/docs/grib2/grib2_doc/grib2_table4-2-0-1.shtml).
-Flat ice,
-radial ice and liquid freezing-rain amount must not be conflated or assigned an
-invented blend. Human-readable conditions should follow that field work.
+The following increment adds that separate native ice/freezing-rain evidence.
+
+## Native ice and freezing-rain liquid on the local grid
+
+The optional `mesoforge.application.prepared_ice` step attaches native accumulated
+amounts to the same **49-cell, 36-hour** context/editable grid. `surface.ice_guidance`
+retains all contributors, intervals and descriptive disagreements. Two independent
+`surface.fields` entries remain null with `policy_unavailable` and empty weights:
+`flat_ice_accretion_mass_equivalent` and `freezing_rain_liquid_equivalent_amount`.
+No approved retained Phase 2 ice blend or local accretion method was found.
+
+| Source/product | Native physical meaning | Time support |
+|---|---|---|
+| NBM core `FICEAC` | Provider FRAM elevated flat-surface ice, published mass-equivalent encoding | Separate native 1-hour and 6-hour accumulations |
+| HRRR `wrfsfc` / RAP `awp130pgrb` `FRZR` | Liquid-equivalent freezing-rain precipitation | Same-cycle cumulative parents differenced into exact hourly intervals |
+| GFS / IFS inspected feeds | No supported native accumulation bound in this adapter | Explicitly unavailable; categorical freezing rain and sea ice are not substitutes |
+
+[NOAA's native parameter table](https://www.nco.ncep.noaa.gov/pmb/docs/grib2/grib2_doc/grib2_table4-2-0-1.shtml)
+defines `FICEAC` (0/1/228) and `FRZR` (0/1/225) separately in kg/m². Equal units do
+**not** make these the same quantity or establish a geometric ice thickness. The
+adapter preserves NBM's published units even when the installed ecCodes dictionary
+reports its local parameter as unknown: a strict source/parameter/grid/time binding
+is required, and original decoded metadata plus the official unit reference remain
+stored. [NBM's element definitions](https://vlab.noaa.gov/web/mdl/nbm-weather-elements)
+and the [FRAM paper](https://repository.library.noaa.gov/view/noaa/15309) describe the
+provider's flat-ice product. This code consumes that native result; it does not
+implement FRAM, a density assumption, a 1:1 liquid-to-ice mapping or a new ice blend.
+
+Extraction samples the nearest native cell with a deterministic tie break. Native
+parent values, exact source-cycle/lead and accumulation bounds, URLs, hashes,
+acquisition/availability times and native geometry remain traceable through the
+local grid and its exact center point. Negative/nonfinite increments stay missing;
+zero is retained. A missing cumulative parent makes that hourly amount unavailable.
+Whole-day inventory spelling (for example `0-1 day`) is accepted only when exactly
+equivalent to the requested interval. Native 6-hour NBM amounts are not spread into
+hourly values. Comparisons reject unlike physical quantities/windows; they do not
+establish skill. A compatible same-source interval aggregation checks contiguous
+bounds and conserves amounts without changing the hourly evidence.
+
+```powershell
+python -m mesoforge.application.prepared_ice --prepared-run EXISTING_PREPARATION --output-dir NEW_ICE_PREPARATION
+python -m mesoforge.application.prepared_ice --prepared-run NEW_ICE_PREPARATION --output-dir OFFLINE_ICE_REPLAY --from-raw
+python -m mesoforge.application.prepared_local_grid --config LOCATIONS_JSON --prepared-run OFFLINE_ICE_REPLAY --output-dir NEW_LOCAL_GRIDS
+```
+
+All output directories must be outside Git. Preparation acquires one selected native
+message per source/lead, shared by regional views and grid cells. Existing prepared
+fields are referenced in place. This optional attachment does not yet add automatic
+ice acquisition to `forward_run`; HTTP requests perform no downloads. Later ice
+acquisition is explicitly separate from original forecast decision-time evidence.
+The hourly report retains kg/m² and labels delivered ice/liquid unavailable. It does
+not imply road icing, radial ice,
+precipitation type, probability or a complete weather condition.
+
+The bounded real case uses September 11, 2026 HRRR **12Z**, RAP **15Z** and NBM
+**18Z**, with target 18Z and hourly valid times through September 13 06Z. Retained
+surface/snowfall guidance was reused for a point near Glacier National Park
+(48.88989256506466, -113.62830155754455); no new surface-model downloads were needed.
+This is real forecast guidance, not observational confirmation of an icing event.
+
+| UTC accumulation window | NBM flat-ice mass equivalent kg/m² | HRRR freezing-rain liquid kg/m² | RAP freezing-rain liquid kg/m² |
+|---|---:|---:|---:|
+| September 12, 08–09Z | 0.005 | 0.007584 | 0 |
+| September 12, 09–10Z | 0.014 | 0.073807998 | 0 |
+| September 13, 05–06Z | 0.108000003 | 0.002400011 | 0 |
+
+These are distinct quantities and model predictions, not interchangeable estimates
+of ice thickness. NBM's separate September 13 **00–06Z** flat-ice product is
+0.250999987 kg/m²; it is not an hourly amount or asserted equal to summed native
+hourly FRAM outputs. GFS/IFS remain unsupported. At the Glacier point all 36 hourly
+NBM/HRRR/RAP values are available, with six native NBM six-hour endpoints. The
+compatible HRRR hourly liquid sum is **0.41335999965667725 kg/m²**, matching the
+native end-minus-start cumulative amount within 1e-12; RAP's corresponding total
+is zero. All underlying values remain unrounded in storage.
+
+Spatial variation exists in both domains. During September 12 08–09Z, HRRR liquid
+spans 0–0.007584 kg/m² in the 9 editable cells and 0–0.226543994 in the 40 context-only
+cells; NBM hourly flat ice spans 0–0.005 and 0–0.006 respectively. Four HRRR context
+cell/hours elsewhere in the window have small negative native cumulative differences
+and remain explicitly missing, without clipping. Zero native amounts are preserved.
+
+The experiment transferred **22,215,385 bytes**, including inventories/probes and
+the exact whole-day inventory recovery. It retained **116 unique selected messages**
+totalling **19,907,170 GRIB bytes**, plus **1,682,319 successful inventory bytes**.
+Compressed ice arrays occupy **269,918 bytes** for Minneapolis and **443,255 bytes**
+for the Montana view; the latter was cropped from retained raw data with no downloads.
+Raw replay reproduced arrays, native events and original acquisition provenance
+exactly with **zero provider calls**. Existing preparation descriptors were unchanged.
+
+Both full grids have 49 cells × 36 hours at unchanged 6 km spacing, with exact
+point extraction equal to their center cell and direct native evidence sampling.
+All **1,764 previous Minneapolis cell/hour payloads match exactly**, including
+thunder and every earlier field. Its new full grid is **93,371,728 bytes compressed**
+and took **352.92 seconds** to build/retain; the Glacier grid is **71,668,489 bytes**
+and took **256.11 seconds**. Complete offline rebuilding reproduced both exact
+compressed retained grids and their provenance with zero provider calls.
+
+Validation: **343 focused/retained offline tests passed**: 87 new adapter/science/
+preparation tests, 49 hourly-report tests, 3 selected grid/replay tests and 204 retained
+application/scientific tests. Coverage includes separate physical quantities, units,
+exact intervals and conservation, zero/missing, native parents, provenance, shared
+loading, point extraction, unchanged prior fields and immutable in-memory readback.
+The new source/science/preparation selection was executed with:
+
+```powershell
+python -m pytest -q tests/unit/guidance/test_ice.py tests/unit/forecasting/test_ice.py tests/unit/application/test_ice.py tests/unit/application/test_prepared_ice.py
+```
+
+Ruff, formatting, mypy, all nine import contracts, documentation/hygiene, offline lock
+validation and `git diff --check` passed. Preparation/grid functions and CLI help were
+executed; the command sequence above uses placeholders for the caller's paths.
+No PostgreSQL/MinIO services, full acceptance suite, ice-observation verification,
+calibration or forecast-skill assessment ran in this increment.
+
+A future derived accretion method needs a validated meteorological algorithm and
+suitable thermodynamic, precipitation-rate and wind inputs. FRAM may be evaluated
+later; a surface-temperature rule or simple liquid conversion is insufficient.
+The next proposed milestone is **inventorying the entire forecast canvas and designing
+the deterministic weather-condition field**: identify which fields are delivered,
+evidence-only, unavailable or incompatible before defining traceable condition rules.
+No further field, derived conditions or accretion algorithm is added here.
 
 ## References
 

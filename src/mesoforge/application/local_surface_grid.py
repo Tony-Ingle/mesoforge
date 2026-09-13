@@ -164,11 +164,13 @@ def _transformation_identity() -> dict[str, Any]:
         "application/cloud_cover.py",
         "application/visibility.py",
         "application/thunder.py",
+        "application/ice.py",
         "forecasting/surface.py",
         "forecasting/snowfall_amount.py",
         "forecasting/cloud_cover.py",
         "forecasting/visibility.py",
         "forecasting/thunder.py",
+        "forecasting/ice.py",
         "forecasting/scalar_blend.py",
         "forecasting/vector_blend.py",
         "forecasting/gust_blend.py",
@@ -342,6 +344,29 @@ def _missing_hours(hours: list[dict[str, Any]], reason: str) -> list[dict[str, A
                 contributor.pop("spatial_extraction", None)
                 contributor.pop("extraction_coordinate", None)
             for comparison in thunder["comparisons"]:
+                comparison.update(
+                    difference_left_minus_right=None,
+                    status="unavailable",
+                    missing_reasons=[reason],
+                )
+        ice = surface.get("ice_guidance")
+        if ice is not None:
+            for name, field in ice["fields"].items():
+                field.update(value=None, status="unavailable", missing_reasons=[reason], weights={})
+                field.pop("spatial_extraction", None)
+                field.pop("extraction_coordinate", None)
+                surface["fields"][name] = deepcopy(field)
+            for contributor in ice["contributors"]:
+                contributor.update(
+                    value=None,
+                    native_value=None,
+                    active_weight=0.0,
+                    status="unavailable",
+                    missing_reasons=[reason],
+                )
+                contributor.pop("spatial_extraction", None)
+                contributor.pop("extraction_coordinate", None)
+            for comparison in ice["comparisons"]:
                 comparison.update(
                     difference_left_minus_right=None,
                     status="unavailable",

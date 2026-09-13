@@ -55,6 +55,16 @@ bound correctly. NBM-only thunder is not the final architecture: future multi-so
 combination/calibration requires suitable verification evidence. Deterministic CAPE,
 QPF, reflectivity or lightning diagnostics are not probabilities by themselves.
 
+An optional native ice attachment retains NBM FRAM flat-ice mass-equivalent
+accumulations separately from HRRR/RAP liquid-equivalent freezing rain across the
+same grid. Exact intervals, native units, cumulative parents, provenance and
+missingness remain traceable. All are zero-weight evidence; no approved active ice
+blend or local accretion algorithm exists. Equal kg/m² units do not imply equal
+physical meaning or ice thickness. Native flat ice, liquid freezing rain and a future
+derived accretion estimate remain three separate concepts. A later method such as
+FRAM needs validated thermodynamic, wind and precipitation inputs; no 1:1 conversion
+or surface-temperature-only inference is adopted.
+
 Shared prepared files hold native model grids. The local MesoForge surface baseline
 uses one coordinate-derived grid covering a larger context domain, with a smaller
 editable subset and an exact forecast-point target. The spot forecast is extracted
@@ -296,15 +306,17 @@ equivalent is now retained as unblended evidence on the same grid. Native interv
 snowfall amounts, native model SLR and first profile-based Kuchera estimates are also
 separate evidence. Snow depth on the ground is not newly accumulated snowfall.
 Native total-cloud, visibility and thunder-probability evidence are now available
-on the same grid. The next proposed field is native ice-accretion/freezing-rain amount
-guidance, preserving flat ice, radial ice and liquid amounts as separate concepts.
-Ice amounts and complete derived conditions remain future work. Low visibility
-alone cannot establish fog, precipitation or another cause. Native snowfall, NBM SLR and Kuchera remain
+on the same grid, together with native flat-ice and freezing-rain liquid evidence.
+The next proposed step is to inventory the forecast canvas and design deterministic
+weather-condition rules that respect delivered versus evidence-only fields, policy
+gaps, event definitions and missingness. Complete derived conditions remain future
+work. Low visibility alone cannot establish fog, precipitation or another cause.
+Native snowfall, NBM SLR and Kuchera remain
 separately traceable until sufficient suitable verification exists; a broad snowfall/SLR
 campaign is deferred. No constant ratio, native single-source rule or derived method
 is assumed to be best; zero/missing water denominators cannot establish an observed SLR.
-Ice accretion requires suitable additional guidance and documented conversion
-semantics; statistical correction, AI, delivery and learning are not prerequisites.
+Locally derived ice accretion requires suitable additional guidance and validated
+meteorological inputs; statistical correction, AI, delivery and learning are not prerequisites.
 
 The exact wider release support matrix, authentication, measured resource limits,
 local-grid design and retention promises remain open. Existing approved field and
@@ -314,9 +326,9 @@ does not authorize implementing the roadmap as one task.
 ## Future roadmap
 
 Fields should grow from today's surface, QPF, PoP, native type, SWE, native/derived
-snowfall-amount, cloud, visibility and native thunder evidence to
-snow depth on the ground, ice amounts and other useful
-forecasts. Conditions must
+snowfall-amount, cloud, visibility, native thunder and distinct ice/freezing-rain
+evidence to other useful forecasts after the canvas inventory. Snow depth on the
+ground and locally derived accretion remain future work. Conditions must
 be derived from the underlying fields with explainable rules and explicit missingness,
 not emitted as an unexplained standalone prediction.
 

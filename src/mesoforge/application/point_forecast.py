@@ -18,6 +18,7 @@ import xarray as xr
 
 from mesoforge.alignment.station_frame import StationAlignmentError, align_station_to_model
 from mesoforge.application.cloud_cover import CloudView, extract_cloud_contributors
+from mesoforge.application.ice import IceView, extract_ice_contributors
 from mesoforge.application.precipitation_type import PTYPE, TypeView, extract_precipitation_type
 from mesoforge.application.prepared_qpf import read_qpf_inputs, required_qpf_leads
 from mesoforge.application.probability_contributors import (
@@ -346,6 +347,8 @@ class PreparedPointForecast:
     _visibility_guidance: dict[str, Any] | None = None
     _thunder_views: list[ThunderView] = field(default_factory=list)
     _thunder_guidance: dict[str, Any] | None = None
+    _ice_views: list[IceView] = field(default_factory=list)
+    _ice_guidance: dict[str, Any] | None = None
 
     @property
     def notice(self) -> str:
@@ -850,6 +853,16 @@ class PreparedPointForecast:
                     )
                     hours[-1]["surface"]["fields"][THUNDER] = thunder["field"]
                     hours[-1]["surface"]["thunder_guidance"] = thunder
+                if self._ice_guidance is not None:
+                    ice = extract_ice_contributors(
+                        self._ice_views,
+                        latitude=latitude,
+                        longitude=longitude,
+                        valid_time=_iso(valid_time),
+                        source_status=self._ice_guidance.get("source_status", {}),
+                    )
+                    hours[-1]["surface"]["fields"].update(ice["fields"])
+                    hours[-1]["surface"]["ice_guidance"] = ice
         contributor_configuration = (
             with_surface_fields(self._configuration)
             if self._surface_configuration is not None
@@ -894,6 +907,8 @@ class PreparedPointForecast:
             result["visibility_guidance"] = deepcopy(self._visibility_guidance)
         if self._thunder_guidance is not None:
             result["thunder_guidance"] = deepcopy(self._thunder_guidance)
+        if self._ice_guidance is not None:
+            result["ice_guidance"] = deepcopy(self._ice_guidance)
         if self._manifest_sha256 is not None:
             result["manifest_sha256"] = self._manifest_sha256
         if self._pop_guidance is not None:
