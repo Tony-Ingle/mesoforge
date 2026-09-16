@@ -92,9 +92,9 @@ The long-term field direction includes temperature, dew point/RH, wind/gust,
 clouds, QPF, PoP, precipitation type, snow, and other useful fields as their
 scientific contracts are implemented. Conditions derive from underlying forecast
 fields rather than an unexplained standalone prediction. The code-grounded canvas
-inventory and proposed deterministic condition layer are in section 6.7. Precipitation
-type and subsequent native evidence increments are complete; the next proposed slice
-is a conservative condition preview, not another meteorological field.
+inventory and deterministic condition layer are in section 6.7. The read-only
+saved-grid preview and initial presentation rules are implemented; the next proposed
+slice is bounded multi-hour transition detection, not another meteorological field.
 
 **Owner model direction, 2026-09-10:** the long-term model mix includes HRRR,
 RAP, NAM 3 km, NAM, GFS, RRFS / REFS, and NBM, with useful deterministic and
@@ -568,11 +568,12 @@ stages, not prerequisites for numerical issuance or first-release acceptance.
 ### 6.7 Forecast canvas and deterministic conditions
 
 **Inventory as of `49656edfadd53601f40356a4c4dee4b4d6c59347`, 2026-09-13.**
-This section records inspected code, then proposes a condition-layer design. The
-owner has approved the guardrails and this design exercise, not new source weights,
-weather thresholds, a condition engine or field promotion. No runtime/schema change
-is made by this documentation milestone. It supersedes older field-status and
-next-field descriptions elsewhere in this RFC, not the remaining proposed architecture.
+The inventory records inspected code at that checkpoint. Subsequent owner approvals
+enabled the saved-ID read-only preview, temporary NBM active sky cover, and the bounded
+presentation policy in §6.7.8. Those explicit approvals do not approve other source
+weights, field promotion, intensity/fog/transition rules or the remaining proposed
+architecture. This section supersedes older field-status and next-field descriptions
+elsewhere in this RFC.
 
 #### 6.7.1 What the saved canvas actually contains
 
@@ -697,19 +698,19 @@ capability is approved or implemented by this design.
 | Temperature | B; `temperature_control_v1`, HRRR/GFS 70/30 for all 36 h; RAP/IFS E | `require_all`: missing active contributor → null, no redistributed weights | Numeric context; never determines p-type/fog/ice alone | issued |
 | Dew point | B; applicable Phase 2 scalar/vector HRRR/GFS rows, 70/30 h1–18, 60/40 h19–36 | Approved eligible sole-source row only; source and final dew-point consistency required; invalid → null | Moisture context; no fog inference by itself | P2 only |
 | RH | B+D; Bolton liquid-water diagnostic from baseline T/Td; per-model diagnostics E | Missing/invalid T/Td or RH outside 0–100 → null; no supersaturation clipping | Numeric moisture context; not a fog detector | none |
-| U/V, speed/direction | B; U/V blended as vectors with coupled eligible gust set and same Phase 2 rows; speed/direction D | Eligible sole-source rows explicit; invalid coupled source excluded; calm speed 0, direction null with reason | Numeric wind is usable; breezy/windy thresholds and duration meaning unapproved; calm-direction can be not applicable | P2 only |
-| Gust | B; same U/V contributor set/row; RAP E; IFS U | Existing approved ≤0.1 m/s source shortfall floor and ≤1e−6 m/s final floor recorded; incompatible IFS interval maximum stays missing | Numeric gust usable; sustained descriptors must not use gust interchangeably | P2 only |
+| U/V, speed/direction | B; U/V blended as vectors with coupled eligible gust set and same Phase 2 rows; speed/direction D | Eligible sole-source rows explicit; invalid coupled source excluded; calm speed 0, direction null with reason | Numeric wind and approved breezy/windy presentation descriptors (§6.7.8); no invented sustained duration; calm-direction can be not applicable | P2 only |
+| Gust | B; same U/V contributor set/row; RAP E; IFS U | Existing approved ≤0.1 m/s source shortfall floor and ≤1e−6 m/s final floor recorded; incompatible IFS interval maximum stays missing | Numeric gust and separately specified gust thresholds in §6.7.8; never relabel gust as sustained wind | P2 only |
 | Hourly QPF | B; Phase 2 precipitation HRRR/GFS rows 70/30 h1–18, 60/40 h19–36; eligible sole-source fallback | Exact hourly intervals and finite corners required; native GFS bucket/reset/tolerance contract retained; zero ≠ missing; RAP/IFS U | State amount and period; not PoP, instant occurrence or observed intensity. Amount/intensity-class thresholds need policy | P2 only |
-| Hourly PoP | S; NBM-only weight-1 passthrough | Exact >0.254 kg/m² event and 1-h bounds; missing/invalid → null; no longer-period fallback | Numeric event probability is usable with its period/threshold; qualitative bands and type-specific event combination unapproved | P2 only |
+| Hourly PoP | S; NBM-only weight-1 passthrough | Exact >0.254 kg/m² event and 1-h bounds; missing/invalid → null; no longer-period fallback | Numeric probability plus approved presentation bands (§6.7.8); no calibrated joint type-specific probability | P2 only |
 | Other precipitation probabilities | E; no delivered weights or calibration | Exact threshold/comparator/window/spatial support required for comparison; native gaps explicit | Supporting diagnostics only; neither substitute nor extra vote for delivered PoP | none |
-| P-type | Temporary B categorical agreement, no scalar weights; RAP/IFS/NBM E | Complete HRRR/GFS flag sets must agree; equal multi-type set → mixed; disagreement → ambiguous; zero flags → unknown, not dry; no one-source fallback | Report the exact endpoint state, including mixed/unknown. Joint occurrence/type and interval interpretation still need policy | none |
+| P-type | Temporary B categorical agreement, no scalar weights; RAP/IFS/NBM E | Complete HRRR/GFS flag sets must agree; equal multi-type set → mixed; disagreement → ambiguous; zero flags → unknown, not dry; no one-source fallback | Native endpoint state retained separately from rendering applicability; §6.7.8 supports conservative labels, not type persistence through an interval or transition claims | none |
 | SWE | E+P; no approved blend; active value null | HRRR/RAP hourly and IFS native 3-h bounds stay separate; GFS snowpack WEASD and absent NBM SWE unsupported; no QPF/type conversion | Evidence-only; cannot make delivered snow occurrence or amount | none |
 | Native snowfall amount | E+P; no approved blend; active value null | Native parents/windows required; NBM snow-and-sleet not silently equated to HRRR/RAP snow; GFS/IFS new-depth U | Evidence-only; no inference of occurrence/type from positive snowfall alone | none |
 | Kuchera snowfall / SLR | E+D+P for delivered amount; versioned RAP method | Missing required profile/SWE → missing; no constant-ratio fallback; preserve interval-end approximation and native-corner calculation | Evidence-only; no automatic promotion over native guidance | none |
 | Native NBM SLR | E; separate instantaneous SNOWLR | Missing/invalid remains unavailable; no unapproved cross-model or interval-average use | Supporting evidence only, not a condition | none |
 | Cloud / per-source sky category | Active temporary NBM under `nbm-native-total-cloud-baseline.v1`; HRRR/GFS/RAP/IFS E; categories D | Incompatible layers/averages rejected; IFS native 3-h gaps explicit; zero cloud valid; missing NBM has no fallback | Eligible for sky using saved active percentage/category. Multi-source cloud weighting/calibration remains open and requires verification evidence | none |
 | Visibility | E+P; active visibility null; HRRR/GFS/RAP/NBM E, IFS U | Native finite nonnegative horizontal visibility required; no invented cap or filling | Reduced-visibility clause blocked by active-policy gap; fog additionally requires suitable causal evidence and a validated rule | none |
-| Hourly thunder | Temporary S; NBM hourly native passthrough | Missing/invalid → null; no 3/6-h replacement; unencoded threshold/footprint remain unknown | Qualified native probability display only; unqualified point thunder/“likely” wording needs event-support and phrase policy | none |
+| Hourly thunder | Temporary S; NBM hourly native passthrough | Missing/invalid → null; no 3/6-h replacement; unencoded threshold/footprint remain unknown | Approved probability wording (§6.7.8), retaining provider-event uncertainty; never deterministic exact-point lightning | none |
 | Longer-period thunder / other lightning products | E or U; no combined source policy | Unlike events/periods/support are incompatible; deterministic diagnostics not probabilities | Evidence-only; cannot determine a delivered thunder clause | none |
 | Freezing-rain liquid | E+P; HRRR/RAP FRZR; no active blend | Same-cycle cumulative parent differencing; negative/nonfinite increments missing, not zero; unsupported sources explicit | Evidence-only amount; does not establish occurrence or accreted ice | none |
 | Native flat ice | E+P; NBM FICEAC native 1/6 h; no active blend | Retain kg/m² native meaning; no density/thickness/period conversion; GFS/IFS U | Evidence-only hazard amount; not a road-icing diagnosis or a substitute for p-type | none |
@@ -843,7 +844,7 @@ the saved event/spatial metadata and policy references omitted from the abbrevia
 example, with hashes/code identity for the derivation and renderer. IDs, digests and
 draft versions above are illustrative, not registered artifacts or approved policies.
 
-#### 6.7.5 Proposed deterministic rule hierarchy
+#### 6.7.5 Deterministic rule hierarchy
 
 1. **Identify and validate the input.** Read one exact saved forecast/grid version,
    chosen field-stage digest, coordinate/cell and target horizon. Validate units,
@@ -863,12 +864,14 @@ draft versions above are illustrative, not registered artifacts or approved poli
 4. **Translate component state without losing meaning.** Preserve p-type mixed versus
    ambiguous/unknown, invalid/missing probabilities versus true zero, and calm direction
    versus absent wind. PoP zero only describes its thresholded event; QPF zero and zero
-   type flags do not prove no trace/drizzle/snow. No currently approved dry classifier
-   makes precipitation type `not_applicable`; retain its raw state for now.
+   type flags do not prove no trace/drizzle/snow. The approved §6.7.8 applicability
+   rule can make precipitation `not_applicable` for rendering while retaining the
+   native p-type state unchanged. It is not a new meteorological dry classifier.
 5. **Derive components using versioned, explicit rules.** Reuse existing numerical
-   diagnostics and sky categories where their active inputs qualify. Every later
-   probability band, intensity class, wind threshold, persistence window and boundary
-   comparator must be explicit in the condition ruleset. Never round before classification.
+   diagnostics and sky categories where their active inputs qualify, plus the approved
+   probability/wind presentation bands in §6.7.8. Any later intensity class,
+   persistence window or changed boundary comparator requires explicit policy.
+   Never round before classification.
    Unsupported rules remain unavailable, rather than silently choosing familiar thresholds.
 6. **Gate combinations and flag tensions.** QPF and PoP disagreements are descriptive
    tension, not instructions to repair either field. Reuse applicable logic from
@@ -881,7 +884,8 @@ draft versions above are illustrative, not registered artifacts or approved poli
    Missing sky does not block a precipitation component, but missing type blocks a
    specific rain/snow claim. Missing snow/ice amount does not inherently block an
    otherwise justified type/occurrence claim. Never infer fog from visibility alone.
-7. **Derive transitions only from eligible adjacent results.** Use one issuance/stage,
+7. **Keep transitions gated until a separately approved milestone.** That work must
+   use eligible adjacent results from one issuance/stage,
    consecutive samples and explicit windows; unknown/gaps break the sequence. Initially
    report endpoint type changes as endpoint changes. “Rain changing to snow” later
    requires approved occurrence/type temporal linkage. Do not invent a transition time
@@ -905,12 +909,12 @@ Specific phrase families and prerequisites:
 | Concept | Eligible derivation / constraint |
 |---|---|
 | Clear → cloudy | Temporary active native NBM total-cloud input plus existing unrounded upper-inclusive 5/25/50/87/100% categories. Shadow categories cannot replace missing active sky. No total from summed cloud layers |
-| Rain/snow; chance/likely variants | Approved occurrence assessment plus resolved compatible type; qualitative probability bands need approval. For now expose numeric thresholded PoP and endpoint type separately, not a calibrated type-specific probability |
+| Rain/snow; chance/likely variants | §6.7.8 hourly applicability/bands plus resolved native endpoint type. Preserve the distinct timed inputs; this is a presentation phrase, not a calibrated type-specific probability or interval-wide type claim |
 | Mixed precipitation | Known supported multi-type set plus appropriate occurrence semantics; disagreement alone remains ambiguous, with alternatives shown rather than false certainty |
 | Freezing rain possible | Eligible occurrence/type linkage and actual freezing-rain type evidence; temperature below freezing, positive FRZR/FICEAC, or surface QPF alone cannot establish it |
-| Thunderstorms / likely | Native probabilistic event, acceptable support and a defined phrase policy; current NBM probability can be quoted with its provider-defined qualification, not asserted as point lightning or unqualified categorical thunder |
+| Thunderstorms / likely | §6.7.8 active hourly probability bands with provider-event uncertainty retained; not deterministic point lightning or a replacement event definition |
 | Reduced visibility / fog | Active compatible visibility plus approved restriction bins for the former; additional suitable fog evidence/validated causal diagnostic for the latter. Low visibility, high RH, small T−Td, snow or rain independently are insufficient |
-| Breezy / windy | Approved sustained-wind threshold and duration policy; gust remains a separate modifier. No silently adopted Beaufort/NWS threshold or instantaneous-to-hourly averaging assumption |
+| Breezy / windy | §6.7.8 separate sustained/gust thresholds; windy takes precedence. Presentation descriptors, not NWS hazard criteria or an instantaneous-to-hourly averaging assumption |
 | Snow with wind | Both separately eligible components at compatible support. “Snow; windy” need not imply **blowing snow**, which needs additional suitable blowing-snow evidence/validated rule |
 | Mostly cloudy with chance of rain | Both sky and typed occurrence gates must pass. A missing active cloud policy cannot be filled from an arbitrary shadow just to complete the sentence |
 
@@ -921,49 +925,46 @@ Specific phrase families and prerequisites:
 | Cloud multi-source skill/calibration remains open | Claims of optimized or permanent multi-source sky delivery | Native NBM is the explicitly approved interim sky baseline; other models remain comparison evidence. Missing NBM yields unavailable sky. No temperature-weight copying |
 | Visibility has no approved active policy; fog has no validated cause rule | Reduced-visibility descriptors and fog | Both unavailable. Retain evidence without inferring fog, rain intensity or blowing snow |
 | SWE/snowfall/SLR/ice have no approved active amount policy | Delivered winter amounts, amount classes and accretion/road-ice claims | Keep E/P fields excluded. Does not block future snow/freezing-rain type wording if independent occurrence/type rules qualify |
-| Temporary p-type agreement; no dry/not-applicable or interval-occurrence linkage | Confident typed interval phrases, transitions and dry/type suppression | Keep endpoint type/state and disagreement; zero flags do not mean dry. Agreement policy remains unchanged |
+| Temporary p-type agreement; no interval-wide type persistence rule | Confident type-throughout-interval claims and transitions | Keep endpoint type/state and disagreement. §6.7.8 rendering applicability is separate; agreement policy and native unknown states remain unchanged |
 | NBM sole-source hourly PoP; no calibrated multi-source policy | Claims of optimized/multi-source/type-specific probability | Existing native event may be displayed numerically; more probability sources/calibration are not prerequisites for that limited use |
-| NBM thunder event threshold/footprint not fully established; no phrase bands | Exact-point thunder claims and unqualified “thunderstorms likely” | Provider-qualified native probability only, or unavailable clause. No new product or deterministic proxy substitution |
-| Occurrence wording, probability bands, amount/intensity thresholds, wind descriptors and transitions not approved | The full condition renderer's qualitative claims | First slice uses numeric event/amount/wind and distinct endpoint type. Proposed values/bands must be reviewed before enabling these descriptors |
+| NBM thunder event threshold/footprint not fully established | Deterministic exact-point thunder claims | §6.7.8 probability wording retains provider-event uncertainty; no new product or deterministic proxy substitution |
+| Amount/intensity classes, transitions and fog rules remain unapproved | Intensity, multi-hour evolution and fog claims | Use only approved sky and §6.7.8 precipitation/thunder/wind wording; omit unsupported components with explicit reasons |
 | Condition verification/calibrated confidence absent | Skill claims, calibrated whole-condition confidence and automatic rule promotion | `confidence: not_calibrated`; independent behavioral tests are not forecast-skill evidence |
 
-The **minimum decision before the first implementation** is approval of the bounded
-preview contract below: exact numeric event/amount and endpoint type remain separate;
-unknown/ambiguous/unavailable are explicit; no qualitative probability, dry, intensity,
-wind or fog thresholds are invented. Choose its actual ruleset/template version when
-implemented. No cloud, visibility, snow, ice or production-weight decision is needed
-for that preview. Conversely, a first release that must already say “mostly cloudy
-with rain likely” needs an active cloud policy and explicit occurrence/type/phrase
-rules before implementation. This RFC does not approve them by describing them.
+The bounded preview, temporary NBM sky and §6.7.8 presentation thresholds have now
+received explicit owner approval. Exact numeric events, amounts and endpoint type
+remain separate. No visibility, winter-amount or production-weight decision is needed
+to render those approved components. Other gaps above remain open; documenting a
+future rule does not approve it.
 
-#### 6.7.7 Smallest proposed implementation slice and checks
+#### 6.7.7 Implemented read-only slice and checks
 
-Implementation status (September 13, 2026): the saved-ID read-only preview below
+Implementation status: the saved-ID read-only preview
 is implemented in `forecasting/conditions.py` and `application/weather_conditions.py`.
 The owner then approved native NBM instantaneous total cloud as a temporary active
 sky source, using the existing category mapping. Preview/template v2 adds that sky
 component without changing other condition policies or historical forecasts.
 NBM-only cloud enables deterministic sky wording while the broader measured
-multi-source architecture remains the intended direction. Explicit precipitation,
-wind and thunder wording/precedence is the next policy milestone; fog remains gated.
-The following original slice description is retained as design context.
+multi-source architecture remains the intended direction. The next increment adds
+the explicitly approved precipitation/wind/thunder policy in §6.7.8 under ruleset
+`saved-active-fields-condition-preview.v3` and template `compositional-conditions-text.v1`.
+Fog and multi-hour transitions remain gated.
 
-Add a **read-only condition preview for one saved issued forecast ID**. Reuse the
+The **read-only condition preview for one saved issued forecast ID** reuses the
 existing verified storage reader and one pure cell/hour function over its saved local
-grid, then extract the center's 36 structured results and render them. First scope:
+grid, then extracts the center's 36 structured results and renders them. Current scope:
 native active hourly PoP with exact threshold/window, active hourly liquid amount,
-and separately qualified instantaneous p-type/state; numeric wind may be displayed
-without qualitative descriptors. Other components are explicitly unavailable/excluded
+and separately qualified instantaneous p-type/state; numeric wind remains separately
+available alongside the new presentation descriptors. Other components are unavailable/excluded
 under the matrix above. Do not acquire data, fill missing attachments, add a new field,
 promote a shadow, change p-type/blend rules or create new history rows/objects.
 
-Likely code seams, **proposed, not files added now**: a small pure
-`forecasting/conditions.py` for components/rules, an application read/preview command
-using `ForecastIssuanceService.read`, and an additive renderer in `hourly_report.py`.
-Use the existing canonical serialization/types when implementing the contract; no
-parallel forecast-history system or new observation/framework layer. An illustrative
-CLI shape is `python -m mesoforge.application.weather_conditions --issued-forecast-id ID`;
-that command does not exist yet. Saved legacy point-only or missing-grid records
+The implementation uses pure forecasting components/rules and an application
+read/preview command using `ForecastIssuanceService.read`. Existing canonical
+serialization is retained; there is no parallel forecast-history system or new
+observation framework. The CLI is
+`python -m mesoforge.application.weather_conditions --issued-forecast-id ID`.
+Saved legacy point-only or missing-grid records
 return a clear unsupported-preview reason rather than regenerating a grid.
 
 Acceptance should use existing real retained Minneapolis/Glacier issued/grid fixtures
@@ -982,6 +983,113 @@ layer's schema, rule/config/code and renderer identities through existing artifa
 issuance infrastructure. Keep the original baseline grid and historical issued JSON
 unchanged; any persisted reinterpretation of an old issuance must be a separately
 linked immutable derivation. First preview deliberately needs no new persistence.
+
+#### 6.7.8 Approved initial presentation policy
+
+**`mesoforge-condition-wording.v1`** records the owner's September 16, 2026 approval
+for deterministic precipitation, thunder and wind wording. The saved-grid preview
+uses ruleset **`saved-active-fields-condition-preview.v3`** and template
+**`compositional-conditions-text.v1`**. These are MesoForge presentation rules, not
+NWS advisory/warning criteria, measured calibration or new blend policies. Preserve
+the explicit policy values/identity in the result so a future revision is identifiable.
+Behavioral validation cannot establish forecast skill; revisions should follow
+verification and product-design evidence.
+
+The numerical canvas, temporary NBM sky source and existing category mapping remain
+unchanged. Use unrounded active values; never promote shadow/evidence-only inputs.
+The same derivation serves every saved cell/hour and its center preview, with no
+field recalculation, provider calls, new forecast history or storage writes.
+
+**Applicability and native type are separate.** For matching valid one-hour QPF/PoP
+events, active hourly PoP **<20%** plus active hourly QPF **exactly zero** makes
+precipitation `not_applicable` for rendering. Preserve the original native type,
+including unknown/ambiguous, and its instantaneous valid time separately. This is
+an omission policy, not proof that all trace precipitation is absent. Positive
+QPF **or** PoP **≥20%** makes precipitation relevant. A native p-type flag alone
+cannot do so. Missing values never become zero, and incompatible windows cannot
+establish joint applicability. Retain unavailable/reason states when support is
+insufficient.
+
+Relevance does not automatically authorize a phrase: positive QPF with PoP <20%
+remains relevant but its precipitation text is omitted under the approved probability
+band. Missing PoP cannot acquire a qualifier from deterministic QPF. Preserve these
+tensions numerically rather than altering the saved fields or inventing confidence.
+
+| Active hourly PoP | Qualifier |
+|---|---|
+| 0 ≤ p < 20% | Omit precipitation text |
+| 20% ≤ p < 30% | Slight chance |
+| 30% ≤ p < 60% | Chance |
+| 60% ≤ p < 80% | Likely |
+| 80% ≤ p ≤ 100% | Supported precipitation label without a probability qualifier |
+
+Qualifiers apply only to the existing active native hourly event, with its exact
+>0.254 kg/m² threshold and `(start,end]` bounds. Neither 3/6-hour shadows nor a
+different threshold may fill a missing hour. When occurrence wording qualifies,
+map known native endpoint rain → rain, snow → snow, freezing rain → freezing rain,
+ice pellets → **sleet**, and supported multiple types → mixed precipitation.
+Unknown, ambiguous and unavailable type all use generic **precipitation** in text,
+but keep those three states distinct internally. Ambiguity does not become a known
+mixed-type set. SWE, snowfall/Kuchera, FRZR and ice evidence cannot override the
+active type policy. No light/moderate/heavy classes are enabled.
+
+QPF amount, thresholded PoP and instantaneous endpoint type remain independent
+structured components with independent evidence references. The compositional
+phrase does not assert a calibrated type-specific probability or that the endpoint
+type occurs throughout the accumulation period. Any future interval-wide type or
+transition interpretation needs an additional approved rule.
+
+| Active native hourly thunder probability | Wording |
+|---|---|
+| 0 ≤ p < 10% | Omit thunder text |
+| 10% ≤ p < 30% | Thunder possible |
+| 30% ≤ p < 60% | Chance of thunderstorms |
+| 60% ≤ p ≤ 100% | Thunderstorms likely |
+
+Retain the numeric probability, exact interval and unresolved native physical-event
+threshold/footprint in the structured result, which records that the wording
+describes native provider-event potential, not an exact-point deterministic
+thunder/lightning claim. No longer-period substitution or CAPE/QPF/reflectivity-derived
+probability is enabled. When both precipitation and thunder qualify, compose them
+coherently without discarding either component or erasing freezing-rain/type uncertainty.
+
+| Descriptor | Active sustained wind or active gust |
+|---|---|
+| Breezy | Sustained ≥15 mph **or** gust ≥25 mph |
+| Windy | Sustained ≥25 mph **or** gust ≥35 mph |
+
+**Windy takes precedence.** Test converted unrounded values; retain exact original
+speed, direction, gust, units and timing. A valid threshold-crossing component can
+support a descriptor independently; missing wind is not calm. This does not change
+gust into sustained wind, create an averaging duration, or imply a hazard product.
+
+The deterministic order is sky → precipitation applicability → PoP qualifier →
+supported type → thunder → independent wind descriptor. Compose one phrase; do
+not hard-code demonstration strings. A known sky leads and joins weather wording
+with "with"; weather parts and the wind descriptor join with "and". When
+precipitation or thunder wording is at least **likely** (≥60%), the sky words are
+omitted from the text ("Rain likely", "Thunderstorms likely and windy") while the
+known sky remains in the structured presentation with an explicit omission reason.
+Type-scope and thunder-event caveats are structured fields, not text. Missing sky
+does not block supported weather wording, and shadow cloud cannot repair it. Omit
+any unsafe component from text while retaining its structured reason. If no
+component supports text, return an explicit unavailable result. All five states
+remain distinct: known, unknown, ambiguous, unavailable and not_applicable.
+
+The saved-ID demonstration uses **`3bd4cada-d4c3-4f1e-94d8-2d5182c61991`**, including
+all 36 center hours. Acceptance covers dry 00Z with preserved unknown native type,
+positive-QPF/ambiguous 15Z, rain at 17Z, available wind/thunder threshold crossings
+and final-hour missingness. Require byte-identical repeated output and unchanged
+PostgreSQL rows/MinIO objects. Independently test each boundary, active/shadow gating,
+composition, timing, missingness and unchanged input; reuse existing readback tests.
+These are acceptance requirements, not a claim that an unexecuted check passed.
+
+Fog/visibility wording, intensity, transitions and winter-amount delivery remain
+disabled. The smallest next slice is a read-only transition preview over consecutive
+eligible hours within one issuance/stage, preserving supporting times and gaps.
+Start with endpoint type changes and sky trends; do not claim an exact transition
+minute, type persistence across missing hours or changing precipitation intensity
+without an approved interpretation.
 
 ## 7. Representative benchmark and admission
 
@@ -1200,9 +1308,9 @@ combined/split for reviewability. The first slice has no dependency on learning,
 accounts, long-term retention, or public SLOs.
 
 The full inspected canvas, including completed p-type and subsequent native evidence,
-is inventoried in section 6.7. The next proposed slice is its conservative read-only
-condition preview from an exact saved forecast, with no new fields or active policies.
-The final engine, richer phrases and any field promotion require separate approval.
+is inventoried in section 6.7. Its read-only saved-grid preview and bounded initial
+wording policy are implemented. The next proposed slice is deterministic multi-hour
+transition detection; further rules and field promotion require separate approval.
 
 File/module/table/code/test/change-size estimates are non-binding planning aids per slice.
 Material overrun triggers review when it reveals changed design, not because of a line

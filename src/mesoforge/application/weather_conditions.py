@@ -14,7 +14,7 @@ from uuid import UUID
 from mesoforge.application.issuance import read_issued_forecast
 from mesoforge.common.errors import IntegrityError, NotFound
 from mesoforge.contracts.serialization import canonical_json_bytes
-from mesoforge.forecasting import cloud_cover, conditions
+from mesoforge.forecasting import cloud_cover, condition_wording, conditions
 from mesoforge.forecasting.conditions import (
     RULESET_ID,
     TEMPLATE_VERSION,
@@ -28,6 +28,7 @@ def _derivation_identity() -> dict[str, Any]:
     """Identify this preview and renderer independently of the saved issuance code."""
     sources = {
         "forecasting/conditions.py": Path(conditions.__file__),
+        "forecasting/condition_wording.py": Path(condition_wording.__file__),
         "forecasting/cloud_cover.py": Path(cloud_cover.__file__),
         "application/weather_conditions.py": Path(__file__),
     }

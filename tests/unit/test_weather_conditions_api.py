@@ -18,7 +18,7 @@ from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.point_forecast import PreparedPointForecast
 from mesoforge.common.errors import IntegrityError, NotFound
 from mesoforge.contracts.serialization import canonical_json_bytes
-from mesoforge.forecasting import cloud_cover, conditions
+from mesoforge.forecasting import cloud_cover, condition_wording, conditions
 from mesoforge.forecasting.conditions import (
     ConditionsPreviewUnavailableError,
     build_conditions_preview,
@@ -78,6 +78,9 @@ def _expected_derivation():
         "ruleset_id": conditions.RULESET_ID,
         "template_version": conditions.TEMPLATE_VERSION,
         "source_sha256": {
+            "forecasting/condition_wording.py": hashlib.sha256(
+                Path(condition_wording.__file__).read_bytes()
+            ).hexdigest(),
             "forecasting/conditions.py": hashlib.sha256(
                 Path(conditions.__file__).read_bytes()
             ).hexdigest(),

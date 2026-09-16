@@ -14,11 +14,12 @@ from typing import Any
 from mesoforge.common.errors import IntegrityError
 from mesoforge.contracts.serialization import canonical_json_digest
 from mesoforge.forecasting.cloud_cover import CLOUD, sky_category, validate_active_cloud_field
+from mesoforge.forecasting.condition_wording import WORDING_POLICY, build_wording
 from mesoforge.forecasting.thunder import ACTIVE_POLICY, validate_thunder_event
 
-RULESET_ID = "saved-active-fields-condition-preview.v2"
+RULESET_ID = "saved-active-fields-condition-preview.v3"
 SCHEMA_VERSION = "mesoforge.weather-condition-preview.v1"
-TEMPLATE_VERSION = "numeric-separate-events-text.v2"
+TEMPLATE_VERSION = "compositional-conditions-text.v1"
 _SURFACE_POLICY = "phase2-scalar-vector-fallback.v1"
 _QPF_POLICY = "phase2-qpf-fallback.v1"
 _RH_POLICY = "bolton-1980-relative-humidity-liquid-water.v1"
@@ -337,7 +338,6 @@ def _describe_hour(
         ("fog", "no_approved_fog_cause_rule"),
         ("occurrence", "no_categorical_occurrence_rule"),
         ("intensity", "no_approved_intensity_rule"),
-        ("wind_descriptor", "no_approved_wind_wording_rule"),
         ("transitions", "no_approved_interval_transition_rule"),
     ):
         components[name] = _unavailable(reason)
@@ -347,7 +347,10 @@ def _describe_hour(
             components[name]["reasons"].extend(cell_reasons)
         if "cloud_percentage" in components["sky"]:
             components["sky"].update(cloud_percentage=None, sky_category=None)
+    presentation = build_wording(components)
+    components["wind_descriptor"] = deepcopy(presentation["wind"])
     result = {
+        "presentation": presentation,
         "horizon_hours": hour["horizon_hours"],
         "valid_time": hour["valid_time"],
         "components": components,
@@ -358,7 +361,7 @@ def _describe_hour(
             "confidence": {"value": None, "status": "not_calibrated"},
             "note": (
                 "Numeric amount, probability event and endpoint type are separate; "
-                "no dry-weather classification."
+                "rendering applicability does not replace native evidence or time semantics."
             ),
         },
     }
@@ -366,59 +369,14 @@ def _describe_hour(
         "template_version": TEMPLATE_VERSION,
         "locale": "en",
         "timezone": "UTC",
-        "text": render_condition_hour(result),
+        "text": str(presentation["text"]),
     }
     return result
 
 
 def render_condition_hour(hour: dict[str, Any]) -> str:
-    """Minimal numeric display; saved unrounded values remain in each component."""
-    components = hour["components"]
-    parts = []
-    sky = components["sky"]
-    if sky["state"] == "known":
-        parts.append(
-            f"Sky {sky['sky_category'].replace('_', ' ')} "
-            f"({sky['cloud_percentage']:.6g}% total cloud) at {sky['valid_time']}"
-        )
-    for name, label in (
-        ("temperature", "Temperature"),
-        ("dew_point", "Dew point"),
-        ("relative_humidity", "RH"),
-        ("wind_speed", "Wind speed"),
-        ("wind_direction", "Wind from"),
-        ("wind_gust", "Gust"),
-    ):
-        component = components[name]
-        if component["state"] == "known":
-            parts.append(
-                f"{label} {component['value']:.6g} {component['unit']} at {component['valid_time']}"
-            )
-    for name in ("qpf", "pop", "thunder"):
-        component = components[name]
-        if component["state"] != "known":
-            continue
-        interval = component["interval"]
-        period = f"({interval['start']}, {interval['end']}]"
-        if name == "qpf":
-            parts.append(f"Liquid amount {component['value']:.6g} kg/m^2 over {period}")
-        elif name == "pop":
-            threshold = component["threshold"]
-            parts.append(
-                f"Precipitation probability {100 * component['value']:.6g}% "
-                f"for liquid >{threshold['value']} {threshold['unit']} over {period}"
-            )
-        else:
-            parts.append(
-                f"NBM native thunder probability {100 * component['value']:.6g}% "
-                f"over {period} (provider-defined event; not exact-point lightning)"
-            )
-    component = components["precipitation_type"]
-    if component["state"] != "unavailable":
-        parts.append(
-            f"Model p-type at {component['valid_time']}: {component['value']} (endpoint state only)"
-        )
-    return "; ".join(parts) + "." if parts else "Weather conditions unavailable."
+    """Compose approved wording from saved, validated active components only."""
+    return str(build_wording(hour["components"])["text"])
 
 
 def build_conditions_preview(saved: dict[str, Any]) -> dict[str, Any]:
@@ -505,6 +463,7 @@ def build_conditions_preview(saved: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "ruleset_id": RULESET_ID,
+        "wording_policy": deepcopy(WORDING_POLICY),
         "input": {
             "issued_forecast_id": saved["issued_forecast_id"],
             "issued_at": saved["issued_at"],

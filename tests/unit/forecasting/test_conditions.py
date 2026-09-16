@@ -255,7 +255,7 @@ def test_active_sky_uses_unrounded_nbm_percentage_and_existing_categories(percen
     ):
         assert sky[key] == field[key]
     assert sky["evidence_refs"][0].endswith("/surface/fields/cloud_area_fraction")
-    assert output["rendering"]["text"].startswith(f"Sky {category.replace('_', ' ')} ")
+    assert output["rendering"]["text"].startswith(category.replace("_", " ").capitalize())
     assert output["components"]["occurrence"]["state"] == "unavailable"
     assert "dry" not in output["rendering"]["text"].lower()
 
@@ -296,7 +296,8 @@ def test_ineligible_active_sky_never_falls_back_to_native_shadow_evidence(change
     assert sky["state"] == "unavailable" and sky["value"] is None
     assert sky["cloud_percentage"] is None and sky["sky_category"] is None
     assert sky["reasons"] and sky["evidence_refs"]
-    assert "Sky " not in output["rendering"]["text"]
+    assert "clear" not in output["rendering"]["text"].lower()
+    assert "cloudy" not in output["rendering"]["text"].lower()
 
 
 def test_active_sky_spans_saved_grid_and_preserves_other_components_and_original_payload():
@@ -328,7 +329,8 @@ def test_active_sky_spans_saved_grid_and_preserves_other_components_and_original
             for name, component in old_hour["components"].items():
                 if name != "sky":
                     assert hour["components"][name] == component
-            assert hour["rendering"]["text"].split("; ", 1)[1] == old_hour["rendering"]["text"]
+            for component in ("precipitation", "thunder", "wind"):
+                assert hour["presentation"][component] == old_hour["presentation"][component]
     center = next(cell for cell in output["cells"] if cell["is_forecast_point"])
     assert output["center_point"]["hours"] == center["hours"]
     unavailable = saved["forecast"]["local_grid_baseline"]["cells"][0]
@@ -366,8 +368,20 @@ def test_active_numerical_fields_and_exact_native_event_metadata_are_preserved()
     thunder = hour["components"]["thunder"]
     assert thunder["event_definition"]["physical_threshold"] is None
     assert thunder["spatial_support"]["radius_km"] is None
-    for component in ("occurrence", "intensity", "fog", "wind_descriptor", "transitions"):
+    for component in ("occurrence", "intensity", "fog", "transitions"):
         assert hour["components"][component]["state"] == "unavailable"
+
+
+def test_rendering_text_is_the_presentation_text_and_wind_descriptor_is_its_component():
+    saved = saved_forecast()
+    preview = build_conditions_preview(saved)
+    hour = preview["center_point"]["hours"][0]
+    assert hour["rendering"]["text"] == hour["presentation"]["text"]
+    assert hour["rendering"]["text"] == "Chance of rain and thunder possible"
+    assert hour["components"]["wind_descriptor"] == hour["presentation"]["wind"]
+    assert hour["presentation"]["sky"]["state"] == "unavailable"
+    assert hour["presentation"]["policy_id"] == preview["wording_policy"]["id"]
+    assert preview["wording_policy"]["id"] == "mesoforge-condition-wording.v1"
 
 
 def test_all_cells_and_36_hours_share_the_same_preview_path_and_exact_center_result():

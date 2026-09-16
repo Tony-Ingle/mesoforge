@@ -124,9 +124,9 @@ thunder potential and separate native ice/freezing-rain liquid evidence are impl
 on the same grid. The [complete canvas inventory and proposed condition design](docs/rfcs/mesoforge-v2-architecture.md#67-forecast-canvas-and-deterministic-conditions)
 record actual field policies, missingness and verification limits. A [read-only
 structured preview](#read-only-structured-condition-preview) now describes approved
-saved fields across the grid and its 36-hour center column. The full qualitative
-condition engine remains future work; only the explicitly approved NBM cloud field
-has been enabled for deterministic sky wording.
+saved fields across the grid and its 36-hour center column. Versioned presentation
+rules now compose active sky, precipitation, thunder and wind into condition text.
+Intensity, transitions, visibility/fog and delivered winter amounts remain gated.
 Neither visibility nor thunder potential alone establishes a complete weather-condition string.
 Native snowfall, NBM SLR and Kuchera remain separately traceable pending sufficient
 verification data; a broad snowfall evaluation campaign is not the next task.
@@ -145,7 +145,7 @@ curl "http://127.0.0.1:8765/issued-forecasts/SAVED_GRID_ISSUANCE_ID/conditions"
 ```
 
 The CLI and GET return `cells[].hours[]` for the complete saved grid and
-`center_point.hours[]` for all 36 center hours, including minimal `rendering.text`.
+`center_point.hours[]` for all 36 center hours, including deterministic `rendering.text`.
 The existing API startup command/settings apply. This endpoint reads an immutable
 version; `/forecast` continues to serve the separate prepared calculation/grid path.
 Neither the preview nor its renderer prepares data, recalculates fields or writes
@@ -160,10 +160,52 @@ hourly PoP, endpoint p-type, qualified native NBM thunder and the temporary acti
 NBM cloud field are eligible. Sky preserves the saved fraction, unrounded percentage,
 category and source policy, using the existing category boundaries. Missing NBM
 remains unavailable even when another cloud contributor exists. Visibility/fog
-and winter amounts remain unavailable for wording, with evidence
-references retained. There are no new dry, likely, intensity, windy or transition
-thresholds. Unknown, ambiguous, unavailable and not-applicable remain distinct;
-exactly calm saved wind can make direction not applicable.
+and winter amounts remain unavailable for wording, with evidence references retained.
+Known, unknown, ambiguous, unavailable and not-applicable remain distinct; exactly
+calm saved wind can make direction not applicable. Intensity and transitions are
+not implemented.
+
+The presentation policy is **`mesoforge-condition-wording.v1`**, with ruleset
+`saved-active-fields-condition-preview.v3` and renderer
+`compositional-conditions-text.v1`. These are initial MesoForge presentation rules,
+not hazard/advisory criteria or new numerical forecast policies. Later revisions
+should follow verification and product evidence:
+
+| Component | Unrounded active-field thresholds | Wording |
+|---|---|---|
+| Hourly PoP | <20%; 20–<30%; 30–<60%; 60–<80%; ≥80% | Omit; slight chance; chance; likely; supported type without a probability qualifier |
+| Hourly thunder | <10%; 10–<30%; 30–<60%; ≥60% | Omit; thunder possible; chance of thunderstorms; thunderstorms likely |
+| Wind | Sustained ≥15 mph **or** gust ≥25 mph | Breezy |
+| Wind | Sustained ≥25 mph **or** gust ≥35 mph | Windy; takes precedence over breezy |
+
+Hourly PoP <20% **and** active hourly QPF exactly zero makes precipitation
+`not_applicable` **for rendering only**. The original endpoint p-type, including
+`unknown`, remains intact. Positive QPF or PoP ≥20% makes precipitation relevant;
+a native p-type flag alone does not. Positive QPF does not override the <20% PoP
+wording band or manufacture a probability when PoP is missing. For supported
+occurrence wording, agreed native type supplies rain, snow, freezing rain, sleet
+or mixed precipitation; unknown/ambiguous/unavailable type uses generic
+“precipitation,” preserving its distinct state internally.
+
+Only compatible active hourly events qualify; 3/6-hour shadows never fill them.
+QPF/PoP retain their exact intervals and thresholds, while p-type retains its
+instantaneous endpoint. A type-qualified phrase is a presentation summary, not a
+new type-specific probability or a claim that the type persists throughout the
+hour. Thunder keeps its native event-definition/footprint uncertainty. Those
+caveats live in each hour's structured `presentation` object (`type_scope`,
+`event_definition_uncertainty`, reasons and component/evidence references), not
+in the text. Missing NBM sky never activates shadow cloud.
+
+The renderer composes sky → precipitation → thunder → wind. A known sky leads
+and joins weather wording with "with"; precipitation, thunder and wind join with
+"and". When precipitation or thunder wording is at least **likely** (≥60%), the
+sky words are omitted from the text and the known sky is retained in
+`presentation.sky` with `rendered: false` and an explicit reason. Omitted or
+unsafe components keep their structured state; an hour with no supported
+component renders `Weather conditions unavailable.` Resulting shapes include
+`Clear`, `Mostly cloudy and breezy`, `Partly cloudy with a slight chance of rain`,
+`Cloudy with a chance of precipitation`, `Rain likely`, `Snow likely and breezy`,
+`Chance of thunderstorms` and `Thunderstorms likely and windy`; none is hard-coded.
 
 In the earlier preview milestone, the retained Minneapolis **unissued grid export** replayed as 49 × 36 results
 with identical bytes on repeat and zero provider calls. Its hour 10 illustrates
@@ -182,7 +224,9 @@ the separately timed components (abbreviated, not a saved-ID response):
 QPF/PoP/thunder each retain `(03:00Z,04:00Z]`; PoP means liquid **>0.254 kg/m²**,
 while p-type is the state at 04:00Z. Thunder retains its provider-defined event and
 unencoded footprint, not an exact-point lightning claim. Hour 1 had QPF/PoP zero,
-p-type unknown and thunder 1%; this does not establish a dry-weather classifier.
+p-type unknown and thunder 1%; those native states remain unchanged. The new
+presentation rule can suppress precipitation wording without asserting that trace
+precipitation is physically impossible.
 
 Earlier preview validation: **148 focused tests passed** (conditions, API/readback, hourly report,
 retained surface/thunder); the affected API regression selection also passed.
@@ -198,7 +242,8 @@ acceptance and condition-skill verification were not run.
 
 The sky-policy increment uses `nbm-native-total-cloud-baseline.v1`, with the existing
 `native-cloud-percentage-display.v1` categories. Preview and minimal-renderer versions
-advance to v2; older saved fields are never retroactively given the new active policy.
+advanced to v2 at that checkpoint; older saved fields are never retroactively given
+the new active policy. The current wording layer has its own versions listed above.
 NBM-only cloud is an interim delivered baseline, not the intended enterprise cloud
 architecture. It enables deterministic ordinary-hour sky descriptions while cloud
 skill remains an open evaluation problem. Future multi-source cloud blending or
@@ -234,8 +279,8 @@ QPF/PoP are zero; endpoint p-type remains `unknown`. At **15Z**, sky is mostly c
 (87%) with **0.08296196207611876 kg/m²** QPF over `(14Z,15Z]` and ambiguous endpoint
 p-type. At **17Z**, cloud is **92.06306327559248%**, QPF is **1.1699372979056493 kg/m²**
 over `(16Z,17Z]`, PoP is **43.39143650808219%** for liquid >0.254 kg/m² over that same
-hour, and instantaneous p-type is rain. These are separate timed components, not a
-new qualitative occurrence rule.
+hour, and instantaneous p-type is rain. These remain separate timed components;
+the new presentation layer does not modify their original values or timing.
 
 Sky is available at all 49 cells for hours **1–35**. Hour **36** stays unavailable:
 the retained cloud adapter stops at NBM source lead 36, whereas this hour needs 37.
@@ -259,9 +304,31 @@ exact JSON, storage snapshots and exercised scripts are under
 is under `MesoForge/forward-runs/nbm-sky-current-20260913T230001Z/` and
 `MesoForge/baselines/20260913-nbm-sky-current/` beneath the same local-data root.
 
-Next proposed policy step: approve explicit wording thresholds and precedence for
-precipitation, wind and thunder, including how instantaneous p-type qualifies an
-interval phrase. Visibility/fog needs separate causal evidence and policy afterward.
+The wording milestone reuses this exact issuance; it does not acquire new guidance
+or create a replacement forecast. Wording validation on September 16: **149 focused
+offline tests passed** (`tests/unit/forecasting/test_condition_wording.py`,
+`tests/unit/forecasting/test_conditions.py`, `tests/unit/test_weather_conditions_api.py`),
+covering every PoP/thunder/wind boundary with unrounded values, precipitation
+applicability, unknown versus not-applicable type, ambiguous type, shadow/evidence
+gating, composition and sky omission, missing components, byte-identical replay and
+unchanged inputs. The broader affected offline selection (forecasting, application,
+API, contract and property modules) passed **1,728 tests**; one pre-existing
+`test_current_forecast_batch` mock-signature failure, unrelated to conditions,
+reproduced unchanged at committed `50d32c1` and is left for a separate task. Ruff,
+mypy, import contracts, locked-dependency, documentation, hygiene and whitespace
+checks passed. The checks ran in a fresh locked Python 3.12 environment;
+`uv run --locked` itself remains unverified here. The real saved-ID
+demonstration against `3bd4cada-d4c3-4f1e-94d8-2d5182c61991`, including its
+byte-identical repeat and unchanged PostgreSQL/MinIO check, **was not run in this
+session**: the retained demonstration storage lives under the separate Codex sandbox
+profile, which this session could not read. The commands above are the ones to run;
+until they are, no rendered real-hour wording is claimed for this milestone.
+
+Next proposed step: a read-only multi-hour transition preview over adjacent eligible
+results from one saved issuance, with explicit windows and gaps breaking a sequence.
+Begin with endpoint type changes and sky trends; “rain changing to snow” needs
+conservative occurrence support and must not invent a transition minute. Visibility/
+fog still needs separate causal evidence and policy.
 
 ## Existing forecast path
 
@@ -2994,20 +3061,20 @@ produces `unavailable`. There is no single-source fallback or category weighting
 Shadow disagreement remains visible even when the active sources agree. This is
 an interim representation, not a verified final multi-source forecast policy.
 
-**Dry-hour applicability:** the current payload keeps native `no_type_classified`
+**Dry-hour applicability:** the numerical payload keeps native `no_type_classified`
 (complete zero flags), missing evidence and contradictory classifications distinct.
 It also retains QPF and PoP as separate fields with their own intervals. This preserves
-the inputs needed for a later applicability assessment without rewriting the original
-type evidence. There is no applicability field or approved meaningful-precipitation
-threshold/time reconciliation rule yet, so applicability is **not assessed**.
-A future separate assessment can distinguish “type not applicable because there is
-no meaningful signal” from “precipitation with an unresolved type.” Neither zero type
-flags nor PoP alone establishes that distinction today; the p-type policy is unchanged.
+the inputs for the separate [conditions presentation policy](#read-only-structured-condition-preview)
+without rewriting original type evidence. Under that policy, hourly PoP <20% plus
+exactly zero active hourly QPF makes precipitation not applicable for rendering;
+positive QPF or PoP ≥20% makes it relevant. Native type flags alone cannot decide
+applicability. This does not change the numerical p-type policy or prove no trace
+precipitation exists.
 In the September 12 replay, hour 1 retained exactly zero QPF, zero hourly PoP and
 zero active type flags with baseline `unknown`. Hour 10 retained 0.22247206611 kg/m²
 QPF over its preceding hour, 21.438868% hourly PoP and native type disagreement
-(`ambiguous`). Those distinct facts survive storage; neither case is automatically
-relabeled by a new dry/wet policy. An accumulation over an hour does not prove
+(`ambiguous`). Those distinct native facts survive storage and are never relabeled
+by the renderer. An accumulation over an hour does not prove
 precipitation is occurring at the instantaneous type valid time.
 
 Categories use deterministic nearest-native-cell extraction; categorical codes
@@ -3453,7 +3520,8 @@ service, full acceptance suite, cloud-observation verification, calibrated blend
 or forecast-skill assessment was run in this increment.
 
 Native visibility evidence is now implemented in the following increment; the cloud
-fields and sky categories remain unchanged. Conditions rules remain future work.
+fields and sky categories remain unchanged. The later [conditions preview](#read-only-structured-condition-preview)
+adds its separately versioned presentation rules.
 
 ## Native visibility on the local grid
 
@@ -3568,8 +3636,8 @@ lock validation and `git diff --check` passed. No PostgreSQL/MinIO services, ful
 acceptance suite, visibility-observation verification, calibrated visibility blend,
 or forecast-skill assessment were run in this increment.
 
-The following thunder increment uses those native probabilities. Ice accretion and
-derived conditions remain future work.
+The following thunder increment uses those native probabilities. Native ice evidence
+and the bounded conditions preview were added later; derived accretion remains future work.
 
 ## Native thunder potential on the local grid
 
@@ -3795,8 +3863,9 @@ suitable thermodynamic, precipitation-rate and wind inputs. FRAM may be evaluate
 later; a surface-temperature rule or simple liquid conversion is insufficient.
 The [canvas inventory and proposed condition preview](docs/rfcs/mesoforge-v2-architecture.md#67-forecast-canvas-and-deterministic-conditions)
 are documented; the [read-only structured preview](#read-only-structured-condition-preview)
-now implements the bounded saved-field description. The full qualitative engine
-and derived accretion remain future work.
+now implements the bounded saved-field description and initial presentation policy.
+Multi-hour transitions, other gated condition rules and derived accretion remain
+future work.
 
 ## References
 
