@@ -378,6 +378,47 @@ directories, raw guidance and evidence remain outside Git under this session's
 `MesoForge/baselines/20260916-conditions-real-validation`. Full acceptance/coverage
 and live-provider canaries were not run.
 
+### Issuance payload measurement
+
+A bounded September 16 measurement of the validated issuance
+`9e989662-551e-4918-92d8-77005eb7e474` (300,528,405 canonical JSON bytes) explains
+the size. `forecast.local_grid_baseline` is **285.7 MB**; the point column
+`forecast.hours` is a **5.8 MB** byte-for-byte copy of the center cell; the saved
+`hourly_report` is 6.5 MB and the model-set/attachment evidence 2.2 MB. Key names
+alone are 113.3 MB (37.7%), values 156.2 MB and JSON punctuation 22.6 MB. Of the
+261.7 MB of grid leaves, **forecast values are 3.5 MB (1.3%)** and extraction
+geometry 9.0 MB (3.4%); the rest is metadata copied into every cell-hour: GRIB
+native keys 63.9 MB, descriptive prose 48.4 MB, timestamps/cycles/leads 36.8 MB,
+policy blocks 31.7 MB, hashes 24.7 MB, URLs/files 20.2 MB, other enumerations
+23.5 MB. By subtree: thunder guidance 73.1 MB (of which 31.1 MB is the all-pairs
+`comparisons` list with only three distinct variants across 1,764 cell-hours),
+cloud guidance 50.2 MB, p-type guidance 45.1 MB, per-model surface contributors
+47.7 MB, shadow sources 10.0 MB; the `surface.fields` copies of the cloud, thunder
+and p-type guidance `field` blocks add 22.9 MB. Storing each (path, hour, value)
+once instead of once per cell would need **9.8 MB**; each (path, value) once, 5.2 MB.
+
+Ordinary lossless compression confirms the repetition: gzip-9 **41.4 MB** (7.3×,
+its 32 KB window cannot see cross-cell repeats), bz2 16.7 MB, zstd-3 11.6 MB,
+zstd-9 9.9 MB, xz-6 2.76 MB and zstd-19 **2.36 MB (127×)**. The 35.7 MB conditions
+response is 35.0 MB of `cells` and **0.71 MB** of `center_point`; gzip-9 1.28 MB,
+zstd-19 0.44 MB. PostgreSQL holds 184 bytes per issued-forecast row and 232 bytes
+per stored-object row (public tables 360 KB including empty index pages; database
+8.0 MB against a 7.5 MB empty template) versus 544 MB of objects for two issuances.
+
+At two issuances per day, measured raw sizes project to **219 GB/year for one
+location, 2.2 TB for ten and 22 TB for a hundred** (30 GB / 302 GB / 3.0 TB with
+gzip-9 at rest; 1.7 GB / 17 GB / 173 GB with zstd-19). Disk is not the first
+limit: `select_hours`, window verification and the conditions route read every
+full version for a coordinate, so a month of two issuances a day makes one
+hour-selection query read about 18 GB. The proposed remedies are recorded in
+[RFC §6.7.9](docs/rfcs/mesoforge-v2-architecture.md#679-issuance-payload-measurement-and-proposed-normalization):
+a content-addressed shared-metadata table inside the immutable issuance (exact
+inflation to today's shape, no change to raw/prepared artifacts or replay), a
+center-point default for `GET /issued-forecasts/{id}/conditions` with explicit
+editable/grid scopes, and a valid-time prefilter for version selection. No storage
+or API change was made; measurement scripts and JSON reports are outside Git under
+`MesoForge/baselines/20260916-payload-measurement`.
+
 Next proposed step: a read-only multi-hour transition preview over adjacent eligible
 results from one saved issuance, with explicit windows and gaps breaking a sequence.
 Begin with endpoint type changes and sky trends; “rain changing to snow” needs

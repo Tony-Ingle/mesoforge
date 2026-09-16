@@ -1095,6 +1095,57 @@ Start with endpoint type changes and sky trends; do not claim an exact transitio
 minute, type persistence across missing hours or changing precipitation intensity
 without an approved interpretation.
 
+#### 6.7.9 Issuance payload measurement and proposed normalization
+
+**Status: measured September 16, 2026; proposal only, no implementation approved.**
+The 300.5 MB issuance `9e989662-…` (49 × 36 grid with PoP, p-type, cloud and thunder
+attachments) contains about 3.5 MB of forecast values and 9 MB of extraction
+geometry; roughly 95% of the grid is source provenance, GRIB keys, policy blocks,
+documentation prose and timestamps copied into every cell-hour by
+`build_local_surface_grid`, which deep-copies each column's fully annotated hours.
+The same hour's 49 cells reference the same model messages, so those blocks are
+identical across cells; storing each (path, hour, value) once needs 9.8 MB. Three
+within-object duplicates add to it: `forecast.hours` repeats the center cell
+(5.8 MB), `surface.fields` repeats the cloud/thunder/p-type guidance `field`
+(22.9 MB), and thunder `comparisons` enumerate all 55 source pairs per cell-hour
+although eight sources are unsupported (31.1 MB, three distinct variants). README
+records the compression results (gzip-9 7×, zstd-19 127×) and projections.
+
+Proposed, in order of safety:
+
+1. **Read-path fixes that change no stored bytes.** Default
+   `GET /issued-forecasts/{id}/conditions` and the CLI to `scope=point`
+   (center-point hours plus input, derivation, wording policy and a geometry
+   summary; measured 0.71 MB instead of 35.7 MB), with explicit `scope=editable`
+   (9 cells) and `scope=grid` (49 cells) opt-ins so the AI forecast desk and grid
+   tools keep the full context. Hoist per-hour policy prose into one response-level
+   `policies` map keyed by policy id and summarize the eleven always-unavailable
+   placeholder components once per response. Let `select_hours`, window
+   verification and the conditions route skip versions whose
+   `target_reference_time` + 1..36 h cannot intersect the requested window before
+   reading any object; this uses existing PostgreSQL columns only.
+2. **Compression at rest** in the object store, keyed and verified by the digest
+   of the canonical bytes (the body carries an encoding marker and readers verify
+   after decoding). Existing uncompressed objects stay readable. This changes the
+   storage adapter contract from ADR 0004 and needs owner approval; a filesystem
+   or S3 service with transparent compression achieves the same with no code change.
+3. **Normalized issuance layout, `issued-forecast.v2` / `local-surface-baseline.v3`.**
+   Before serialization, intern every subtree that is identical across cells or
+   hours — provenance, GRIB keys, inventory evidence, acquisition and source
+   metadata, policy and event-definition blocks, documentation notes, comparisons —
+   into a content-addressed `shared` table inside the same immutable object, and
+   replace each copy with a short reference. A deterministic `inflate()` in the
+   issuance reader reconstructs today's exact v2 shape, so `conditions.py`,
+   `hourly_report.py`, verification and comparison code keep reading the inflated
+   object unchanged; v2 records remain readable as-is. Expected size 12–20 MB raw and
+   1.5–2.5 MB compressed, with every native evidence value, active/shadow role, hash,
+   URL and cycle/lead retained and raw/prepared artifacts and replay untouched.
+   Whether to keep the point column and the saved hourly report as copies, and
+   whether to emit comparisons only for available sources, are owner decisions.
+
+None of this is a prerequisite for the transition-detection milestone; item 1 should
+precede sustained forward accumulation because read cost, not disk, is the first limit.
+
 ## 7. Representative benchmark and admission
 
 Before finalizing API support and cache packaging, benchmark the intended host using the
