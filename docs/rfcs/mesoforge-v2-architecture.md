@@ -1083,6 +1083,10 @@ and final-hour missingness. Require byte-identical repeated output and unchanged
 PostgreSQL rows/MinIO objects. Independently test each boundary, active/shadow gating,
 composition, timing, missingness and unchanged input; reuse existing readback tests.
 These are acceptance requirements, not a claim that an unexecuted check passed.
+The September 16 real validation used a fresh issuance in a separate environment,
+`9e989662-551e-4918-92d8-77005eb7e474`, because the earlier ID was unreadable there;
+README records its byte-identical CLI/HTTP repeats, forbidden-hook replay, exact
+readback, unchanged storage counts and the naturally occurring wording.
 
 Fog/visibility wording, intensity, transitions and winter-amount delivery remain
 disabled. The smallest next slice is a read-only transition preview over consecutive

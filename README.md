@@ -317,12 +317,66 @@ API, contract and property modules) passed **1,728 tests**; one pre-existing
 reproduced unchanged at committed `50d32c1` and is left for a separate task. Ruff,
 mypy, import contracts, locked-dependency, documentation, hygiene and whitespace
 checks passed. The checks ran in a fresh locked Python 3.12 environment;
-`uv run --locked` itself remains unverified here. The real saved-ID
-demonstration against `3bd4cada-d4c3-4f1e-94d8-2d5182c61991`, including its
-byte-identical repeat and unchanged PostgreSQL/MinIO check, **was not run in this
-session**: the retained demonstration storage lives under the separate Codex sandbox
-profile, which this session could not read. The commands above are the ones to run;
-until they are, no rendered real-hour wording is claimed for this milestone.
+`uv run --locked` itself remains unverified here.
+
+The earlier demonstration issuance `3bd4cada-d4c3-4f1e-94d8-2d5182c61991` stayed
+unreadable from this session (it lives under the separate Codex sandbox profile), so
+the real validation used a **fresh rich-grid issuance in this environment** on
+September 16. Automatic discovery at **22:31:54Z** selected **HRRR 18Z / GFS 18Z /
+RAP 21Z / IFS 12Z** for reference 22Z (valid September 16 23Z through September 18
+10Z); shared preparation with PoP, then the documented p-type, cloud and thunder
+attachments and `run_batch` issuance followed, all under 11 minutes. Automatic NBM
+PoP discovery rejected the still-publishing **22Z** cycle: the AWS index returned 404,
+and on NOMADS the GRIB's Last-Modified (22:37:58Z) followed its index (22:36:21Z)
+with no ETag, so object identity could not be validated. That evidence is retained
+in the run's `prepared/preparation.json`; the existing `prepared_pop --nbm-cycle`
+override then attached NBM **21Z** before the cloud/thunder attachments and issuance.
+The first automatic attempt, issued as `5bd637dd-77d4-4f0d-ac92-bd39d73918c4` with
+PoP, active sky and thunder explicitly unavailable, remains unchanged history. The
+validated issuance is **`9e989662-551e-4918-92d8-77005eb7e474`**, issued **22:48:56Z**
+with the complete calculated **49 × 36** grid (300,528,405-byte stored object).
+
+Conditions validation against that issuance: the CLI ran twice and was
+**byte-identical** (35,739,570 bytes); `GET /issued-forecasts/9e989662-…/conditions`
+ran twice against a listening localhost server and was **byte-identical** (HTTP 200,
+the same JSON as the CLI). An in-process replay with point calculation, grid
+building, issuance, `requests`, `xarray.open_dataset` and every non-loopback socket
+forbidden reproduced the CLI bytes exactly. Two readbacks of the saved payload were
+identical and matched both the preview's input digest and the stored object. PostgreSQL
+rows (2 issued forecasts, 2 stored objects) and object-store contents (2 objects with
+unchanged keys, ETags and sizes) were identical before and after every retrieval. All
+36 center hours and all 49 × 36 cell hours rendered. Center states: PoP, QPF and wind
+known ×36; p-type unknown ×28, ambiguous ×7, rain ×1; sky and thunder known ×35, each
+unavailable at hour 36 (the NBM lead-37 adapter gap).
+
+Actual center wording, with the inputs that produced it: hour 8, September 17 06Z
+(1 a.m. CDT) — sky 86.4%, PoP 50.7%, QPF 2.04 mm, HRRR/GFS-agreed rain →
+**Mostly cloudy with a chance of rain**; hour 5 — 90.0%, 22.2%, unknown type →
+**Cloudy with a slight chance of precipitation**; hour 7 — 86.9%, 55.0%, 2.24 mm,
+ambiguous type → **Mostly cloudy with a chance of precipitation**; hour 10 — 82.3%,
+19.6%, 0.62 mm, ambiguous → **Mostly cloudy** (relevant, wording omitted below 20%);
+hours 18–34 with PoP 0, QPF 0 and native type `unknown` → **Partly cloudy**,
+**Mostly clear** or **Mostly cloudy**, with precipitation `not_applicable` for
+rendering and the native `unknown` retained; hour 36 — sky and thunder unavailable,
+PoP 4.3%, wind below thresholds → **Weather conditions unavailable.** with every
+structured state and reason retained. Sustained wind peaked at 7.7 mph, gusts at
+18.7 mph and hourly thunder at 4%, so no breezy/windy or thunder wording occurred
+naturally; no precipitation reached 60%, so sky omission and the precipitation-plus-
+thunder phrasings were not exercised by real data and the wording policy is unchanged.
+After validation the **149 focused condition tests passed again**, and **37
+integration tests** (batch issuance, forward run, S3 object store and migrations)
+passed against an ephemeral test `pgserver` and the same local S3 endpoint using
+their own test buckets; the validation database and bucket were unchanged afterwards.
+
+Environment notes for that validation: MinIO's download site now returns HTTP 410
+(the open-source server is archived), so the S3-compatible endpoint was a local
+`moto` server, which honored the adapter's conditional `If-None-Match` put with 412;
+PostgreSQL was the existing `pgserver` script; the API served synthetic `/forecast`
+guidance because only the storage-backed conditions route was exercised. Run
+directories, raw guidance and evidence remain outside Git under this session's
+`MesoForge/forward-runs/rich-20260916T2231Z` and
+`MesoForge/baselines/20260916-conditions-real-validation`. Full acceptance/coverage
+and live-provider canaries were not run.
 
 Next proposed step: a read-only multi-hour transition preview over adjacent eligible
 results from one saved issuance, with explicit windows and gaps breaking a sequence.
