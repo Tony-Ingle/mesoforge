@@ -221,8 +221,11 @@ persistent issuance, verification, site knowledge, bias correction, AI desk beha
 and delivery can accumulate. Today the registration is the forward run's coordinate
 list (`lat`, `lon`, optional `name`, optional presentation `display_timezone`).
 Repeated forward runs accumulate immutable issued versions and verification facts
-for those coordinates, and a read-only accumulation status reports how much
-verified history exists per coordinate and lead range. Accumulating that history is
+for those coordinates, a read-only accumulation status reports how much
+verified history exists per coordinate and lead range, and a read-only verification
+analysis describes temperature error from canonical samples (stored facts are
+evidence, not automatically samples) while reporting insufficient evidence for any
+correction. Accumulating that history is
 the learning loop's data source; it is not yet learning: no weights, bias
 corrections or regime labels are derived from it, and the complete future lifecycle
 (site knowledge, corrections, AI desk, delivery) is not implemented.

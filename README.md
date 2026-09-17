@@ -544,11 +544,15 @@ remains future work. Measurement scripts and JSON reports are outside Git under
 The learning loop's data source is now in place: [repeatable forward runs](#repeat-forward-runs-and-read-accumulation-status)
 accumulate immutable versions and idempotent verification facts for configured
 coordinates behind an overlap lock and a decision-window guard, and a read-only
-accumulation status reports verified history per coordinate and lead bucket.
-Next proposed step: the first read-only deterministic site/regime analysis over
-that verified history, still without applying corrections. Presentation polish waits
-unless a concrete missing capability blocks use. Visibility/fog still needs separate
-causal evidence and policy.
+accumulation status reports verified history per coordinate and lead bucket. A
+[read-only site verification analysis](#read-only-site-verification-analysis) turns
+the stored facts into canonical samples and describes temperature error by lead,
+day/night and station; it applies no correction and currently reports
+`insufficient_evidence`. Next proposed step: keep accumulating forward verification
+history across leads, times of day and weather, then a read-only candidate
+correction proposal once an approved evidence policy exists. Presentation polish
+waits unless a concrete missing capability blocks use. Visibility/fog still needs
+separate causal evidence and policy.
 
 ## Existing forecast path
 
@@ -2658,6 +2662,109 @@ acquisition on later runs until their window is retained; facts persisted before
 attributes existed are not indexed; the lock is process-wide, so two forward runs on
 different coordinate lists also serialize; and every forward `verify()` still reads
 the full issuance payloads (the read-cost limit measured earlier).
+
+### Read-only site verification analysis
+
+A descriptive, **temperature-only** view of the verified history that forward
+accumulation produces. It applies no correction, derives no weight or regime, and
+writes nothing (schema `mesoforge.site-verification-analysis.v1`):
+
+```text
+python -B -m mesoforge.application.site_verification_analysis --lat 44.98859 --lon -93.25557 [--display-timezone America/Chicago]
+curl "http://127.0.0.1:8765/verification-analysis?lat=44.98859&lon=-93.25557"
+```
+
+**Stored facts are evidence, not statistical samples.** Canonicalization
+(`mesoforge-verification-canonicalization.v1`) keeps every fact in provenance and
+resolves them in two steps:
+
+1. An *opportunity* is one issued version and hour under one verification policy.
+   Facts whose evidence is identical — forecast value and issuance digest, station,
+   observation time and value, observation revision and logical-observation digests,
+   matching policy and error — are the same verification repeated over a re-acquired
+   copy of the same observation revision and form one opportunity (earliest fact
+   canonical). Facts that disagree, for example a revised observation, make the
+   opportunity **ambiguous**: excluded and reported with its reason, never chosen by rule.
+2. A *sample* is one target reference time and valid time. Several versions of one
+   target are one sample only when their forecast value, observation revision and
+   error are identical (a re-issue); versions that differ are ambiguous. Different
+   targets verified at one valid time remain separate samples at their own horizons.
+
+Facts are usable only with verified status under `issued-temperature-verification.v1`,
+finite kelvin values, a horizon equal to valid − target within 1–36 h, a saved error
+equal to forecast − observation and agreement with the issuance metadata row. Facts
+saved before identity attributes existed are found with a bounded query and
+identified from their immutable payload; nothing is backfilled or modified.
+
+The report gives the inventory (indexed, legacy, usable, excluded by reason,
+ambiguous); overall and per lead bucket 1–6 / 7–18 / 19–36 N, bias, MAE, RMSE and
+min/max error, with empty buckets left null and nothing extrapolated between them;
+local day (06–18) and night (18–06) groups using the period-summary convention in the
+requested zone, else the samples' saved report zone, else UTC; per-station proxy
+accounting (a station is a proxy for, not identical to, the coordinate); and regime
+*readiness* — which saved forecast dimensions (sky, wind, dew point/RH, precipitation,
+p-type, thunder, model spread) are reconstructable per sample, as availability and
+ranges only. Metrics are labelled `descriptive_only` or `no_samples`.
+`correction_readiness.status` is `insufficient_evidence` with `evidence_policy: null`:
+no approved policy defines the sample size, lead coverage, period or independence
+needed to evaluate a candidate correction, so the report lists the observed evidence
+and what it does **not** conclude (persistent site bias, lead-dependent correction,
+regime bias, preferred model, recommended adjustment) and invents no threshold.
+
+Real result on **September 17, 2026** over the forward-accumulation history above.
+Inspecting the payloads showed that cycle 2's eight second facts used the **identical
+observation revision** as the first (same KMIC report, time, value, revision and
+record digests, forecast, policy, code and error); only acquisition provenance
+differs (raw artifact, record index, ingest time, normalized-observation artifact,
+cutoff, candidate list). They are re-acquired identical evidence, not revisions.
+
+| Minneapolis `44.98859, -93.25557` | Value |
+| --- | --- |
+| Stored facts → verified opportunities → samples | **23 → 15 → 9** |
+| Opportunities with two identical-evidence facts | 8 (none ambiguous, none excluded) |
+| Samples backed by two identical re-issued versions (`5bd637dd…`, `9e989662…`) | 6 |
+| Bias / MAE / RMSE | **+1.45 K / 1.54 K / 2.04 K** (+2.6 / 2.8 / 3.7 °F) |
+| Min / max error | −0.32 K / +4.59 K (22Z target, hour 6, 04Z) |
+| Lead 1–6 | N 9, same metrics; **7–18 and 19–36: N 0, null** |
+| Day / night (America/Chicago, saved report zone) | day N 0; night N 9, local hours 18–23 |
+| Station proxy | KMIC only, 11.1 km, 263 m; 6 distinct observations shared by 9 samples |
+| Targets / valid span | 3 targets, 23Z–04Z (5 h, one evening) |
+| Correction readiness | `insufficient_evidence` |
+| Reads | 5 issuance metadata rows, 23 fact payloads (180.8 MB), **0 issued forecast objects** |
+
+St. Paul (`44.9537, -93.09`): 3 facts → 3 opportunities → 3 samples, bias +0.93 K,
+MAE 0.93 K, RMSE 0.96 K, all lead 1–6, station KSTP (3.6 km, 213 m, 2 distinct
+observations), saved report zone UTC (grouped by UTC wall clock, as the note says),
+`insufficient_evidence`. Regime readiness for Minneapolis: dew point, RH, wind speed,
+direction, gust, precipitation amount and model spread (3–4 models, 0.8–3.2 K) are
+saved for all 9 samples; p-type for 6, PoP for 2, cloud fraction and thunder for 0,
+because context comes from each sample's canonical (earliest) version. Nine samples
+from one evening, one station and short leads describe that evening only; they do not
+support a site bias, a lead dependence or any adjustment.
+
+Validation: two CLI runs and two HTTP reads per coordinate were identical outside the
+`evaluation` block; a guarded in-process replay that forbids provider requests,
+non-loopback connections, forecast calculation, issuance, issuance reads, observation
+acquisition, station discovery and verification made zero forbidden calls; and every
+PostgreSQL row count (8 issuances, 26 facts), all 50 object identities and the fact
+count were unchanged. Invalid coordinates or zones return 422. Evidence is under
+`%LOCALAPPDATA%/MesoForge/baselines/20260917-site-verification-analysis`.
+**3,265 offline tests** passed (the same three pre-existing failures deselected), as
+did the forward-run, verification and storage integration tests against pgserver and
+an S3-compatible moto server, including a real-storage analysis and a legacy fact
+recovered from its payload. Ruff, mypy, all nine import contracts, lock consistency,
+documentation/hygiene checks and `git diff --check` passed.
+
+```text
+python -B -m pytest tests/unit/verification/test_site_analysis.py tests/unit/application/test_site_verification_analysis.py tests/unit/test_site_verification_analysis_api.py -q
+python -B -m pytest tests/integration/application/test_forward_run.py tests/integration/application/test_issued_temperature_verification.py tests/integration/storage -q
+```
+
+Limitations: temperature only; each fact payload is 4–9 MB because it embeds the
+forecast context, so analysis cost grows with fact count until facts carry compact
+analytical attributes or the stored layout is normalized; regime context is read from
+the canonical version only; and no evidence policy exists yet, so nothing here can
+graduate beyond descriptive.
 
 ### Local surface baseline grid
 

@@ -468,6 +468,30 @@ class PostgresArtifactRepository:
         )
         return tuple(_artifact_row_to_manifest(row) for row in rows)
 
+    def find_unindexed_issued_temperature_verifications(
+        self, *, limit: int
+    ) -> tuple[ArtifactManifest, ...]:
+        """Find saved verification facts that carry no identity attributes (any coordinate).
+
+        Facts persisted before attributes existed can only be identified from their
+        immutable payload, so callers must bound how many they read.
+        """
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be an integer between 1 and 1000")
+        rows = self._session.scalars(
+            sa.select(ArtifactRow)
+            .where(
+                ArtifactRow.artifact_type == "issued-temperature-verification",
+                sa.or_(
+                    ArtifactRow.attributes.is_(None),
+                    sa.not_(ArtifactRow.attributes.has_key("issued_forecast_id")),
+                ),
+            )
+            .order_by(ArtifactRow.registered_at, ArtifactRow.id)
+            .limit(limit)
+        )
+        return tuple(_artifact_row_to_manifest(row) for row in rows)
+
     def find_station_discovery_sources(
         self, *, latitude: float, longitude: float, policy_version: str
     ) -> tuple[ArtifactManifest, ...]:

@@ -27,6 +27,7 @@ from mesoforge.application.prepared_temperature import (
     _write_prepared_file,
     prepare_temperature_guidance,
 )
+from mesoforge.application.site_verification_analysis import analyze_site_verification
 from mesoforge.common.identifiers import ArtifactId, Digest
 from mesoforge.guidance.acquisition_v2 import acquire_nbm_lead
 from mesoforge.storage.postgres.idempotency_lock import AdvisoryLockBusy, PostgresIdempotencyLock
@@ -435,6 +436,89 @@ def test_forward_run_verifies_then_issues_and_reuses_verification_without_mutati
     assert untouched["hours"]["verified"] == 0 and untouched["hours"]["pending"] == 72
     assert untouched["station_evidence"]["source"] is None
     assert complete_storage_inventory(migrated_dsn, object_store) == after_repeat
+
+    # Read-only site analysis: four stored facts are four verified (version, hour)
+    # opportunities, but the two historical versions are the same forecast issued
+    # twice for one target, so only two analytical samples exist.
+    forbidden_read = Mock(side_effect=AssertionError("No issued forecast object may be read"))
+    monkeypatch.setattr(ForecastIssuanceService, "read", forbidden_read)
+    analysis = analyze_site_verification(FIRST["lat"], FIRST["lon"], now=DECISION)
+    forbidden_read.assert_not_called()
+    assert analysis["inventory"]["indexed_facts"] == 4
+    assert analysis["inventory"]["legacy_unindexed_facts_examined"] == 0
+    assert analysis["inventory"]["analytically_usable_facts"] == 4
+    assert analysis["canonicalization"]["verified_opportunities"] == 4
+    assert analysis["canonicalization"]["fact_classification"] == {"single_fact": 4}
+    assert analysis["canonicalization"]["sample_classification"] == {
+        "identical_reissued_versions": 2
+    }
+    assert analysis["canonicalization"]["ambiguous"] == []
+    assert analysis["overall"]["n"] == 2
+    assert analysis["overall"]["observation_stations"] == ["KROS"]
+    assert analysis["overall"]["issued_versions_represented"] == 2
+    # Both versions saved the same error per hour; each hour counts once.
+    errors_by_hour = {
+        row["valid_time"]: row["temperature_error"]["value"]
+        for row in first_verification["results"]
+        if row["status"] == "verified"
+    }
+    assert len(errors_by_hour) == 2
+    assert analysis["overall"]["bias_k"] == pytest.approx(sum(errors_by_hour.values()) / 2)
+    assert analysis["lead_buckets"]["1-6"]["n"] == 2
+    assert analysis["lead_buckets"]["7-18"]["bias_k"] is None
+    assert analysis["correction_readiness"]["status"] == "insufficient_evidence"
+    assert analysis["reads"]["issuance_payloads_read"] == 0
+    assert analysis["reads"]["fact_payloads_read"] == 4
+    repeated_analysis = analyze_site_verification(
+        FIRST["lat"], FIRST["lon"], now=DECISION + timedelta(hours=3)
+    )
+    assert {k: v for k, v in analysis.items() if k != "evaluation"} == {
+        k: v for k, v in repeated_analysis.items() if k != "evaluation"
+    }
+    assert complete_storage_inventory(migrated_dsn, object_store) == after_repeat
+
+    # A fact saved before identity attributes existed (same immutable payload, no
+    # attributes) is recovered from its payload and adds evidence, not a sample.
+    with PostgresUnitOfWork(migrated_dsn) as uow:
+        source = uow.artifacts.find_issued_temperature_verifications(
+            latitude=FIRST["lat"], longitude=FIRST["lon"]
+        )[0]
+        legacy = uow.artifacts.add_derived(
+            artifact_id=ArtifactId.generate(),
+            artifact_type=source.artifact_type,
+            artifact_schema_version=source.artifact_schema_version,
+            content_digest=source.content_digest,
+            created_at=source.created_at,
+            availability_authority="mesoforge.derived",
+            availability_method="test-legacy-fact",
+            parent_available_ats=(source.availability.available_at,),
+            activity_completed_at=source.created_at,
+            run_id=None,
+            configuration_snapshot_id=source.configuration_snapshot_id,
+            configuration_digest=source.configuration_digest,
+            code_revision=source.code_revision,
+            environment_digest=source.environment_digest,
+            quality_state="valid",
+            attributes=None,
+        )
+        uow.commit()
+    with PostgresUnitOfWork(migrated_dsn) as uow:
+        unindexed = uow.artifacts.find_unindexed_issued_temperature_verifications(limit=10)
+    assert [item.artifact_id for item in unindexed] == [legacy.artifact_id]
+    with_legacy = analyze_site_verification(FIRST["lat"], FIRST["lon"], now=DECISION)
+    assert with_legacy["inventory"]["indexed_facts"] == 4
+    assert with_legacy["inventory"]["legacy_unindexed_facts_for_coordinate"] == 1
+    assert with_legacy["inventory"]["stored_facts_for_coordinate"] == 5
+    assert with_legacy["canonicalization"]["verified_opportunities"] == 4
+    assert with_legacy["canonicalization"]["fact_classification"] == {
+        "identical_evidence_reacquired": 1,
+        "single_fact": 3,
+    }
+    assert with_legacy["overall"] == analysis["overall"]
+    elsewhere = analyze_site_verification(LAST["lat"], LAST["lon"], now=DECISION)
+    assert elsewhere["inventory"]["legacy_unindexed_facts_examined"] == 1
+    assert elsewhere["inventory"]["legacy_unindexed_facts_for_coordinate"] == 0
+    assert elsewhere["overall"]["n"] == 0
 
 
 def test_overlapping_forward_run_is_refused_by_the_shared_lock(

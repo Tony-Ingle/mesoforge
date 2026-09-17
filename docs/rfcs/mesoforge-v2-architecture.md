@@ -1201,7 +1201,7 @@ per-hour prose hoisting was deferred; items 2 and 3 remain future work):
 None of this is a prerequisite for the transition-detection milestone; item 1 should
 precede sustained forward accumulation because read cost, not disk, is the first limit.
 
-#### 6.7.10 Repeatable forward accumulation and read-only status
+#### 6.7.12 Repeatable forward accumulation and read-only status
 
 **Status: implemented September 17, 2026.** The learning loop's data source is the
 existing forward run, made safe to call repeatedly by an external caller; no second
@@ -1248,6 +1248,54 @@ workflow, scheduler, VPS or CI deployment was added.
   skill are derived; accumulating history is not learning corrections.
 - **Boundary.** Manual repeated invocation is the orchestration today; a future
   external scheduler calls the same command and reads the same exit codes.
+
+#### 6.7.13 Read-only site verification analysis
+
+**Status: implemented September 17, 2026; temperature only; no correction is derived
+or applied.** `site_verification_analysis` (CLI and `GET /verification-analysis`)
+describes the verified history that forward accumulation produces. Its schema is
+`mesoforge.site-verification-analysis.v1`.
+
+- **A stored fact is evidence, not a statistical sample.** Canonicalization policy
+  `mesoforge-verification-canonicalization.v1` resolves facts in two steps and never
+  modifies or deletes one; every fact stays in the sample's provenance.
+  1. *Opportunity* = (`issued_forecast_id`, `valid_time`, verification policy). Facts
+     of one opportunity whose evidence signature is identical (forecast value and
+     issuance digest, station, observation time and value, observation revision and
+     logical-observation digests, matching policy, error) are one verification
+     repeated over a re-acquired copy of the same observation revision; the earliest
+     registered fact is canonical. Facts whose signatures differ (a revised
+     observation, another station, another matching policy) make the opportunity
+     **ambiguous**: it is excluded and reported with its reason, never resolved by rule.
+  2. *Sample* = (coordinate, `target_reference_time`, `valid_time`, policy). Several
+     issued versions of one target are one sample only when forecast value, selected
+     observation revision and error are identical (a re-issue); versions that differ
+     are ambiguous because no approved rule names the version that represents the
+     decision window. Different targets verified at one valid time are separate
+     samples at their own horizons, and the report counts the observations they share.
+- **Usable fact:** verified status under `issued-temperature-verification.v1`, finite
+  kelvin values, horizon equal to valid − target within 1..36 h, a saved error equal
+  to forecast − observation, and agreement with the issuance metadata row. Facts
+  without identity attributes are found by a bounded query (200) and identified from
+  their immutable payload; nothing is backfilled.
+- **Report:** inventory (indexed, legacy, usable, excluded by reason, ambiguous);
+  overall and per lead bucket 1–6 / 7–18 / 19–36 N, bias, MAE, RMSE, min/max (empty
+  buckets stay null, nothing is extrapolated); local day/night groups using the
+  period-summary convention (06–18 / 18–06) in the requested, saved-report or UTC zone;
+  per-station proxy accounting with distance, elevation and distinct observations;
+  and regime *readiness*: which saved forecast dimensions (sky, wind, dew point/RH,
+  precipitation, p-type, thunder, model spread) are reconstructable per sample, with
+  availability and ranges only — no classes, thresholds or splits.
+- **Evidence states.** Metrics are `descriptive_only` or `no_samples`.
+  `correction_readiness.status` is `insufficient_evidence` with `evidence_policy: null`
+  because no approved evidence policy (sample size, lead coverage, period,
+  independence) exists; the report lists observed evidence and what it does not
+  conclude, and invents no threshold.
+- **Reads.** Issuance metadata rows and one immutable fact payload per fact; values,
+  observation identity and forecast context all live in the fact, so **no issued
+  forecast object is read**. Fact payloads are 4–9 MB each because they embed the
+  forecast context, which bounds this analysis until facts carry compact analytical
+  attributes or the stored layout is normalized (§6.7.9).
 
 ## 7. Representative benchmark and admission
 

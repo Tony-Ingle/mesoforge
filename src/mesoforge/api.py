@@ -27,6 +27,7 @@ from mesoforge.application.point_forecast import (
     prepare_demo_files,
 )
 from mesoforge.application.prepared_local_grid import PreparedLocalGrids
+from mesoforge.application.site_verification_analysis import analyze_site_verification
 from mesoforge.application.spatial_coverage import CoverageRequiredError, UnsupportedCoordinateError
 from mesoforge.application.spatial_preparation import PreparedRegions, load_prepared
 from mesoforge.application.weather_conditions import preview_weather_conditions
@@ -444,6 +445,36 @@ def create_app(directory: Path) -> FastAPI:
                     "error": {
                         "code": "accumulation_status_failed",
                         "message": "Could not read the saved issuance and verification metadata.",
+                    }
+                },
+            )
+
+    @app.get("/verification-analysis", response_model=None)
+    def verification_analysis(
+        lat: float, lon: float, display_timezone: str | None = None
+    ) -> dict[str, Any] | JSONResponse:
+        try:
+            return analyze_site_verification(lat, lon, display_timezone=display_timezone)
+        except ValueError:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": {
+                        "code": "invalid_analysis_request",
+                        "message": (
+                            "Provide finite geographic lat and lon and, optionally, a "
+                            "resolvable IANA display_timezone."
+                        ),
+                    }
+                },
+            )
+        except Exception:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": {
+                        "code": "verification_analysis_failed",
+                        "message": "Could not read the saved verification history.",
                     }
                 },
             )
