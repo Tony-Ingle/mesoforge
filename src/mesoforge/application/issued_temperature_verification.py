@@ -37,6 +37,10 @@ from mesoforge.storage.postgres.database import resolve_database_dsn
 from mesoforge.storage.postgres.idempotency_lock import PostgresIdempotencyLock
 from mesoforge.storage.postgres.repositories import PostgresUnitOfWork
 from mesoforge.storage.s3 import S3ArtifactObjectStore
+from mesoforge.verification.analytical_attributes import (
+    ATTRIBUTE_KEY,
+    build_analytical_attributes,
+)
 from mesoforge.verification.issued_temperature import evaluate_temperature_verification
 
 VERIFICATION_SCHEMA_VERSION = "issued-temperature-verification.v1"
@@ -182,6 +186,8 @@ class IssuedTemperatureVerificationService:
                 "latitude": forecast["latitude"],
                 "longitude": forecast["longitude"],
                 "verification_status": "verified",
+                # Compact projection for analysis; the payload stays the evidence record.
+                ATTRIBUTE_KEY: build_analytical_attributes(result),
             },
         )
 

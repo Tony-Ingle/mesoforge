@@ -468,7 +468,22 @@ def test_forward_run_verifies_then_issues_and_reuses_verification_without_mutati
     assert analysis["lead_buckets"]["7-18"]["bias_k"] is None
     assert analysis["correction_readiness"]["status"] == "insufficient_evidence"
     assert analysis["reads"]["issuance_payloads_read"] == 0
-    assert analysis["reads"]["fact_payloads_read"] == 4
+    # Facts saved by this code carry compact attributes, so no fact payload is opened.
+    assert analysis["reads"]["fact_payloads_read"] == 0
+    assert analysis["reads"]["facts_from_compact_attributes"] == 4
+    assert 0 < analysis["reads"]["compact_attribute_bytes"] < 4 * 4000
+    assert analysis["inventory"]["fact_sources"]["payload_fallback"] == 0
+    audited = analyze_site_verification(FIRST["lat"], FIRST["lon"], now=DECISION, payload_only=True)
+    assert audited["reads"]["fact_payloads_read"] == 4
+    # Even these small synthetic payloads are several times their compact projection.
+    assert audited["reads"]["fact_payload_bytes"] > 5 * analysis["reads"]["compact_attribute_bytes"]
+
+    def analytical_content(result: dict[str, Any]) -> dict[str, Any]:
+        content = {k: v for k, v in result.items() if k not in {"evaluation", "reads"}}
+        content["inventory"] = {k: v for k, v in result["inventory"].items() if k != "fact_sources"}
+        return content
+
+    assert analytical_content(audited) == analytical_content(analysis)
     repeated_analysis = analyze_site_verification(
         FIRST["lat"], FIRST["lon"], now=DECISION + timedelta(hours=3)
     )
@@ -509,6 +524,11 @@ def test_forward_run_verifies_then_issues_and_reuses_verification_without_mutati
     assert with_legacy["inventory"]["indexed_facts"] == 4
     assert with_legacy["inventory"]["legacy_unindexed_facts_for_coordinate"] == 1
     assert with_legacy["inventory"]["stored_facts_for_coordinate"] == 5
+    assert with_legacy["inventory"]["fact_sources"]["compact_attributes"] == 4
+    assert with_legacy["inventory"]["fact_sources"]["payload_fallback_reasons"] == {
+        "unindexed_legacy_fact": 1
+    }
+    assert with_legacy["reads"]["fact_payloads_read"] == 1
     assert with_legacy["canonicalization"]["verified_opportunities"] == 4
     assert with_legacy["canonicalization"]["fact_classification"] == {
         "identical_evidence_reacquired": 1,

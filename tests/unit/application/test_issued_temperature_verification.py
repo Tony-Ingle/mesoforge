@@ -17,6 +17,11 @@ from mesoforge.common.errors import IntegrityError, NotFound
 from mesoforge.common.identifiers import ArtifactId, Digest
 from mesoforge.contracts.artifacts import Availability
 from mesoforge.storage.json import CanonicalJsonSerializer
+from mesoforge.verification.analytical_attributes import (
+    ANALYTICAL_SCHEMA_VERSION,
+    ATTRIBUTE_KEY,
+    build_analytical_attributes,
+)
 from tests.unit.application import test_artifact_service as artifact_tests
 
 service_and_uow = artifact_tests.service_and_uow
@@ -215,6 +220,40 @@ def test_verify_round_trip_and_retry_preserve_exact_forecast_and_observation(ver
     assert _inventory(case) == after
     assert case.objects.objects[case.issued.content_digest] == original_bytes
     assert case.uow.issued_forecasts == {case.issued.issued_forecast_id: case.issued}
+
+
+def test_saved_fact_carries_compact_attributes_beside_the_unchanged_payload(verification_case):
+    case = verification_case
+    result = case.service.verify(case.issued.issued_forecast_id, _VALID)
+    manifest = case.uow.artifacts[ArtifactId(result["verification_id"])]
+    attributes = manifest.attributes
+    # The flat index keys that existing queries rely on are unchanged.
+    assert {k: v for k, v in attributes.items() if k != ATTRIBUTE_KEY} == {
+        "issued_forecast_id": str(case.issued.issued_forecast_id),
+        "valid_time": _iso(_VALID),
+        "horizon_hours": 1,
+        "latitude": 45.8,
+        "longitude": -93.1,
+        "verification_status": "verified",
+    }
+    block = attributes[ATTRIBUTE_KEY]
+    assert block["schema_version"] == ANALYTICAL_SCHEMA_VERSION
+    assert block == build_analytical_attributes(result["result"])
+    assert block["forecast_temperature_k"] == 281.25
+    assert block["temperature_error_k"] == 2.25
+    assert block["observation"]["station_id"] == "KTST"
+    assert block["observation"]["temperature_k"] == 279.0
+    assert block["observation"]["revision_digest"] == str(
+        Digest.of_bytes(b"synthetic revision one")
+    )
+    assert block["target_reference_time"] == _iso(_TARGET)
+    assert block["issued_forecast_digest"] == result["result"]["issued_forecast_digest"]
+    assert len(_JSON.serialize(block)) < 2500
+    # The evidence payload is complete and byte-identical to what the fact returns.
+    stored = case.objects.objects[manifest.content_digest]
+    assert stored == _JSON.serialize(result["result"])
+    assert ATTRIBUTE_KEY not in result["result"]
+    assert result["result"]["match"] == case.match
 
 
 def test_two_issued_versions_of_same_hour_have_independent_verification_facts(verification_case):

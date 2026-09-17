@@ -1,9 +1,9 @@
 """Read-only site verification analysis over saved temperature verification facts.
 
-Reads issuance metadata rows and the immutable verification fact payloads of one
-coordinate; every value needed for error statistics and forecast context is inside
-those facts, so no issued forecast object is read. Nothing is written, acquired,
-calculated as a forecast or corrected.
+Reads issuance metadata rows and, per fact, either its compact analytical attributes
+or (for facts saved before those existed) its immutable payload. Both go through one
+projection, so the result does not depend on the path. No issued forecast object is
+read. Nothing is written, acquired, calculated as a forecast or corrected.
 """
 
 from __future__ import annotations
@@ -12,19 +12,24 @@ import argparse
 import json
 import os
 import sys
+from collections import Counter
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
 from mesoforge.application.accumulation_status import _validate
 from mesoforge.application.weather_transitions import validate_display_timezone
-from mesoforge.common.identifiers import Digest
 from mesoforge.contracts.artifacts import ArtifactManifest
 from mesoforge.contracts.issued_forecasts import IssuedForecastRecord
 from mesoforge.contracts.serialization import canonical_json_bytes
 from mesoforge.storage.postgres.database import resolve_database_dsn
 from mesoforge.storage.postgres.repositories import PostgresUnitOfWork
 from mesoforge.storage.s3 import S3ArtifactObjectStore
+from mesoforge.verification.analytical_attributes import (
+    ANALYTICAL_SCHEMA_VERSION,
+    analytical_block,
+    build_analytical_attributes,
+)
 from mesoforge.verification.site_analysis import (
     ANALYSIS_POLICY,
     CANONICALIZATION_POLICY,
@@ -50,88 +55,21 @@ def _configured_loader() -> Callable[[ArtifactManifest], bytes]:
     return lambda manifest: objects.get_verified(manifest.storage_uri, manifest.content_digest)
 
 
-def _mapping(value: Any) -> dict[str, Any]:
-    return value if isinstance(value, dict) else {}
-
-
-def _kelvin(value: Any) -> Any:
-    block = _mapping(value)
-    return block.get("value") if block.get("unit") == "K" else None
-
-
-def extract_fact(
-    manifest: ArtifactManifest, payload: dict[str, Any], *, indexed: bool
+def fact_record(
+    manifest: ArtifactManifest, block: dict[str, Any], *, indexed: bool
 ) -> dict[str, Any]:
-    """Flatten one immutable fact payload into the identity and values the analysis uses."""
-    match = _mapping(payload.get("match"))
-    forecast = _mapping(match.get("forecast"))
-    selected = _mapping(match.get("selected"))
-    provenance = _mapping(selected.get("provenance"))
-    context = _mapping(match.get("forecast_context"))
-    inputs = _mapping(match.get("input_provenance"))
-    fields = _mapping(_mapping(forecast.get("surface")).get("fields"))
-    selection_policy = match.get("selection_policy")
-    models = {}
-    for group in ("sources", "shadow_sources"):
-        for source in forecast.get(group) or []:
-            if isinstance(source, dict) and isinstance(source.get("model"), str):
-                models[source["model"]] = _kelvin(source.get("temperature"))
+    """Join repository metadata with one compact block, whichever path produced it."""
     return {
+        **{
+            key: value
+            for key, value in block.items()
+            if key not in {"schema_version", "fact_schema_version"}
+        },
         "artifact_id": str(manifest.artifact_id),
         "registered_at": manifest.registered_at,
         "indexed": indexed,
         "quality_state": manifest.quality_state,
-        "schema_version": payload.get("schema_version"),
-        "status": payload.get("status"),
-        "verification_policy_id": _mapping(payload.get("verification_policy")).get("policy_id"),
-        "matching_policy_digest": (
-            str(Digest.of_bytes(canonical_json_bytes(selection_policy)))
-            if isinstance(selection_policy, dict)
-            else None
-        ),
-        "issued_forecast_id": match.get("issued_forecast_id"),
-        "issued_at": match.get("issued_at"),
-        "issued_forecast_digest": payload.get("issued_forecast_digest"),
-        "target_reference_time": context.get("target_reference_time"),
-        "valid_time": forecast.get("valid_time"),
-        "horizon_hours": forecast.get("horizon_hours"),
-        "latitude": forecast.get("latitude"),
-        "longitude": forecast.get("longitude"),
-        "forecast_temperature_k": _kelvin(forecast.get("temperature")),
-        "temperature_error_k": (
-            _mapping(payload.get("temperature_error")).get("value")
-            if _mapping(payload.get("temperature_error")).get("unit") == "K"
-            else None
-        ),
-        "verification_cutoff": payload.get("verification_cutoff"),
-        "code_commit": _mapping(payload.get("code_identity")).get("git_commit"),
-        "observation": {
-            "station_id": selected.get("station_id"),
-            "catalog_station_id": selected.get("catalog_station_id"),
-            "network": selected.get("network"),
-            "provider": selected.get("provider"),
-            "latitude": selected.get("latitude"),
-            "longitude": selected.get("longitude"),
-            "elevation_m": selected.get("elevation_m"),
-            "distance_km": selected.get("distance_km"),
-            "observation_time": selected.get("observation_time"),
-            "time_difference_seconds": selected.get("time_difference_seconds"),
-            "temperature_k": _kelvin(selected.get("temperature")),
-            "revision_digest": provenance.get("revision_digest"),
-            "logical_observation_digest": provenance.get("logical_observation_digest"),
-            "raw_record_digest": provenance.get("raw_record_digest"),
-            "raw_artifact_id": provenance.get("raw_artifact_id"),
-            "observations_artifact_id": _mapping(inputs.get("observations")).get("artifact_id"),
-        },
-        "display_timezone": _mapping(context.get("hourly_report")).get("display_timezone"),
-        "context": {
-            "fields": {
-                name: field.get("value")
-                for name, field in fields.items()
-                if isinstance(field, dict)
-            },
-            "model_temperatures_k": models,
-        },
+        "schema_version": block.get("fact_schema_version"),
     }
 
 
@@ -160,11 +98,16 @@ def analyze_site_verification(
     longitude: float,
     *,
     display_timezone: str | None = None,
+    payload_only: bool = False,
     now: datetime | None = None,
     unit_of_work_factory: Callable[[], Any] | None = None,
     load_payload: Callable[[ArtifactManifest], bytes] | None = None,
 ) -> dict[str, Any]:
-    """Describe verified temperature errors for one coordinate from canonical samples."""
+    """Describe verified temperature errors for one coordinate from canonical samples.
+
+    ``payload_only`` ignores compact attributes and projects every fact from its
+    authoritative payload; it exists to audit that both paths agree.
+    """
     latitude, longitude = _validate(latitude, longitude)
     if display_timezone is not None:
         validate_display_timezone(display_timezone)
@@ -181,9 +124,9 @@ def analyze_site_verification(
             limit=LEGACY_SCAN_LIMIT + 1
         )
     records = {str(record.issued_forecast_id): record for record in issued}
-    load = load_payload or _configured_loader()
-    payload_bytes = 0
-    payloads_read = 0
+    loader: list[Callable[[ArtifactManifest], bytes]] = [load_payload] if load_payload else []
+    payload_bytes = payloads_read = attribute_bytes = from_attributes = 0
+    fallback_reasons: Counter[str] = Counter()
     unreadable: list[dict[str, Any]] = []
     facts: list[dict[str, Any]] = []
     legacy_for_coordinate = 0
@@ -191,28 +134,43 @@ def analyze_site_verification(
     for manifest, is_indexed in [(m, True) for m in indexed] + [
         (m, False) for m in legacy_examined
     ]:
-        try:
-            raw = load(manifest)
-            payload = json.loads(raw)
-            if not isinstance(payload, dict):
-                raise ValueError("fact payload is not an object")
-        except Exception:
-            if is_indexed:
-                unreadable.append(
-                    {"artifact_id": str(manifest.artifact_id), "reason": "payload_unreadable"}
-                )
-            continue
-        payload_bytes += len(raw)
-        payloads_read += 1
-        fact = extract_fact(manifest, payload, indexed=is_indexed)
+        block, reason = (None, "unindexed_legacy_fact")
+        if is_indexed:
+            block, reason = analytical_block(manifest.attributes)
+            if payload_only:
+                block, reason = None, "payload_only_requested"
+        if block is not None:
+            from_attributes += 1
+            attribute_bytes += len(canonical_json_bytes(block))
+            source = "compact_attributes"
+        else:
+            if not loader:
+                loader.append(_configured_loader())
+            try:
+                raw = loader[0](manifest)
+                payload = json.loads(raw)
+                if not isinstance(payload, dict):
+                    raise ValueError("fact payload is not an object")
+            except Exception:
+                if is_indexed:
+                    unreadable.append(
+                        {"artifact_id": str(manifest.artifact_id), "reason": "payload_unreadable"}
+                    )
+                continue
+            payload_bytes += len(raw)
+            payloads_read += 1
+            block, source = build_analytical_attributes(payload), "payload"
+        fact = fact_record(manifest, block, indexed=is_indexed)
         if not is_indexed:
             # Identity recovered from the immutable payload; other coordinates are not ours.
             if fact["latitude"] != latitude or fact["longitude"] != longitude:
                 continue
             legacy_for_coordinate += 1
-        reason = _metadata_exclusion(fact, records)
-        if reason is not None:
-            fact["integrity_exclusion"] = reason
+        if source == "payload":
+            fallback_reasons[reason] += 1
+        exclusion = _metadata_exclusion(fact, records)
+        if exclusion is not None:
+            fact["integrity_exclusion"] = exclusion
         facts.append(fact)
 
     analysis = analyze_facts(facts, display_timezone=display_timezone)
@@ -243,6 +201,12 @@ def analyze_site_verification(
                 "identity_source": "bounded read of each unindexed immutable fact payload",
             },
             "stored_facts_for_coordinate": len(indexed) + legacy_for_coordinate,
+            "fact_sources": {
+                "analytical_schema_version": ANALYTICAL_SCHEMA_VERSION,
+                "compact_attributes": from_attributes,
+                "payload_fallback": sum(fallback_reasons.values()),
+                "payload_fallback_reasons": dict(sorted(fallback_reasons.items())),
+            },
             "analytically_usable_facts": canonical["usable_facts"],
             "excluded_facts": len(canonical["excluded_facts"]),
             "excluded_by_reason": canonical["excluded_by_reason"],
@@ -251,14 +215,16 @@ def analyze_site_verification(
         **analysis,
         "reads": {
             "issuance_metadata_rows": len(records),
+            "facts_from_compact_attributes": from_attributes,
+            "compact_attribute_bytes": attribute_bytes,
             "fact_payloads_read": payloads_read,
             "fact_payload_bytes": payload_bytes,
             "issuance_payloads_read": 0,
             "provider_calls": 0,
             "writes": 0,
             "note": (
-                "Forecast values, observation identity, errors and forecast context all come "
-                "from the saved fact payloads; no issued forecast object is needed."
+                "Compact analytical attributes answer facts that carry them; older facts are "
+                "projected from their immutable payload. No issued forecast object is needed."
             ),
         },
     }
@@ -272,10 +238,20 @@ def main(argv: list[str] | None = None) -> int:
         "--display-timezone",
         help="IANA zone for the day/night grouping; default is the saved report zone or UTC",
     )
+    parser.add_argument(
+        "--payload-only",
+        action="store_true",
+        help="Audit mode: ignore compact attributes and read every fact payload",
+    )
     args = parser.parse_args(argv)
     try:
         payload = canonical_json_bytes(
-            analyze_site_verification(args.lat, args.lon, display_timezone=args.display_timezone)
+            analyze_site_verification(
+                args.lat,
+                args.lon,
+                display_timezone=args.display_timezone,
+                payload_only=args.payload_only,
+            )
         )
     except ValueError as exc:
         error = {"code": "invalid_analysis_request", "message": str(exc)}

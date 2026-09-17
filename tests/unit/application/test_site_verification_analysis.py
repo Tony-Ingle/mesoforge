@@ -17,6 +17,11 @@ from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.site_verification_analysis import analyze_site_verification
 from mesoforge.common.identifiers import Digest
 from mesoforge.contracts.issued_forecasts import IssuedForecastRecord
+from mesoforge.verification.analytical_attributes import (
+    ANALYTICAL_SCHEMA_VERSION,
+    ATTRIBUTE_KEY,
+    build_analytical_attributes,
+)
 from tests.unit.application.test_accumulation_status import manifest
 
 LAT, LON = 44.98859, -93.25557
@@ -130,7 +135,15 @@ class Storage:
         self.loads: list[str] = []
         self.queries: list[tuple] = []
 
-    def add(self, body: dict[str, Any] | bytes, *, indexed: bool = True, minutes: int = 0):
+    def add(
+        self,
+        body: dict[str, Any] | bytes,
+        *,
+        indexed: bool = True,
+        minutes: int = 0,
+        compact: bool = False,
+        analysis: Any = None,
+    ):
         attributes = None
         if indexed and isinstance(body, dict):
             forecast = body["match"]["forecast"]
@@ -142,6 +155,10 @@ class Storage:
                 "longitude": forecast["longitude"],
                 "verification_status": "verified",
             }
+            if compact:
+                attributes[ATTRIBUTE_KEY] = build_analytical_attributes(body)
+            if analysis is not None:
+                attributes[ATTRIBUTE_KEY] = analysis
         elif indexed:
             attributes = {"issued_forecast_id": "unreadable", "latitude": LAT, "longitude": LON}
         item = manifest(
@@ -246,6 +263,12 @@ def test_facts_become_samples_without_reading_any_issued_forecast(history, monke
             "identity_source": "bounded read of each unindexed immutable fact payload",
         },
         "stored_facts_for_coordinate": 7,
+        "fact_sources": {
+            "analytical_schema_version": ANALYTICAL_SCHEMA_VERSION,
+            "compact_attributes": 0,
+            "payload_fallback": 7,
+            "payload_fallback_reasons": {"no_analytical_attributes": 7},
+        },
         "analytically_usable_facts": 7,
         "excluded_facts": 0,
         "excluded_by_reason": {},
@@ -269,6 +292,8 @@ def test_facts_become_samples_without_reading_any_issued_forecast(history, monke
     assert result["correction_readiness"]["status"] == "insufficient_evidence"
     assert result["reads"] == {
         "issuance_metadata_rows": 3,
+        "facts_from_compact_attributes": 0,
+        "compact_attribute_bytes": 0,
         "fact_payloads_read": 7,
         "fact_payload_bytes": sum(len(body) for body in history.payloads.values()),
         "issuance_payloads_read": 0,
@@ -283,6 +308,123 @@ def test_facts_become_samples_without_reading_any_issued_forecast(history, monke
     assert sample["context"]["fields"] == {"wind_speed_10m": 3.4, "cloud_area_fraction": None}
     assert sample["context"]["model_temperatures_k"] == {"HRRR": 296.2, "GFS": 295.6, "IFS": None}
     assert result["regime_readiness"]["dimensions"]["wind_speed"]["available_samples"] == 3
+
+
+def _compact_history() -> Storage:
+    """The same history as ``history``, but every fact carries compact attributes."""
+    a, b = issued(VERSION_A, TARGET, 42), issued(VERSION_B, TARGET, 49)
+    c = issued(VERSION_C, TARGET + timedelta(hours=4), 45)
+    storage = Storage([a, b, c])
+    for record in (a, b):
+        storage.add(payload(record, 1, forecast=296.0, observed=295.0), compact=True)
+        storage.add(payload(record, 2, forecast=294.5, observed=295.0), compact=True)
+    for record in (a, b):
+        storage.add(
+            payload(record, 1, forecast=296.0, observed=295.0, raw_artifact="art_raw_2"),
+            minutes=46,
+            compact=True,
+        )
+    storage.add(payload(c, 1, forecast=290.9, observed=291.0), compact=True)
+    return storage
+
+
+def _analytical_content(result: dict[str, Any]) -> dict[str, Any]:
+    """Everything except the clock and the accounting of which path supplied each fact."""
+    content = {k: v for k, v in result.items() if k not in {"evaluation", "reads"}}
+    content["inventory"] = {k: v for k, v in result["inventory"].items() if k != "fact_sources"}
+    return content
+
+
+def test_compact_attributes_answer_every_fact_without_opening_a_payload():
+    storage = _compact_history()
+    storage.load = Mock(side_effect=AssertionError("Compact facts need no payload read"))
+    result = analyze_site_verification(
+        LAT, LON, now=NOW, unit_of_work_factory=storage.factory, load_payload=storage.load
+    )
+    storage.load.assert_not_called()
+    assert result["inventory"]["fact_sources"] == {
+        "analytical_schema_version": ANALYTICAL_SCHEMA_VERSION,
+        "compact_attributes": 7,
+        "payload_fallback": 0,
+        "payload_fallback_reasons": {},
+    }
+    assert result["reads"]["facts_from_compact_attributes"] == 7
+    assert result["reads"]["fact_payloads_read"] == 0
+    assert result["reads"]["fact_payload_bytes"] == 0
+    assert 0 < result["reads"]["compact_attribute_bytes"] < 7 * 2500
+    assert result["canonicalization"]["verified_opportunities"] == 5
+    assert result["canonicalization"]["analytical_samples"] == 3
+    assert result["overall"]["bias_k"] == pytest.approx((1.0 - 0.5 - 0.1) / 3)
+
+
+def test_compact_and_payload_paths_give_identical_analysis():
+    storage = _compact_history()
+    compact = analyze(storage)
+    assert storage.loads == []
+    audited = analyze(storage, payload_only=True)
+    assert len(storage.loads) == 7
+    assert audited["inventory"]["fact_sources"]["payload_fallback_reasons"] == {
+        "payload_only_requested": 7
+    }
+    assert _analytical_content(compact) == _analytical_content(audited)
+    # The payload bytes the audit read are exactly what was stored: nothing was rewritten.
+    assert audited["reads"]["fact_payload_bytes"] == sum(map(len, storage.payloads.values()))
+
+
+def test_mixed_legacy_and_compact_facts_canonicalize_together(history):
+    a, c = history.records[0], history.records[2]
+    # A new compact fact re-verifies a legacy hour with the identical observation revision...
+    history.add(
+        payload(a, 2, forecast=294.5, observed=295.0, raw_artifact="art_raw_3"),
+        minutes=90,
+        compact=True,
+    )
+    # ...another new compact fact covers a new hour...
+    history.add(payload(c, 2, forecast=290.0, observed=289.0), minutes=95, compact=True)
+    # ...and one disagrees with a legacy fact through a genuinely revised observation.
+    history.add(
+        payload(c, 1, forecast=290.9, observed=290.2, revision="rev-2"), minutes=99, compact=True
+    )
+    result = analyze(history)
+    assert result["inventory"]["fact_sources"] == {
+        "analytical_schema_version": ANALYTICAL_SCHEMA_VERSION,
+        "compact_attributes": 3,
+        "payload_fallback": 7,
+        "payload_fallback_reasons": {"no_analytical_attributes": 7},
+    }
+    assert len(history.loads) == 7  # only the legacy facts were opened
+    canonical = result["canonicalization"]
+    assert canonical["stored_facts"] == 10
+    assert canonical["verified_opportunities"] == 6
+    assert canonical["fact_classification"] == {
+        "ambiguous": 1,
+        "identical_evidence_reacquired": 3,
+        "single_fact": 2,
+    }
+    [conflict] = [row for row in canonical["ambiguous"] if row["level"] == "opportunity"]
+    assert conflict["reason"] == "conflicting_observation_revisions"
+    assert conflict["distinct_observation_revisions"] == ["sha256:rev-1", "sha256:rev-2"]
+    # Samples: target A/B hours 1 and 2, plus C hour 2; C hour 1 is ambiguous and excluded.
+    assert result["overall"]["n"] == 3
+    assert result["overall"]["bias_k"] == pytest.approx((1.0 - 0.5 + 1.0) / 3)
+    assert _analytical_content(result) == _analytical_content(analyze(history, payload_only=True))
+
+
+def test_unusable_attribute_blocks_fall_back_to_the_authoritative_payload(history):
+    a = history.records[0]
+    body = payload(a, 3, forecast=293.5, observed=292.05)
+    block = build_analytical_attributes(body)
+    history.add(body, analysis={**block, "schema_version": "mesoforge.other.v9"})
+    history.add(payload(a, 4, forecast=293.0, observed=292.05), analysis="not an object")
+    result = analyze(history)
+    assert result["inventory"]["fact_sources"]["compact_attributes"] == 0
+    assert result["inventory"]["fact_sources"]["payload_fallback_reasons"] == {
+        "malformed_analytical_attributes": 1,
+        "no_analytical_attributes": 7,
+        "unsupported_analytical_schema": 1,
+    }
+    assert result["overall"]["n"] == 5
+    assert len(history.loads) == 9
 
 
 def test_legacy_unindexed_facts_are_recovered_from_payloads_within_a_bound(history, monkeypatch):
@@ -387,8 +529,11 @@ def test_cli_prints_canonical_json_and_reports_errors(monkeypatch, capsys):
         '{"overall":{"n":0},"schema_version":"mesoforge.site-verification-analysis.v1"}\n'
     )
     module.analyze_site_verification.assert_called_once_with(
-        44.98859, -93.25557, display_timezone=None
+        44.98859, -93.25557, display_timezone=None, payload_only=False
     )
+    module.main(["--lat", "44.98859", "--lon", "-93.25557", "--payload-only"])
+    assert module.analyze_site_verification.call_args.kwargs["payload_only"] is True
+    capsys.readouterr()
     monkeypatch.setattr(module, "analyze_site_verification", Mock(side_effect=ValueError("zone")))
     assert module.main(["--lat", "45", "--lon", "-93", "--display-timezone", "Nope"]) == 2
     assert json.loads(capsys.readouterr().err)["error"]["code"] == "invalid_analysis_request"
