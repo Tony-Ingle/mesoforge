@@ -1291,11 +1291,33 @@ describes the verified history that forward accumulation produces. Its schema is
   because no approved evidence policy (sample size, lead coverage, period,
   independence) exists; the report lists observed evidence and what it does not
   conclude, and invents no threshold.
-- **Reads.** Issuance metadata rows and one immutable fact payload per fact; values,
-  observation identity and forecast context all live in the fact, so **no issued
-  forecast object is read**. Fact payloads are 4–9 MB each because they embed the
-  forecast context, which bounds this analysis until facts carry compact analytical
-  attributes or the stored layout is normalized (§6.7.9).
+- **Reads.** Issuance metadata rows and, per fact, either its compact analytical
+  attributes or its immutable payload; values, observation identity and forecast
+  context all live in the fact, so **no issued forecast object is read**.
+- **Compact analytical attributes (implemented September 17, 2026).** A fact payload
+  is 4–9 MB because it embeds the forecast context, so every newly saved fact also
+  carries `attributes.analysis`, schema
+  `mesoforge.verification-analytical-attributes.v1`: a pure projection of that payload
+  holding identity (issued forecast ID and digest, coordinate, target, horizon, valid
+  time, fact schema, verification policy, status), forecast and observed temperature,
+  error and unit, observation identity (station, coordinates, distance, elevation,
+  observation time and offset, revision, logical-observation and raw-record digests,
+  acquisition artifacts), the matching-policy digest, cutoff, code commit, saved
+  report zone, and a compact point context (ten saved surface values with units and
+  the per-model temperatures). It holds no candidate list, provenance block, GRIB
+  metadata, URL, policy prose or grid data, and measured 2.4–2.6 KB against
+  4.2–9.3 MB payloads on 112 real facts (the Minneapolis analysis then opened 23
+  payloads instead of 93, with identical results).
+  - The payload stays the **authoritative, immutable evidence**; attributes are not
+    part of the idempotency digest, so payload bytes and replay are unchanged.
+  - The analysis prefers the block and **falls back to a bounded payload read** for
+    facts without a usable one (facts saved earlier, unindexed legacy facts,
+    unsupported or malformed blocks). Both paths run the same projection, so
+    canonicalization and metrics are identical; the report counts facts and bytes per
+    path and `--payload-only` audits that they agree. Nothing is migrated, rewritten
+    or backfilled, and the canonicalization policy is unchanged.
+  - The context snapshot is descriptive input for later regime analysis. It is not a
+    learned model, a weight or a correction.
 
 ## 7. Representative benchmark and admission
 

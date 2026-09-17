@@ -548,7 +548,9 @@ accumulation status reports verified history per coordinate and lead bucket. A
 [read-only site verification analysis](#read-only-site-verification-analysis) turns
 the stored facts into canonical samples and describes temperature error by lead,
 day/night and station; it applies no correction and currently reports
-`insufficient_evidence`. Next proposed step: keep accumulating forward verification
+`insufficient_evidence`. New facts also carry [compact analytical attributes](#compact-analytical-attributes-on-new-facts)
+so that analysis scales without opening each multi-megabyte evidence payload, while
+older facts stay readable without migration. Next proposed step: keep accumulating forward verification
 history across leads, times of day and weather, then a read-only candidate
 correction proposal once an approved evidence policy exists. Presentation polish
 waits unless a concrete missing capability blocks use. Visibility/fog still needs
@@ -2760,11 +2762,82 @@ python -B -m pytest tests/unit/verification/test_site_analysis.py tests/unit/app
 python -B -m pytest tests/integration/application/test_forward_run.py tests/integration/application/test_issued_temperature_verification.py tests/integration/storage -q
 ```
 
-Limitations: temperature only; each fact payload is 4–9 MB because it embeds the
-forecast context, so analysis cost grows with fact count until facts carry compact
-analytical attributes or the stored layout is normalized; regime context is read from
-the canonical version only; and no evidence policy exists yet, so nothing here can
-graduate beyond descriptive.
+Limitations: temperature only; regime context is read from the canonical version
+only; and no evidence policy exists yet, so nothing here can graduate beyond
+descriptive.
+
+#### Compact analytical attributes on new facts
+
+A fact payload is 4–9 MB because it embeds the forecast context, candidate list and
+hourly report, so the analysis above read 180.8 MB to analyze 23 facts. Every
+**newly saved** fact now also carries a small projection of its own payload in
+`attributes.analysis` (schema `mesoforge.verification-analytical-attributes.v1`),
+beside the unchanged flat index keys:
+
+- identity: issued forecast ID and digest, coordinate, target, horizon, valid time,
+  fact schema, verification policy, status;
+- forecast and observed temperature, error (forecast − observation) and unit;
+- observation identity: station, coordinates, distance, elevation, observation time and
+  offset, revision, logical-observation and raw-record digests, acquisition artifacts;
+- matching-policy digest, verification cutoff, code commit and saved report zone;
+- a compact point context: ten saved surface values with units (cloud fraction, wind
+  speed/direction/gust, dew point, RH, QPF, PoP, p-type, thunder) and the per-model
+  temperatures. No candidates, provenance blocks, GRIB metadata, URLs, policy prose
+  or grid data.
+
+The full payload remains the **authoritative, immutable evidence record**; attributes
+are not part of the idempotency digest, so payload bytes and replay are unchanged.
+The analysis prefers the block and **falls back to a bounded payload read** for facts
+without a usable one (facts saved earlier, unindexed legacy facts, unsupported or
+malformed blocks). Both paths run the same projection, so canonicalization and
+metrics are identical; `inventory.fact_sources` and `reads` say how many facts and
+bytes each path supplied, and `--payload-only` audits that the paths agree. Existing
+facts are never rewritten, migrated or backfilled, and the canonicalization policy
+is unchanged. The context snapshot is descriptive input for later regime analysis,
+not a learned model, weight or correction.
+
+Real measurement on **September 17, 2026**. With the new code the 23 existing
+Minneapolis facts still gave exactly 15 opportunities, 9 samples and bias / MAE /
+RMSE +1.4541 / 1.5437 / 2.0414 K, all through payload fallback. Forward cycle 4
+(started 18:15:29Z) then verified hours 05Z–18Z for every saved version through the
+normal path: **70 new Minneapolis facts and 42 St. Paul facts**, each with the block
+(the 15 and 3 already-verified hours were answered from saved facts). Its issuance
+stage failed honestly on a provider outage (ECMWF open-data HTTP 503 during IFS
+discovery; verification results were kept); a retry at 18:31:50Z answered all 130
+saved hours from fact attributes in about 10 seconds with no download and issued
+Minneapolis `b96f23cd-179c-4ff0-bf1f-e7e7c8740a58` and St. Paul
+`2982255e-47cf-40c1-980c-082fe6eccc7b` for target 18Z (HRRR 12Z / GFS 12Z / RAP 15Z /
+IFS 06Z).
+
+| Measurement | Value |
+| --- | --- |
+| Compact block per new fact | 2,408–2,614 bytes (median 2,440); whole attributes median 2,641 |
+| Full payload per new fact | 4.20–9.34 MB (median 4.48 MB) — about 1,800× the block |
+| New facts whose block equals the projection of their own retained payload | 112 of 112 |
+| Historical facts (26): attributes and registration unchanged, none given a block | yes |
+| Minneapolis analysis, 93 facts: payloads opened | **23 (180.8 MB)** instead of 93 (601.6 MB); 70 facts from 174.6 KB of attributes |
+| St. Paul analysis, 45 facts: payloads opened | **3 (13.3 MB)** instead of 45 (198.3 MB) |
+| Compact-preferred versus `--payload-only` analysis | identical for both coordinates |
+
+Mixed legacy/new canonicalization stayed correct: Minneapolis **93 facts → 85
+opportunities → 65 samples** (the 8 re-acquired duplicates and the 20 identical
+re-issued-version hours still collapse; nothing ambiguous or excluded). Descriptive
+metrics: bias +1.43 K, MAE 1.44 K, RMSE 1.65 K; lead 1–6 N 24 (+1.49 K), 7–18 N 39
+(+1.32 K), 19–36 N 2 (+2.71 K); day N 32, night N 33; one station (KMIC), 20 distinct
+observations over 19 hours, 4 targets. St. Paul: 45 → 45 → 45, bias +0.58 K, MAE
+0.61 K, RMSE 0.79 K, station KSTP. Both remain **`insufficient_evidence`**: this is
+still one 19-hour weather episode at one station per site. Repeated CLI runs and the
+HTTP route were identical outside the `evaluation` block and changed no row or object
+(10 issuances, 138 facts, 172 objects). Evidence is under
+`%LOCALAPPDATA%/MesoForge/baselines/20260917-compact-attributes`. **3,274 offline
+tests** (same three pre-existing failures deselected) and the 72 forward-run,
+verification and storage integration tests passed, with Ruff, mypy, nine import
+contracts, lock, documentation/hygiene and `git diff --check`.
+
+Remaining limitations: the 26 facts saved before this change keep needing payload
+reads (by design, no backfill); the saved cloud fraction is null in plain forward-run
+issuances, so sky context is available only where the richer issuance path saved it;
+and forward `verify()` itself still reads full issuance payloads.
 
 ### Local surface baseline grid
 
