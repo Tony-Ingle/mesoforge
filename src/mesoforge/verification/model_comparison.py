@@ -22,13 +22,18 @@ PREDICTION_KEYS = tuple(model.model_id for model in DEFAULT_CONFIGURATION.models
     recipe.result_key for recipe in DEFAULT_CONFIGURATION.recipes()
 )
 _CONTROL_TOLERANCE_K = 1e-10
-_BUCKETS = ("1-6", "7-18", "19-36")
+LEAD_BUCKETS = ("1-6", "7-18", "19-36")
+_BUCKETS = LEAD_BUCKETS
 
 
-def _lead_bucket(horizon: Any) -> str:
+def lead_bucket(horizon: Any) -> str:
+    """Shared horizon grouping for comparisons and verified-history counts."""
     if type(horizon) is not int or not 1 <= horizon <= 36:
         raise ValueError("comparison requires an integer target horizon from 1 through 36")
     return "1-6" if horizon <= 6 else "7-18" if horizon <= 18 else "19-36"
+
+
+_lead_bucket = lead_bucket
 
 
 def _prediction(temperature: Any, reasons: Any, label: str) -> dict[str, Any]:

@@ -15,6 +15,7 @@ from importlib.metadata import version
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.prepared_temperature import _code_identity, prepare_locations
@@ -90,11 +91,17 @@ def _json_float(value: str) -> float | str:
 
 
 def _coordinates(location: object) -> tuple[float, float]:
-    message = "Each location requires finite numeric lat and lon, with an optional string name."
+    message = (
+        "Each location requires finite numeric lat and lon, with an optional string name "
+        "and an optional string display_timezone."
+    )
     if (
         not isinstance(location, dict)
-        or not {"lat", "lon"} <= set(location) <= {"lat", "lon", "name"}
-        or ("name" in location and not isinstance(location["name"], str))
+        or not {"lat", "lon"} <= set(location) <= {"lat", "lon", "name", "display_timezone"}
+        or any(
+            key in location and not isinstance(location[key], str)
+            for key in ("name", "display_timezone")
+        )
     ):
         raise ValueError(message)
     if any(type(location[key]) not in (int, float) for key in ("lat", "lon")):
@@ -106,6 +113,20 @@ def _coordinates(location: object) -> tuple[float, float]:
     if not math.isfinite(latitude) or not math.isfinite(longitude):
         raise ValueError(message)
     return latitude, longitude
+
+
+def location_display_timezone(location: dict[str, Any]) -> str | None:
+    """Optional per-location presentation zone; it never selects data or changes values."""
+    zone = location.get("display_timezone")
+    if zone is None:
+        return None
+    if not isinstance(zone, str):
+        raise ValueError("display_timezone must be an IANA zone name string")
+    try:
+        ZoneInfo(zone)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise ValueError(f"display_timezone must be a resolvable IANA zone, not {zone!r}") from exc
+    return zone
 
 
 def load_locations(config_path: Path) -> list[Any]:

@@ -17,6 +17,12 @@ match = science_tests.match
 NOW = datetime(2026, 9, 11, tzinfo=UTC)
 
 
+@pytest.fixture(autouse=True)
+def no_saved_facts(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The saved-fact index is a PostgreSQL query; these tests model an empty history.
+    monkeypatch.setattr(forward, "saved_fact_index", lambda latitude, longitude: {})
+
+
 def outcome(saved: dict[str, Any], status: str = "verified") -> dict[str, Any]:
     return {
         "status": "completed",
@@ -168,6 +174,104 @@ def test_matching_margin_is_complete_at_boundary_and_downloads_are_reported(
     assert ready["summary"]["verified"] == 1
     assert ready["downloaded_bytes"] == 713
     runner.assert_called_once()
+
+
+def test_hours_with_saved_facts_skip_the_observation_path(
+    match: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    saved = selection(match, (13, 13, 14, 19, 20))
+    monkeypatch.setattr(forward, "select_issued_forecast_hours", Mock(return_value=saved))
+    rows = saved["results"]
+    facts = {
+        (row["issued"]["issued_forecast_id"], datetime.fromisoformat(row["hour"]["valid_time"])): (
+            f"art_fact_{index}"
+        )
+        for index, row in enumerate(rows)
+        if index in (0, 2, 4)  # 13Z first version, 14Z and 20Z hold saved facts.
+    }
+    monkeypatch.setattr(forward, "saved_fact_index", lambda latitude, longitude: facts)
+    calls = []
+
+    def runner(**kwargs: Any) -> dict[str, Any]:
+        calls.append((kwargs["start_valid_time"].hour, kwargs["end_valid_time"].hour))
+        subset = {
+            "results": [
+                row
+                for row in rows
+                if kwargs["start_valid_time"]
+                <= datetime.fromisoformat(row["hour"]["valid_time"])
+                < kwargs["end_valid_time"]
+            ]
+        }
+        return outcome(subset)
+
+    monkeypatch.setattr(forward, "run_window", runner)
+    result = forward.verify_previous(45.8, -93.1, now=NOW)
+    # Only the second 13Z version and 19Z still need observations: one window, no 20Z.
+    assert calls == [(13, 19)]
+    assert result["preflight"]["ready_valid_times"] == [
+        "2026-09-10T13:00:00+00:00",
+        "2026-09-10T19:00:00+00:00",
+    ]
+    assert result["summary"] == {
+        "verified": 2,
+        "unavailable": 0,
+        "ineligible": 0,
+        "already_existing": 3,
+        "errors": 0,
+        "deferred": 0,
+    }
+    assert result["saved_facts"] == {"status": "read", "hours_already_verified": 3}
+    by_key = {(row["issued_forecast_id"], row["valid_time"]): row for row in result["results"]}
+    skipped = by_key[(rows[2]["issued"]["issued_forecast_id"], rows[2]["hour"]["valid_time"])]
+    assert skipped["status"] == "already_existing"
+    assert skipped["verification_id"] == "art_fact_2"
+    assert skipped["source"] == "saved_fact_attributes"
+    # The window verifier's own answer for a saved-fact hour never overrides the index.
+    first = by_key[(rows[0]["issued"]["issued_forecast_id"], rows[0]["hour"]["valid_time"])]
+    assert first["verification_id"] == "art_fact_0"
+    assert result["status"] == "completed"
+
+
+def test_all_hours_already_verified_makes_no_observation_calls(
+    match: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    saved = selection(match, (13, 14))
+    monkeypatch.setattr(forward, "select_issued_forecast_hours", Mock(return_value=saved))
+    facts = {
+        (row["issued"]["issued_forecast_id"], datetime.fromisoformat(row["hour"]["valid_time"])): (
+            "art_saved"
+        )
+        for row in saved["results"]
+    }
+    monkeypatch.setattr(forward, "saved_fact_index", lambda latitude, longitude: facts)
+    runner = Mock(side_effect=AssertionError("Saved facts need no observation work"))
+    monkeypatch.setattr(forward, "run_window", runner)
+    result = forward.verify_previous(45.8, -93.1, now=NOW)
+    runner.assert_not_called()
+    assert result["status"] == "completed"
+    assert result["summary"]["already_existing"] == 2
+    assert result["downloaded_bytes"] == 0
+    assert result["windows"] == []
+
+
+def test_unavailable_fact_index_falls_back_to_idempotent_verification(
+    match: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    saved = selection(match, (13,))
+    monkeypatch.setattr(forward, "select_issued_forecast_hours", Mock(return_value=saved))
+    monkeypatch.setattr(
+        forward,
+        "saved_fact_index",
+        Mock(side_effect=RuntimeError("dsn=postgresql://private")),
+    )
+    runner = Mock(return_value=outcome(saved, "already_existing"))
+    monkeypatch.setattr(forward, "run_window", runner)
+    result = forward.verify_previous(45.8, -93.1, now=NOW)
+    runner.assert_called_once()
+    assert result["summary"]["already_existing"] == 1
+    assert result["saved_facts"]["status"] == "unavailable"
+    assert "private" not in str(result)
 
 
 def test_naive_evaluation_time_is_rejected_before_storage(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 from mesoforge.application import automatic_verification, batch_forecast, prepared_observations
+from mesoforge.application.accumulation_status import accumulation_status
 from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.point_forecast import PreparedPointForecast
 from mesoforge.application.prepared_ifs import IFS_CONFIGURATION
@@ -28,6 +29,7 @@ from mesoforge.application.prepared_temperature import (
 )
 from mesoforge.common.identifiers import ArtifactId, Digest
 from mesoforge.guidance.acquisition_v2 import acquire_nbm_lead
+from mesoforge.storage.postgres.idempotency_lock import AdvisoryLockBusy, PostgresIdempotencyLock
 from mesoforge.storage.postgres.repositories import PostgresUnitOfWork
 from mesoforge.storage.s3 import S3ArtifactObjectStore
 from tests.integration.application import test_batch_issuance as issuance_tests
@@ -257,7 +259,8 @@ def test_forward_run_verifies_then_issues_and_reuses_verification_without_mutati
 
     def prepare(locations: list[Any], selection_path: Path, output_directory: Path, **_: Any):
         events.append("prepare")
-        assert locations == configured_locations
+        # Only valid coordinates without a version for this window reach preparation.
+        assert locations == [configured_locations[0], configured_locations[2]]
         assert json.loads(selection_path.read_text(encoding="utf-8")) == selection
         return preparation
 
@@ -287,22 +290,55 @@ def test_forward_run_verifies_then_issues_and_reuses_verification_without_mutati
     assert first["results"][2]["verification"]["status"] == "nothing_to_verify"
     assert first["results"][2]["verification"]["downloaded_bytes"] == 0
     after_first = complete_storage_inventory(migrated_dsn, object_store)
+    # Same decision window again (a scheduler retry): verification replays without new
+    # facts and the guard skips issuance, so no competing version is created.
     repeated = forward_run.run_forward(
         config, tmp_path / "repeat", issuer=issuer, display_timezone="America/Chicago"
     )
-    assert [row["status"] for row in repeated["results"]] == ["ok", "error", "ok"]
+    assert [row["status"] for row in repeated["results"]] == [
+        "skipped_already_issued",
+        "error",
+        "skipped_already_issued",
+    ]
+    assert repeated["summary"]["issued"] == 0
+    assert repeated["summary"]["skipped"] == 2
+    assert repeated["summary"]["failed"] == 1
+    for index in (0, 2):
+        skipped = repeated["results"][index]["skipped"]
+        assert skipped["existing_issued_forecast_ids"] == [
+            first["results"][index]["issued"]["issued_forecast_id"]
+        ]
+        assert skipped["target_reference_time"] == selection["target_reference_time"]
+        assert "issued" not in repeated["results"][index]
     repeated_verification = repeated["results"][0]["verification"]
     assert repeated_verification["summary"]["verified"] == 0
     assert repeated_verification["summary"]["already_existing"] == 4
     assert repeated_verification["downloaded_bytes"] == 0
     assert repeated["results"][2]["verification"]["status"] == "nothing_to_verify"
+    assert complete_storage_inventory(migrated_dsn, object_store) == after_first
+    assert events == ["discover", "prepare", "discover"]
+    assert not (tmp_path / "repeat" / "issuance-locations.json").exists()
+
+    # An explicit reissue adds versions for the same window; history stays untouched.
+    reissued = forward_run.run_forward(
+        config,
+        tmp_path / "reissue",
+        issuer=issuer,
+        display_timezone="America/Chicago",
+        reissue=True,
+    )
+    assert [row["status"] for row in reissued["results"]] == ["ok", "error", "ok"]
+    assert reissued["results"][0]["verification"]["summary"]["already_existing"] == 4
     assert len(transport.get_calls) == 1
     metadata_provider.assert_called_once_with(FIRST["lat"], FIRST["lon"])
-    assert events == ["discover", "prepare", "discover", "prepare"]
-    assert discover_provider.call_count == prepare_provider.call_count == 2
+    assert events == ["discover", "prepare", "discover", "discover", "prepare"]
+    assert discover_provider.call_count == 3 and prepare_provider.call_count == 2
+    assert json.loads((tmp_path / "reissue" / "issuance-locations.json").read_text()) == {
+        "locations": [configured_locations[0], configured_locations[2]]
+    }
 
     saved_ids = set()
-    for run in (first, repeated):
+    for run in (first, reissued):
         assert run["preparation"]["downloaded_bytes"] == 0
         assert run["coverage"]["downloaded_bytes"] == 0
         for index in (0, 2):
@@ -355,9 +391,89 @@ def test_forward_run_verifies_then_issues_and_reuses_verification_without_mutati
         }
         assert saved["match"]["selected"]["temperature"] == {"value": 293.15, "unit": "K"}
     assert complete_storage_inventory(migrated_dsn, object_store) == after_repeat
-    for name in ("first", "repeat"):
+    for name in ("first", "reissue"):
         assert json.loads((tmp_path / name / "result.json").read_text())["summary"]["issued"] == 2
         assert "not_run" in (tmp_path / name / "hourly-report.md").read_text(encoding="utf-8")
+    assert "Issuance skipped" in (tmp_path / "repeat" / "hourly-report.md").read_text()
+
+    # Read-only accumulation status over the same storage, from metadata alone.
+    factory = lambda: PostgresUnitOfWork(migrated_dsn)  # noqa: E731
+    status = accumulation_status(
+        FIRST["lat"], FIRST["lon"], now=DECISION, unit_of_work_factory=factory
+    )
+    assert status["issuances"]["count"] == 4
+    assert status["issuances"]["distinct_target_reference_times"] == 2
+    assert status["issuances"]["targets_with_multiple_versions"] == 2
+    assert status["issuances"]["earliest_issued_at"] == "2026-08-30T12:00:00Z"
+    assert status["issuances"]["latest_issued_at"] == "2026-08-30T18:30:00Z"
+    # Historical versions: hours 13..18Z are eligible at 18:30Z and one retained
+    # acquisition (12:45-18:15Z) covers them all; only 13Z and 15Z had records.
+    assert status["hours"] == {
+        "total": 144,
+        "eligible": 12,
+        "verified": 4,
+        "pending": 132,
+        "no_retained_observations": 0,
+        "retained_observations_without_fact": 8,
+    }
+    assert status["verified_by_lead_bucket"] == {"1-6": 4, "7-18": 0, "19-36": 0}
+    assert status["verification_facts"]["count"] == 4
+    assert status["verification_facts"]["hours_with_multiple_facts"] == 0
+    assert status["verification_facts"]["facts_without_usable_attributes"] == 0
+    assert status["observation_coverage"]["retained_acquisitions"] == 1
+    assert status["station_evidence"]["source"] == "retained_metar_acquisition"
+    assert "KROS" in status["station_evidence"]["station_ids"]
+    assert [row["hours"]["verified"] for row in status["per_issuance"]] == [2, 2, 0, 0]
+    assert [row["hours"]["pending"] for row in status["per_issuance"]] == [30, 30, 36, 36]
+    assert status == accumulation_status(
+        FIRST["lat"], FIRST["lon"], now=DECISION, unit_of_work_factory=factory
+    )
+    untouched = accumulation_status(
+        LAST["lat"], LAST["lon"], now=DECISION, unit_of_work_factory=factory
+    )
+    assert untouched["issuances"]["count"] == 2
+    assert untouched["hours"]["verified"] == 0 and untouched["hours"]["pending"] == 72
+    assert untouched["station_evidence"]["source"] is None
+    assert complete_storage_inventory(migrated_dsn, object_store) == after_repeat
+
+
+def test_overlapping_forward_run_is_refused_by_the_shared_lock(
+    tmp_path: Path,
+    migrated_dsn: str,
+    object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mesoforge.application import forward_run
+
+    forbidden = Mock(side_effect=AssertionError("An overlapping run must not verify or issue"))
+    for name in ("_discover", "verify_previous", "run_selected_batch"):
+        monkeypatch.setattr(forward_run, name, forbidden)
+    config = write_config(tmp_path, [FIRST])
+    issuer = ForecastIssuanceService(
+        object_store,
+        lambda: PostgresUnitOfWork(migrated_dsn),
+        code_identity=verification_tests.CODE_IDENTITY,
+        clock=lambda: DECISION,
+    )
+    holder = PostgresIdempotencyLock(migrated_dsn)
+    with holder.try_acquire(forward_run.FORWARD_RUN_LOCK):
+        with pytest.raises(AdvisoryLockBusy):
+            forward_run.run_forward(config, tmp_path / "overlap", issuer=issuer)
+        assert not (tmp_path / "overlap").exists()
+        code = forward_run.main(
+            ["--config", str(config), "--output-dir", str(tmp_path / "overlap-cli")]
+        )
+        assert code == 3
+        assert not (tmp_path / "overlap-cli").exists()
+    forbidden.assert_not_called()
+    # Once released, the same call proceeds to real work: verification, then discovery
+    # (both refused by the fixture and isolated as this run's own errors).
+    released = forward_run.run_forward(config, tmp_path / "after", issuer=issuer)
+    assert forbidden.call_count == 2
+    assert released["results"][0]["verification"]["status"] == "error"
+    assert released["issuance_error"]["code"] == "current_issuance_failed"
+    assert (tmp_path / "after" / "result.json").is_file()
 
 
 def test_surface_forward_run_saves_exact_fields_and_preserves_older_temperature_version(
@@ -441,19 +557,21 @@ def test_surface_forward_run_saves_exact_fields_and_preserves_older_temperature_
     monkeypatch.setattr(forward_run, "_discover", discovery)
     monkeypatch.setattr(selected_forecast, "prepare_selected", preparation_call)
     config = write_config(tmp_path, [{**FIRST, "name": "Surface fixture"}, OUTSIDE, LAST])
+    # The older temperature-only version shares this target, so the decision-window
+    # guard would skip FIRST; this test deliberately adds a richer version beside it.
     result = forward_run.run_forward(
-        config, tmp_path / "surface-forward", issuer=issuer, display_timezone="America/Chicago"
+        config,
+        tmp_path / "surface-forward",
+        issuer=issuer,
+        display_timezone="America/Chicago",
+        reissue=True,
     )
     assert [row["status"] for row in result["results"]] == ["ok", "error", "ok"], result
     assert result["summary"]["issued"] == 2
     discovery.assert_called_once()
     preparation_call.assert_called_once()
     assert preparation_call.call_args.kwargs["include_pop"] is True
-    assert preparation_call.call_args.args[0] == [
-        {**FIRST, "name": "Surface fixture"},
-        OUTSIDE,
-        LAST,
-    ]
+    assert preparation_call.call_args.args[0] == [{**FIRST, "name": "Surface fixture"}, LAST]
     assert result["preparation"]["downloaded_bytes"] == 0
     assert result["coverage"]["downloaded_bytes"] == 0
     assert "issued" not in result["results"][1]

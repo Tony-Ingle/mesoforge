@@ -342,7 +342,7 @@ def _sky_trends(states: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], lis
             )
             if confirmed:
                 start = position - 1
-                while start > reference_index and (levels[start] - reference) * sign >= 1:  # type: ignore[operator]
+                while start > reference_index and (levels[start] - reference) * sign >= 1:
                     start -= 1
                 previous, nxt = states[start], states[position]
                 facts.append(

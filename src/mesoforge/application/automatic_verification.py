@@ -39,7 +39,9 @@ from mesoforge.storage.postgres.repositories import PostgresUnitOfWork
 from mesoforge.verification.issued_temperature import forecast_eligibility_reasons
 
 _JSON = CanonicalJsonSerializer()
-_MARGIN = timedelta(minutes=15)
+# An hour is eligible once its observation matching window (valid time ± 15 min) is complete.
+ELIGIBILITY_MARGIN = timedelta(minutes=15)
+_MARGIN = ELIGIBILITY_MARGIN
 
 
 def derive_request(selection: dict[str, Any], *, now: datetime) -> dict[str, Any]:

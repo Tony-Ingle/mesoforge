@@ -39,8 +39,10 @@ from mesoforge.storage.postgres.repositories import PostgresUnitOfWork
 from mesoforge.storage.s3 import S3ArtifactObjectStore
 from mesoforge.verification.issued_temperature import evaluate_temperature_verification
 
-_SCHEMA = "issued-temperature-verification.v1"
-_TYPE = "issued-temperature-verification"
+VERIFICATION_SCHEMA_VERSION = "issued-temperature-verification.v1"
+VERIFICATION_ARTIFACT_TYPE = "issued-temperature-verification"
+_SCHEMA = VERIFICATION_SCHEMA_VERSION
+_TYPE = VERIFICATION_ARTIFACT_TYPE
 _JSON = CanonicalJsonSerializer()
 
 
@@ -173,6 +175,14 @@ class IssuedTemperatureVerificationService:
             configuration_digest=observations.configuration_digest,
             code_revision=self._code_revision,
             environment_digest=self._environment_digest,
+            attributes={
+                "issued_forecast_id": str(issued_forecast_id),
+                "valid_time": match["forecast"]["valid_time"],
+                "horizon_hours": hour["horizon_hours"],
+                "latitude": forecast["latitude"],
+                "longitude": forecast["longitude"],
+                "verification_status": "verified",
+            },
         )
 
         transform_called = False

@@ -541,9 +541,12 @@ compression at rest is unchanged, so the measured storage-normalization opportun
 remains future work. Measurement scripts and JSON reports are outside Git under
 `MesoForge/baselines/20260916-payload-measurement`.
 
-Next proposed step: return to the learning loop — sustained forward verification
-accumulation for the registered coordinate, then the first deterministic site/regime
-bias-learning capability over that verification history. Presentation polish waits
+The learning loop's data source is now in place: [repeatable forward runs](#repeat-forward-runs-and-read-accumulation-status)
+accumulate immutable versions and idempotent verification facts for configured
+coordinates behind an overlap lock and a decision-window guard, and a read-only
+accumulation status reports verified history per coordinate and lead bucket.
+Next proposed step: the first read-only deterministic site/regime analysis over
+that verified history, still without applying corrections. Presentation polish waits
 unless a concrete missing capability blocks use. Visibility/fog still needs separate
 causal evidence and policy.
 
@@ -2491,6 +2494,170 @@ python -B -m pytest tests/integration/application/test_issued_temperature_verifi
 Native probability shadows and the subsequent ECMWF compatibility assessment are
 recorded below. [Native precipitation type](#native-precipitation-type-on-the-local-grid)
 now preserves categorical guidance and uncertainty without surface-temperature inference.
+
+### Repeat forward runs and read accumulation status
+
+The same forward run is the learning loop's data source for configured coordinates.
+It is safe to call repeatedly from an external caller (a person today, a scheduler
+later); nothing else was added: no second workflow, queue, VPS or CI deployment.
+Locations stay coordinate-only. `display_timezone` is an optional per-location
+presentation zone that never selects data or changes values:
+
+```json
+{"locations":[
+  {"lat":44.98859,"lon":-93.25557,"name":"Minneapolis","display_timezone":"America/Chicago"},
+  {"lat":44.9537,"lon":-93.09,"name":"St. Paul"}
+]}
+```
+
+```text
+python -B -m mesoforge.application.forward_run --config locations.json --output-dir EXTERNAL_NEW_RUN_DIRECTORY --display-timezone UTC [--reissue]
+python -B -m mesoforge.application.accumulation_status --lat 44.98859 --lon -93.25557
+curl "http://127.0.0.1:8765/accumulation-status?lat=44.98859&lon=-93.25557"
+```
+
+Each run: verifies every eligible unverified hour of earlier versions through the
+existing automatic verification (facts are idempotent; unavailable/ineligible reasons
+stay in `previous-verification.json`), discovers the current model set once, then
+issues immutable versions. Exit codes: `0` completed, `1` at least one location
+failed, `2` the run could not start, `3` another forward run is in progress.
+
+- **Overlap protection.** The whole run holds one process-wide PostgreSQL session
+  advisory lock (`pg_try_advisory_lock`, key `sha256:22cd5cd5…` derived from
+  `mesoforge.forward-run.v1`). A concurrent run stops immediately with
+  `forward_run_overlap` before creating its directory, verifying or issuing; it never
+  waits. The lock is released when the run ends or its connection drops.
+- **Decision-window guard.** After discovery, a coordinate that already holds a
+  version for the discovered `target_reference_time` is reported
+  `skipped_already_issued` (with the existing IDs) from issuance metadata alone;
+  `--reissue` adds a version deliberately. Only the remaining coordinates reach
+  shared preparation (`issuance-locations.json`), so a fully covered retry downloads
+  no guidance. Verification still runs and one invalid coordinate still fails alone.
+- **Queryable facts.** Saved verification facts now carry searchable attributes
+  (`issued_forecast_id`, `valid_time`, `horizon_hours`, `latitude`, `longitude`,
+  `verification_status`). They are output metadata only: not part of the idempotency
+  digest or the fact payload, so replay still finds the same fact.
+- **Only unverified hours enter the observation path.** Before acquiring anything,
+  the run indexes the coordinate's saved facts from those attributes and reports
+  hours that already hold one as `already_existing` with the fact ID
+  (`saved_facts.hours_already_verified`). Without that index a later, wider
+  observation acquisition is a new input revision and the idempotent verifier would
+  legitimately save a second fact for an already-verified hour (this happened once in
+  the demonstration below, before the index existed). If the index cannot be read the
+  run says so and falls back to idempotent re-verification.
+
+The accumulation status (`mesoforge.accumulation-status.v1`) reads only issuance
+rows, fact attributes and retained observation-source attributes: no forecast
+payload, no observation, no provider access, no writes, and no weights, bias, regime
+or skill. It reports version count with earliest/latest issuance and target times;
+hours `verified`, `pending` (valid time + 15 min still in the future),
+`no_retained_observations` (eligible, but no retained METAR acquisition covers
+valid time ± 15 min for this coordinate and the current observation configuration)
+and `retained_observations_without_fact` (retained inputs cover the hour but no
+fact exists: no eligible station match, QC failure or ineligibility; the reasons are
+in the run reports, not storage); verified counts by lead bucket 1–6 / 7–18 / 19–36;
+fact counts including hours with more than one fact; retained observation coverage;
+and the newest station evidence. Repeated reads differ only in `evaluated_at`.
+
+Real demonstration on **September 17, 2026** against the retained local PostgreSQL
+and the restored S3 store holding the two Minneapolis versions issued on September 16
+(`5bd637dd-77d4-4f0d-ac92-bd39d73918c4`, `9e989662-551e-4918-92d8-77005eb7e474`,
+both target 22Z). The configuration listed Minneapolis (America/Chicago), St. Paul
+(`44.9537, -93.09`, no zone) and an invalid `95.0, -93.0` entry.
+
+**Cycle 1** (started 02:34:02Z, 719 s, exit 1 because of the invalid entry):
+Minneapolis verified **8 real hours** on the two retained versions, 23Z–02Z, after
+discovering 8 METAR stations (K21D, KANE, KFCM, KLVN, KMIC, KMSP, KSGS, KSTP) and
+downloading **25,436 bytes** of observations; forecast-minus-observation errors were
+**+0.19, −0.32, +1.48, +1.01 K** (identical for both versions, which share numerical
+hours). St. Paul had nothing to verify; the invalid entry failed with
+`invalid_location` before any work. Discovery at 02:36:12Z selected
+**HRRR 00Z / GFS 18Z / RAP 21Z / IFS 18Z** for target **02Z** and preparation
+downloaded **545,168,677 bytes**. Issued: Minneapolis
+`5133bee6-dba6-4000-8313-8e24189553fa` (02:44:40Z, saved report zone
+America/Chicago) and St. Paul `1c260243-1a20-40b9-8e36-0d9d30a55380` (02:45:46Z,
+UTC), both covering 03Z through September 18 14Z. Exact readback matched the run
+report for both. The status for Minneapolis then showed 3 versions over 2 targets,
+108 hours (8 verified, 100 pending, all 8 in lead bucket 1–6), 8 facts, one retained
+acquisition covering 22:45–02:15Z; St. Paul showed 1 version, 36 pending hours and
+no station evidence yet. CLI and HTTP results were equal, repeated reads changed
+only `evaluated_at`, an invalid coordinate returned 422, and the reads changed no
+row or object.
+
+**Same-window replay** (started 02:46:17Z, 262 s): the identical command in a new
+directory re-verified the same 8 hours as `already_existing` with the same 8 fact
+IDs, downloaded **0 bytes** (retained observations and station discovery reused),
+discovered the same set for target 02Z at 02:48:15Z, and reported both coordinates
+`skipped_already_issued` naming cycle 1's IDs; no `issuance-locations.json` or
+preparation directory was created and every table count, issuance row, fact and
+S3 object was identical before and after. The status was unchanged.
+
+**Overlap** (03:20:41Z): a second command started while cycle 2 held the lock
+exited with code **3** after 3 seconds, printed only
+`{"error": {"code": "forward_run_overlap", ...}}` on stderr, and created no output
+directory; cycle 2 continued unaffected.
+
+**Cycle 2** (started 03:20:16Z, 728 s, exit 1): hour 03Z had become eligible for
+every saved version. Minneapolis verified it for the two September 16 versions
+(**+1.73 K** each) and for cycle 1's version (**−0.08 K**); St. Paul discovered its
+own 9 stations (adds KRNH) and verified cycle 1's 03Z hour (**+0.57 K**, 10,384
+observation bytes). Discovery at 03:23:02Z selected the same four cycles for target
+**03Z**, preparation downloaded **512,963,380 bytes**, and it issued Minneapolis
+`f0f0dd57-cb7e-4c0e-93e3-761efeda4d5c` (03:31:09Z, America/Chicago) and St. Paul
+`dd313459-f8ac-40e8-bef1-3c534d64cfad` (03:32:09Z, UTC), covering 04Z through
+September 18 15Z; readback matched. This cycle ran **before** the saved-fact index
+existed: Minneapolis' wider 23Z–03Z window acquired a new observation revision
+(35,982 bytes) and the idempotent verifier therefore saved a second, equally valid
+fact for each of the 8 already-verified hours (`verified: 11`, not
+`already_existing: 8` + 3). The status shows that honestly: Minneapolis 4 versions
+over 3 targets, 144 hours, **11 verified** (all lead bucket 1–6), 133 pending,
+**19 facts** with **8 hours holding two facts**; St. Paul 2 versions, 72 hours,
+1 verified, 1 fact. The index added afterwards makes such hours `already_existing`
+without observation work; the duplicate facts stay immutable and count as one
+verified hour each.
+
+**Cycle 3** (started 04:15:41Z, 634 s, exit 1) ran with the saved-fact index.
+Minneapolis reported its 11 verified hours as `already_existing` from fact
+attributes (`saved_facts.hours_already_verified = 11`, each row naming its fact
+ID) and sent only the four newly eligible 04Z hours through one one-hour window
+(**5,646 bytes**): **+4.59 K** for both September 16 versions and **+2.24 K** for
+the 02Z and 03Z versions. St. Paul reused its 1 fact and verified 04Z for its two
+versions (**+1.11 K**, 7,323 bytes). Discovery at 04:16:56Z selected
+**HRRR 00Z / GFS 00Z / RAP 03Z / IFS 18Z** for target **04Z**; preparation
+downloaded **514,013,712 bytes**; it issued Minneapolis
+`67123abe-4350-43e1-94c7-379844596466` (04:25:01Z) and St. Paul
+`4ce698ba-c2fe-4f28-9830-3e80c7ea410d` (04:26:01Z), covering 05Z through
+September 18 16Z, and readback matched. Exactly 6 facts were added (26 in total;
+the 8 double-fact hours are unchanged). Final status: Minneapolis **5 versions over
+4 targets, 180 hours, 15 verified (all lead bucket 1–6), 165 pending, 23 facts,
+3 retained acquisitions**; St. Paul **3 versions, 108 hours, 3 verified, 3 facts**.
+Every status read (CLI and HTTP, repeated) changed no row or object. Retained
+evidence for all runs is under
+`%LOCALAPPDATA%/MesoForge/baselines/20260917-forward-accumulation` (per-cycle
+result directories, `*-summary.json`, `*-db.json`, `*-evidence/`); on this machine
+the physical path is the `Packages/Claude_…/LocalCache/Local/MesoForge` mirror of
+`%LOCALAPPDATA%`. Temporary PostgreSQL, S3 and API services were stopped afterwards.
+
+Validation on September 17, 2026: **3,242 offline tests** (unit, contract, property;
+three pre-existing failures unrelated to this work were deselected: one
+current-forecast-batch mock signature and two typed-boundary inventories that fail
+identically at the previous commit) and the **forward-run, verification, batch
+issuance, storage and advisory-lock integration tests** passed against pgserver and
+an S3-compatible moto server. Ruff, mypy, all nine import contracts, lock
+consistency, documentation/hygiene checks and `git diff --check` passed.
+
+```text
+python -B -m pytest tests/unit/application/test_forward_run.py tests/unit/application/test_forward_verification.py tests/unit/application/test_accumulation_status.py tests/unit/test_accumulation_status_api.py -q
+python -B -m pytest tests/integration/application/test_forward_run.py tests/integration/storage/test_idempotency_lock.py tests/integration/application/test_issued_temperature_verification.py tests/integration/application/test_batch_issuance.py tests/integration/storage -q
+```
+
+Limitations: unavailable/ineligible attempt reasons are not persisted (they stay in
+each run's `previous-verification.json`), so the status can only distinguish retained
+observation coverage from a saved fact; hours that stay unverified keep re-entering
+acquisition on later runs until their window is retained; facts persisted before the
+attributes existed are not indexed; the lock is process-wide, so two forward runs on
+different coordinate lists also serialize; and every forward `verify()` still reads
+the full issuance payloads (the read-cost limit measured earlier).
 
 ### Local surface baseline grid
 

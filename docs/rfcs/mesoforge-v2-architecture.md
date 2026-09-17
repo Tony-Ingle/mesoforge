@@ -1201,6 +1201,54 @@ per-hour prose hoisting was deferred; items 2 and 3 remain future work):
 None of this is a prerequisite for the transition-detection milestone; item 1 should
 precede sustained forward accumulation because read cost, not disk, is the first limit.
 
+#### 6.7.10 Repeatable forward accumulation and read-only status
+
+**Status: implemented September 17, 2026.** The learning loop's data source is the
+existing forward run, made safe to call repeatedly by an external caller; no second
+workflow, scheduler, VPS or CI deployment was added.
+
+- **Registration is the coordinate list.** Each configured location is `lat`, `lon`,
+  optional `name` and optional `display_timezone` (presentation only; it never
+  selects data or changes values). No station IDs, grid cells or proxies.
+- **One run, one decision window.** Per run: verify every eligible unverified hour of
+  earlier versions through existing automatic verification (idempotent facts,
+  unavailable/ineligible reasons kept in `previous-verification.json`), discover the
+  current model set once, then issue immutable versions. Verification trouble never
+  blocks issuance; one failed coordinate never stops the others.
+- **Overlap protection.** The whole run holds one process-wide PostgreSQL session
+  advisory lock (`pg_try_advisory_lock` on the key derived from
+  `mesoforge.forward-run.v1`). A concurrent run fails immediately with
+  `forward_run_overlap` (exit code 3) before creating its directory, verifying or
+  issuing; it never waits. Connection loss releases the lock.
+- **Decision-window guard.** After discovery, a coordinate that already holds a
+  version for the discovered `target_reference_time` is reported
+  `skipped_already_issued` from issuance metadata alone; `--reissue` adds a version
+  deliberately. Only the remaining coordinates reach shared preparation
+  (`issuance-locations.json`), so a fully covered retry downloads no guidance.
+- **Queryable facts.** Saved verification facts now carry searchable attributes
+  (`issued_forecast_id`, `valid_time`, `horizon_hours`, `latitude`, `longitude`,
+  `verification_status`). They are output metadata only: not part of the idempotency
+  digest or the fact payload, and facts persisted earlier would lack them.
+- **Unverified means no saved fact.** `verify_previous` indexes the coordinate's
+  saved facts from those attributes before any observation work and reports indexed
+  hours as `already_existing`; only hours without a fact enter acquisition and
+  verification. Fact identity still includes the observation revision, so without
+  this index a wider later acquisition would add a second, equally valid fact for
+  an already-verified hour. The index is a read; if it fails the run reports
+  `saved_facts.status = unavailable` and falls back to idempotent re-verification.
+- **Accumulation status** (`accumulation_status` CLI, `GET /accumulation-status`)
+  counts, from issuance rows, fact attributes and retained observation-source
+  attributes only (no payload reads, no writes): versions with earliest/latest
+  issuance and target times; hours `verified`, `pending` (valid time + 15 min still
+  future), `no_retained_observations` and `retained_observations_without_fact`;
+  verified counts by lead bucket 1–6 / 7–18 / 19–36; and the newest station
+  evidence. Unavailable/ineligible attempt reasons are not persisted, so the status
+  distinguishes "no retained acquisition covers this hour" from "retained inputs but
+  no fact" and points to the run reports for reasons. No weights, bias, regime or
+  skill are derived; accumulating history is not learning corrections.
+- **Boundary.** Manual repeated invocation is the orchestration today; a future
+  external scheduler calls the same command and reads the same exit codes.
+
 ## 7. Representative benchmark and admission
 
 Before finalizing API support and cache packaging, benchmark the intended host using the

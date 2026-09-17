@@ -139,6 +139,18 @@ class ForecastIssuanceService:
             uow.commit()
         return record
 
+    def find_versions(
+        self, *, latitude: float, longitude: float, target_reference_time: datetime
+    ) -> tuple[IssuedForecastRecord, ...]:
+        """Metadata-only lookup of saved versions sharing one coordinate and target time."""
+        if target_reference_time.tzinfo is None or target_reference_time.utcoffset() is None:
+            raise ValueError("target_reference_time must include a timezone")
+        with self._uow_factory() as uow:
+            records = uow.issued_forecasts.list_for_coordinate(latitude, longitude, limit=None)
+        return tuple(
+            record for record in records if record.target_reference_time == target_reference_time
+        )
+
     def read(self, issued_forecast_id: UUID) -> dict[str, Any]:
         """Read one exact saved version and verify its stored content checksum."""
         with self._uow_factory() as uow:

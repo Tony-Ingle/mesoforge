@@ -218,13 +218,22 @@ which observation is an acceptable proxy for a forecast coordinate.
 Ordinary one-off requests may receive a numerical point forecast without silently
 becoming tracked locations. Explicitly configured/registered locations are where
 persistent issuance, verification, site knowledge, bias correction, AI desk behavior
-and delivery can accumulate. Current explicit batch runs already preserve history;
-registration and the complete future lifecycle are not yet implemented.
+and delivery can accumulate. Today the registration is the forward run's coordinate
+list (`lat`, `lon`, optional `name`, optional presentation `display_timezone`).
+Repeated forward runs accumulate immutable issued versions and verification facts
+for those coordinates, and a read-only accumulation status reports how much
+verified history exists per coordinate and lead range. Accumulating that history is
+the learning loop's data source; it is not yet learning: no weights, bias
+corrections or regime labels are derived from it, and the complete future lifecycle
+(site knowledge, corrections, AI desk, delivery) is not implemented.
 
 The intended deployment keeps the API and persistent forecast data on a VPS. A future
 GitHub Actions caller or scheduler may process the coordinate list sequentially or
-in bounded batches. That deployment and scheduling remain deferred; preparation must
-stay outside forecast HTTP requests regardless of how runs are started.
+in bounded batches by invoking the same forward-run command, which is already safe
+to repeat: an overlapping run is refused by a storage-level lock and a repeated run
+skips coordinates that already hold a version for the discovered decision window.
+That deployment and scheduling remain deferred; preparation must stay outside
+forecast HTTP requests regardless of how runs are started.
 
 ## Long-term model direction
 

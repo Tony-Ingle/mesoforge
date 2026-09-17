@@ -447,6 +447,27 @@ class PostgresArtifactRepository:
         )
         return tuple(_artifact_row_to_manifest(row) for row in rows)
 
+    def find_issued_temperature_verifications(
+        self, *, latitude: float, longitude: float
+    ) -> tuple[ArtifactManifest, ...]:
+        """Find saved verification facts by their coordinate attributes, without payload reads."""
+        for value, bound in ((latitude, 90), (longitude, 180)):
+            if (
+                type(value) not in (int, float)
+                or not math.isfinite(value)
+                or not -bound <= value <= bound
+            ):
+                raise ValueError("latitude and longitude must be finite geographic coordinates")
+        rows = self._session.scalars(
+            sa.select(ArtifactRow)
+            .where(
+                ArtifactRow.artifact_type == "issued-temperature-verification",
+                ArtifactRow.attributes.contains({"latitude": latitude, "longitude": longitude}),
+            )
+            .order_by(ArtifactRow.registered_at, ArtifactRow.id)
+        )
+        return tuple(_artifact_row_to_manifest(row) for row in rows)
+
     def find_station_discovery_sources(
         self, *, latitude: float, longitude: float, policy_version: str
     ) -> tuple[ArtifactManifest, ...]:

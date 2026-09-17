@@ -25,7 +25,12 @@ from contextlib import contextmanager
 
 import psycopg
 
+from mesoforge.common.errors import Conflict
 from mesoforge.common.identifiers import Digest
+
+
+class AdvisoryLockBusy(Conflict):
+    """Another session holds the requested advisory lock; nothing was waited for."""
 
 
 def _digest_to_signed_bigint(digest: Digest) -> int:
@@ -53,6 +58,28 @@ class PostgresIdempotencyLock:
         connection = psycopg.connect(self._dsn, autocommit=True)
         try:
             connection.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
+            try:
+                yield
+            finally:
+                connection.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+        finally:
+            connection.close()
+
+    @contextmanager
+    def try_acquire(self, digest: Digest) -> Iterator[None]:
+        """Hold the lock for the block, or raise ``AdvisoryLockBusy`` immediately.
+
+        Non-blocking so a repeated caller (an external scheduler) detects an
+        overlapping run instead of queueing behind it. Connection loss releases
+        the lock exactly as for ``acquire``.
+        """
+        digest = Digest(digest)
+        lock_key = _digest_to_signed_bigint(digest)
+        connection = psycopg.connect(self._dsn, autocommit=True)
+        try:
+            row = connection.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,)).fetchone()
+            if row is None or row[0] is not True:
+                raise AdvisoryLockBusy(f"advisory lock {digest} is held by another session")
             try:
                 yield
             finally:

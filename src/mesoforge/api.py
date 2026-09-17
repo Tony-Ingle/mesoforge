@@ -15,6 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException
 
+from mesoforge.application.accumulation_status import accumulation_status
 from mesoforge.application.issuance import (
     read_issued_forecast,
     select_issued_forecast_hours,
@@ -418,6 +419,31 @@ def create_app(directory: Path) -> FastAPI:
                     "error": {
                         "code": "issued_forecast_hour_selection_failed",
                         "message": "Could not read and verify the saved forecast hours.",
+                    }
+                },
+            )
+
+    @app.get("/accumulation-status", response_model=None)
+    def accumulation(lat: float, lon: float) -> dict[str, Any] | JSONResponse:
+        try:
+            return accumulation_status(lat, lon)
+        except ValueError:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": {
+                        "code": "invalid_coordinate",
+                        "message": "Provide finite geographic lat and lon query parameters.",
+                    }
+                },
+            )
+        except Exception:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": {
+                        "code": "accumulation_status_failed",
+                        "message": "Could not read the saved issuance and verification metadata.",
                     }
                 },
             )

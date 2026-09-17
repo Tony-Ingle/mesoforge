@@ -203,6 +203,8 @@ class TransformationRequest(BaseModel):
     environment_digest: Digest
     run_id: RunId | None = None
     quality_state: str = "valid"
+    # Searchable output metadata only; never part of the idempotency digest or payload.
+    attributes: dict[str, object] | None = None
 
     @field_validator("code_revision")
     @classmethod
@@ -633,7 +635,7 @@ class ArtifactService:
                                 code_revision=first.code_revision,
                                 environment_digest=first.environment_digest,
                                 quality_state=request.quality_state,
-                                attributes=None,
+                                attributes=request.attributes,
                             )
                         )
                     refs = tuple(
@@ -883,7 +885,7 @@ class ArtifactService:
                         code_revision=request.code_revision,
                         environment_digest=request.environment_digest,
                         quality_state=request.quality_state,
-                        attributes=None,
+                        attributes=request.attributes,
                     )
                     output_ref = ActivityArtifactRef(
                         role=request.output_role, artifact_id=created_output.artifact_id

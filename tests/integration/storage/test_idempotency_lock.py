@@ -12,7 +12,7 @@ import time
 
 import pytest
 
-from mesoforge.storage.postgres.idempotency_lock import PostgresIdempotencyLock
+from mesoforge.storage.postgres.idempotency_lock import AdvisoryLockBusy, PostgresIdempotencyLock
 
 pytestmark = pytest.mark.integration
 
@@ -95,3 +95,29 @@ class TestPostgresIdempotencyLock:
         t.start()
         t.join(timeout=2)
         assert acquired.is_set()
+
+    def test_try_acquire_fails_fast_while_held_and_succeeds_after_release(
+        self, postgres_dsn: str
+    ) -> None:
+        lock = PostgresIdempotencyLock(postgres_dsn)
+        digest = "sha256:" + "f" * 64
+        started = time.monotonic()
+        with lock.try_acquire(digest):
+            # A blocking acquire elsewhere would wait; the non-blocking form reports instead.
+            with pytest.raises(AdvisoryLockBusy):
+                with lock.try_acquire(digest):
+                    raise AssertionError("second holder must never enter the block")
+            with lock.try_acquire("sha256:" + "0" * 64):
+                pass  # other keys stay independent
+        assert time.monotonic() - started < 2
+        with lock.try_acquire(digest):
+            pass  # released with the first block
+
+    def test_try_acquire_releases_on_exception(self, postgres_dsn: str) -> None:
+        lock = PostgresIdempotencyLock(postgres_dsn)
+        digest = "sha256:" + "9" * 64
+        with pytest.raises(ValueError):
+            with lock.try_acquire(digest):
+                raise ValueError("boom")
+        with lock.try_acquire(digest):
+            pass
