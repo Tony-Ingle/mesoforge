@@ -884,8 +884,8 @@ draft versions above are illustrative, not registered artifacts or approved poli
    Missing sky does not block a precipitation component, but missing type blocks a
    specific rain/snow claim. Missing snow/ice amount does not inherently block an
    otherwise justified type/occurrence claim. Never infer fog from visibility alone.
-7. **Keep transitions gated until a separately approved milestone.** That work must
-   use eligible adjacent results from one issuance/stage,
+7. **Derive transitions only from eligible adjacent results (§6.7.10).** That layer
+   uses eligible adjacent results from one issuance/stage,
    consecutive samples and explicit windows; unknown/gaps break the sequence. Initially
    report endpoint type changes as endpoint changes. “Rain changing to snow” later
    requires approved occurrence/type temporal linkage. Do not invent a transition time
@@ -1088,12 +1088,39 @@ The September 16 real validation used a fresh issuance in a separate environment
 README records its byte-identical CLI/HTTP repeats, forbidden-hook replay, exact
 readback, unchanged storage counts and the naturally occurring wording.
 
-Fog/visibility wording, intensity, transitions and winter-amount delivery remain
-disabled. The smallest next slice is a read-only transition preview over consecutive
-eligible hours within one issuance/stage, preserving supporting times and gaps.
-Start with endpoint type changes and sky trends; do not claim an exact transition
-minute, type persistence across missing hours or changing precipitation intensity
-without an approved interpretation.
+Fog/visibility wording, intensity and winter-amount delivery remain disabled.
+Multi-hour evolution is now a separate read-only resource under §6.7.10; it claims
+no exact transition minute, no type persistence across missing hours and no
+precipitation-intensity change.
+
+#### 6.7.10 Weather evolution and transitions
+
+**Implemented September 16, 2026** as `mesoforge-transition-policy.v1`
+(`forecasting/transitions.py`, `application/weather_transitions.py`,
+`GET /issued-forecasts/{id}/conditions/transitions`). Input is the point-scoped
+conditions preview of one exact issuance; the layer reads no grid cell and
+recalculates nothing. Facts are structured and versioned, separate from
+`transition-text.v1` rendering, and carry type, track, status, window, both endpoint
+states, hour and evidence references, reasons and policy id.
+
+- **Timing:** a change is known only within `(previous endpoint, next endpoint]`,
+  matching the hourly interval closure; sub-hourly timing is never inferred.
+- **Gaps:** an unavailable endpoint breaks its track; nothing is inferred across it
+  and the gap is reported. Known/unknown/ambiguous/unavailable/not_applicable stay distinct.
+- **Tracks:** applicability onset/ending (structured only), presentation-band
+  wording onset/ending (rendered with the endpoint's type label), endpoint p-type
+  changes on consecutive applicable hours (status known/ambiguous/unknown; only
+  known→known rendered; unknown↔ambiguous is not an event; rain→ambiguous→snow stays
+  two conservative facts), and sky trends on the ordered category scale requiring a
+  two-category move that persists three hours, with the window starting at the last
+  hour on the reference side.
+- **Rendering:** "{Label} developing/ending between A and B", "{From} changing to
+  {to} between A and B", "Becoming {category} between A and B", in the requested
+  zone, else the issuance's saved report zone, else UTC. No LLM text.
+
+Thunder and wind remain hourly-only; intensity, fog, period summaries and
+narrative composition need separate policies. Evidence-only fields never influence
+these facts.
 
 #### 6.7.9 Issuance payload measurement and proposed normalization
 

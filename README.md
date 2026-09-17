@@ -125,8 +125,10 @@ on the same grid. The [complete canvas inventory and proposed condition design](
 record actual field policies, missingness and verification limits. A [read-only
 structured preview](#read-only-structured-condition-preview) now describes approved
 saved fields across the grid and its 36-hour center column. Versioned presentation
-rules now compose active sky, precipitation, thunder and wind into condition text.
-Intensity, transitions, visibility/fog and delivered winter amounts remain gated.
+rules now compose active sky, precipitation, thunder and wind into condition text,
+and a [deterministic transition layer](#weather-evolution-and-transitions) records
+precipitation onset/ending, endpoint type changes and sky trends between consecutive
+hours of one issuance. Intensity, visibility/fog and delivered winter amounts remain gated.
 Neither visibility nor thunder potential alone establishes a complete weather-condition string.
 Native snowfall, NBM SLR and Kuchera remain separately traceable pending sufficient
 verification data; a broad snowfall evaluation campaign is not the next task.
@@ -394,6 +396,59 @@ directories, raw guidance and evidence remain outside Git under this session's
 `MesoForge/baselines/20260916-conditions-real-validation`. Full acceptance/coverage
 and live-provider canaries were not run.
 
+### Weather evolution and transitions
+
+`GET /issued-forecasts/{id}/conditions/transitions` and
+`python -B -m mesoforge.application.weather_transitions --issued-forecast-id ID
+[--display-timezone ZONE]` detect evolution between consecutive hours of one saved
+issuance. Both read the exact version once, describe only its point-scoped hours,
+and neither recalculates a field, reads a grid cell, calls a provider or writes
+history. Structured facts (`mesoforge.weather-transitions.v1`, policy
+**`mesoforge-transition-policy.v1`**) are separate from rendered text
+(`transition-text.v1`); every fact carries its type, track, status, an explicit
+window, both endpoint states, hour references into the conditions preview, evidence
+references, reasons and the policy id. Rendered times use the request's
+`display_timezone`, else the issuance's saved report zone, else UTC; structured
+times stay UTC.
+
+**Timing.** A change is known only within `(previous endpoint, next endpoint]`, the
+same left-open, right-closed closure as the hourly intervals; no sub-hourly timing is
+inferred, so text says "between 9 PM and 10 PM Wednesday", never a minute.
+**Gaps.** An unavailable component at either endpoint breaks that track's sequence;
+nothing is inferred across it and the gap is listed. Known, unknown, ambiguous,
+unavailable and not-applicable stay distinct throughout.
+
+| Track | Source | Transition types | Rendered |
+|---|---|---|---|
+| `precipitation_occurrence` | applicability policy (not applicable ↔ applicable) | `precipitation_onset`, `precipitation_ending` | No (structured only; trace amounts are applicable but unworded) |
+| `precipitation_wording` | presentation probability band (omitted ↔ slight chance/chance/likely/direct) | `precipitation_wording_onset`, `precipitation_wording_ending` | "Rain developing …", "Precipitation ending …" |
+| `precipitation_type` | active endpoint p-type on consecutive applicable hours | `precipitation_type_change` with status known/ambiguous/unknown | Only known→known: "Rain changing to snow …" |
+| `sky` | active NBM category on the ordered scale clear → mostly clear → partly cloudy → mostly cloudy → cloudy | `sky_trend` (`clearing`, `increasing_clouds`) | "Becoming mostly clear …" |
+
+`rain → ambiguous → snow` yields two `ambiguous` facts, never a direct rain-to-snow
+claim; unknown↔ambiguous changes are not events. A sky trend needs a move of at
+least **two categories** from the reference level that persists for **three hours**
+(the trend hour and the next two all available and at least one level on that side);
+its window runs from the last hour at or beyond the reference on the other side, and
+the trend hour becomes the new reference, so one-hour wobbles and one-level changes
+never become prose. Thunder and wind stay hourly-only.
+
+Real September 16 demonstration on `9e989662-551e-4918-92d8-77005eb7e474`
+(display zone America/Chicago from the saved report): **11 facts, 4 rendered** —
+"Precipitation developing between 9 PM and 10 PM Wednesday" (PoP 19.6% → 22.2%,
+unknown type), "Precipitation ending between 2 AM and 3 AM Thursday" (33.5% → 19.6%),
+"Becoming mostly clear between 2 PM and 5 PM Thursday" (mostly cloudy at 19Z, mostly
+clear at 22Z, persisting through 00Z) and "Becoming mostly cloudy between 7 PM and
+10 PM Thursday". The 05Z–07Z hours produced `ambiguous → rain` and `rain → ambiguous`
+type facts with status `ambiguous`, left unrendered. Applicability onsets/endings at
+23Z–00Z, 11Z–12Z, 14Z–15Z, 15Z–16Z and 09Z–10Z (trace QPF with PoP below 20%) are
+structured only. Hour 36's unavailable NBM sky is reported as a gap and no trend
+crosses it. CLI and HTTP outputs were byte-identical on repeat (37,097 / 37,118
+bytes), UTC and Chicago renderings shared identical facts, an unknown zone returned
+422 `invalid_display_timezone`, a forbidden-hook replay reproduced the CLI bytes, and
+PostgreSQL rows and stored objects were unchanged. The per-hour `components.transitions`
+placeholder in the conditions preview is unchanged; evolution lives in this resource.
+
 ### Issuance payload measurement
 
 A bounded September 16 measurement of the validated issuance
@@ -439,11 +494,10 @@ compression at rest is unchanged, so the measured storage-normalization opportun
 remains future work. Measurement scripts and JSON reports are outside Git under
 `MesoForge/baselines/20260916-payload-measurement`.
 
-Next proposed step: a read-only multi-hour transition preview over adjacent eligible
-results from one saved issuance, with explicit windows and gaps breaking a sequence.
-Begin with endpoint type changes and sky trends; “rain changing to snow” needs
-conservative occurrence support and must not invent a transition minute. Visibility/
-fog still needs separate causal evidence and policy.
+Next proposed step: period-level summarization of the transition facts (grouping
+rendered items into day/night periods and combining coincident precipitation and sky
+events into one sentence) without new meteorological rules. Visibility/fog still
+needs separate causal evidence and policy.
 
 ## Existing forecast path
 
