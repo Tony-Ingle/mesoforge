@@ -18,8 +18,15 @@ from mesoforge.forecasting.condition_wording import WORDING_POLICY, build_wordin
 from mesoforge.forecasting.thunder import ACTIVE_POLICY, validate_thunder_event
 
 RULESET_ID = "saved-active-fields-condition-preview.v3"
-SCHEMA_VERSION = "mesoforge.weather-condition-preview.v1"
+SCHEMA_VERSION = "mesoforge.weather-condition-preview.v2"
 TEMPLATE_VERSION = "compositional-conditions-text.v1"
+# Which saved cells a preview returns; the exact forecast point is always described.
+SCOPES = ("point", "editable", "grid")
+_CELL_SELECTION = {
+    "point": "none_center_point_only",
+    "editable": "inside_editable_domain",
+    "grid": "all_cells",
+}
 _SURFACE_POLICY = "phase2-scalar-vector-fallback.v1"
 _QPF_POLICY = "phase2-qpf-fallback.v1"
 _RH_POLICY = "bolton-1980-relative-humidity-liquid-water.v1"
@@ -379,12 +386,16 @@ def render_condition_hour(hour: dict[str, Any]) -> str:
     return str(build_wording(hour["components"])["text"])
 
 
-def build_conditions_preview(saved: dict[str, Any]) -> dict[str, Any]:
-    """Describe all saved cells/hours and copy the exact center's descriptions.
+def build_conditions_preview(saved: dict[str, Any], *, scope: str = "point") -> dict[str, Any]:
+    """Describe the exact center and the cells the scope selects from one saved grid.
 
-    Checksums establish attachment identity, not a promise that every field is
-    available or that any weather-word policy has been scientifically verified.
+    The point scope returns no grid cells; editable and grid scopes select cells by
+    their saved domain markers. Checksums establish attachment identity, not a
+    promise that every field is available or that any weather-word policy has been
+    scientifically verified.
     """
+    if scope not in SCOPES:
+        raise ValueError(f"Unsupported conditions scope {scope!r}; use one of {', '.join(SCOPES)}")
     forecast = saved.get("forecast", {})
     grid = forecast.get("local_grid_baseline")
     if not isinstance(grid, dict) or grid.get("version") != "mesoforge.local-surface-baseline.v2":
@@ -427,6 +438,7 @@ def build_conditions_preview(saved: dict[str, Any]) -> dict[str, Any]:
     reference = _time(forecast["target_reference_time"])
     cells = []
     center = None
+    editable_cells = 0
     for index, cell in enumerate(grid["cells"]):
         hours = cell["hours"]
         if [hour["horizon_hours"] for hour in hours] != list(range(1, 37)):
@@ -438,6 +450,12 @@ def build_conditions_preview(saved: dict[str, Any]) -> dict[str, Any]:
             for hour in hours
         ):
             raise IntegrityError("Saved grid hour and target reference times disagree")
+        is_center = (cell["x_index"], cell["y_index"]) == (target["x_index"], target["y_index"])
+        editable = cell.get("inside_editable_domain") is True
+        editable_cells += editable
+        selected = scope == "grid" or (scope == "editable" and editable)
+        if not (selected or is_center):
+            continue
         result = {key: deepcopy(value) for key, value in cell.items() if key != "hours"}
         result["hours"] = [
             _describe_hour(
@@ -448,8 +466,9 @@ def build_conditions_preview(saved: dict[str, Any]) -> dict[str, Any]:
             )
             for hour_index, hour in enumerate(hours)
         ]
-        cells.append(result)
-        if (cell["x_index"], cell["y_index"]) == (target["x_index"], target["y_index"]):
+        if selected:
+            cells.append(result)
+        if is_center:
             if center is not None or cell["hours"] != forecast["hours"]:
                 raise IntegrityError("Saved point column differs from the unique grid center")
             if (cell["latitude"], cell["longitude"]) != (
@@ -463,6 +482,13 @@ def build_conditions_preview(saved: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "ruleset_id": RULESET_ID,
+        "scope": {
+            "requested": scope,
+            "cell_selection": _CELL_SELECTION[scope],
+            "cells_returned": len(cells),
+            "grid_cells": len(grid["cells"]),
+            "editable_cells": editable_cells,
+        },
         "wording_policy": deepcopy(WORDING_POLICY),
         "input": {
             "issued_forecast_id": saved["issued_forecast_id"],

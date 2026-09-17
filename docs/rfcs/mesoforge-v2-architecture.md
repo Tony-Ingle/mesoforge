@@ -1111,7 +1111,10 @@ within-object duplicates add to it: `forecast.hours` repeats the center cell
 although eight sources are unsupported (31.1 MB, three distinct variants). README
 records the compression results (gzip-9 7×, zstd-19 127×) and projections.
 
-Proposed, in order of safety:
+Proposed, in order of safety (item 1 was implemented on September 16 without
+changing any stored bytes or digests: point-scoped conditions with explicit
+`editable`/`grid` scopes, and the metadata prefilter reported as `version_scan`;
+per-hour prose hoisting was deferred; items 2 and 3 remain future work):
 
 1. **Read-path fixes that change no stored bytes.** Default
    `GET /issued-forecasts/{id}/conditions` and the CLI to `scope=point`

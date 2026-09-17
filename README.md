@@ -142,11 +142,27 @@ already contains `local_grid_baseline`:
 ```bash
 python -B -m mesoforge.application.weather_conditions --issued-forecast-id SAVED_GRID_ISSUANCE_ID > preview.json
 curl "http://127.0.0.1:8765/issued-forecasts/SAVED_GRID_ISSUANCE_ID/conditions"
+curl "http://127.0.0.1:8765/issued-forecasts/SAVED_GRID_ISSUANCE_ID/conditions?scope=grid"
 ```
 
-The CLI and GET return `cells[].hours[]` for the complete saved grid and
-`center_point.hours[]` for all 36 center hours, including deterministic `rendering.text`.
-The existing API startup command/settings apply. This endpoint reads an immutable
+The ordinary read path is **point-scoped**: by default the CLI and GET return
+`center_point.hours[]` for all 36 center hours, including deterministic
+`rendering.text`, plus the input, derivation, wording-policy and geometry metadata,
+with an empty `cells` list. `--scope editable` / `?scope=editable` adds the cells
+whose saved `inside_editable_domain` marker is true, and `--scope grid` /
+`?scope=grid` returns the complete context/editable grid as `cells[].hours[]` for
+forecast-desk and grid tooling; an unknown scope returns HTTP 422
+`invalid_conditions_scope` (CLI usage error) before any storage read. The response
+records the `scope` requested, the cells returned and the grid/editable cell counts
+(preview schema `mesoforge.weather-condition-preview.v2`). Only the requested cells
+and the center are described; every returned cell keeps its exact structured states
+and evidence. On the real issuance `9e989662-…`, the default response is **728,712
+bytes** (HTTP 728,723) against **35,739,570 bytes** for the previous full response
+(2.04%); `editable` is 7,161,366 bytes and `grid` 35,739,683 bytes, whose cells,
+center point, input, geometry and policies equal the previous output exactly. Point
+and grid responses were byte-identical on repeat, CLI and HTTP JSON agreed, a
+forbidden-hook replay reproduced the CLI bytes, and PostgreSQL rows and stored
+objects were unchanged. The existing API startup command/settings apply. This endpoint reads an immutable
 version; `/forecast` continues to serve the separate prepared calculation/grid path.
 Neither the preview nor its renderer prepares data, recalculates fields or writes
 forecast/verification history. Missing/older point-only grids return HTTP 409
@@ -415,8 +431,12 @@ hour-selection query read about 18 GB. The proposed remedies are recorded in
 a content-addressed shared-metadata table inside the immutable issuance (exact
 inflation to today's shape, no change to raw/prepared artifacts or replay), a
 center-point default for `GET /issued-forecasts/{id}/conditions` with explicit
-editable/grid scopes, and a valid-time prefilter for version selection. No storage
-or API change was made; measurement scripts and JSON reports are outside Git under
+editable/grid scopes, and a valid-time prefilter for version selection. The two
+read-path items are now implemented (point-scoped conditions above and the
+[metadata prefilter](#select-saved-forecast-hours) below) without touching stored
+bytes or digests; the immutable issuance format has **not** been normalized and
+compression at rest is unchanged, so the measured storage-normalization opportunity
+remains future work. Measurement scripts and JSON reports are outside Git under
 `MesoForge/baselines/20260916-payload-measurement`.
 
 Next proposed step: a read-only multi-hour transition preview over adjacent eligible
@@ -851,8 +871,20 @@ regenerates forecasts nor reads observations, scores error, or writes storage. I
 does not apply an issuance cutoff or declare a forecast eligible for verification;
 historically issued demonstration records retain their distinct issuance/valid times.
 No versions are silently dropped at the repository's usual 100-record listing limit.
-This initial implementation reads all versions for that coordinate; it has no pagination
-or hour-level query index. A storage/integrity failure returns 500 with
+Selection lists every version's PostgreSQL metadata for the coordinate, then reads
+an object payload only when that version's possible valid times —
+`target_reference_time` plus the fixed 1–36 h horizons every issuance is validated to
+hold — can intersect the `[start, end)` window; matching still uses each saved hour's
+actual valid time, so results are unchanged and versions stay distinct. The response's
+`version_scan` reports `versions_for_coordinate`, `versions_read` and the prefilter
+name; automatic/window verification and forward runs share this path. On the two
+retained real Minneapolis versions, an overlapping window still read 2 of 2 objects,
+while windows ending at the first valid hour, starting after the last, or outside
+the covered days read **0 of 2** where the earlier implementation read all versions.
+A four-version demonstration with three target times read 3, 1, 1, 0 and 4 of 4
+objects and matched a full scan every time. The existing coordinate/issuance index
+serves the metadata query; no index was added. There is still no pagination or
+hour-level query index. A storage/integrity failure returns 500 with
 `issued_forecast_hour_selection_failed`, without a partial successful result.
 
 On September 10, the example query returned **six matches**: 13:00, 14:00, and 15:00 UTC

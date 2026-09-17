@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from mesoforge import api
 from mesoforge.application.batch_forecast import run_batch
-from mesoforge.application.issuance import ForecastIssuanceService
+from mesoforge.application.issuance import VERSION_PREFILTER, ForecastIssuanceService
 from mesoforge.application.point_forecast import PreparedPointForecast
 from mesoforge.application.prepared_ifs import IFS_CONFIGURATION
 from mesoforge.application.prepared_shadow import normalize_shadow_temperature
@@ -187,14 +187,21 @@ def test_fresh_full_grid_nbm_sky_issuance_and_conditions_are_exact_and_read_only
     issued = service.issue(forecast, batch_run_id=uuid4(), location_index=0)
     saved = service.read(issued.issued_forecast_id)
     assert saved["forecast"] == forecast
-    expected = build_conditions_preview(saved)
+    expected = build_conditions_preview(saved, scope="grid")
     before = complete_storage_inventory(migrated_dsn, object_store)
     forbidden = forbid_retrieval_writes_and_calculation(monkeypatch)
     with TestClient(api.create_app(prepared_guidance)) as client:
-        first = client.get(f"/issued-forecasts/{issued.issued_forecast_id}/conditions")
-        repeat = client.get(f"/issued-forecasts/{issued.issued_forecast_id}/conditions")
+        url = f"/issued-forecasts/{issued.issued_forecast_id}/conditions"
+        # The ordinary read path is point-scoped; the full grid is an explicit opt-in.
+        point = client.get(url)
+        assert point.status_code == 200 and point.content == client.get(url).content
+        assert point.json()["cells"] == [] and point.json()["scope"]["requested"] == "point"
+        assert point.json()["center_point"] == expected["center_point"]
+        first = client.get(url, params={"scope": "grid"})
+        repeat = client.get(url, params={"scope": "grid"})
         assert first.status_code == repeat.status_code == 200
         assert first.content == repeat.content
+        assert len(point.content) < len(first.content)
         preview = first.json()
         assert preview["cells"] == expected["cells"]
         assert len(preview["cells"]) == 49
@@ -686,16 +693,23 @@ def test_api_selects_each_saved_hour_version_without_writes_or_calculation(
                 "start_valid_time": "2026-08-30T13:00:00Z",
                 "end_valid_time": "2026-08-30T16:00:00Z",
                 "interval_closure": "left_closed_right_open",
+                "version_scan": {
+                    "versions_for_coordinate": 2,
+                    "versions_read": 2,
+                    "prefilter": VERSION_PREFILTER,
+                },
                 "results": expected_results,
             }
-        # The first saved valid time is the excluded end of this adjacent window.
-        for coordinate, start, end in (
-            (FIRST, "2026-08-30T12:00:00Z", "2026-08-30T13:00:00Z"),
-            ({"lat": 44.98, "lon": -93.27}, "2026-08-30T13:00:00Z", "2026-08-30T16:00:00Z"),
+        # The first saved valid time is the excluded end of this adjacent window: the
+        # metadata prefilter rejects both versions before any payload is read.
+        for coordinate, start, end, read in (
+            (FIRST, "2026-08-30T12:00:00Z", "2026-08-30T13:00:00Z", 0),
+            ({"lat": 44.98, "lon": -93.27}, "2026-08-30T13:00:00Z", "2026-08-30T16:00:00Z", 0),
             (
                 {"lat": FIRST["lat"] + 0.000001, "lon": FIRST["lon"]},
                 "2026-08-30T13:00:00Z",
                 "2026-08-30T16:00:00Z",
+                0,
             ),
         ):
             response = client.get(
@@ -704,6 +718,7 @@ def test_api_selects_each_saved_hour_version_without_writes_or_calculation(
             )
             assert response.status_code == 200
             assert response.json()["results"] == []
+            assert response.json()["version_scan"]["versions_read"] == read
     forbidden.assert_not_called()
     assert storage_inventory(migrated_dsn, object_store) == before
 

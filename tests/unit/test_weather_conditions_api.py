@@ -108,15 +108,31 @@ def test_preview_reuses_exact_versions_and_center_without_writes(
         assert response.content == repeated.content
         result = response.json()
         assert result == {**build_conditions_preview(saved), "derivation": _expected_derivation()}
+        assert result["scope"]["requested"] == "point" and result["cells"] == []
         assert result["input"]["code_identity"] == saved["code_identity"]
         assert result["derivation"] != result["input"]["code_identity"]
         assert result["input"]["issued_forecast_id"] == str(record.issued_forecast_id)
         assert result["input"]["issued_payload_digest"] == str(record.content_digest)
         grid = saved["forecast"]["local_grid_baseline"]
-        assert len(result["cells"]) == len(grid["cells"])
-        assert all(len(cell["hours"]) == 36 for cell in result["cells"])
-        center = next(cell for cell in result["cells"] if cell["is_forecast_point"])
+        url = _url(record.issued_forecast_id)
+        full = preview_client.get(url, params={"scope": "grid"})
+        assert full.status_code == 200
+        assert full.content == preview_client.get(url, params={"scope": "grid"}).content
+        assert len(full.content) > len(response.content)
+        full_result = full.json()
+        assert full_result == {
+            **build_conditions_preview(saved, scope="grid"),
+            "derivation": _expected_derivation(),
+        }
+        assert len(full_result["cells"]) == len(grid["cells"])
+        assert all(len(cell["hours"]) == 36 for cell in full_result["cells"])
+        center = next(cell for cell in full_result["cells"] if cell["is_forecast_point"])
         assert result["center_point"]["hours"] == center["hours"]
+        assert result["center_point"] == full_result["center_point"]
+        editable = preview_client.get(url, params={"scope": "editable"}).json()
+        assert editable["cells"] == [c for c in full_result["cells"] if c["inside_editable_domain"]]
+        assert editable["scope"]["cells_returned"] == 9
+        assert editable["center_point"] == result["center_point"]
         sky = center["hours"][0]["components"]["sky"]
         assert sky["state"] == ("unavailable" if index == 0 else "known")
         if index == 1:
@@ -141,6 +157,51 @@ def test_invalid_id_is_rejected_before_storage(preview_client, monkeypatch, bad_
     assert response.json()["error"]["code"] == "invalid_issued_forecast_id"
     assert "data_kind" not in response.json()
     reader.assert_not_called()
+
+
+def test_unknown_scope_is_rejected_before_storage(preview_client, monkeypatch):
+    reader = Mock(side_effect=AssertionError("Invalid scope reached storage"))
+    monkeypatch.setattr(weather_conditions, "read_issued_forecast", reader)
+    response = preview_client.get(_url(uuid4()), params={"scope": "region"})
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {
+            "code": "invalid_conditions_scope",
+            "message": "Provide scope=point (default), scope=editable or scope=grid.",
+        }
+    }
+    reader.assert_not_called()
+
+
+def test_cli_scopes_match_the_preview_function_and_unknown_scopes_never_read(
+    condition_versions, monkeypatch, capsys
+):
+    service, factory, objects, records = condition_versions
+    record = records[1]
+    saved = service.read(record.issued_forecast_id)
+    reader = Mock(return_value=deepcopy(saved))
+    monkeypatch.setattr(weather_conditions, "read_issued_forecast", reader)
+    before = dict(objects.objects)
+    for scope in ("editable", "grid"):
+        assert (
+            weather_conditions.main(
+                ["--issued-forecast-id", str(record.issued_forecast_id), "--scope", scope]
+            )
+            == 0
+        )
+        expected = {
+            **build_conditions_preview(saved, scope=scope),
+            "derivation": _expected_derivation(),
+        }
+        assert capsys.readouterr().out.encode("utf-8") == canonical_json_bytes(expected) + b"\n"
+    assert reader.call_count == 2
+    with pytest.raises(SystemExit):
+        weather_conditions.main(
+            ["--issued-forecast-id", str(record.issued_forecast_id), "--scope", "region"]
+        )
+    capsys.readouterr()
+    assert reader.call_count == 2
+    assert objects.objects == before and len(factory.issued_forecasts) == 2
 
 
 def test_unknown_id_returns_not_found(preview_client, condition_versions):

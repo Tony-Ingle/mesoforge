@@ -14,8 +14,10 @@ from mesoforge.application.local_surface_grid import (
 )
 from mesoforge.application.precipitation_type import POLICY as TYPE_POLICY
 from mesoforge.common.errors import IntegrityError
+from mesoforge.forecasting import conditions
 from mesoforge.forecasting.cloud_cover import CLOUD, CLOUD_ACTIVE_POLICY, SKY_CATEGORY_POLICY
 from mesoforge.forecasting.conditions import (
+    SCOPES,
     ConditionsPreviewUnavailableError,
     build_conditions_preview,
 )
@@ -302,7 +304,7 @@ def test_ineligible_active_sky_never_falls_back_to_native_shadow_evidence(change
 
 def test_active_sky_spans_saved_grid_and_preserves_other_components_and_original_payload():
     saved = saved_forecast()
-    previous = build_conditions_preview(saved)
+    previous = build_conditions_preview(saved, scope="grid")
     for cell in saved["forecast"]["local_grid_baseline"]["cells"]:
         for hour in cell["hours"]:
             percentage = float(
@@ -316,9 +318,9 @@ def test_active_sky_spans_saved_grid_and_preserves_other_components_and_original
             )
     refresh_saved_grid(saved)
     original = JSON.serialize(saved)
-    output = build_conditions_preview(saved)
+    output = build_conditions_preview(saved, scope="grid")
     assert JSON.serialize(output) == JSON.serialize(
-        build_conditions_preview(JSON.deserialize(original))
+        build_conditions_preview(JSON.deserialize(original), scope="grid")
     )
     assert JSON.serialize(saved) == original
     assert {cell["context_only"] for cell in output["cells"]} == {False, True}
@@ -336,7 +338,7 @@ def test_active_sky_spans_saved_grid_and_preserves_other_components_and_original
     unavailable = saved["forecast"]["local_grid_baseline"]["cells"][0]
     unavailable.update(status="unavailable", missing_reasons=["No spatial coverage"])
     refresh_saved_grid(saved)
-    missing = build_conditions_preview(saved)["cells"][0]["hours"][0]
+    missing = build_conditions_preview(saved, scope="grid")["cells"][0]["hours"][0]
     assert missing["components"]["sky"]["state"] == "unavailable"
     assert missing["components"]["sky"]["sky_category"] is None
     assert missing["components"]["sky"]["cloud_percentage"] is None
@@ -392,7 +394,7 @@ def test_all_cells_and_36_hours_share_the_same_preview_path_and_exact_center_res
         "air_temperature_2m"
     ]["value"] = 281.2
     refresh_saved_grid(saved)
-    preview = build_conditions_preview(saved)
+    preview = build_conditions_preview(saved, scope="grid")
     assert len(preview["cells"]) == 25
     assert all(
         [h["horizon_hours"] for h in c["hours"]] == list(range(1, 37)) for c in preview["cells"]
@@ -698,7 +700,7 @@ def test_unavailable_cell_suppresses_stale_positive_fields_but_retains_reasons_a
     assert cell["hours"][0]["surface"]["fields"][QPF]["value"] > 0
     refresh_saved_grid(saved)
     before = JSON.serialize(saved)
-    preview = build_conditions_preview(saved)
+    preview = build_conditions_preview(saved, scope="grid")
     result = preview["cells"][0]
     assert result["status"] == "unavailable" and result["missing_reasons"] == [reason]
     for index, hour in enumerate(result["hours"]):
@@ -711,4 +713,82 @@ def test_unavailable_cell_suppresses_stale_positive_fields_but_retains_reasons_a
             ]
         assert hour["rendering"]["text"] == "Weather conditions unavailable."
     assert preview["center_point"]["hours"][0]["components"]["qpf"]["state"] == "known"
+    assert JSON.serialize(saved) == before
+
+
+@pytest.mark.parametrize(
+    "scope,cells,selection",
+    [
+        ("point", 0, "none_center_point_only"),
+        ("editable", 9, "inside_editable_domain"),
+        ("grid", 25, "all_cells"),
+    ],
+)
+def test_scopes_select_cells_by_saved_domain_markers_and_share_one_center(scope, cells, selection):
+    saved = saved_forecast()
+    preview = build_conditions_preview(saved, scope=scope)
+    assert preview["schema_version"] == "mesoforge.weather-condition-preview.v2"
+    assert preview["scope"] == {
+        "requested": scope,
+        "cell_selection": selection,
+        "cells_returned": cells,
+        "grid_cells": 25,
+        "editable_cells": 9,
+    }
+    assert len(preview["cells"]) == cells
+    assert [hour["horizon_hours"] for hour in preview["center_point"]["hours"]] == list(
+        range(1, 37)
+    )
+    grid = build_conditions_preview(saved, scope="grid")
+    center = next(cell for cell in grid["cells"] if cell["is_forecast_point"])
+    assert preview["center_point"]["hours"] == center["hours"]
+    assert preview["center_point"] == grid["center_point"]
+    for key in ("input", "geometry", "ruleset_id", "wording_policy"):
+        assert preview[key] == grid[key]
+    if scope == "editable":
+        assert preview["cells"] == [
+            cell for cell in grid["cells"] if cell["inside_editable_domain"]
+        ]
+        assert any(cell["is_forecast_point"] for cell in preview["cells"])
+        assert not any(cell["context_only"] for cell in preview["cells"])
+
+
+def test_default_scope_is_point_and_describes_only_the_center_column(monkeypatch):
+    saved = saved_forecast()
+    described = []
+    original = conditions._describe_hour
+
+    def counting(hour, pointer, **kwargs):
+        described.append(pointer)
+        return original(hour, pointer, **kwargs)
+
+    monkeypatch.setattr(conditions, "_describe_hour", counting)
+    preview = build_conditions_preview(saved)
+    center_index = next(
+        i
+        for i, cell in enumerate(saved["forecast"]["local_grid_baseline"]["cells"])
+        if cell["is_forecast_point"]
+    )
+    assert preview["scope"]["requested"] == "point" and preview["cells"] == []
+    assert len(described) == 36
+    assert all(
+        p.startswith(f"/forecast/local_grid_baseline/cells/{center_index}/") for p in described
+    )
+
+
+def test_unknown_scope_is_rejected_before_any_grid_work():
+    saved = saved_forecast()
+    with pytest.raises(ValueError, match="scope"):
+        build_conditions_preview(saved, scope="region")
+    with pytest.raises(ValueError, match="scope"):
+        build_conditions_preview({}, scope="")
+
+
+@pytest.mark.parametrize("scope", SCOPES)
+def test_every_scope_replays_byte_identically_without_mutating_the_saved_payload(scope):
+    saved = saved_forecast()
+    before = JSON.serialize(saved)
+    first = build_conditions_preview(saved, scope=scope)
+    second = build_conditions_preview(JSON.deserialize(before), scope=scope)
+    assert JSON.serialize(first) == JSON.serialize(second)
     assert JSON.serialize(saved) == before

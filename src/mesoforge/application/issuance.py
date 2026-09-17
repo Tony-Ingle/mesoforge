@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -51,6 +51,27 @@ def validate_hour_selection(
         end=end_valid_time,
         closure=IntervalClosure.left_closed_right_open,
     )
+
+
+# Every issued version is validated to hold exactly these horizons, each valid at the
+# target reference time plus its horizon, so issuance metadata alone bounds its hours.
+ISSUED_HORIZON_HOURS = (1, 36)
+VERSION_PREFILTER = "target_reference_time_plus_horizons_1_to_36"
+
+
+def possible_valid_window(target_reference_time: datetime) -> tuple[datetime, datetime]:
+    """Earliest and latest valid times any saved hour of one version can have."""
+    first, last = ISSUED_HORIZON_HOURS
+    return (
+        target_reference_time + timedelta(hours=first),
+        target_reference_time + timedelta(hours=last),
+    )
+
+
+def version_may_overlap(record: IssuedForecastRecord, window: IntervalDefinition) -> bool:
+    """Metadata-only test against a start-inclusive, end-exclusive window; no object read."""
+    first, last = possible_valid_window(record.target_reference_time)
+    return first < window.end and last >= window.start
 
 
 class ForecastIssuanceService:
@@ -144,8 +165,10 @@ class ForecastIssuanceService:
         window = validate_hour_selection(latitude, longitude, start_valid_time, end_valid_time)
         with self._uow_factory() as uow:
             records = uow.issued_forecasts.list_for_coordinate(latitude, longitude, limit=None)
+        # Reject versions from metadata first; only possibly overlapping payloads are read.
+        candidates = [record for record in records if version_may_overlap(record, window)]
         results: list[dict[str, Any]] = []
-        for record in records:
+        for record in candidates:
             saved = self.read(record.issued_forecast_id)
             forecast = saved["forecast"]
             context = issued_forecast_context(forecast)
@@ -175,6 +198,11 @@ class ForecastIssuanceService:
             "start_valid_time": window.start.isoformat().replace("+00:00", "Z"),
             "end_valid_time": window.end.isoformat().replace("+00:00", "Z"),
             "interval_closure": window.closure.value,
+            "version_scan": {
+                "versions_for_coordinate": len(records),
+                "versions_read": len(candidates),
+                "prefilter": VERSION_PREFILTER,
+            },
             "results": results,
         }
 

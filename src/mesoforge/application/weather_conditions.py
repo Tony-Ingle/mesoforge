@@ -17,6 +17,7 @@ from mesoforge.contracts.serialization import canonical_json_bytes
 from mesoforge.forecasting import cloud_cover, condition_wording, conditions
 from mesoforge.forecasting.conditions import (
     RULESET_ID,
+    SCOPES,
     TEMPLATE_VERSION,
     ConditionsPreviewUnavailableError,
     build_conditions_preview,
@@ -41,12 +42,14 @@ def _derivation_identity() -> dict[str, Any]:
     }
 
 
-def preview_weather_conditions(issued_forecast_id: UUID) -> dict[str, Any]:
+def preview_weather_conditions(issued_forecast_id: UUID, *, scope: str = "point") -> dict[str, Any]:
     """Read verified saved bytes once; derive a preview without generation or persistence."""
+    if scope not in SCOPES:
+        raise ValueError(f"Unsupported conditions scope {scope!r}; use one of {', '.join(SCOPES)}")
     saved = read_issued_forecast(issued_forecast_id)
     if saved.get("issued_forecast_id") != str(issued_forecast_id):
         raise IntegrityError("Readback returned a different issued forecast")
-    result = build_conditions_preview(saved)
+    result = build_conditions_preview(saved, scope=scope)
     result["derivation"] = deepcopy(_derivation_identity())
     return result
 
@@ -54,9 +57,18 @@ def preview_weather_conditions(issued_forecast_id: UUID) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--issued-forecast-id", type=UUID, required=True)
+    parser.add_argument(
+        "--scope",
+        choices=SCOPES,
+        default="point",
+        help="point: exact forecast point only (default); editable: editable-domain cells; "
+        "grid: complete context/editable grid",
+    )
     args = parser.parse_args(argv)
     try:
-        payload = canonical_json_bytes(preview_weather_conditions(args.issued_forecast_id))
+        payload = canonical_json_bytes(
+            preview_weather_conditions(args.issued_forecast_id, scope=args.scope)
+        )
     except NotFound:
         error = {
             "code": "issued_forecast_not_found",

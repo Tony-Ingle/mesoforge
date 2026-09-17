@@ -30,7 +30,7 @@ from mesoforge.application.spatial_coverage import CoverageRequiredError, Unsupp
 from mesoforge.application.spatial_preparation import PreparedRegions, load_prepared
 from mesoforge.application.weather_conditions import preview_weather_conditions
 from mesoforge.common.errors import NotFound
-from mesoforge.forecasting.conditions import ConditionsPreviewUnavailableError
+from mesoforge.forecasting.conditions import SCOPES, ConditionsPreviewUnavailableError
 
 
 def _error(
@@ -177,7 +177,9 @@ def create_app(directory: Path) -> FastAPI:
             )
 
     @app.get("/issued-forecasts/{issued_forecast_id}/conditions", response_model=None)
-    def weather_conditions(issued_forecast_id: str) -> dict[str, Any] | JSONResponse:
+    def weather_conditions(
+        issued_forecast_id: str, scope: str = "point"
+    ) -> dict[str, Any] | JSONResponse:
         try:
             identifier = UUID(issued_forecast_id)
         except ValueError:
@@ -190,8 +192,18 @@ def create_app(directory: Path) -> FastAPI:
                     }
                 },
             )
+        if scope not in SCOPES:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": {
+                        "code": "invalid_conditions_scope",
+                        "message": "Provide scope=point (default), scope=editable or scope=grid.",
+                    }
+                },
+            )
         try:
-            return preview_weather_conditions(identifier)
+            return preview_weather_conditions(identifier, scope=scope)
         except NotFound:
             return JSONResponse(
                 status_code=404,
