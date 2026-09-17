@@ -1118,9 +1118,34 @@ states, hour and evidence references, reasons and policy id.
   {to} between A and B", "Becoming {category} between A and B", in the requested
   zone, else the issuance's saved report zone, else UTC. No LLM text.
 
-Thunder and wind remain hourly-only; intensity, fog, period summaries and
-narrative composition need separate policies. Evidence-only fields never influence
-these facts.
+Thunder and wind remain hourly-only; intensity, fog and narrative composition need
+separate policies. Evidence-only fields never influence these facts.
+
+#### 6.7.11 Period summaries
+
+**Implemented September 16, 2026** as `mesoforge-period-summary.v1`
+(`forecasting/periods.py`, `application/weather_periods.py`,
+`GET /issued-forecasts/{id}/conditions/periods`), a presentation aggregation over
+the §6.7.10 facts of one issuance. It derives no weather: no period maxima,
+dominant categories, totals or representative conditions.
+
+- **Boundaries:** local wall-clock 12-hour periods, day 06:00–18:00 and night
+  18:00–06:00, left-closed/right-open, partial first/last periods allowed; UTC is
+  used for membership and lengths so daylight-saving periods are 11 or 13 hours.
+  A presentation convention, not a daylight definition.
+- **Grouping:** a fact belongs to the period containing its window end; windows
+  starting earlier are flagged and kept exactly. Omitted facts keep their
+  transition reasons; gaps are listed per period and never bridged.
+- **Labels:** natural local descriptors (late night 01–03, early morning 04–06,
+  morning, afternoon, evening with early/late halves) only when every endpoint of
+  the window is in one band; otherwise the explicit clock phrase.
+- **Combination:** identical windows plus a listed rule (wording onset with
+  increasing clouds; wording ending with clearing); otherwise separate sentences.
+
+Limitations: no combination across different windows, no period-level condition
+statements, and no thunder/wind evolution. The next work returns to the learning
+loop (forward verification accumulation, then deterministic site/regime bias
+learning) rather than further presentation.
 
 #### 6.7.9 Issuance payload measurement and proposed normalization
 

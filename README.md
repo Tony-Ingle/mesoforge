@@ -449,6 +449,53 @@ bytes), UTC and Chicago renderings shared identical facts, an unknown zone retur
 PostgreSQL rows and stored objects were unchanged. The per-hour `components.transitions`
 placeholder in the conditions preview is unchanged; evolution lives in this resource.
 
+### Period summaries
+
+`GET /issued-forecasts/{id}/conditions/periods[?display_timezone=ZONE]` and
+`python -B -m mesoforge.application.weather_periods --issued-forecast-id ID
+[--display-timezone ZONE]` group the transition facts above into local
+presentation periods (`mesoforge.period-summary.v1`, policy
+**`mesoforge-period-summary.v1`**, renderer `period-text.v1`). They reuse the
+transition preview (one saved read, point scope only) and derive **no** new
+weather: no period maxima, dominant sky, totals or representative conditions —
+only grouping and wording of facts that already exist. Structured output keeps
+every period's local and UTC bounds, its hour references, its transition
+references with exact UTC windows, omitted facts with their reasons, gaps,
+per-track availability counts, and the transition facts themselves.
+
+**Boundaries.** Local 12-hour periods on wall-clock time: day 06:00–18:00, night
+18:00–06:00, left-closed/right-open, identified by start date and kind
+(`2026-09-16-night`). The first/last periods may be partial; membership and
+lengths are computed in UTC, so a period spanning a daylight-saving change is 11
+or 13 hours and every hour lands exactly once. This is a presentation convention,
+not a daylight definition. **Grouping.** A fact belongs to the period containing
+its window end (the first hour holding the new state); a window that starts in an
+earlier period is flagged and its exact window is retained. **Labels.** Text uses a
+natural local descriptor only when every hourly endpoint inside the window falls
+in one band — late … night (01–03), early … morning (04–06), morning (07–12),
+afternoon (13–18), evening (19–24), with early/late only when the whole window sits
+in that half — otherwise the explicit "between 4 PM and 7 PM Thursday" phrase.
+**Combination.** Two rendered facts combine only when their windows are identical
+and a listed rule applies (wording onset + increasing clouds; wording ending +
+clearing); everything else stays a separate sentence in window order. Ambiguous
+and unrendered facts remain omitted with their transition reasons; gaps stay
+listed and nothing is inferred across them.
+
+Real September 16 demonstration on `9e989662-551e-4918-92d8-77005eb7e474`
+(America/Chicago from the saved report; three complete periods 18:00 Wed –
+06:00 Fri): **"Precipitation developing late Wednesday evening. Precipitation
+ending late Wednesday night. Becoming mostly clear Thursday afternoon. Clouds
+increasing Thursday evening."** Wednesday night holds five facts (two rendered,
+one structured-only applicability onset, two `ambiguous` type changes omitted);
+Thursday day holds the clearing trend plus three structured-only applicability
+facts; Thursday night holds the increasing-clouds trend, a structured-only trace
+onset and the hour-36 sky gap (`active_sky_unavailable`). No windows coincided,
+so no sentences were combined. The same facts rendered in UTC give four periods
+(7 and 5-hour partial ends) and relabelled text. CLI and HTTP outputs were
+byte-identical on repeat (31,964 / 32,007 bytes), unknown zones returned 422, a
+forbidden-hook replay reproduced the CLI bytes, and PostgreSQL rows and stored
+objects were unchanged.
+
 ### Issuance payload measurement
 
 A bounded September 16 measurement of the validated issuance
@@ -494,10 +541,11 @@ compression at rest is unchanged, so the measured storage-normalization opportun
 remains future work. Measurement scripts and JSON reports are outside Git under
 `MesoForge/baselines/20260916-payload-measurement`.
 
-Next proposed step: period-level summarization of the transition facts (grouping
-rendered items into day/night periods and combining coincident precipitation and sky
-events into one sentence) without new meteorological rules. Visibility/fog still
-needs separate causal evidence and policy.
+Next proposed step: return to the learning loop — sustained forward verification
+accumulation for the registered coordinate, then the first deterministic site/regime
+bias-learning capability over that verification history. Presentation polish waits
+unless a concrete missing capability blocks use. Visibility/fog still needs separate
+causal evidence and policy.
 
 ## Existing forecast path
 

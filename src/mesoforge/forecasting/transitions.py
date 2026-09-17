@@ -383,6 +383,11 @@ def _between(window: dict[str, Any], zone: ZoneInfo) -> str:
     return f"between {_clock(start)} {start.strftime('%A')} and {_clock(end)} {end.strftime('%A')}"
 
 
+def describe_window(window: dict[str, Any], zone: ZoneInfo) -> str:
+    """The explicit clock-time phrase for one window, shared with period rendering."""
+    return _between(window, zone)
+
+
 def _render(facts: list[dict[str, Any]], zone: ZoneInfo, timezone_name: str) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
     omitted: list[dict[str, Any]] = []
