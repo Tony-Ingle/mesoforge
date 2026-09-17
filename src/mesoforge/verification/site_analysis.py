@@ -81,8 +81,105 @@ CANONICALIZATION_POLICY: dict[str, Any] = {
     "not_changed": "No stored fact, issuance, observation or attribute is modified or deleted.",
 }
 
+DECISION_WINDOW_POLICY: dict[str, Any] = {
+    "id": "mesoforge-decision-window-policy.v1",
+    "status": "owner-approved; stored issuances do not yet carry decision-window metadata",
+    "primary": (
+        "The first successful eligible issuance for a scheduled decision window is the "
+        "canonical operational forecast of that window."
+    ),
+    "identical_reissue": "Preserved, and collapsed analytically with the primary version.",
+    "different_reissue": (
+        "Preserved as an alternate/reissue; it never silently replaces the primary version."
+    ),
+    "historical_versions": (
+        "Versions issued before this policy carry no decision-window identity or role. When "
+        "the operational version cannot be determined safely they remain ambiguous; nothing "
+        "is rewritten or relabelled."
+    ),
+    "current_analysis": (
+        "Until issuances carry decision_window_id and issuance_role, a decision window is "
+        "identified by coordinate and target_reference_time, identical versions collapse to "
+        "the earliest issued, and versions that differ stay ambiguous."
+    ),
+    "future_metadata": {
+        "decision_window_id": "stable identity of the scheduled decision window",
+        "issuance_role": "primary | reissue",
+        "reissue_of": "issued_forecast_id of the primary version, only for a reissue",
+    },
+}
+
+_EVIDENCE_MIN_SAMPLES = 30
+_EVIDENCE_MIN_DECISION_DATES = 10
+_EVIDENCE_MAX_DATE_SHARE = 0.25
+EVIDENCE_POLICY: dict[str, Any] = {
+    "id": "mesoforge-bias-evidence-policy.v1",
+    "purpose": (
+        "Minimum evidence before a deterministic temperature-bias correction may be proposed "
+        "for shadow evaluation. Versioned initial governance thresholds, not a claim that "
+        "they are statistically sufficient."
+    ),
+    "samples": "canonical verified samples only",
+    "scope": "each lead bucket is evaluated independently; nothing is pooled or extrapolated",
+    "lead_buckets": list(LEAD_BUCKETS),
+    "criteria": {
+        "min_canonical_samples": _EVIDENCE_MIN_SAMPLES,
+        "min_distinct_decision_dates": _EVIDENCE_MIN_DECISION_DATES,
+        "max_share_from_one_decision_date": _EVIDENCE_MAX_DATE_SHARE,
+        "bias_interval_excludes_zero": True,
+    },
+    "definitions": {
+        "decision_date": "UTC calendar date of the sample's target_reference_time",
+        "multiple_episodes": (
+            "No weather-episode detection exists. Ten distinct decision dates span at least "
+            "nine days, longer than one contiguous weather event, and the share limit keeps "
+            "one date from dominating; together they are the v1 proxy for several episodes."
+        ),
+        "mean_bias_uncertainty": (
+            "Hourly errors within one decision date are not independent, so the interval is "
+            "built from decision-date means: mean of the date means +/- t(0.975, D-1) * "
+            "sd(date means) / sqrt(D). Reported whenever at least two decision dates exist."
+        ),
+        "inconsistent": "the 95% interval of the mean bias includes zero",
+    },
+    "owner_specified": [
+        "canonical samples only",
+        "independent lead buckets 1-6, 7-18 and 19-36",
+        "at least 30 canonical samples in the bucket",
+        "at least 10 distinct forecast decision dates/windows",
+        "evidence spanning several forecast episodes",
+        "reported uncertainty of the mean bias",
+        "no proposal from sparse, concentrated or inconsistent evidence",
+    ],
+    "operational_proxies": [
+        "decision dates are counted as UTC dates (hourly windows of one evening are one date)",
+        "concentration limit of 25% of a bucket's samples from one decision date",
+        "date-clustered 95% interval; inconsistent when it includes zero",
+    ],
+    "lifecycle": [
+        "verified historical evidence",
+        "deterministic candidate correction",
+        "shadow correction on future forecasts",
+        "identical-sample verification against the unchanged baseline",
+        "human, versioned promotion decision only if improvement is demonstrated",
+    ],
+    "promotion": (
+        "Meeting this policy never activates a correction. Promotion must weigh at least MAE "
+        "and RMSE, not mean bias alone, on identical samples against the unchanged baseline."
+    ),
+    "ai_desk": "A later AI forecast desk is evaluated against the bias-corrected baseline.",
+    "not_implemented": "No candidate correction value is calculated and nothing is applied.",
+}
+
+# Two-sided 95% Student t multipliers for 1..30 degrees of freedom.
+_T975: tuple[float, ...] = (
+    12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
+    2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
+    2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042,
+)  # fmt: skip
+
 ANALYSIS_POLICY: dict[str, Any] = {
-    "id": "mesoforge-site-verification-analysis.v1",
+    "id": "mesoforge-site-verification-analysis.v2",
     "field": "air_temperature_2m",
     "unit": "K",
     "error_definition": "forecast_minus_observation",
@@ -106,12 +203,15 @@ ANALYSIS_POLICY: dict[str, Any] = {
     "evidence_states": {
         "descriptive_only": "a metric computed from the available canonical samples",
         "no_samples": "no canonical sample exists for this group; metrics are null",
-        "candidate_pattern_evaluable": (
-            "requires an approved evidence policy (sample size, lead coverage, period and "
-            "independence); none exists, so this state is never assigned"
+        "evidence_policy_met": (
+            f"a lead bucket satisfies every criterion of {EVIDENCE_POLICY['id']}: a candidate "
+            "correction may be proposed for shadow evaluation; nothing becomes active"
         ),
-        "insufficient_evidence": "correction readiness while no approved evidence policy is met",
+        "insufficient_evidence": (
+            "at least one evidence criterion is unmet; no correction may be proposed"
+        ),
     },
+    "changes": "v2 evaluates the evidence policy per lead bucket; v1 metrics are unchanged",
     "not_derived": "No correction, learned weight, regime label, preferred model or skill claim.",
 }
 
@@ -527,19 +627,112 @@ def _regime_readiness(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _t975(degrees_of_freedom: int) -> float:
+    if degrees_of_freedom <= len(_T975):
+        return _T975[degrees_of_freedom - 1]
+    # Conservative upper bounds beyond the table (t(31) = 2.040, t(61) = 2.000).
+    return 2.040 if degrees_of_freedom <= 60 else 2.000
+
+
+def _mean_bias_uncertainty(date_errors: Mapping[str, Sequence[float]]) -> dict[str, Any] | None:
+    """Date-clustered 95% interval of the mean bias; None with fewer than two dates."""
+    means = [sum(errors) / len(errors) for _, errors in sorted(date_errors.items())]
+    count = len(means)
+    if count < 2:
+        return None
+    center = sum(means) / count
+    variance = sum((value - center) ** 2 for value in means) / (count - 1)
+    standard_error = math.sqrt(variance / count)
+    multiplier = _t975(count - 1)
+    return {
+        "method": "decision_date_means_student_t_95",
+        "decision_dates": count,
+        "mean_of_decision_date_means_k": center,
+        "standard_error_k": standard_error,
+        "t_multiplier": multiplier,
+        "interval_95_k": [
+            center - multiplier * standard_error,
+            center + multiplier * standard_error,
+        ],
+    }
+
+
+def evaluate_evidence(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Evaluate one lead bucket's canonical samples against the evidence policy."""
+    date_errors: dict[str, list[float]] = {}
+    for sample in samples:
+        date = _instant(sample["target_reference_time"]).date().isoformat()
+        date_errors.setdefault(date, []).append(sample["temperature_error_k"])
+    count = len(samples)
+    dates = sorted(date_errors)
+    largest_share = max(len(errors) for errors in date_errors.values()) / count if count else None
+    uncertainty = _mean_bias_uncertainty(date_errors)
+    excludes_zero = uncertainty is not None and not (
+        uncertainty["interval_95_k"][0] <= 0.0 <= uncertainty["interval_95_k"][1]
+    )
+    valid_times = sorted(_instant(sample["valid_time"]) for sample in samples)
+    criteria: dict[str, dict[str, Any]] = {
+        "min_canonical_samples": {
+            "required": _EVIDENCE_MIN_SAMPLES,
+            "observed": count,
+            "met": count >= _EVIDENCE_MIN_SAMPLES,
+        },
+        "min_distinct_decision_dates": {
+            "required": _EVIDENCE_MIN_DECISION_DATES,
+            "observed": len(dates),
+            "met": len(dates) >= _EVIDENCE_MIN_DECISION_DATES,
+        },
+        "max_share_from_one_decision_date": {
+            "required": _EVIDENCE_MAX_DATE_SHARE,
+            "observed": largest_share,
+            "met": largest_share is not None and largest_share <= _EVIDENCE_MAX_DATE_SHARE,
+        },
+        "bias_interval_excludes_zero": {
+            "required": True,
+            "observed": excludes_zero if uncertainty is not None else None,
+            "met": excludes_zero,
+        },
+    }
+    unmet = [name for name, row in criteria.items() if not row["met"]]
+    return {
+        "status": "insufficient_evidence" if unmet else "evidence_policy_met",
+        "unmet_criteria": unmet,
+        "criteria": criteria,
+        "canonical_samples": count,
+        "distinct_decision_windows": len({s["target_reference_time"] for s in samples}),
+        "distinct_decision_dates": len(dates),
+        "earliest_decision_date": dates[0] if dates else None,
+        "latest_decision_date": dates[-1] if dates else None,
+        "verified_valid_time_span_hours": (
+            (valid_times[-1] - valid_times[0]).total_seconds() / 3600 if valid_times else None
+        ),
+        "observation_stations": sorted({s["observation"]["station_id"] for s in samples}),
+        "mean_bias_k": sum(s["temperature_error_k"] for s in samples) / count if count else None,
+        "mean_bias_uncertainty": uncertainty,
+    }
+
+
 def _correction_readiness(
     samples: Sequence[Mapping[str, Any]], lead_buckets: Mapping[str, Mapping[str, Any]]
 ) -> dict[str, Any]:
     valid_times = sorted(_instant(sample["valid_time"]) for sample in samples)
     span_hours = (valid_times[-1] - valid_times[0]).total_seconds() / 3600 if valid_times else None
+    by_bucket = {
+        bucket: evaluate_evidence([s for s in samples if s["lead_bucket"] == bucket])
+        for bucket in LEAD_BUCKETS
+    }
+    ready = [b for b in LEAD_BUCKETS if by_bucket[b]["status"] == "evidence_policy_met"]
     return {
-        "status": "insufficient_evidence",
-        "evidence_policy": None,
+        "status": "evidence_policy_met_for_some_lead_buckets" if ready else "insufficient_evidence",
+        "evidence_policy": EVIDENCE_POLICY["id"],
         "basis": (
-            "No approved evidence policy defines the sample size, lead coverage, period or "
-            "independence required before a candidate correction may be evaluated. Until one "
-            "exists every metric in this report is descriptive only."
+            "Each lead bucket is evaluated independently against the evidence policy. Meeting "
+            "it only permits proposing a candidate correction for shadow evaluation; this "
+            "report calculates no correction value and nothing becomes active."
         ),
+        "correction_ready_lead_buckets": ready,
+        "lead_buckets": by_bucket,
+        "candidate_correction": None,
         "observed_evidence": {
             "canonical_samples": len(samples),
             "lead_buckets_with_samples": [b for b in LEAD_BUCKETS if lead_buckets[b]["n"]],

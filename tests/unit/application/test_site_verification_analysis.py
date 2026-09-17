@@ -250,7 +250,11 @@ def test_facts_become_samples_without_reading_any_issued_forecast(history, monke
     result = analyze(history)
     forbidden.assert_not_called()
     assert result["schema_version"] == "mesoforge.site-verification-analysis.v1"
-    assert result["analysis_policy"]["id"] == "mesoforge-site-verification-analysis.v1"
+    assert result["analysis_policy"]["id"] == "mesoforge-site-verification-analysis.v2"
+    assert result["decision_window_policy"]["id"] == "mesoforge-decision-window-policy.v1"
+    assert result["evidence_policy"]["id"] == "mesoforge-bias-evidence-policy.v1"
+    assert result["correction_readiness"]["evidence_policy"] == result["evidence_policy"]["id"]
+    assert result["correction_readiness"]["candidate_correction"] is None
     assert result["canonicalization_policy"]["id"] == "mesoforge-verification-canonicalization.v1"
     assert result["inventory"] == {
         "issued_versions_for_coordinate": 3,

@@ -1287,10 +1287,10 @@ describes the verified history that forward accumulation produces. Its schema is
   precipitation, p-type, thunder, model spread) are reconstructable per sample, with
   availability and ranges only — no classes, thresholds or splits.
 - **Evidence states.** Metrics are `descriptive_only` or `no_samples`.
-  `correction_readiness.status` is `insufficient_evidence` with `evidence_policy: null`
-  because no approved evidence policy (sample size, lead coverage, period,
-  independence) exists; the report lists observed evidence and what it does not
-  conclude, and invents no threshold.
+  `correction_readiness` evaluates each lead bucket against the evidence policy of
+  §6.7.14 (analysis policy `mesoforge-site-verification-analysis.v2`; v1 reported
+  `evidence_policy: null` because no policy existed). It lists observed evidence and
+  what it does not conclude, and never calculates a correction value.
 - **Reads.** Issuance metadata rows and, per fact, either its compact analytical
   attributes or its immutable payload; values, observation identity and forecast
   context all live in the fact, so **no issued forecast object is read**.
@@ -1318,6 +1318,75 @@ describes the verified history that forward accumulation produces. Its schema is
     or backfilled, and the canonicalization policy is unchanged.
   - The context snapshot is descriptive input for later regime analysis. It is not a
     learned model, a weight or a correction.
+
+#### 6.7.14 Decision-window policy and bias evidence policy
+
+**Status: owner-approved policies recorded September 17, 2026. No correction is
+calculated or applied, no scheduler exists, and no stored issuance or fact is changed.**
+
+**Decision-window policy `mesoforge-decision-window-policy.v1`.** The canonical
+operational forecast of a scheduled decision window is the **first successful eligible
+issuance** for that window (the primary version). An identical reissue is preserved and
+collapses analytically. A materially different later reissue is preserved as an
+alternate/reissue and never silently replaces the primary. Versions issued before this
+policy carry no window identity or role; when the operational version cannot be
+determined safely they stay ambiguous, and nothing is rewritten or relabelled.
+
+- *Today:* a window is identified by coordinate and `target_reference_time`. The
+  forward run's guard already refuses a second version for a window unless `--reissue`
+  is given, so since that guard every ordinary issuance is the first of its window. The
+  analysis collapses identical versions to the earliest issued and keeps differing
+  versions ambiguous (§6.7.13). The only pre-guard pair in the retained history
+  (`5bd637dd…`, `9e989662…`) is numerically identical.
+- *Smallest future schema addition (not introduced now):* three nullable fields on the
+  issuance header (`issued_forecasts` row and the saved metadata block):
+  `decision_window_id` (stable identity of the scheduled window, independent of how the
+  target hour is later derived), `issuance_role` (`primary` | `reissue`) and
+  `reissue_of` (the primary's `issued_forecast_id`, only for a reissue), with a partial
+  unique index allowing one `primary` per `decision_window_id`. Historical rows stay
+  null, meaning "role not recorded". No migration is needed yet: no scheduler exists,
+  the guard prevents accidental competing versions, and the role of every post-guard
+  issuance remains derivable from `issued_at` order. Add the fields with scheduling.
+
+**Evidence policy `mesoforge-bias-evidence-policy.v1`.** The minimum evidence before a
+deterministic temperature-bias correction may even be *proposed for shadow evaluation*.
+These are versioned initial governance thresholds, not a claim that they are
+statistically sufficient.
+
+- Canonical verified samples only (§6.7.13). Lead buckets 1–6, 7–18 and 19–36 h are
+  evaluated **independently**; nothing is pooled or extrapolated between them.
+- A bucket needs **at least 30 canonical samples** from **at least 10 distinct decision
+  dates**. A decision date is the UTC date of `target_reference_time`, so the hourly
+  windows of one evening count once.
+- Evidence must span several forecast episodes rather than one contiguous weather
+  event. No episode detection exists; the v1 proxy is the ten-date requirement (at
+  least nine days) plus a concentration limit: **no decision date may supply more than
+  25%** of the bucket's samples.
+- The **uncertainty of the mean bias is always reported** when at least two decision
+  dates exist. Hourly errors of one date are not independent, so the 95% interval is
+  built from decision-date means (Student t, D − 1 degrees of freedom). Evidence is
+  inconsistent, and no correction may be proposed, when that interval includes zero.
+- The ten-date, 25% and 95% readings are the minimal operational proxies for the
+  approved wording; the policy lists them separately from the owner-specified items.
+- The analysis reports every criterion's required and observed value per bucket.
+  `correction_readiness.status` is `insufficient_evidence` unless a bucket meets all
+  four, and `candidate_correction` stays null: no correction value is calculated.
+- No weather-regime thresholds exist yet.
+
+**Correction lifecycle.** Meeting the evidence policy never activates a correction:
+verified historical evidence → deterministic candidate correction → shadow correction
+on future forecasts → identical-sample verification against the unchanged baseline →
+human, versioned promotion decision only if improvement is demonstrated. Promotion must
+weigh at least MAE and RMSE on identical samples, not mean bias alone. The later AI
+forecast desk is evaluated against the bias-corrected baseline, not merely the raw blend.
+
+**Current data (September 17, 2026).** Minneapolis has 65 canonical samples from one
+roughly 19-hour weather episode, four decision windows on two decision dates, one
+observation proxy (KMIC), and lead coverage dominated by hours 1–18 (N 24 / 39 / 2).
+Under the policy: 1–6 fails sample count, dates and concentration; 7–18 has 39 samples
+but two dates, 69% from one date and an interval of −2.4 to +5.2 K; 19–36 has two
+samples. St. Paul (45 samples, one decision date, KSTP) fails every bucket. Both are
+`insufficient_evidence`; the correct action is continued forward accumulation.
 
 ## 7. Representative benchmark and admission
 

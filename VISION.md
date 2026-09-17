@@ -381,6 +381,31 @@ the original numerical baseline as a separate comparison. AI must not receive cr
 for corrections that ordinary statistical methods can make. Missing evidence remains
 missing; neither tiny demonstrations nor unmatched samples establish forecast skill.
 
+Two owner-approved policies govern that learning (details in the
+[RFC](docs/rfcs/mesoforge-v2-architecture.md)):
+
+- **Decision window** (`mesoforge-decision-window-policy.v1`): the first successful
+  eligible issuance for a scheduled decision window is the canonical operational
+  forecast. An identical reissue is preserved and collapses analytically; a materially
+  different reissue is preserved as an alternate and never silently replaces the
+  primary. Older versions whose operational role cannot be determined stay ambiguous,
+  and immutable history is never rewritten. Scheduled runs will eventually carry an
+  explicit `decision_window_id` and primary/reissue role.
+- **Evidence before correction** (`mesoforge-bias-evidence-policy.v1`): a deterministic
+  temperature-bias correction may be *proposed* only per lead bucket (1–6, 7–18,
+  19–36 h), from at least 30 canonical verified samples on at least 10 distinct
+  decision dates, spanning several forecast episodes rather than one weather event,
+  with the uncertainty of the mean bias reported and no proposal from sparse,
+  concentrated or inconsistent evidence. These are initial governance thresholds, not
+  claims of statistical sufficiency.
+
+A satisfied evidence policy never activates a correction. The lifecycle is: verified
+historical evidence → deterministic candidate correction → shadow correction on future
+forecasts → identical-sample verification against the unchanged baseline → human,
+versioned promotion only if improvement is demonstrated, judged on at least MAE and
+RMSE rather than mean bias alone. Current history (65 Minneapolis samples from one
+roughly 19-hour episode and one station) is `insufficient_evidence`.
+
 ## Essential boundaries
 
 - Numerical fields and deterministic edits must be reproducible for fixed retained

@@ -550,9 +550,11 @@ the stored facts into canonical samples and describes temperature error by lead,
 day/night and station; it applies no correction and currently reports
 `insufficient_evidence`. New facts also carry [compact analytical attributes](#compact-analytical-attributes-on-new-facts)
 so that analysis scales without opening each multi-megabyte evidence payload, while
-older facts stay readable without migration. Next proposed step: keep accumulating forward verification
-history across leads, times of day and weather, then a read-only candidate
-correction proposal once an approved evidence policy exists. Presentation polish
+older facts stay readable without migration. Two owner-approved policies now govern
+future learning: [which issuance represents a decision window and what evidence a
+correction proposal needs](#decision-window-and-evidence-policies). Next proposed
+step: simply keep accumulating forward verification history across days, leads and
+weather; no lead bucket is close to the evidence policy. Presentation polish
 waits unless a concrete missing capability blocks use. Visibility/fog still needs
 separate causal evidence and policy.
 
@@ -2707,9 +2709,10 @@ accounting (a station is a proxy for, not identical to, the coordinate); and reg
 *readiness* — which saved forecast dimensions (sky, wind, dew point/RH, precipitation,
 p-type, thunder, model spread) are reconstructable per sample, as availability and
 ranges only. Metrics are labelled `descriptive_only` or `no_samples`.
-`correction_readiness.status` is `insufficient_evidence` with `evidence_policy: null`:
-no approved policy defines the sample size, lead coverage, period or independence
-needed to evaluate a candidate correction, so the report lists the observed evidence
+`correction_readiness` evaluates each lead bucket against the
+[evidence policy](#decision-window-and-evidence-policies) (when this section's first
+results were produced no policy existed and it reported `evidence_policy: null`). It
+lists the observed evidence
 and what it does **not** conclude (persistent site bias, lead-dependent correction,
 regime bias, preferred model, recommended adjustment) and invents no threshold.
 
@@ -2763,8 +2766,8 @@ python -B -m pytest tests/integration/application/test_forward_run.py tests/inte
 ```
 
 Limitations: temperature only; regime context is read from the canonical version
-only; and no evidence policy exists yet, so nothing here can graduate beyond
-descriptive.
+only; and the current history is far from meeting the evidence policy, so nothing
+here graduates beyond descriptive.
 
 #### Compact analytical attributes on new facts
 
@@ -2838,6 +2841,50 @@ Remaining limitations: the 26 facts saved before this change keep needing payloa
 reads (by design, no backfill); the saved cloud fraction is null in plain forward-run
 issuances, so sky context is available only where the richer issuance path saved it;
 and forward `verify()` itself still reads full issuance payloads.
+
+#### Decision-window and evidence policies
+
+Two owner-approved policies are recorded (full text in RFC §6.7.14). Neither changes a
+forecast, a stored issuance or a fact, and **no correction is calculated or applied**.
+
+- **`mesoforge-decision-window-policy.v1`.** The first successful eligible issuance
+  for a scheduled decision window is its canonical operational forecast. An identical
+  reissue is preserved and collapses analytically; a materially different reissue is
+  preserved as an alternate and never silently replaces the primary; older versions
+  whose role cannot be determined stay ambiguous. Today a window is the coordinate and
+  `target_reference_time`, and the forward run already refuses a second version unless
+  `--reissue` is given. The smallest future addition, to arrive with scheduling and not
+  before, is three nullable issuance-header fields: `decision_window_id`,
+  `issuance_role` (`primary` | `reissue`) and `reissue_of`.
+- **`mesoforge-bias-evidence-policy.v1`.** A deterministic temperature-bias correction
+  may be *proposed for shadow evaluation* only per lead bucket (1–6, 7–18, 19–36 h,
+  never pooled), from canonical samples only, with at least **30 samples** on at least
+  **10 distinct decision dates** (UTC date of the target reference time), no more than
+  **25% of the samples from one date** (the v1 proxy, with the ten dates, for spanning
+  several weather episodes), and a reported date-clustered 95% interval of the mean bias
+  that **excludes zero**. These are initial governance thresholds, not claims of
+  statistical sufficiency. There are no regime thresholds.
+- **Lifecycle.** Verified evidence → deterministic candidate correction → shadow
+  correction on future forecasts → identical-sample verification against the unchanged
+  baseline → human, versioned promotion only if improvement is shown on at least MAE
+  and RMSE. The later AI desk is judged against the bias-corrected baseline.
+
+The analysis (policy `mesoforge-site-verification-analysis.v2`) reports each criterion's
+required and observed value per bucket and keeps `candidate_correction` null. Real
+evaluation on September 17, 2026:
+
+| Minneapolis bucket | N | Decision dates (windows) | Largest date share | 95% interval of mean bias | Result |
+| --- | --- | --- | --- | --- | --- |
+| 1–6 h | 24 | 2 (4) | 75% | +1.13 to +1.82 K | insufficient: samples, dates, concentration |
+| 7–18 h | 39 | 2 (4) | 69% | −2.37 to +5.25 K | insufficient: dates, concentration, interval includes zero |
+| 19–36 h | 2 | 1 (1) | 100% | not computable | insufficient: every criterion |
+
+Thirty-nine samples alone do not satisfy the policy. All 65 samples come from one
+roughly 19-hour episode and one station (KMIC). St. Paul (45 samples, one decision
+date, KSTP) fails every bucket. Both coordinates are `insufficient_evidence`; the right
+next action is continued forward accumulation. Repeated runs were identical outside the
+`evaluation` block and changed no row or object; 37 site-analysis unit tests, Ruff,
+mypy, import contracts and the documentation/hygiene checks passed.
 
 ### Local surface baseline grid
 

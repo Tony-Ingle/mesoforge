@@ -357,35 +357,166 @@ def test_unusable_facts_are_excluded_with_reasons_and_never_counted():
     assert result["overall"]["n"] == 1
 
 
-def test_correction_readiness_stays_insufficient_without_an_approved_policy():
-    tiny = analyze_facts([fact()])["correction_readiness"]
-    assert tiny["status"] == "insufficient_evidence"
-    assert tiny["evidence_policy"] is None
-    assert tiny["observed_evidence"]["canonical_samples"] == 1
-    assert tiny["observed_evidence"]["empty_lead_buckets"] == ["7-18", "19-36"]
-    assert "recommended_adjustment" in tiny["not_concluded"]
+DAY = datetime(2026, 10, 1, 12, tzinfo=UTC)
 
-    # Many samples across all leads still do not invent a threshold.
-    many = [
-        fact(
-            version=f"00000000-0000-0000-0000-{day:06d}{horizon:06d}",
-            artifact=f"art_{day}_{horizon}",
-            target=TARGET + timedelta(days=day),
-            horizon=horizon,
-            forecast=290.0 + (horizon % 5) * 0.3,
-            observed=290.0,
-        )
-        for day in range(30)
-        for horizon in range(1, 37)
-    ]
-    large = analyze_facts(many)
-    assert large["overall"]["n"] == 1080
-    assert all(large["lead_buckets"][bucket]["n"] > 0 for bucket in ("1-6", "7-18", "19-36"))
-    readiness = large["correction_readiness"]
+
+def history(errors_by_target: dict[datetime, float], horizons: range) -> list[dict[str, Any]]:
+    """One version per target; every horizon of a target shares that target's error."""
+    rows = []
+    for number, (target, error) in enumerate(sorted(errors_by_target.items())):
+        for horizon in horizons:
+            rows.append(
+                fact(
+                    version=f"00000000-0000-0000-0000-{number:012d}",
+                    artifact=f"art_{number}_{horizon}",
+                    target=target,
+                    horizon=horizon,
+                    forecast=290.0 + error,
+                    observed=290.0,
+                )
+            )
+    return rows
+
+
+def test_tiny_history_fails_every_evidence_criterion():
+    readiness = analyze_facts([fact()])["correction_readiness"]
     assert readiness["status"] == "insufficient_evidence"
-    assert readiness["observed_evidence"]["empty_lead_buckets"] == []
-    assert large["overall"]["evidence"] == "descriptive_only"
-    assert "candidate_pattern_evaluable" in site_analysis.ANALYSIS_POLICY["evidence_states"]
+    assert readiness["evidence_policy"] == "mesoforge-bias-evidence-policy.v1"
+    assert readiness["correction_ready_lead_buckets"] == []
+    assert readiness["candidate_correction"] is None
+    assert readiness["observed_evidence"]["canonical_samples"] == 1
+    assert readiness["observed_evidence"]["empty_lead_buckets"] == ["7-18", "19-36"]
+    assert "recommended_adjustment" in readiness["not_concluded"]
+    bucket = readiness["lead_buckets"]["1-6"]
+    assert bucket["status"] == "insufficient_evidence"
+    assert bucket["unmet_criteria"] == [
+        "min_canonical_samples",
+        "min_distinct_decision_dates",
+        "max_share_from_one_decision_date",
+        "bias_interval_excludes_zero",
+    ]
+    assert bucket["mean_bias_uncertainty"] is None  # one decision date: no interval
+    empty = readiness["lead_buckets"]["19-36"]
+    assert empty["canonical_samples"] == 0 and empty["mean_bias_k"] is None
+    assert empty["criteria"]["max_share_from_one_decision_date"]["observed"] is None
+
+
+def test_sample_count_alone_never_satisfies_the_policy():
+    # Like the real Minneapolis 7-18 bucket: plenty of samples from one short episode.
+    targets = {
+        datetime(2026, 9, 16, 22, tzinfo=UTC): 1.3,
+        datetime(2026, 9, 17, 2, tzinfo=UTC): 1.2,
+        datetime(2026, 9, 17, 3, tzinfo=UTC): 1.4,
+        datetime(2026, 9, 17, 4, tzinfo=UTC): 1.5,
+    }
+    readiness = analyze_facts(history(targets, range(7, 19)))["correction_readiness"]
+    bucket = readiness["lead_buckets"]["7-18"]
+    assert bucket["canonical_samples"] == 48
+    assert bucket["criteria"]["min_canonical_samples"]["met"] is True
+    assert bucket["distinct_decision_windows"] == 4
+    assert bucket["distinct_decision_dates"] == 2
+    assert bucket["criteria"]["min_distinct_decision_dates"] == {
+        "required": 10,
+        "observed": 2,
+        "met": False,
+    }
+    assert bucket["criteria"]["max_share_from_one_decision_date"]["observed"] == 0.75
+    assert bucket["status"] == "insufficient_evidence"
+    assert readiness["status"] == "insufficient_evidence"
+    assert readiness["correction_ready_lead_buckets"] == []
+
+
+def test_a_bucket_meeting_every_criterion_is_ready_only_for_a_shadow_proposal():
+    targets = {DAY + timedelta(days=day): 1.0 + 0.05 * (day % 3) for day in range(12)}
+    result = analyze_facts(history(targets, range(1, 7)))
+    readiness = result["correction_readiness"]
+    bucket = readiness["lead_buckets"]["1-6"]
+    assert bucket["status"] == "evidence_policy_met" and bucket["unmet_criteria"] == []
+    assert bucket["canonical_samples"] == 72 and bucket["distinct_decision_dates"] == 12
+    assert bucket["criteria"]["max_share_from_one_decision_date"]["observed"] == pytest.approx(
+        1 / 12
+    )
+    low, high = bucket["mean_bias_uncertainty"]["interval_95_k"]
+    assert 0 < low < bucket["mean_bias_k"] < high
+    assert readiness["status"] == "evidence_policy_met_for_some_lead_buckets"
+    assert readiness["correction_ready_lead_buckets"] == ["1-6"]
+    # Other buckets are judged on their own samples; nothing is extrapolated to them.
+    assert readiness["lead_buckets"]["7-18"]["status"] == "insufficient_evidence"
+    assert readiness["lead_buckets"]["19-36"]["canonical_samples"] == 0
+    # Meeting the policy computes and activates nothing.
+    assert readiness["candidate_correction"] is None
+    assert "recommended_adjustment" in readiness["not_concluded"]
+    assert result["overall"]["evidence"] == "descriptive_only"
+    assert "Promotion must weigh at least MAE" in site_analysis.EVIDENCE_POLICY["promotion"]
+    assert site_analysis.EVIDENCE_POLICY["lifecycle"][2] == "shadow correction on future forecasts"
+
+
+def test_concentrated_evidence_is_refused_even_with_enough_samples_and_dates():
+    targets = {DAY + timedelta(hours=hour): 1.0 for hour in range(8)}  # one busy date
+    targets.update({DAY + timedelta(days=day): 1.1 for day in range(1, 10)})
+    bucket = analyze_facts(history(targets, range(1, 7)))["correction_readiness"]["lead_buckets"][
+        "1-6"
+    ]
+    assert bucket["canonical_samples"] == 102 and bucket["distinct_decision_dates"] == 10
+    assert bucket["distinct_decision_windows"] == 17
+    assert bucket["criteria"]["max_share_from_one_decision_date"]["observed"] == pytest.approx(
+        48 / 102
+    )
+    assert bucket["unmet_criteria"] == ["max_share_from_one_decision_date"]
+    assert bucket["status"] == "insufficient_evidence"
+
+
+def test_inconsistent_evidence_is_refused_and_its_uncertainty_is_reported():
+    targets = {DAY + timedelta(days=day): (1.0 if day % 2 else -1.0) for day in range(12)}
+    bucket = analyze_facts(history(targets, range(1, 7)))["correction_readiness"]["lead_buckets"][
+        "1-6"
+    ]
+    assert bucket["unmet_criteria"] == ["bias_interval_excludes_zero"]
+    low, high = bucket["mean_bias_uncertainty"]["interval_95_k"]
+    assert low < 0 < high
+    assert bucket["criteria"]["bias_interval_excludes_zero"]["observed"] is False
+
+
+def test_mean_bias_uncertainty_is_clustered_by_decision_date():
+    # Date means 1.0 and 3.0: centre 2.0, sd sqrt(2), standard error 1.0, t(1) = 12.706.
+    targets = {DAY: 1.0, DAY + timedelta(hours=1): 1.0, DAY + timedelta(days=1): 3.0}
+    bucket = site_analysis.evaluate_evidence(
+        analyze_facts(history(targets, range(1, 3)))["samples"]
+    )
+    uncertainty = bucket["mean_bias_uncertainty"]
+    assert uncertainty["method"] == "decision_date_means_student_t_95"
+    assert uncertainty["decision_dates"] == 2
+    assert uncertainty["mean_of_decision_date_means_k"] == pytest.approx(2.0)
+    assert uncertainty["standard_error_k"] == pytest.approx(1.0)
+    assert uncertainty["t_multiplier"] == 12.706
+    assert uncertainty["interval_95_k"] == pytest.approx([2.0 - 12.706, 2.0 + 12.706])
+    # The plain sample mean is reported separately: four samples at 1.0, two at 3.0.
+    assert bucket["mean_bias_k"] == pytest.approx((4 * 1.0 + 2 * 3.0) / 6)
+    assert site_analysis._t975(9) == 2.262
+    assert site_analysis._t975(30) == 2.042
+    assert site_analysis._t975(45) == 2.040 and site_analysis._t975(200) == 2.000
+
+
+def test_policies_are_versioned_and_state_their_limits():
+    evidence = site_analysis.EVIDENCE_POLICY
+    assert evidence["id"] == "mesoforge-bias-evidence-policy.v1"
+    assert evidence["criteria"] == {
+        "min_canonical_samples": 30,
+        "min_distinct_decision_dates": 10,
+        "max_share_from_one_decision_date": 0.25,
+        "bias_interval_excludes_zero": True,
+    }
+    assert evidence["lead_buckets"] == ["1-6", "7-18", "19-36"]
+    assert "not a claim" in evidence["purpose"]
+    assert evidence["lifecycle"][0] == "verified historical evidence"
+    assert "bias-corrected baseline" in evidence["ai_desk"]
+    window = site_analysis.DECISION_WINDOW_POLICY
+    assert window["id"] == "mesoforge-decision-window-policy.v1"
+    assert "first successful eligible issuance" in window["primary"]
+    assert "never silently replaces" in window["different_reissue"]
+    assert set(window["future_metadata"]) == {"decision_window_id", "issuance_role", "reissue_of"}
+    assert site_analysis.ANALYSIS_POLICY["id"] == "mesoforge-site-verification-analysis.v2"
+    assert "evidence_policy_met" in site_analysis.ANALYSIS_POLICY["evidence_states"]
 
 
 def test_regime_readiness_reports_availability_without_splits():

@@ -33,6 +33,8 @@ from mesoforge.verification.analytical_attributes import (
 from mesoforge.verification.site_analysis import (
     ANALYSIS_POLICY,
     CANONICALIZATION_POLICY,
+    DECISION_WINDOW_POLICY,
+    EVIDENCE_POLICY,
     SCHEMA_VERSION,
     analyze_facts,
 )
@@ -185,6 +187,8 @@ def analyze_site_verification(
         "schema_version": SCHEMA_VERSION,
         "analysis_policy": ANALYSIS_POLICY,
         "canonicalization_policy": CANONICALIZATION_POLICY,
+        "decision_window_policy": DECISION_WINDOW_POLICY,
+        "evidence_policy": EVIDENCE_POLICY,
         "coordinate": {"latitude": latitude, "longitude": longitude},
         "evaluation": {
             "evaluated_at": evaluated_at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
