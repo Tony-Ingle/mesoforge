@@ -108,6 +108,20 @@ Registration services and delivery also remain future work. The retained Phase 2
 baseline has HRRR/NBM/GFS, QPF and PoP support; its defaults and technical references
 remain intact. Existing `_v2` names describe Phase 2 contracts.
 
+**How to read the current policies.** The long-term rule is that *the blend is the
+forecast*: one coherent MesoForge grid from field-specific blends, with every model
+kept as contributor evidence rather than offered as a competing forecast
+([VISION.md](VISION.md#north-star-the-blend-is-the-forecast)). The fixed HRRR/GFS
+weights, the NBM-only PoP/sky/thunder sources, the HRRR/GFS p-type agreement rule and
+the zero-weight RAP/IFS shadows described above are today's scaffolding for that
+blend, not its final form, and they stay in force until explicitly replaced. Likewise,
+a forward run currently discovers, downloads and prepares guidance inline before it
+can issue (about 11–13 minutes locally, and within one UTC clock hour). The intended
+operation is a background guidance refresh that publishes a latest complete prepared
+snapshot which ad-hoc and scheduled forecasts consume without waiting; that split is
+the [proposed next milestone](docs/rfcs/mesoforge-v2-architecture.md#56-background-guidance-refresh-and-the-latest-complete-prepared-snapshot)
+and is not implemented.
+
 Future direction: add bounded spatial editing to the coherent context/editable baseline.
 Versioned deterministic tools would validate bounded GFE-style AI edit recipes, keeping
 numerical, bias-corrected and final fields separate before exact-point interpolation.

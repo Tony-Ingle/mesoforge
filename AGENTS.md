@@ -25,6 +25,28 @@ measure AI's added value against the bias-corrected baseline on identical sample
 Site knowledge must be versioned and inspectable, not assumed LLM memory.
 The local surface baseline now uses one grid with context and smaller editable
 domains; bias correction and AI editing are not implemented yet.
+
+Forecast philosophy guardrails ([VISION.md](VISION.md#north-star-the-blend-is-the-forecast)):
+
+1. The final forecast is the MesoForge field-specific blend and its later stages.
+   There is no universal weight set; each field keeps mathematics valid for it
+   (vector winds, interval QPF, real probabilistic PoP, categorical p-type support).
+2. Models are contributor evidence, provenance and context, preserved beside the
+   blend even at zero weight. Never present or select one model as "the forecast."
+3. Future AI edits the MesoForge grid through bounded, interpretable field edits made
+   after deterministic site correction; it does not choose a model. Contributors may
+   be cited as the evidence for an edit.
+4. Slow model discovery, acquisition and preparation should not ultimately live inside
+   an ordinary forecast request. The intended shape is a background refresh publishing
+   an atomic latest-complete prepared snapshot that forecasts consume. An external
+   scheduler decides when MesoForge runs, never what a run means; keep weather science
+   out of workflow YAML. Source cycles need not match the issuance hour, only precede
+   the issuance's information cutoff.
+5. This direction is not permission to implement future stages. Current fixed weights,
+   NBM-only sources, the HRRR/GFS p-type agreement rule and zero-weight shadows are
+   approved scaffolding: do not change them, add dynamic weighting, snapshots,
+   corrections or AI editing unless the owner's current task asks for it.
+
 This direction does not authorize future stages during unrelated tasks or settle
 unapproved domain dimensions, grid spacing, tapering or storage choices.
 

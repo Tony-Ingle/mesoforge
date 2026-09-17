@@ -32,6 +32,19 @@ and bounded AI tool recipes may later adjust those fields, and interpolation at 
 exact coordinate produces the delivered spot forecast. A point-value blending API
 is an early capability, not the complete product architecture.
 
+**Owner direction clarified, 2026-09-17 — the blend is the forecast.** The canonical
+pipeline is: native contributors (HRRR, RAP, GFS, IFS, NBM, ensembles) →
+field-specific blends → MesoForge baseline grid → deterministic site learning → an AI
+desk that sees the baseline, every contributor and the surrounding context → bounded
+spatial/temporal field edits → final MesoForge grid → spot forecast. Individual models
+are contributors, evidence, provenance and context, never competing final forecasts
+and never a "selected model." Section 5.5 describes the field-specific blend layer;
+section 5.6 separates the slow background guidance refresh from forecast requests.
+[VISION.md](../../VISION.md#north-star-the-blend-is-the-forecast) holds the
+owner-facing statement. This clarifies direction; current fixed weights and
+single-source rules remain in force as implementation scaffolding, and no future
+stage is approved by this text.
+
 The selective rebuild reuses scientific kernels and infrastructure whose contracts
 remain valid, ports cohesive donor algorithms with independent tests, and replaces
 obsolete Phase 3 product architecture. The `main` baseline and donor revisions above
@@ -93,8 +106,9 @@ clouds, QPF, PoP, precipitation type, snow, and other useful fields as their
 scientific contracts are implemented. Conditions derive from underlying forecast
 fields rather than an unexplained standalone prediction. The code-grounded canvas
 inventory and deterministic condition layer are in section 6.7. The read-only
-saved-grid preview and initial presentation rules are implemented; the next proposed
-slice is bounded multi-hour transition detection, not another meteorological field.
+saved-grid preview, initial presentation rules, multi-hour transition detection and
+period summaries are implemented. The next proposed slice is the reusable
+latest-complete prepared snapshot of section 5.6, not another meteorological field.
 
 **Owner model direction, 2026-09-10:** the long-term model mix includes HRRR,
 RAP, NAM 3 km, NAM, GFS, RRFS / REFS, and NBM, with useful deterministic and
@@ -231,11 +245,14 @@ available guidance, and scientific suitability still bound what can be supported
 
 The API and persistent forecast data belong on a VPS. A GitHub Actions workflow
 can read the configurable coordinate collection and invoke processing sequentially
-or in bounded batches. Acquisition/preparation stays outside forecast HTTP requests
-and produces shared guidance reusable across nearby coordinates, not per-location
-downloads. Section 6.6 describes the intended location lifecycle, including later
-AI and delivery stages. This direction does not implement or approve a combined
-Actions, registration, verification, AI, and delivery milestone.
+or in bounded batches. The orchestrator decides **when** MesoForge is invoked;
+MesoForge owns **what** a forecast run means. Model discovery, blending and weather
+science never move into workflow YAML. Acquisition/preparation stays outside forecast
+HTTP requests and produces shared guidance reusable across nearby coordinates, not
+per-location downloads; section 5.6 describes the intended background refresh.
+Section 6.6 describes the intended location lifecycle, including later AI and
+delivery stages. This direction does not implement or approve a combined Actions,
+registration, verification, AI, and delivery milestone.
 
 ## 3. Terminology
 
@@ -337,8 +354,12 @@ does not implement the broader availability-and-ingestion cutoff design below.
   coordinate and horizon; preserve its temperature and all unrelated fields, sources,
   coordinates, and horizons. QPF is nonnegative with exact interval bounds. QPF does not
   synthesize PoP; missing accumulation is not zero.
-- **Baseline blend:** contributor set and lead band select a reviewed versioned weight row.
-  Fallback is explicit/degraded; weights are not invented or silently renormalized.
+- **Baseline blend:** the delivered forecast is the MesoForge field-specific blend and
+  its later stages, never one selected model. Each field's policy is versioned and
+  uses mathematics valid for that field (section 5.5). Today contributor set and lead
+  band select a reviewed versioned weight row. Fallback is explicit/degraded; weights
+  are not invented or silently renormalized. Every contributor's values stay retained
+  beside the blend whether or not they carry active weight.
 - **Deterministic editing:** AI proposes bounded tool recipes, never unrestricted grid
   writes or unchecked numerical publication. Versioned deterministic execution and
   validation enforce physical consistency, approved bounds, spatial/temporal continuity,
@@ -363,9 +384,13 @@ workers     -> application services -> scientific/domain contracts
 application services -> storage interfaces
 storage adapters      -> storage interfaces + contracts
 
+Future guidance path (background, independent of requests):
+new cycles -> discover/acquire/decode/prepare -> validate -> atomic latest-complete snapshot
+
 Future configured-location path:
-shared guidance -> local grid baseline -> deterministic bias correction
-bias-corrected fields + context/evidence -> AI tool recipe
+latest-complete snapshot -> field-specific blends -> local grid baseline
+local grid baseline -> deterministic bias correction
+bias-corrected fields + every contributor + context/evidence -> AI tool recipe
 saved recipe + corrected fields -> deterministic tools/validation -> final fields
 final fields -> exact-coordinate interpolation -> immutable spot forecast/delivery
 learning    -> immutable forecast/verification query contracts
@@ -440,7 +465,11 @@ or temporal taper, value anchor with surrounding blending, artifact smoothing, s
 or retiming a precipitation feature, adjusting a freezing-line/rain-snow transition,
 removing unsupported isolated trace QPF, and modifying a coherent region while preserving
 continuity at its boundary. These are examples for later design, not implemented tools
-or approved numerical algorithms.
+or approved numerical algorithms. Every operation edits MesoForge's own blended field.
+When HRRR/RAP support heavier QPF than GFS/IFS, the recipe is "raise the MesoForge QPF
+field toward the stronger solution over this region and time window," with those
+contributors cited as evidence; "use HRRR instead of GFS" is not an operation, and a
+recipe never stores a global model-selection decision.
 
 Deterministic versioned tools execute retained recipes against the identified corrected
 forecast. Validation checks physical and cross-field consistency, parameter/value bounds,
@@ -448,6 +477,127 @@ continuity, cutoff eligibility and the editable domain before any result can be 
 Invalid proposals retain an explicit rejection reason; a permitted fallback to unchanged
 corrected fields must be recorded. Human approval governs tool/policy development and
 release, not each normal configured forecast. The AI cannot bypass that policy.
+
+### 5.5 Field-specific blend layer
+
+**Owner direction, 2026-09-17; conceptual, not an approved algorithm.** The MesoForge
+baseline grid is produced by one blend policy *per field*. A policy is a named,
+versioned object that states its eligible contributors, the mathematics valid for
+that field, its missingness/fallback behavior and the evidence that justified it.
+There is no universal weight vector.
+
+| Field family | Blend mathematics the policy must respect |
+|---|---|
+| Scalars (temperature, dew point, cloud fraction, visibility, …) | Weighted numerical blending after unit normalization; cross-field consistency (for example dew point ≤ temperature) still applies |
+| Wind | Blend earth-relative U/V components, then derive speed/direction; never average direction degrees; gust stays coupled to its contributor set |
+| QPF, SWE, snowfall, ice amounts | Blend only amounts with identical exact accumulation intervals; preserve interval semantics and native definitions (snow versus snow-and-sleet, liquid versus flat ice) |
+| PoP, thunder and other probabilities | Combine/calibrate real probabilistic guidance for one identical event (threshold, period, spatial support); never infer probability from deterministic QPF |
+| Precipitation type | Weighted categorical/probabilistic support for rain, snow, freezing rain, sleet and mixed states across all suitable sources, replacing the interim requirement that two particular deterministic models agree |
+| Derived fields (RH, speed/direction, sky category, Kuchera) | Derived from the blended parents by a versioned method, not blended independently |
+
+**Dynamic-weight inputs (conceptual).** A policy may eventually let weights depend on
+field, forecast lead, which contributors are actually available, the age/freshness of
+each available cycle, verified historical skill of each contributor for that field,
+site-specific performance and, later, weather regime. Freshness is one input, never
+the sole decision: a newer cycle does not automatically outweigh a better-verifying
+model. This RFC defines no equations, multipliers or default values; each must come
+from suitable verification evidence through a separately approved, versioned policy,
+following the existing shadow → evaluated → active lifecycle.
+
+**Contributor preservation.** Whatever the weights, an issuance retains every
+contributor's field values, cycle, lead, units, missingness and provenance beside the
+blend, including zero-weight contributors. Verification must be able to answer: what
+did the baseline say, what did each contributor say, what did deterministic
+correction change, what did the AI change, and did the AI improve the forecast?
+
+**Stage order.** Native contributors → field-specific baseline blend → deterministic
+verified site/regime correction → AI forecast-desk adjustment → final grid →
+verification. Persistent statistical bias is removed by the deterministic correction
+first, so the AI is judged against the bias-corrected baseline and earns no credit
+for rediscovering a mean bias (section 11).
+
+**Current scaffolding (inspected at `aedbde2`).** The implemented policies are fixed
+and remain in force; none of them is the final philosophy:
+
+| Field | Current representation | Where it lives |
+|---|---|---|
+| Temperature | Named recipe `temperature_control_v1`, HRRR/GFS 70/30, `require_all`; issuance refuses any other control recipe | `forecasting/recipes.py`, `validate_current_control` in `application/batch_forecast.py` |
+| Dew point, U/V, gust, QPF | Retained Phase 2 fallback tables keyed by available-model set and lead band (70/30 h1–18, 60/40 h19–36); active set and table column order are constants | `blend_configuration` in `configs/phase2-grasston.yaml`, `forecasting/surface.py` |
+| PoP, sky, thunder | Temporary single-source NBM passthrough policies with weight 1 and no substitute | `pop_policy` in the same configuration; policy constants in `forecasting/cloud_cover.py` and `forecasting/thunder.py` |
+| Precipitation type | Temporary HRRR/GFS categorical agreement rule | `application/precipitation_type.py` |
+| Visibility, SWE, snowfall, Kuchera, ice | Evidence only; "no approved policy" placeholders with a null active value | the corresponding `application/*` and `forecasting/*` modules |
+| RAP, IFS, other NBM/GEFS/REFS/ECMWF products | Zero-weight shadows/evidence | contributor registry and attachments |
+
+Weights therefore exist in three unrelated shapes (a named recipe, configuration
+tables, and per-module policy constants). Converging them into one field-policy
+abstraction is future work and is not required before section 5.6. The saved grid
+already stores, for every cell and hour, both the blended `fields` and the
+per-contributor evidence, so a more general blend changes the column calculation and
+its policy identity, not the grid representation.
+
+### 5.6 Background guidance refresh and the latest complete prepared snapshot
+
+**Owner direction, 2026-09-17; proposed design.** Model acquisition/preparation and
+forecast generation are separate activities with separate clocks.
+
+```text
+BACKGROUND GUIDANCE REFRESH
+new model cycles become available
+  -> discover / acquire / decode / prepare
+  -> validate completeness and provenance
+  -> build/update shared prepared guidance
+  -> publish an atomic `latest complete` prepared snapshot
+  -> retain the previous good snapshot until the replacement is complete
+
+AD-HOC FORECAST
+lat/lon request
+  -> use the newest complete prepared snapshot already available
+  -> construct/read the local MesoForge baseline grid
+  -> later: deterministic correction + AI desk
+  -> return forecast
+```
+
+- The refresh is slow and never runs inside a forecast request. A request never waits
+  for GRIB downloads or for the next clock-hour decision window; with no usable
+  snapshot it reports that state honestly instead of acquiring guidance.
+- A snapshot is immutable once published. Publication is one atomic pointer change
+  made only after every required input passed validation; a failed or partial refresh
+  leaves the previous good snapshot current. Still-publishing provider cycles are
+  incomplete candidates: the refresh falls back to the newest complete cycle and
+  records the rejected candidate as evidence.
+- A snapshot records its own information cutoff, each contributor's cycle, provider
+  availability and acquisition times, and the valid-time range it can serve.
+  Contributing cycles are not required to match one another or the issuance/reference
+  hour: an issuance at 17:37 local time may use HRRR 18Z, RAP 21Z, GFS 18Z and IFS 12Z
+  if those are the newest complete eligible inputs. The rule is that every input used
+  was legitimately available before that issuance's information cutoff. Issuance time,
+  source cycles and source availability stay separately recorded facts.
+- Issued/scheduled forecasts use the same snapshot. An external orchestrator such as
+  GitHub Actions decides when to invoke issuance and delivery; MesoForge decides what
+  the run means (section 2.3). The decision-window policy of section 6.7.14 continues
+  to define the canonical scheduled forecast.
+- Snapshot cadence, how long a snapshot may serve, retention of superseded snapshots
+  and the storage location of the pointer are open (section 17).
+
+**Current implementation versus this design (inspected at `aedbde2`).**
+`forward_run` performs verification, discovery (`select_model_set`), acquisition and
+preparation (`prepare_selected`, NBM PoP) and issuance (`run_batch`) in one locked
+invocation; the 2026-09-17 demonstration needed about 13 minutes before it could
+issue. Reusable pieces already exist: preparation retains complete native messages
+and writes `manifest.json` only through an atomic rename after all four models pass;
+`preparation.json` describes a finished prepared run and its attachments;
+`load_prepared`, `run_batch --data-dir` and `prepare_local_grids` consume such a run
+with no network access; `ensure_coverage` cuts views for new coordinates from the
+retained raw messages without reacquiring a cycle. What is missing is the published
+pointer, a refresh command separate from issuance, automatic inclusion of the
+p-type/cloud/thunder attachments that are still explicit manual steps, and a fallback
+in NBM selection, which currently stops at a still-publishing newest cycle instead of
+trying the next older one. The concrete constraint is temporal: a selection and its
+prepared window are bound to the decision clock hour (`target_reference_time` is the
+decision hour, hours 1–36 follow it, the selection expires at the first valid hour and
+issuance refuses a first valid time in the past), so a prepared run can serve requests
+only until its hour ends. How a snapshot should serve the following hour is an open
+owner decision, not something this text settles.
 
 ## 6. First-release flows
 
@@ -468,8 +618,10 @@ the API checks region/readiness and a packaging-aware work estimator populated b
 representative benchmark. Unsupported combinations or work beyond measured read, decode,
 memory, output, or timeout bounds receive stable `422`.
 
-The API reads enclosing objects, extracts the point, applies deterministic weights and
-field-specific operators, and returns values, units, contributors/exclusions, freshness,
+The request consumes the newest complete prepared snapshot (section 5.6) and never
+waits for acquisition or for a clock-hour decision window. The API reads enclosing
+objects, extracts the point, applies the field-specific blend policies (section 5.5),
+and returns values, units, contributors/exclusions, freshness,
 cutoff, missingness, baseline configuration, and compact lineage. It does not persist
 registered history. The benchmark may support every required field across 36 horizons or
 only measured subsets; the advertised matrix follows evidence.
@@ -537,16 +689,18 @@ retention precede the per-location work. For each configured/registered location
    using the version originally issued and the applicable time, quality, spatial
    support, and cutoff rules. Record unavailable verification explicitly and
    proceed with the new forecast when no suitable observation is available.
-3. Regrid and blend ready shared guidance into coherent local MesoForge fields using
-   deterministic scientific operators. Save the original numerical baseline and its
+3. Regrid and blend the newest complete prepared snapshot (section 5.6) into coherent
+   local MesoForge fields using the field-specific blend policies (section 5.5). Save
+   the original numerical baseline, every contributor's values and the
    source/transform/configuration identity. No acquisition or regional grid preparation
    occurs inside a forecast HTTP request.
 4. Apply approved deterministic site/regime bias correction learned from eligible
    verified history, keeping the corrected fields separate from the original baseline.
    With insufficient history or no approved correction, report that status explicitly.
-5. Let the later AI forecast desk inspect surrounding meteorology, disagreement,
-   eligible observations, verification history and structured site knowledge, then
-   propose a bounded spatial/temporal edit recipe against the corrected fields.
+5. Let the later AI forecast desk inspect the baseline, every contributor field,
+   surrounding meteorology, disagreement, eligible observations, verification history
+   and structured site knowledge, then propose a bounded spatial/temporal edit recipe
+   against the corrected MesoForge fields. It never selects a model as the forecast.
 6. Execute the saved recipe through versioned deterministic tools and validate physical
    and cross-field consistency, bounds, continuity, cutoffs and edit-domain limits.
    Retain the proposal, validation decision and final adjusted fields separately.
@@ -714,6 +868,11 @@ capability is approved or implemented by this design.
 | Longer-period thunder / other lightning products | E or U; no combined source policy | Unlike events/periods/support are incompatible; deterministic diagnostics not probabilities | Evidence-only; cannot determine a delivered thunder clause | none |
 | Freezing-rain liquid | E+P; HRRR/RAP FRZR; no active blend | Same-cycle cumulative parent differencing; negative/nonfinite increments missing, not zero; unsupported sources explicit | Evidence-only amount; does not establish occurrence or accreted ice | none |
 | Native flat ice | E+P; NBM FICEAC native 1/6 h; no active blend | Retain kg/m² native meaning; no density/thickness/period conversion; GFS/IFS U | Evidence-only hazard amount; not a road-icing diagnosis or a substitute for p-type | none |
+
+Every **B**, **S** and temporary row above is current scaffolding. Each is expected to
+become a field-specific blend policy under section 5.5, and each **E+P** row needs one
+before its field can be delivered; none changes without separate owner approval and
+suitable verification evidence.
 
 Across every row, original cycles, **model source leads versus target horizons**, valid
 times, interval bounds, field/recipe identities, raw/prepared hashes, spatial extraction,
@@ -1605,9 +1764,12 @@ combined/split for reviewability. The first slice has no dependency on learning,
 accounts, long-term retention, or public SLOs.
 
 The full inspected canvas, including completed p-type and subsequent native evidence,
-is inventoried in section 6.7. Its read-only saved-grid preview and bounded initial
-wording policy are implemented. The next proposed slice is deterministic multi-hour
-transition detection; further rules and field promotion require separate approval.
+is inventoried in section 6.7. Its read-only saved-grid preview, bounded initial
+wording policy, multi-hour transition detection and period summaries are implemented.
+The next proposed slice is separating the background guidance refresh from forecast
+generation through a reusable latest-complete prepared snapshot (section 5.6). It is
+proposed, not approved; further rules, field promotion and dynamic blending require
+separate approval.
 
 File/module/table/code/test/change-size estimates are non-binding planning aids per slice.
 Material overrun triggers review when it reveals changed design, not because of a line
@@ -1674,7 +1836,15 @@ all-in-one proof-harness requirement.
    The approved preparation/station defaults in section 2.3 do not settle these choices.
 5. Retention costs/durations and advertised capability levels.
 6. Private authentication/operator authorization.
-7. Separately later: correction methods/promotion, site-knowledge representation,
+7. Prepared-snapshot operation (section 5.6): refresh cadence, how long a snapshot may
+   serve requests once its first valid hour has passed (shorter remaining horizon,
+   extra prepared leads, or preparing the next hour ahead), whether NBM selection may
+   demote a still-publishing newest cycle and fall back, pointer/storage location and
+   retention of superseded snapshots.
+8. Field-specific blend policies (section 5.5): the per-field mathematics, dynamic
+   weight inputs and their evidence thresholds, and the order in which current
+   scaffolding is replaced. No equation, multiplier or default is approved.
+9. Separately later: correction methods/promotion, site-knowledge representation,
    bounded AI tool algorithms/validation and evaluation policies, delivery, and public
    accounts/privacy/billing/SLOs. The long-term direction does not approve these details.
 
@@ -1714,6 +1884,10 @@ all-in-one proof-harness requirement.
 | First release | Private baseline, registered history, observations/verification, bounded evaluation |
 | Roadmap | Local forecast fields, site/regime bias correction, bounded GFE-style AI tools, delivery and public accounts in separately approved stages |
 | Guidance | Ingest once into shared source cache; derive local MesoForge fields using larger context and smaller editable domains, then interpolate the exact point |
+| Forecast identity | The blend is the forecast: one coherent baseline grid from field-specific blend policies; models are contributors/evidence, preserved beside the blend, never a selected final forecast |
+| Blend weights | Per-field policies with field-valid mathematics; dynamic inputs (lead, availability, freshness, verified skill, site, later regime) are conceptual; current fixed weights and single-source rules are scaffolding |
+| AI edits | Persisted as bounded, interpretable edits to the MesoForge field after deterministic correction; contributors are cited evidence, not selections |
+| Refresh versus request | Background refresh publishes an atomic latest-complete prepared snapshot and keeps the previous good one; ad-hoc and scheduled forecasts consume it; the orchestrator decides when, MesoForge decides what; mixed source cycles are valid when available before the issuance cutoff |
 | Issuance | Immutable baseline, corrected fields, proposal/recipe and final fields when implemented; mutable pointer/status only |
 | Facts | Normalized facts and on-demand evaluation; no Cartesian lattice |
 | Errors | Derive on demand; no first-release `error_facts` |
