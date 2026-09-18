@@ -2787,14 +2787,35 @@ same three pre-existing failures deselected), the forward-run, batch-issuance an
 storage integration tests (71) against pgserver and moto, ruff, mypy, the nine import
 contracts, documentation checks and `git diff --check` passed.
 
-Limitations: the local-grid build (49 columns, about 3.6 s each with the full
-attachment set) is the request-time bottleneck and is not interactive; the refresh
+Limitations: the local-grid build is still the request-time cost and is not
+interactive (see [the optimization below](#local-grid-build-cost)); the refresh
 must still finish inside its decision hour (existing selection expiry); coordinates
 outside the refreshed collection's footprint are refused rather than prepared
 offline; the pointer is a local file, not a shared service; superseded and failed
 snapshot directories are retained without any pruning policy; ad-hoc (non-issued)
 forecasts have no conditions/transitions/period preview because those layers read
 saved issuances only.
+
+#### Local-grid build cost
+
+The snapshot-consuming path reuses one transformer per native CRS instead of
+rebuilding it for every projection and coverage check, and hands the ephemeral grid
+and its freshly built columns to the result instead of copying them a second time.
+Neither changes a forecast value; both are opt-in at the call site, so retained
+grids and callbacks that return shared structures keep the previous copies.
+
+Measured on snapshot `20260918T004459Z-fcb1b488` (Minneapolis, 7x7 nodes, 36 hours,
+all attachments): the local-grid build fell from **178.6 s to 25.4 s (7.0x)** and the
+whole `forecast_from_snapshot` call from 180.8 s to 27.6 s, with 97,021 transformer
+constructions replaced by 6. Two coordinates from one loaded snapshot take 53.7 s and
+still load guidance once. Peak memory fell from 2,592 MB to 2,209 MB. An in-process
+A/B on that snapshot, running both the optimized and the original expressions under
+one code identity, produced **identical full canonical bytes** including
+`local_grid.sha256`.
+
+What remains, per column (0.28 s) and per build: about 14 s in the 49 columns
+(dominated by `copy.deepcopy` over JSON-shaped evidence and per-hour xarray
+`Dataset.__getitem__`) and about 10 s in the required canonical digest of the grid.
 
 ### Read-only site verification analysis
 

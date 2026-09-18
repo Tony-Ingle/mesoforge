@@ -1714,3 +1714,150 @@ def test_qpf_spans_both_domains_and_exact_point_replays_with_provenance(prepared
         assert before["surface"]["contributors"] == after["surface"]["contributors"]
     for original, view in zip(probability_originals, probability_views, strict=True):
         xr.testing.assert_identical(original, view.dataset)
+
+
+def _all_attachment_baseline(prepared_surface):
+    """One baseline carrying every attachment this module can build offline."""
+    datasets = {
+        model: source.copy(deep=True) for model, source in prepared_surface._guidance.items()
+    }
+    manifest = deepcopy(prepared_surface._manifest)
+    manifest["qpf_inputs"] = []
+    for model, dataset in datasets.items():
+        _add_qpf(dataset, [horizon / 10 for horizon in HOURS])
+        metadata = {}
+        for lead_time in dataset.source_lead_time.values:
+            lead = int(lead_time / np.timedelta64(1, "h"))
+            parent = {"model": model, "source_lead_hours": lead, "raw_sha256": "f" * 64}
+            metadata[str(lead)] = {"parents": [parent]}
+            manifest["qpf_inputs"].append({**parent, "messages": [{"raw_sha256": "f" * 64}]})
+        dataset.attrs["qpf_metadata_json"] = json.dumps(metadata)
+    return replace(
+        prepared_surface,
+        _guidance=datasets,
+        _manifest=manifest,
+        _cloud_views=_cloud_views(),
+        _cloud_guidance={"status": "prepared"},
+        _type_views=_type_views(),
+        _type_guidance={"status": "prepared"},
+        _snow_views=[*_snow_views(), *_snow_views("RAP")],
+        _snow_guidance={"status": "prepared"},
+        _snow_amount_views=_amount_views(),
+        _snow_amount_guidance={"status": "prepared"},
+        _pop_views=[_pop_entry(hours=HOURS)],
+        _pop_guidance={"status": "prepared"},
+        _probability_views=_spatial_probability_views(),
+        _visibility_views=_visibility_views(),
+        _visibility_guidance={"status": "prepared"},
+        _thunder_views=_thunder_views(),
+        _thunder_guidance={"status": "prepared"},
+    )
+
+
+def _uncached_transformer(crs):
+    """The pre-optimization expression: a brand-new transformer on every call."""
+    return pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+
+
+def test_shared_transformer_and_owned_columns_reproduce_the_original_bytes_exactly(
+    prepared_surface, monkeypatch
+):
+    """Both legs run under one code identity, so the FULL canonical bytes must match."""
+    from mesoforge.alignment import spatial
+    from mesoforge.application import spatial_coverage
+
+    baseline = _all_attachment_baseline(prepared_surface)
+    constructions = []
+    real_from_crs = pyproj.Transformer.from_crs
+
+    def counting(*args, **kwargs):
+        constructions.append(args[1] if len(args) > 1 else kwargs.get("crs_to"))
+        return real_from_crs(*args, **kwargs)
+
+    monkeypatch.setattr(pyproj.Transformer, "from_crs", staticmethod(counting))
+    results, counts = {}, {}
+    for leg, owned in (("optimized", True), ("original", False)):
+        if leg == "original":
+            monkeypatch.setattr(spatial, "wgs84_to_native_transformer", _uncached_transformer)
+            monkeypatch.setattr(
+                spatial_coverage, "wgs84_to_native_transformer", _uncached_transformer
+            )
+        spatial._WGS84_TO_NATIVE.clear()
+        constructions.clear()
+        with patch("requests.Session", side_effect=AssertionError("No provider calls")):
+            grid = build_local_surface_grid(
+                latitude=LATITUDE,
+                longitude=LONGITUDE,
+                calculate_column=baseline._forecast_column,
+                geometry=TEST_GEOMETRY,
+                columns_owned=owned,
+            )
+            results[leg] = extract_grid_point(
+                grid, latitude=LATITUDE, longitude=LONGITUDE, copy_grid=not owned
+            )
+        counts[leg] = len(constructions)
+
+    assert canonical_json_bytes(results["optimized"]) == canonical_json_bytes(results["original"])
+    # Canonical JSON sorts keys, so pin insertion order separately.
+    assert json.dumps(results["optimized"], allow_nan=False, default=str) == json.dumps(
+        results["original"], allow_nan=False, default=str
+    )
+    assert (
+        results["optimized"]["local_grid"]["sha256"] == results["original"]["local_grid"]["sha256"]
+    )
+    # One transformer per distinct native CRS, plus the grid's own inverse aeqd
+    # transform; independent of the 25 nodes and 36 hours that used to drive it.
+    assert counts["optimized"] <= 4
+    assert counts["original"] > 25 * 36
+
+
+def test_owned_columns_stay_isolated_from_each_other_and_from_loaded_guidance(
+    prepared_surface, monkeypatch
+):
+    baseline = _all_attachment_baseline(prepared_surface)
+    manifests = deepcopy(
+        [view.manifest for view in (*baseline._cloud_views, *baseline._thunder_views)]
+    )
+    guidance = {model: dataset.copy(deep=True) for model, dataset in baseline._guidance.items()}
+    with patch("requests.Session", side_effect=AssertionError("No provider calls")):
+        grid = build_local_surface_grid(
+            latitude=LATITUDE,
+            longitude=LONGITUDE,
+            calculate_column=baseline._forecast_column,
+            geometry=TEST_GEOMETRY,
+            columns_owned=True,
+        )
+        point = extract_grid_point(grid, latitude=LATITUDE, longitude=LONGITUDE, copy_grid=False)
+    # Ownership transfer, not aliasing: the baseline is the built grid itself, while
+    # the delivered hours and geometry remain independent copies of it.
+    assert point["local_grid_baseline"] is grid
+    assert point["hours"] is not grid["cells"][12]["hours"]
+    assert point["local_grid"]["geometry"] is not grid["geometry"]
+    hours = [id(cell["hours"]) for cell in grid["cells"]]
+    assert len(set(hours)) == len(hours)
+    # Mutating the delivered result must not reach the grid or the loaded guidance.
+    point["hours"][0]["surface"]["fields"][T]["value"] = -999.0
+    assert grid["cells"][12]["hours"][0]["surface"]["fields"][T]["value"] != -999.0
+    assert (
+        deepcopy([view.manifest for view in (*baseline._cloud_views, *baseline._thunder_views)])
+        == manifests
+    )
+    for model, dataset in guidance.items():
+        xr.testing.assert_identical(baseline._guidance[model], dataset)
+
+
+def test_grid_defaults_still_copy_columns_and_the_retained_grid(prepared_surface):
+    """A callback that reuses one structure must keep getting independent cells."""
+    shared = prepared_surface._forecast_column(latitude=LATITUDE, longitude=LONGITUDE)
+    grid = build_local_surface_grid(
+        latitude=LATITUDE,
+        longitude=LONGITUDE,
+        calculate_column=lambda **_: shared,
+        geometry=TEST_GEOMETRY,
+    )
+    cells = [id(cell["hours"]) for cell in grid["cells"]]
+    assert len(set(cells)) == len(cells)
+    assert all(cell["hours"] is not shared["hours"] for cell in grid["cells"])
+    point = extract_grid_point(grid, latitude=LATITUDE, longitude=LONGITUDE)
+    assert point["local_grid_baseline"] is not grid
+    assert point["local_grid_baseline"] == grid

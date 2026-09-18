@@ -396,6 +396,7 @@ def build_local_surface_grid(
     longitude: float,
     calculate_column: Callable[..., dict[str, Any]],
     geometry: SurfaceGridGeometry | None = None,
+    columns_owned: bool = False,
 ) -> dict[str, Any]:
     """Derive one local grid from coordinates and the existing in-memory calculation.
 
@@ -403,6 +404,11 @@ def build_local_surface_grid(
     or dataset loading. Center failures propagate normally; peripheral coverage
     failures remain explicit cells without invalidating a supported center.
     Shared forecast context and decision evidence are stored once for this grid.
+
+    ``columns_owned`` states that the callback returns a freshly built column that
+    no one else retains, so the grid may take its hours instead of copying them.
+    It changes no value; it only skips a defensive copy. Leave it False for a
+    callback that may return shared or reused structures.
     """
     layout = derive_grid_geometry(latitude=latitude, longitude=longitude, geometry=geometry)
     center_x = layout["point_target"]["x_index"]
@@ -442,7 +448,7 @@ def build_local_surface_grid(
                     )
                     cells.append(cell)
                     continue
-            cell["hours"] = deepcopy(column["hours"])
+            cell["hours"] = column["hours"] if columns_owned else deepcopy(column["hours"])
             cells.append(cell)
     return {
         "version": _VERSION,
@@ -455,12 +461,17 @@ def build_local_surface_grid(
 
 
 def extract_grid_point(
-    grid: dict[str, Any], *, latitude: float, longitude: float
+    grid: dict[str, Any], *, latitude: float, longitude: float, copy_grid: bool = True
 ) -> dict[str, Any]:
     """Read the exact center baseline, retaining the complete grid for later replay.
 
     Other coordinates require their own coordinate-derived grid. This intentionally
     does not introduce off-node interpolation across differing fallback policies.
+
+    ``copy_grid=False`` transfers ownership of an ephemeral grid the caller drops
+    immediately, avoiding a second full copy of the largest object in the result.
+    The returned hours, geometry and context stay independent copies either way.
+    A retained grid that outlives this call must keep the default.
     """
     validate_coordinate(latitude, longitude)
     if grid["version"] not in (_VERSION, _LEGACY_VERSION):
@@ -497,5 +508,5 @@ def extract_grid_point(
                 "y_index": y_index,
             },
         },
-        "local_grid_baseline": deepcopy(grid),
+        "local_grid_baseline": deepcopy(grid) if copy_grid else grid,
     }

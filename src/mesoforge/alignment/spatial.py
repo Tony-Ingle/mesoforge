@@ -158,12 +158,35 @@ def bilinear_interpolate(
     return ExtractedValue(value=value, cell=cell, weights=weights)
 
 
+# One transformer per native CRS definition. ``crs.srs`` is exactly what
+# ``Transformer.from_crs`` consumes for a CRS object, so this memoises pyproj's own
+# input; a reused transformer returns bit-identical coordinates. Building one costs
+# about 2 ms, and a 49-node, 36-hour local grid used to build roughly 97,000 of them.
+_WGS84_TO_NATIVE: dict[str, pyproj.Transformer] = {}
+_WGS84_TO_NATIVE_LIMIT = 64
+
+
+def wgs84_to_native_transformer(crs: pyproj.CRS) -> pyproj.Transformer:
+    """The WGS84 (longitude, latitude) to native-grid transformer for one CRS."""
+    key = crs.srs if isinstance(crs, pyproj.CRS) else None
+    if key is None:
+        return pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    transformer = _WGS84_TO_NATIVE.get(key)
+    if transformer is None:
+        if len(_WGS84_TO_NATIVE) >= _WGS84_TO_NATIVE_LIMIT:
+            _WGS84_TO_NATIVE.clear()  # Native model grids are a handful; never grow unbounded.
+        transformer = _WGS84_TO_NATIVE[key] = pyproj.Transformer.from_crs(
+            "EPSG:4326", crs, always_xy=True
+        )
+    return transformer
+
+
 def project_station_point(
     crs: pyproj.CRS, *, latitude: float, longitude: float
 ) -> tuple[float, float]:
     """Transform a station's WGS84 coordinate into the source
     projection (plan Section 3.6 step 1)."""
     lon = longitude - 360.0 if longitude > 180.0 else longitude
-    transformer = pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    transformer = wgs84_to_native_transformer(crs)
     x, y = transformer.transform(lon, latitude)
     return float(x), float(y)

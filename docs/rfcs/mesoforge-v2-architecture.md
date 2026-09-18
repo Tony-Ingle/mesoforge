@@ -638,8 +638,11 @@ exist as separate commands; the operator/compatibility `forward_run` path is unc
 - *Still bound*: the refresh must still complete inside its decision hour (the
   existing selection expiry), coordinates outside the refreshed collection's footprint
   are refused rather than prepared on demand, conditions/transitions/period previews
-  remain read-only over saved issuances, and the local-grid build (about one to four
-  seconds per column, 49 columns) dominates request time.
+  remain read-only over saved issuances, and the local-grid build still dominates
+  request time. It reuses one projection transformer per native CRS and takes
+  ownership of the ephemeral grid instead of copying it, which cut a measured
+  49-node, 36-hour build from 178.6 s to 25.4 s with byte-identical output; the
+  remainder is per-column evidence copying and the required canonical grid digest.
 
 ## 6. First-release flows
 

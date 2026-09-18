@@ -29,6 +29,7 @@ from mesoforge.application.prepared_temperature import (
     prepare_temperature_guidance,
 )
 from mesoforge.common.identifiers import Digest
+from mesoforge.contracts.serialization import canonical_json_bytes
 from mesoforge.guidance.coverage import COVERAGE_POLICY, REQUIRED_HOURS
 from tests.support.in_memory_uow import InMemoryObjectStore, InMemoryUnitOfWorkFactory
 from tests.support.phase1_fixture_transports import FixedClock
@@ -595,3 +596,40 @@ def test_historical_36_hour_preparation_still_loads_and_serves_its_own_hour(tmp_
     ] == _iso(TARGET + timedelta(hours=36))
     with pytest.raises(ReferenceCoverageError):
         prepared.reference_view(TARGET + timedelta(hours=1))
+
+
+def test_snapshot_column_builds_one_transformer_per_native_crs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real loader format carries four distinct CRSs; cost must not scale with hours."""
+    import pyproj
+
+    from mesoforge.alignment import spatial
+    from mesoforge.application import spatial_coverage
+
+    preparation = json.loads(prepared_window_fixture(tmp_path).read_text(encoding="utf-8"))
+    prepared = snapshots.load_preparation(preparation)
+    view = prepared.reference_view(TARGET)
+    constructions: list[object] = []
+    real_from_crs = pyproj.Transformer.from_crs
+
+    def counting(*args: object, **kwargs: object) -> object:
+        constructions.append(args[1] if len(args) > 1 else kwargs.get("crs_to"))
+        return real_from_crs(*args, **kwargs)
+
+    monkeypatch.setattr(pyproj.Transformer, "from_crs", staticmethod(counting))
+    spatial._WGS84_TO_NATIVE.clear()
+    memoized = view.point_column(latitude=FIRST["lat"], longitude=FIRST["lon"])
+    cached_count = len(constructions)
+
+    def uncached(crs: object) -> object:
+        return pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+
+    monkeypatch.setattr(spatial, "wgs84_to_native_transformer", uncached)
+    monkeypatch.setattr(spatial_coverage, "wgs84_to_native_transformer", uncached)
+    constructions.clear()
+    original = view.point_column(latitude=FIRST["lat"], longitude=FIRST["lon"])
+
+    assert canonical_json_bytes(memoized) == canonical_json_bytes(original)
+    assert cached_count <= 4  # HRRR and RAP Lambert, GFS and IFS geographic
+    assert len(constructions) > 36 * 4  # the per-hour, per-model construction it replaces

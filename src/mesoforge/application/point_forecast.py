@@ -644,12 +644,15 @@ class PreparedPointForecast:
                 extract_grid_point,
             )
 
+            # This grid is built here and dropped on return, so its columns and the
+            # grid itself are handed over instead of being copied a second time.
             grid = build_local_surface_grid(
                 latitude=latitude,
                 longitude=longitude,
                 calculate_column=self._forecast_column,
+                columns_owned=True,
             )
-            return extract_grid_point(grid, latitude=latitude, longitude=longitude)
+            return extract_grid_point(grid, latitude=latitude, longitude=longitude, copy_grid=False)
         return self._forecast_column(latitude=latitude, longitude=longitude)
 
     def point_column(self, *, latitude: float, longitude: float) -> dict[str, Any]:

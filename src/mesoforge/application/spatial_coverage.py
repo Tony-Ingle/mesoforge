@@ -8,6 +8,7 @@ from numbers import Real
 import numpy as np
 import pyproj
 
+from mesoforge.alignment.spatial import wgs84_to_native_transformer
 from mesoforge.catalog.domains import BoundingBox
 
 MODEL_BUFFER_KM = 50.0
@@ -133,7 +134,7 @@ def _points_in_grid(
     x_bounds, y_bounds = _axis_bounds(x), _axis_bounds(y)
     if x_bounds is None or y_bounds is None:
         return False
-    transformer = pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    transformer = wgs84_to_native_transformer(crs)
     projected_x, projected_y = transformer.transform(longitudes, latitudes)
     projected_x, projected_y = np.asarray(projected_x), np.asarray(projected_y)
     if crs.is_geographic and x_bounds[0] >= 0.0:
@@ -207,7 +208,7 @@ def native_bbox_bounds(bbox: BoundingBox, crs: pyproj.CRS) -> tuple[float, float
     let preparation and later coverage checks use the same physical geometry.
     """
     longitude, latitude = _bbox_boundary(bbox, crs)
-    transformer = pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    transformer = wgs84_to_native_transformer(crs)
     x, y = transformer.transform(longitude, latitude)
     if not np.all(np.isfinite(x)) or not np.all(np.isfinite(y)):
         # A projection singularity is never evidence of absent model coverage.
