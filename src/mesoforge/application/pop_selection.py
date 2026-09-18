@@ -9,6 +9,7 @@ from typing import Any
 
 from mesoforge.catalog.sources import NbmSourceSettings
 from mesoforge.guidance.acquisition_v2 import Phase2LeadAcquisition, acquire_nbm_lead
+from mesoforge.guidance.coverage import MAXIMUM_PREPARED_HOURS, REQUIRED_HOURS
 from mesoforge.guidance.cycle_selection import generate_candidate_reference_times
 from mesoforge.guidance.http_fetch import FetchedObject, FetchError, fetch_with_retry, header
 from mesoforge.guidance.index_parsing import (
@@ -152,6 +153,11 @@ def select_pop_guidance(
 ) -> dict[str, Any]:
     """Prefer newest complete native intervals, then freshest partial cycle with clear gaps.
 
+    Completeness is judged on the first 36 requested hours; later hours of an extended
+    window are recorded as available or missing without changing the choice. A cycle
+    whose provider evidence cannot be validated, typically one still being published,
+    is rejected with its evidence retained and the next older cycle is tried.
+
     This separate discovery records its own actual availability cutoff. It does not
     claim PoP availability at an earlier HRRR/GFS/RAP/IFS selection decision.
     """
@@ -159,9 +165,15 @@ def select_pop_guidance(
     if (
         not horizons
         or horizons != tuple(sorted(set(horizons)))
-        or any(type(hour) is not int or not 1 <= hour <= 36 for hour in horizons)
+        or any(
+            type(hour) is not int or not 1 <= hour <= MAXIMUM_PREPARED_HOURS for hour in horizons
+        )
     ):
-        raise ValueError("PoP target horizons must be unique increasing hours within 1..36")
+        raise ValueError(
+            "PoP target horizons must be unique increasing hours within "
+            f"1..{MAXIMUM_PREPARED_HOURS}"
+        )
+    required_hours = tuple(hour for hour in horizons if hour <= REQUIRED_HOURS)
     if target > cutoff:
         raise ValueError("PoP target reference time cannot be after execution")
     cycles = (
@@ -199,6 +211,7 @@ def select_pop_guidance(
     }
     partial: dict[str, Any] | None = None
     chosen: dict[str, Any] | None = None
+    rejected: list[dict[str, Any]] = []
     for cycle in cycles:
         age = int((target - cycle).total_seconds() / 3600)
         candidate: dict[str, Any] = {"cycle": _iso(cycle), "probes": [], "status": "checking"}
@@ -215,16 +228,31 @@ def select_pop_guidance(
             )
             candidate["probes"].append(probe)
             if probe["status"] == "error":
-                candidate.update(status="error", reason=probe["reason"])
-                report["reason"] = "Provider evidence could not be validated: " + probe["reason"]
+                # Invalid identity/range evidence usually means the cycle is still being
+                # published. Reject this cycle, keep its evidence, try the next older one.
+                candidate.update(
+                    status="rejected_invalid_evidence",
+                    reason="Provider evidence could not be validated: " + probe["reason"],
+                    rejected_lead=probe["source_lead_hours"],
+                )
+                rejected.append(
+                    {
+                        "cycle": candidate["cycle"],
+                        "lead": probe["source_lead_hours"],
+                        "reason": candidate["reason"],
+                    }
+                )
                 break
-        if candidate["status"] == "error":
-            break
+        if candidate["status"] == "rejected_invalid_evidence":
+            continue
         available = [p for p in candidate["probes"] if p["status"] == "available"]
         candidate["source_leads"] = [p["source_lead_hours"] for p in available]
+        required_available = [
+            p for p in available if p["source_lead_hours"] - age <= REQUIRED_HOURS
+        ]
         candidate["status"] = (
             "complete"
-            if len(available) == len(horizons)
+            if len(required_available) == len(required_hours)
             else "partial"
             if available
             else "unavailable"
@@ -236,6 +264,8 @@ def select_pop_guidance(
             partial = candidate
     else:
         chosen = partial
+    if rejected:
+        report["rejected_candidates"] = rejected
     if chosen is not None:
         gaps = [
             {
@@ -254,10 +284,15 @@ def select_pop_guidance(
             missing_hours=gaps,
             reason="Newest complete native-hourly cycle"
             if not gaps
+            else "Newest complete native-hourly cycle for the required 36 hours; "
+            "requested extension hours past native availability are explicit gaps"
+            if chosen["status"] == "complete"
             else "No complete cycle; newest cycle with native hourly guidance, explicit gaps",
         )
     report.setdefault(
-        "reason", "No native one-hour NBM PoP is available within the bounded cycle window"
+        "reason",
+        "No native one-hour NBM PoP is available within the bounded cycle window"
+        + ("; rejected cycles: " + ", ".join(row["cycle"] for row in rejected) if rejected else ""),
     )
     report.update(
         completed_at=_iso(clock.now()),
@@ -287,7 +322,9 @@ def acquire_selected_pop(
     if (
         not horizons
         or horizons != tuple(sorted(set(horizons)))
-        or any(type(hour) is not int or not 1 <= hour <= 36 for hour in horizons)
+        or any(
+            type(hour) is not int or not 1 <= hour <= MAXIMUM_PREPARED_HOURS for hour in horizons
+        )
     ):
         raise ValueError("PoP selection target horizons changed")
     age = int((target - cycle).total_seconds() / 3600)

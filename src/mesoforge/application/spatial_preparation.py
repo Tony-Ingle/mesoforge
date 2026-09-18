@@ -7,8 +7,11 @@ import json
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from mesoforge.application.point_forecast import PreparedPointForecast
 from mesoforge.application.prepared_qpf import qpf_raw_bytes
@@ -57,7 +60,28 @@ class PreparedRegions:
     def horizon_hours(self) -> tuple[int, ...]:
         return self.regions[0].horizon_hours
 
-    def forecast(self, *, latitude: float, longitude: float) -> dict[str, Any]:
+    @property
+    def prepared_reference_time(self) -> np.datetime64:
+        return self.regions[0].prepared_reference_time
+
+    def prepared_valid_times(self) -> dict[str, list[np.datetime64]]:
+        """Valid times common to every region; regions share one source window."""
+        held = [region.prepared_valid_times() for region in self.regions]
+        return {
+            model: [
+                value
+                for value in held[0][model]
+                if all(value in set(other.get(model, [])) for other in held[1:])
+            ]
+            for model in held[0]
+        }
+
+    def reference_view(self, reference_time: datetime | np.datetime64) -> PreparedRegions:
+        return replace(
+            self, regions=[region.reference_view(reference_time) for region in self.regions]
+        )
+
+    def _region_for(self, latitude: float, longitude: float) -> PreparedPointForecast:
         validate_coordinate(latitude, longitude)
         if (latitude, longitude) in self.failures:
             raise UnsupportedCoordinateError(self.failures[latitude, longitude])
@@ -70,11 +94,21 @@ class PreparedRegions:
             except UnsupportedCoordinateError as exc:
                 unsupported.append(exc)
                 continue
-            return region.forecast(latitude=latitude, longitude=longitude)
+            return region
         if len(unsupported) == len(self.regions):
             raise unsupported[0]
         raise CoverageRequiredError(
             "Coverage is not prepared; run coordinate preparation before HTTP"
+        )
+
+    def forecast(self, *, latitude: float, longitude: float) -> dict[str, Any]:
+        return self._region_for(latitude, longitude).forecast(
+            latitude=latitude, longitude=longitude
+        )
+
+    def point_column(self, *, latitude: float, longitude: float) -> dict[str, Any]:
+        return self._region_for(latitude, longitude).point_column(
+            latitude=latitude, longitude=longitude
         )
 
 

@@ -18,6 +18,7 @@ from mesoforge.application.prepared_ifs import IFS_CONFIGURATION
 from mesoforge.application.prepared_temperature import BoundedHttpTransport, _code_identity, _iso
 from mesoforge.catalog.configuration import Phase2Configuration, load_configuration_source
 from mesoforge.forecasting.recipes import with_qpf_fields, with_surface_fields
+from mesoforge.guidance.coverage import COVERAGE_POLICY, REQUIRED_HOURS, prepared_horizons
 from mesoforge.guidance.cycle_selection import generate_candidate_reference_times
 from mesoforge.guidance.interfaces import Clock, HttpTransport, Sleeper
 from mesoforge.guidance.precipitation import is_bucket_reset_hour
@@ -30,7 +31,7 @@ from mesoforge.guidance.sources.ifs import IFS_CAPABILITIES
 from mesoforge.guidance.sources.rap import maximum_lead
 
 _ROOT = Path(__file__).resolve().parents[3]
-_HOURS = tuple(range(1, 37))
+_HOURS = tuple(range(1, REQUIRED_HOURS + 1))
 
 
 def select_model_set(
@@ -44,10 +45,18 @@ def select_model_set(
     probe: Callable[..., Any] = probe_temperature,
     surface_fields: bool = False,
     qpf_fields: bool = False,
+    coverage_hours: int = REQUIRED_HOURS,
 ) -> dict[str, Any]:
-    """Newest metadata-complete cycles, or an explicit failure with retained evidence."""
+    """Newest metadata-complete cycles, or an explicit failure with retained evidence.
+
+    Cycle acceptance always uses the first 36 hours. With ``coverage_hours`` above 36,
+    hours 37..coverage_hours are probed on the accepted cycle only; the window ends at
+    the last hour every model reaches, and unavailable extension leads never reject
+    a cycle or fail the selection.
+    """
     if qpf_fields and not surface_fields:
         raise ValueError("QPF selection requires surface_fields")
+    extension_hours = prepared_horizons(coverage_hours)[REQUIRED_HOURS:]
     started = clock.now()
     decision = decision_time or started
     if any(value.tzinfo is None or value.utcoffset() is None for value in (started, decision)):
@@ -101,8 +110,16 @@ def select_model_set(
             "HRRR/GFS/RAP require 36 hourly temperature messages; IFS requires every "
             "native three-hourly valid time. Older complete cycles may be selected only "
             "within existing adapter lead limits and bounded lookback, with rejection "
-            "reasons retained. No cycles are spliced and no partial model set succeeds."
+            "reasons retained. No cycles are spliced and no partial model set succeeds. "
+            "Requested hours beyond 36 extend the window only where the accepted cycle "
+            "already publishes them; the window ends at the last hour every model reaches."
         ),
+        "coverage": {
+            "policy": COVERAGE_POLICY,
+            "requested_hours": coverage_hours,
+            "prepared_hours": None,
+            "models": {},
+        },
         "preparation_requirements": (
             "Acquire the exact selected URLs/messages outside HTTP, revalidate their "
             "recorded object/index identities and decision-time availability, then decode "
@@ -261,6 +278,44 @@ def select_model_set(
                         "the fixed decision cutoff"
                     ),
                 )
+                # Extension hours ride on the accepted cycle; a missing extension lead
+                # ends the window for this model but never rejects the cycle.
+                extended_to, stopped = REQUIRED_HOURS, None
+                extension_probes: list[dict[str, Any]] = []
+                for hour in extension_hours:
+                    lead = age + hour
+                    if lead % native_step:
+                        extended_to = hour  # A native gap inside the window, as within 1..36.
+                        continue
+                    if lead > supported_max or lead not in definition.supported_leads:
+                        stopped = f"lead {lead} is outside this cycle's adapter lead envelope"
+                        break
+                    if expired():
+                        return report
+                    try:
+                        result = probe(
+                            model=model,
+                            cycle=cycle,
+                            lead=lead,
+                            configuration=configuration,
+                            transport=transport,
+                            clock=clock,
+                            sleeper=sleeper,
+                            decision_time=decision,
+                            **({"surface_fields": True} if surface_fields else {}),
+                            **({"qpf_fields": True} if qpf_fields else {}),
+                        )
+                    except ProviderEvidenceError as exc:
+                        extension_probes.append(retain(exc.evidence, exc.index_payloads))
+                        stopped = f"lead {lead} evidence could not be validated: {exc}"
+                        break
+                    extension_probes.append(retain(result.evidence, result.index_payloads))
+                    if not result.available:
+                        stopped = f"lead {lead}: {result.reason}"
+                        break
+                    extended_to = hour
+                    save()
+                candidate["extension_probes"] = extension_probes
                 model_report.update(
                     status="metadata_complete",
                     selected_cycle=_iso(cycle),
@@ -275,6 +330,8 @@ def select_model_set(
                         for hour in _HOURS
                         if age + hour not in required
                     ],
+                    extended_to_hour=extended_to,
+                    extension_stopped=stopped,
                 )
                 break
             save()
@@ -291,6 +348,7 @@ def select_model_set(
             status="unavailable", reason="No complete compatible model set: " + ", ".join(missing)
         )
     else:
+        _finalize_window(report, target)
         report.update(
             status="selected",
             selected_cycles={
@@ -305,6 +363,47 @@ def select_model_set(
     return report
 
 
+def _finalize_window(report: dict[str, Any], target: datetime) -> None:
+    """Close the window at the last hour every model reached; prune unused extension evidence."""
+    prepared_hours = min(row["extended_to_hour"] for row in report["models"].values())
+    horizons = prepared_horizons(prepared_hours)
+    report["horizon_hours"] = list(horizons)
+    report["last_valid_time"] = _iso(target + timedelta(hours=prepared_hours))
+    report["coverage"]["prepared_hours"] = prepared_hours
+    for model, row in report["models"].items():
+        cycle = datetime.fromisoformat(row["selected_cycle"])
+        age = int((target - cycle).total_seconds() / 3600)
+        native_step = IFS_CAPABILITIES["native_step_hours"] if model == "IFS" else 1
+        assert isinstance(native_step, int)
+        required = [age + hour for hour in horizons if (age + hour) % native_step == 0]
+        candidate = next(c for c in row["candidates"] if c["status"] == "metadata_complete")
+        extension = candidate.pop("extension_probes", [])
+        used = [probe for probe in extension if probe["source_lead_hours"] in required]
+        unused = [probe for probe in extension if probe["source_lead_hours"] not in required]
+        candidate["probes"] = [*candidate["probes"], *used]
+        candidate["source_leads"] = required
+        if unused:
+            candidate["unused_extension_probes"] = unused
+        row.update(
+            source_leads=required,
+            valid_times=[_iso(cycle + timedelta(hours=lead)) for lead in required],
+            expected_native_gaps=[
+                {
+                    "horizon_hours": hour,
+                    "valid_time": _iso(target + timedelta(hours=hour)),
+                    "reason": "No native prediction at this valid time; no interpolation",
+                }
+                for hour in horizons
+                if age + hour not in required
+            ],
+        )
+        report["coverage"]["models"][model] = {
+            "extended_to_hour": row["extended_to_hour"],
+            "extension_stopped": row["extension_stopped"],
+            "last_valid_time": row["valid_times"][-1],
+        }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -316,6 +415,12 @@ def main(argv: list[str] | None = None) -> int:
         "--qpf-fields",
         action="store_true",
         help="Include bounded HRRR/GFS interval QPF (requires --surface-fields)",
+    )
+    parser.add_argument(
+        "--coverage-hours",
+        type=int,
+        default=REQUIRED_HOURS,
+        help="Prepared window length 36..42; hours past 36 never change cycle acceptance",
     )
     args = parser.parse_args(argv)
     configuration, _ = load_configuration_source(
@@ -335,6 +440,7 @@ def main(argv: list[str] | None = None) -> int:
             decision_time=args.decision_time,
             surface_fields=args.surface_fields,
             qpf_fields=args.qpf_fields,
+            coverage_hours=args.coverage_hours,
             transport=transport,
             clock=clock,
             sleeper=SystemSleeper(),

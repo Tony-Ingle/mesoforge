@@ -212,3 +212,65 @@ def test_changed_selection_or_provider_object_never_reaches_unpinned_acquisition
             sleeper=RecordingSleeper(clock),
         )
     assert not any(url.endswith(".grib2") for method, url, _ in transport.calls if method == "GET")
+
+
+class StillPublishingTransport(InventoryTransport):
+    """The newest cycle's object is shorter than its inventory claims: still being written."""
+
+    def __init__(self, publishing_cycle=12):
+        super().__init__()
+        self.publishing_cycle = publishing_cycle
+
+    def head(self, url, *, headers=None, timeout=None):
+        response = super().head(url, headers=headers, timeout=timeout)
+        cycle = int(re.search(r"/(\d{2})/core/", url).group(1))
+        if cycle == self.publishing_cycle:
+            response.headers["Content-Length"] = "210"  # Selected message range runs past it.
+        return response
+
+
+def test_still_publishing_newest_cycle_is_rejected_and_the_next_complete_cycle_is_used():
+    transport = StillPublishingTransport()
+    selection = select(transport)
+    assert selection["status"] == "selected"
+    assert selection["selected_cycle"] == "2026-09-11T11:00:00Z"
+    assert selection["source_leads"] == [2, 3, 4]
+    newest = selection["candidates"][0]
+    assert newest["cycle"] == "2026-09-11T12:00:00Z"
+    assert newest["status"] == "rejected_invalid_evidence"
+    assert "could not be validated" in newest["reason"]
+    assert newest["rejected_lead"] == 1
+    assert newest["probes"][0]["status"] == "error"  # Evidence retained, not discarded.
+    assert selection["rejected_candidates"] == [
+        {"cycle": "2026-09-11T12:00:00Z", "lead": 1, "reason": newest["reason"]}
+    ]
+    assert selection["candidates"][1]["status"] == "complete"
+
+
+def test_all_candidates_invalid_is_unavailable_with_every_rejection_recorded():
+    transport = StillPublishingTransport(publishing_cycle=None)
+    transport.head = lambda url, *, headers=None, timeout=None: _FakeResponse(
+        200, {"ETag": '"source-object"', "Content-Length": "210"}
+    )
+    selection = select(transport)
+    assert selection["status"] == "unavailable"
+    assert len(selection["rejected_candidates"]) == 4
+    assert "rejected cycles" in selection["reason"]
+
+
+def test_extended_window_completeness_is_judged_on_the_required_36_hours():
+    clock = FixedClock(NOW)
+    transport = InventoryTransport(lambda cycle, lead: lead - (12 - cycle) > 38)
+    selection = select_pop_guidance(
+        target_reference_time=TARGET,
+        horizons=tuple(range(1, 43)),
+        settings=SETTINGS,
+        transport=transport,
+        clock=clock,
+        sleeper=RecordingSleeper(clock),
+    )
+    assert selection["status"] == "partial"
+    assert selection["selected_cycle"] == "2026-09-11T12:00:00Z"
+    assert selection["candidates"][0]["status"] == "complete"
+    assert [gap["horizon_hours"] for gap in selection["missing_hours"]] == [39, 40, 41, 42]
+    assert "required 36 hours" in selection["reason"]

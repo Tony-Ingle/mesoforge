@@ -12,6 +12,7 @@ import xarray as xr
 
 from mesoforge.application.spatial_coverage import UnsupportedCoordinateError, native_bbox_bounds
 from mesoforge.catalog.domains import BoundingBox
+from mesoforge.guidance.coverage import MAXIMUM_PREPARED_HOURS
 from mesoforge.guidance.normalization import (
     build_lambert_conformal_crs,
     compute_latlon_grid,
@@ -286,8 +287,13 @@ def normalize_shadow_temperature(
     if not decoded:
         raise ValueError("No decoded shadow temperature frames are available")
     age = int((target_time - source_time) / np.timedelta64(1, "h"))
-    if any(type(lead) is not int or not age + 1 <= lead <= age + 36 for lead in decoded):
-        raise ValueError("Shadow leads must align with target hours 1 through 36")
+    if any(
+        type(lead) is not int or not age + 1 <= lead <= age + MAXIMUM_PREPARED_HOURS
+        for lead in decoded
+    ):
+        raise ValueError(
+            f"Shadow leads must align with target hours 1 through {MAXIMUM_PREPARED_HOURS}"
+        )
     leads = sorted(decoded)
     frames: list[np.ndarray] = []
     native: tuple[pyproj.CRS, np.ndarray, np.ndarray] | None = None

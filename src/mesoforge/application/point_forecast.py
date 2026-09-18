@@ -7,7 +7,7 @@ import json
 import math
 from collections.abc import Mapping
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -52,6 +52,7 @@ from mesoforge.forecasting.recipes import (
     with_qpf_fields,
     with_surface_fields,
 )
+from mesoforge.guidance.coverage import REQUIRED_HOURS, is_prepared_window
 
 _DATA_KIND = "synthetic_demonstration"
 _NOTICE = "Synthetic demonstration data; not a current weather forecast."
@@ -65,6 +66,10 @@ _VARIABLE = "air_temperature_2m"
 # Owner-approved demonstration weights throughout hours 1..36, not optimized
 # weights or the Phase 2 table's 60/40 HRRR/GFS row for hours 19..36.
 _CRS = pyproj.CRS.from_epsg(4326)
+
+
+class ReferenceCoverageError(ValueError):
+    """The prepared valid times do not cover hours 1..36 after the requested reference."""
 
 
 def _iso(value: np.datetime64) -> str:
@@ -349,6 +354,72 @@ class PreparedPointForecast:
     _thunder_guidance: dict[str, Any] | None = None
     _ice_views: list[IceView] = field(default_factory=list)
     _ice_guidance: dict[str, Any] | None = None
+    # Set only on a reference view: the window the guidance was prepared for.
+    _prepared_reference_time: np.datetime64 | None = None
+    _prepared_horizons: tuple[int, ...] | None = None
+
+    @property
+    def target_reference_time(self) -> np.datetime64:
+        return self._target_reference_time
+
+    @property
+    def prepared_reference_time(self) -> np.datetime64:
+        """The reference hour the guidance was prepared for, even when a view moved it."""
+        if self._prepared_reference_time is not None:
+            return self._prepared_reference_time
+        return self._target_reference_time
+
+    def prepared_valid_times(self) -> dict[str, list[np.datetime64]]:
+        """Absolute valid times each active contributor actually holds."""
+        return {
+            model: [
+                cast(np.datetime64, value.astype("datetime64[ns]"))
+                for value in dataset["source_valid_time"].values
+            ]
+            for model, dataset in self._guidance.items()
+        }
+
+    def reference_view(self, reference_time: datetime | np.datetime64) -> PreparedPointForecast:
+        """The same prepared guidance read as hours 1..36 after a later reference hour.
+
+        Nothing is recomputed or re-acquired: every valid time is looked up as before,
+        so source cycles, leads and evidence stay exactly what was prepared. The view is
+        refused unless each active contributor holds all 36 valid times.
+        """
+        if isinstance(reference_time, datetime):
+            if reference_time.tzinfo is None or reference_time.utcoffset() is None:
+                raise ValueError("Reference time must include a timezone")
+            reference = np.datetime64(reference_time.astimezone(UTC).replace(tzinfo=None), "ns")
+        else:
+            reference = reference_time.astype("datetime64[ns]")
+        if reference.astype("datetime64[h]") != reference:
+            raise ValueError("Reference time must be an exact UTC hour")
+        prepared = self.prepared_reference_time
+        if reference < prepared:
+            raise ReferenceCoverageError(
+                f"Reference {_iso(reference)} precedes the prepared window start {_iso(prepared)}"
+            )
+        if self._prepared_horizons is None and not is_prepared_window(self._horizons):
+            raise ReferenceCoverageError("Reference views require a complete prepared window")
+        horizons = tuple(range(1, REQUIRED_HOURS + 1))
+        required = [reference + np.timedelta64(hour, "h") for hour in horizons]
+        for model, valid_times in self.prepared_valid_times().items():
+            held = set(valid_times)
+            missing = [_iso(valid) for valid in required if valid not in held]
+            if missing:
+                raise ReferenceCoverageError(
+                    f"{model}: prepared guidance lacks {len(missing)} of the 36 valid times "
+                    f"after {_iso(reference)}; first missing {missing[0]}"
+                )
+        return replace(
+            self,
+            _target_reference_time=reference,
+            _horizons=horizons,
+            _prepared_reference_time=prepared,
+            _prepared_horizons=(
+                self._prepared_horizons if self._prepared_horizons is not None else self._horizons
+            ),
+        )
 
     @property
     def notice(self) -> str:
@@ -449,11 +520,10 @@ class PreparedPointForecast:
                 _lists_to_tuples(policy)
             )
         horizons = tuple(manifest.get("target_horizon_hours", (1, 2, 3))) if manifest else (1, 2, 3)
-        if horizons not in ((1, 2, 3), tuple(range(1, 37))) or any(
-            type(hour) is not int for hour in horizons
-        ):
+        if horizons != (1, 2, 3) and not is_prepared_window(horizons):
             raise ValueError(
-                "Prepared temperature horizons must be 1..36 or the retained 1..3 slice"
+                "Prepared temperature horizons must be a 1..36 to 1..42 window "
+                "or the retained 1..3 slice"
             )
         shadow_views: dict[str, list[_ShadowView]] = {}
         for model, definition in definitions.items():
@@ -580,6 +650,13 @@ class PreparedPointForecast:
                 calculate_column=self._forecast_column,
             )
             return extract_grid_point(grid, latitude=latitude, longitude=longitude)
+        return self._forecast_column(latitude=latitude, longitude=longitude)
+
+    def point_column(self, *, latitude: float, longitude: float) -> dict[str, Any]:
+        """One column of the same science without building the surrounding grid.
+
+        Used to validate a prepared snapshot cheaply; issuance still builds the grid.
+        """
         return self._forecast_column(latitude=latitude, longitude=longitude)
 
     def _forecast_column(self, *, latitude: float, longitude: float) -> dict[str, Any]:
@@ -881,6 +958,17 @@ class PreparedPointForecast:
             "hours": hours,
             "contributor_configuration": contributor_configuration.model_dump(mode="json"),
         }
+        if self._prepared_reference_time is not None:
+            # A reference view: the guidance was prepared for an earlier window and is
+            # read by absolute valid time; the request hour never rewrites that fact.
+            result["prepared_window"] = {
+                "prepared_reference_time": _iso(self._prepared_reference_time),
+                "prepared_horizon_hours": list(self._prepared_horizons or ()),
+                "reference_offset_hours": int(
+                    (self._target_reference_time - self._prepared_reference_time)
+                    / np.timedelta64(1, "h")
+                ),
+            }
         if self._probability_views:
             result["probability_sources"] = [
                 {

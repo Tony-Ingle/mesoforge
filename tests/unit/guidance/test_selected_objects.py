@@ -293,3 +293,44 @@ def test_unsafe_discovery_evidence_is_rejected_before_network(mutation):
         evidence["selected_message"]["byte_end_exclusive"] = 201
     with pytest.raises(ValueError):
         selected(evidence=evidence)
+
+
+def test_unlatched_shadow_view_keeps_acquiring_after_a_provider_failure():
+    """A zero-weight shadow's transient 503 stays recorded; later objects are still tried."""
+    evidence = probe(MetadataTransport("IFS"), "IFS").evidence
+    underlying = AcquisitionTransport("IFS")
+    wrapper = SelectedObjectTransport(
+        underlying,
+        [evidence],
+        decision_time=DECISION,
+        clock=FixedClock(DECISION + timedelta(minutes=2)),
+        latch_failures=False,
+    )
+    healthy = underlying.index
+    underlying.index = FakeHttpResponse(503, {}, b"")
+    with pytest.raises(SelectedObjectError, match="HTTP 503"):
+        wrapper.get(evidence["index"]["url"])
+    assert wrapper.failed_reason is not None
+    assert [row["reason"] for row in wrapper.failures] == [
+        "Selected object returned HTTP 503; expected 200"
+    ]
+    underlying.index = healthy
+    # Without latching the same object may be retried and every object is still validated.
+    response = acquire(wrapper, evidence)
+    assert response.content == underlying.ranged.content
+    assert [row["status"] for row in wrapper.validations] == [
+        "failed",
+        "matched",
+        "matched",
+        "matched",
+    ]
+    with pytest.raises(SelectedObjectError, match="HTTP 503"):
+        wrapper.assert_complete()  # Completeness still reports the recorded failure.
+    latched, latched_underlying, latched_evidence = selected("IFS")
+    latched_underlying.index = FakeHttpResponse(503, {}, b"")
+    with pytest.raises(SelectedObjectError, match="HTTP 503"):
+        latched.get(latched_evidence["index"]["url"])
+    latched_underlying.index = healthy
+    with pytest.raises(SelectedObjectError, match="HTTP 503"):
+        latched.get(latched_evidence["index"]["url"])  # The default view stays latched.
+    assert len(latched_underlying.calls) == 1

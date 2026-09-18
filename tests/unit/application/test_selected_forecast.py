@@ -342,6 +342,7 @@ def test_inventory_changed_during_copy_is_revalidated_before_acquisition(
         (None, True, "unavailable"),
         ("RAP missing hour", False, None),
         ("IFS missing hour", False, None),
+        ("IFS missing hour (tolerated)", False, None),
         ("IFS cycle", False, None),
     ],
 )
@@ -349,6 +350,9 @@ def test_preparation_reuses_one_selected_source_set_and_rejects_partial_shadows(
     selection, tmp_path, monkeypatch, failure, qpf, pop_status
 ):
     from mesoforge.application import prepared_pop
+
+    # The background refresh tolerates a short zero-weight shadow and records the gap.
+    tolerated = bool(failure) and failure.endswith("(tolerated)")
 
     pop_descriptor = {
         "status": pop_status,
@@ -399,12 +403,22 @@ def test_preparation_reuses_one_selected_source_set_and_rejects_partial_shadows(
             selected_forecast, "_qpf_messages", Mock(return_value=([], "missing fixture QPF"))
         )
         selection_path.write_text(json.dumps(selection_report), encoding="utf-8")
-    pinned = Mock(
-        spec=selected_forecast.SelectedObjectTransport,
-        validations=[{"status": "validated", "fixture": True}],
-        downloaded_bytes=120,
-    )
-    pin = Mock(return_value=pinned)
+    pins: list[Mock] = []
+    real_transport = selected_forecast.SelectedObjectTransport
+
+    def make_pin(*args, **kwargs):
+        # One pinned view for the active HRRR/GFS objects, then one per shadow model.
+        pins.append(
+            Mock(
+                spec=real_transport,
+                validations=[{"status": "validated", "fixture": True, "pin": len(pins)}],
+                failures=[],
+                downloaded_bytes=120,
+            )
+        )
+        return pins[-1]
+
+    pin = Mock(side_effect=make_pin)
     monkeypatch.setattr(selected_forecast, "SelectedObjectTransport", pin)
     acquired = {"HRRR": [object()], "GFS": [object()]}
     acquire = Mock(return_value=acquired)
@@ -440,8 +454,9 @@ def test_preparation_reuses_one_selected_source_set_and_rejects_partial_shadows(
             "supported_hours": expected,
             "retained_raw_bytes": 0,
         }
-        if failure == f"{model} missing hour":
+        if failure and failure.startswith(f"{model} missing hour"):
             shadow["supported_hours"] = expected[1:]
+            shadow["missing_hours"] = {str(expected[0]): "fixture provider outage"}
         elif failure == f"{model} cycle":
             shadow["selected_cycle"] = "2026-09-11T00:00:00Z"
         shadow_mocks[model] = Mock(return_value=shadow)
@@ -453,7 +468,9 @@ def test_preparation_reuses_one_selected_source_set_and_rejects_partial_shadows(
         manifest = json.loads((source / "manifest.json").read_text())
         assert manifest["fixture"] is True
         assert manifest["current_model_set"]["selection"] == selection_report
-        assert manifest["current_model_set"]["object_validation"] == pinned.validations
+        assert manifest["current_model_set"]["object_validation"] == [
+            row for pinned in pins for row in pinned.validations
+        ]
         assert kwargs["contributor_configuration"] == expected_configuration
         return object(), {"fixture": True}
 
@@ -466,12 +483,13 @@ def test_preparation_reuses_one_selected_source_set_and_rejects_partial_shadows(
         "clock": clock,
         "sleeper": RecordingSleeper(clock),
         **({"include_pop": True} if pop_status else {}),
+        **({"require_complete_shadows": False} if tolerated else {}),
     }
-    if failure:
+    if failure and not tolerated:
         with pytest.raises(ValueError, match="no issuance"):
             selected_forecast.prepare_selected(location_rows, selection_path, output, **arguments)
         cover.assert_not_called()
-        pinned.assert_complete.assert_not_called()
+        pins[0].assert_complete.assert_not_called()  # The control set never completed.
         assert (output / "failure.json").is_file()
         assert not (output / "preparation.json").exists()
     else:
@@ -492,25 +510,44 @@ def test_preparation_reuses_one_selected_source_set_and_rejects_partial_shadows(
         else:
             assert "pop_guidance" not in result
         assert set(result["shadow_directories"]) == {"RAP", "IFS"}
+        if tolerated:
+            shortfall = result["shadow_shortfalls"]["IFS"]
+            assert shortfall["supported_hours"] == shortfall["expected_hours"][1:]
+            assert shortfall["missing_hours"] == {
+                str(shortfall["expected_hours"][0]): "fixture provider outage"
+            }
+            assert "RAP" not in result["shadow_shortfalls"]
+        else:
+            assert "shadow_shortfalls" not in result
         assert json.loads((output / "preparation.json").read_text()) == result
         assert (output / "discovery" / "selection.json").read_bytes() == selection_path.read_bytes()
         assert len(list((output / "discovery" / "inventories").iterdir())) == 120
         cover.assert_called_once()
-        pinned.assert_complete.assert_called_once()
-    pin.assert_called_once()
+        pins[0].assert_complete.assert_called_once()
+        for shadow_pin in pins[1:]:
+            if tolerated:
+                shadow_pin.assert_complete.assert_not_called()
+            else:
+                shadow_pin.assert_complete.assert_called_once()
+    assert pin.call_count == 3
+    assert [len(call.args[1]) for call in pin.call_args_list] == [72, 36, 12]
+    assert [call.kwargs.get("latch_failures", True) for call in pin.call_args_list] == [
+        True,
+        not tolerated,
+        not tolerated,
+    ]
     if not pop_status:
         prepare_pop.assert_not_called()
-    assert len(pin.call_args.args[1]) == 120
     acquire.assert_called_once()
     if qpf:
         qpf_acquire.assert_called_once()
-        assert qpf_acquire.call_args.args[3] is pinned
+        assert qpf_acquire.call_args.args[3] is pins[0]
     else:
         qpf_acquire.assert_not_called()
     prepare_control.assert_called_once()
     assert prepare_control.call_args.kwargs["hrrr_cycle"].isoformat() == "2026-09-11T06:00:00+00:00"
     assert prepare_control.call_args.kwargs["gfs_cycle"].isoformat() == "2026-09-11T06:00:00+00:00"
-    for model, prepare in shadow_mocks.items():
+    for index, (model, prepare) in enumerate(shadow_mocks.items(), start=1):
         if failure == "RAP missing hour" and model == "IFS":
             prepare.assert_not_called()
             continue
@@ -519,7 +556,7 @@ def test_preparation_reuses_one_selected_source_set_and_rejects_partial_shadows(
         assert prepare.call_args.kwargs["cycle_override"] == selected_forecast._time(
             selection_report["selected_cycles"][model]
         )
-        assert prepare.call_args.kwargs["transport"] is pinned
+        assert prepare.call_args.kwargs["transport"] is pins[index]
 
 
 def test_control_acquisition_only_uses_each_selected_endpoint_and_lead(
@@ -649,3 +686,21 @@ def test_selected_batch_prepares_once_and_preserves_shadows_and_evidence_in_immu
         assert saved["forecast"] == forecast
     assert len(records.issued_forecasts) == 2
     forbid_network.assert_not_called()
+
+
+def test_extended_42_hour_selection_loads_and_a_43_hour_window_is_rejected(tmp_path):
+    from tests.unit.application.test_current_model_set import MetadataProbe, _select_extended
+
+    report = _select_extended(tmp_path, probe=MetadataProbe())
+    assert report["horizon_hours"] == list(range(1, 43))
+    path = tmp_path / "selection" / "selection.json"
+    loaded, _, probes = selected_forecast.load_selection(path, clock=FixedClock(NOW))
+    assert loaded == report
+    assert len(probes) == 42 * 3 + 14  # Hourly HRRR/GFS/RAP plus native three-hourly IFS.
+    assert loaded["last_valid_time"] == "2026-09-13T04:00:00Z"
+    too_long = deepcopy(report)
+    too_long["horizon_hours"] = list(range(1, 44))
+    too_long["last_valid_time"] = "2026-09-13T05:00:00Z"
+    path.write_text(json.dumps(too_long), encoding="utf-8")
+    with pytest.raises(ValueError, match="complete, unchanged and unexpired"):
+        selected_forecast.load_selection(path, clock=FixedClock(NOW))

@@ -23,6 +23,7 @@ from mesoforge.guidance.acquisition_v2 import (
     _head_full_object_length,
     resolve_available_at,
 )
+from mesoforge.guidance.coverage import MAXIMUM_PREPARED_HOURS
 from mesoforge.guidance.http_fetch import FetchedObject, FetchError, fetch_with_retry, header
 from mesoforge.guidance.index_parsing import (
     GribIndexError,
@@ -309,10 +310,16 @@ def discover_rap_cycle(
     target = _utc_hour(target_reference_time)
     if (
         not target_horizons
-        or any(type(hour) is not int or not 1 <= hour <= 36 for hour in target_horizons)
+        or any(
+            type(hour) is not int or not 1 <= hour <= MAXIMUM_PREPARED_HOURS
+            for hour in target_horizons
+        )
         or tuple(sorted(set(target_horizons))) != target_horizons
     ):
-        raise ValueError("target_horizons must be a sorted unique nonempty subset of 1..36")
+        raise ValueError(
+            "target_horizons must be a sorted unique nonempty subset of "
+            f"1..{MAXIMUM_PREPARED_HOURS}"
+        )
     now = clock.now()
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("Discovery clock must be timezone aware")

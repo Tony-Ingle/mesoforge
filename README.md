@@ -75,6 +75,10 @@ only required geographic inputs; names are optional display metadata.
 - **Shared inputs:** [current four-model discovery](#discover-the-current-four-model-set)
   and [selected preparation/issuance](#prepare-and-issue-the-exact-selected-model-set)
   preserve actual provider availability, identities, cycles/leads and acquisition times.
+  A [background refresh](#refresh-guidance-and-forecast-from-the-latest-complete-snapshot)
+  publishes a complete prepared contributor snapshot (36–42 hours) behind an atomic
+  `latest_complete` pointer, and a network-free command serves 36-hour forecasts and
+  issuances from it for the current UTC hour.
   [Coordinate-derived coverage](#automatic-spatial-coverage) reuses native-grid guidance
   across locations; raw messages support offline rebuilding. The separate local
   MesoForge grid reuses these loaded sources and retains its own transformation identity.
@@ -114,13 +118,15 @@ kept as contributor evidence rather than offered as a competing forecast
 ([VISION.md](VISION.md#north-star-the-blend-is-the-forecast)). The fixed HRRR/GFS
 weights, the NBM-only PoP/sky/thunder sources, the HRRR/GFS p-type agreement rule and
 the zero-weight RAP/IFS shadows described above are today's scaffolding for that
-blend, not its final form, and they stay in force until explicitly replaced. Likewise,
-a forward run currently discovers, downloads and prepares guidance inline before it
-can issue (about 11–13 minutes locally, and within one UTC clock hour). The intended
-operation is a background guidance refresh that publishes a latest complete prepared
-snapshot which ad-hoc and scheduled forecasts consume without waiting; that split is
-the [proposed next milestone](docs/rfcs/mesoforge-v2-architecture.md#56-background-guidance-refresh-and-the-latest-complete-prepared-snapshot)
-and is not implemented.
+blend, not its final form, and they stay in force until explicitly replaced. The slow
+provider work is now separate from forecast requests: a
+[background refresh](#refresh-guidance-and-forecast-from-the-latest-complete-snapshot)
+publishes a complete prepared contributor snapshot (up to 42 hours) and a
+network-free command serves 36-hour forecasts and issuances from it for the current
+UTC hour; the compatibility forward run still prepares inline. Continuous refresh on
+the VPS, GitHub Actions scheduling, the generalized blend engine and a cross-field
+coherence engine remain future work
+([RFC §5.5–5.6](docs/rfcs/mesoforge-v2-architecture.md#55-field-specific-blend-layer)).
 
 Future direction: add bounded spatial editing to the coherent context/editable baseline.
 Versioned deterministic tools would validate bounded GFE-style AI edit recipes, keeping
@@ -2680,6 +2686,115 @@ acquisition on later runs until their window is retained; facts persisted before
 attributes existed are not indexed; the lock is process-wide, so two forward runs on
 different coordinate lists also serialize; and every forward `verify()` still reads
 the full issuance payloads (the read-cost limit measured earlier).
+
+### Refresh guidance and forecast from the latest complete snapshot
+
+The slow provider work and the forecast request are now separate commands. The
+compatibility forward run above is unchanged; these two reuse its functions.
+
+**Background refresh** (network, roughly 10–15 minutes here):
+
+```text
+python -m mesoforge.application.refresh_guidance --config locations.json --root %LOCALAPPDATA%\MesoForge\guidance
+```
+
+It discovers the newest complete HRRR/GFS/RAP/IFS cycles with a **42-hour target
+window** (`mesoforge-prepared-coverage-policy.v1`, `--coverage-hours 36..42`; cycle
+acceptance still uses the first 36 hours, hours 37–42 are acquired only where the
+accepted cycle publishes them, and the window ends at the last hour every model
+reaches), runs `prepare_selected` with NBM PoP, attaches native p-type, cloud and
+thunder, attaches visibility evidence (optional; a failure is recorded, not fatal),
+loads the finished preparation offline, computes one validation column per configured
+coordinate, writes `snapshots/<id>/snapshot.json` (`mesoforge.prepared-snapshot.v1`)
+and only then replaces `latest_complete.json`
+(`mesoforge.latest-complete-pointer.v1`) atomically. A failed step leaves the previous
+pointer unchanged and retains `failure.json`; the pointer never moves to an older
+reference time. The manifest separates native deterministic contributors (HRRR/GFS
+active; RAP/IFS shadow evidence), the blended meta-model NBM with its
+active-current-policy products (hourly PoP, sky, thunder) and evidence-only inputs,
+names the current field-policy identities, and references every preparation artifact
+by path and digest. NBM PoP selection now rejects a still-publishing newest cycle
+(identity/range validation failure), records it under `rejected_candidates` and uses
+the next complete cycle; validation is unchanged. The refresh calls `prepare_selected`
+with `require_complete_shadows=False`: the active HRRR/GFS objects and each zero-weight
+shadow use their own pinned view of the same discovery, a shadow provider failure
+(for example an ECMWF open-data 503) stays recorded per object under
+`shadow_shortfalls` instead of aborting the preparation, and the snapshot marks that
+shadow `partial`/`unavailable`. The compatibility forward run keeps the strict default.
+
+**Forecast from the snapshot** (no provider access; the request hour is the
+reference time):
+
+```text
+python -m mesoforge.application.forecast_from_snapshot --root %LOCALAPPDATA%\MesoForge\guidance --lat 44.98859 --lon -93.25557 --name Minneapolis --display-timezone America/Chicago
+python -m mesoforge.application.forecast_from_snapshot --root … --config locations.json --issue [--reissue] [--output-dir DIR]
+```
+
+It resolves the pointer, verifies the manifest and retained-artifact digests, derives
+`reference_time = floor(request_time)` (22:37Z → 22Z, 23:05Z → 23Z), checks that HRRR
+and GFS hold every valid time R+1…R+36, reads the prepared files as a *reference view*
+for that hour (source cycles and leads are exactly what was prepared; the forecast
+records `prepared_window` beside its `target_reference_time`), builds the local grid
+with the existing policies and returns the 36-hour point forecast plus the hourly
+report. NBM-based products report their own covered and missing valid times and never
+shorten the forecast. Insufficient coverage returns `no_current_snapshot` (exit 3).
+`--issue` reuses the same path, applies the decision-window guard before the grid
+build, and saves the `prepared_snapshot` provenance (snapshot ID, publication time,
+request and reference times, contributor cycles, field policies, coverage) inside the
+immutable issuance. Coordinates outside the refreshed collection's footprint are
+refused (`coverage_required`); the snapshot is not extended on demand.
+
+**Real demonstration, September 18, 2026** (evidence under
+`%LOCALAPPDATA%\MesoForge\guidance` and `%LOCALAPPDATA%\MesoForge\baselines\20260918-snapshot-demo`,
+physically in the `Packages/Claude_…/LocalCache/Local/MesoForge` mirror; the ECMWF
+open-data bucket returned 503s/connection failures during the first three attempts,
+which failed without publishing anything and retained their `failure.json`):
+
+- **Refresh** (Minneapolis + St. Paul, `--coverage-hours 42`): snapshot
+  `20260918T004459Z-fcb1b488`, decision 00:44:59Z, reference 00Z, **819.6 s** total
+  (discovery 166.1 s, `prepare_selected` with PoP 397.6 s, p-type 111.5 s, cloud
+  58.7 s, thunder 28.1 s, visibility evidence 49.2 s, offline validation 8.4 s,
+  publish 0.0 s), **1,171,658,713 bytes** downloaded, 1.78 GB retained. Selected
+  cycles: HRRR 18Z (leads 7–48), GFS 18Z (7–48), RAP 21Z (4–45), IFS 18Z (native
+  3-hourly 9–48): all four reached hour 42, so the window is
+  2026-09-18T01Z–2026-09-19T18Z. NBM PoP: the 00Z cycle was entirely unavailable
+  (404), so the newest complete cycle 23Z served all 42 hours; the new
+  invalid-evidence rejection path was therefore not exercised in this run. NBM 23Z also
+  covered total cloud for all 42 hours, but its native one-hour thunder product ended at
+  lead 36 (11Z Sep 19) and visibility at lead 37, both recorded as `partial` with the
+  missing valid times. RAP 42/42 and IFS 14/14 native hours were retained (no shadow
+  shortfall this time). The manifest is 64 KB and references, not copies, its 1.78 GB
+  of preparation artifacts.
+- **Ad-hoc forecast, all sockets blocked** (`netguard.py --block-all`): request
+  00:59:09Z → reference 00Z, 36 hours 01Z–12Z, `blocked_attempts: []`, **180.8 s**
+  (pointer/digest verification 0.02 s, guidance load 2.0 s, **local-grid build
+  178.6 s**, hourly report 0.14 s).
+- **Issuance from the same snapshot** (loopback only, Minneapolis + St. Paul + an
+  invalid entry): request 01:02:49Z → reference 01Z (offset +1 h from the prepared
+  window), Minneapolis `8148c74e-4e0f-4660-a923-aa36b94b5100` and St. Paul
+  `2fbc62dc-a218-4a9e-957e-cdbb426473a5`, hours 02Z–13Z, guidance loaded once (2.0 s),
+  grid 177.9/178.4 s, issuance 18.9/19.1 s, 396.8 s total, the invalid entry isolated as
+  `invalid_location`, no provider attempts. Conditions, transitions and period
+  summaries then ran unchanged on the Minneapolis issuance (five transitions, no gaps;
+  about 26 s each, dominated by reading the issuance object).
+- **Later reuse and boundary**: the same snapshot at an explicit reference of 06Z
+  (offset +6 h) served 07Z–18Z Sep 19 (176.3 s; thunder partial for 12Z–18Z as
+  recorded), and 07Z returned `no_current_snapshot` in 1.2 s with the exact reason
+  (`first missing 2026-09-19T19:00:00Z` for HRRR and GFS), exit 3.
+
+Validation on September 18, 2026: the offline unit/contract/property suites (the
+same three pre-existing failures deselected), the forward-run, batch-issuance and
+storage integration tests (71) against pgserver and moto, ruff, mypy, the nine import
+contracts, documentation checks and `git diff --check` passed.
+
+Limitations: the local-grid build (49 columns, about 3.6 s each with the full
+attachment set) is the request-time bottleneck and is not interactive; the refresh
+must still finish inside its decision hour (existing selection expiry); coordinates
+outside the refreshed collection's footprint are refused rather than prepared
+offline; the pointer is a local file, not a shared service; superseded and failed
+snapshot directories are retained without any pruning policy; ad-hoc (non-issued)
+forecasts have no conditions/transitions/period preview because those layers read
+saved issuances only.
 
 ### Read-only site verification analysis
 

@@ -67,11 +67,17 @@ class SelectedObjectTransport:
         *,
         decision_time: datetime,
         clock: Clock,
+        latch_failures: bool = True,
     ) -> None:
         if decision_time.tzinfo is None or decision_time.utcoffset() is None:
             raise ValueError("decision_time must be timezone aware")
         self.transport, self.clock = transport, clock
         self.decision_time = decision_time.astimezone(UTC)
+        # Every object is validated individually either way. With latching (the
+        # default for the active model set) one failure stops all later requests;
+        # without it a zero-weight shadow keeps acquiring its other selected objects
+        # and each failure stays recorded and explicit.
+        self.latch_failures = latch_failures
         self.failed_reason: str | None = None
         self._records: list[dict[str, Any]] = []
         self._indexes: dict[str, dict[str, Any]] = {}
@@ -176,6 +182,10 @@ class SelectedObjectTransport:
         self.failed_reason = reason
         raise SelectedObjectError(reason)
 
+    @property
+    def failures(self) -> list[dict[str, Any]]:
+        return [deepcopy(record) for record in self._records if record["status"] == "failed"]
+
     def _publication(self, headers: Mapping[str, str], expected: dict[str, Any]) -> None:
         modified = header(dict(headers), "Last-Modified")
         published = parse_provider_availability(modified)
@@ -197,7 +207,7 @@ class SelectedObjectTransport:
         headers: Mapping[str, str] | None,
         timeout: tuple[float, float] | None,
     ) -> HttpResponse:
-        if self.failed_reason is not None:
+        if self.failed_reason is not None and self.latch_failures:
             raise SelectedObjectError(self.failed_reason)
         is_index = url in self._indexes
         if not is_index and url not in self._gribs:

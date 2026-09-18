@@ -371,3 +371,104 @@ def test_retained_metadata_matches_report_and_existing_selection_is_never_overwr
         for path in directory.rglob("*")
         if path.is_file()
     } == before
+
+
+def _select_extended(tmp_path, *, probe, coverage_hours=42):
+    clock = FixedClock(NOW)
+    return select_model_set(
+        tmp_path / "selection",
+        configuration=phase2_configuration(),
+        decision_time=DECISION,
+        transport=Mock(spec=[], downloaded_bytes=0),
+        clock=clock,
+        sleeper=RecordingSleeper(clock),
+        probe=probe,
+        coverage_hours=coverage_hours,
+    )
+
+
+def test_extended_window_probes_only_the_accepted_cycle_and_reaches_42_hours(tmp_path):
+    probe = MetadataProbe()
+    report = _select_extended(tmp_path, probe=probe)
+    assert report["status"] == "selected"
+    assert report["selected_cycles"] == {model: _iso(cycle) for model, cycle in LATEST.items()}
+    assert report["horizon_hours"] == list(range(1, 43))
+    assert report["last_valid_time"] == _iso(TARGET + timedelta(hours=42))
+    assert report["coverage"]["policy"]["id"] == "mesoforge-prepared-coverage-policy.v1"
+    assert report["coverage"]["requested_hours"] == 42
+    assert report["coverage"]["prepared_hours"] == 42
+    for model, cycle in LATEST.items():
+        row = report["models"][model]
+        assert row["extended_to_hour"] == 42 and row["extension_stopped"] is None
+        age = int((TARGET - cycle).total_seconds() / 3600)
+        native = [age + h for h in range(1, 43) if model != "IFS" or (age + h) % 3 == 0]
+        assert row["source_leads"] == native
+        assert row["valid_times"][-1] == _iso(cycle + timedelta(hours=native[-1]))
+        selected = next(c for c in row["candidates"] if c["status"] == "metadata_complete")
+        assert sorted(p["source_lead_hours"] for p in selected["probes"]) == native
+        assert "unused_extension_probes" not in selected and "extension_probes" not in selected
+        extension_calls = [
+            lead for name, chosen, lead in probe.calls if name == model and chosen == cycle
+        ]
+        assert max(extension_calls) == native[-1]  # Only the accepted cycle was extended.
+    assert report["coverage"]["models"]["HRRR"]["last_valid_time"] == _iso(
+        TARGET + timedelta(hours=42)
+    )
+
+
+def test_missing_extension_lead_ends_the_window_without_rejecting_the_cycle(tmp_path):
+    probe = MetadataProbe()
+    hrrr_age = 4
+    probe.missing = lambda model, cycle, lead: model == "HRRR" and lead == hrrr_age + 41
+    report = _select_extended(tmp_path, probe=probe)
+    assert report["status"] == "selected"
+    assert report["selected_cycles"]["HRRR"] == _iso(LATEST["HRRR"])
+    assert report["models"]["HRRR"]["extended_to_hour"] == 40
+    assert str(hrrr_age + 41) in report["models"]["HRRR"]["extension_stopped"]
+    assert report["horizon_hours"] == list(range(1, 41))
+    assert report["last_valid_time"] == _iso(TARGET + timedelta(hours=40))
+    assert report["coverage"]["prepared_hours"] == 40
+    hrrr = next(
+        c for c in report["models"]["HRRR"]["candidates"] if c["status"] == "metadata_complete"
+    )
+    assert hrrr["source_leads"] == list(range(hrrr_age + 1, hrrr_age + 41))
+    assert len(hrrr["probes"]) == 40
+    assert [p["source_lead_hours"] for p in hrrr["unused_extension_probes"]] == [hrrr_age + 41]
+    gfs = next(
+        c for c in report["models"]["GFS"]["candidates"] if c["status"] == "metadata_complete"
+    )
+    assert report["models"]["GFS"]["extended_to_hour"] == 42
+    assert [p["source_lead_hours"] for p in gfs["unused_extension_probes"]] == [45, 46]
+    assert len(gfs["probes"]) == 40
+
+
+def test_extension_evidence_error_ends_the_window_but_never_fails_the_selection(tmp_path):
+    inner = MetadataProbe()
+
+    def probe(**kwargs):
+        if kwargs["model"] == "GFS" and kwargs["lead"] > 4 + 36:
+            raise ProviderEvidenceError(
+                "ambiguous temperature inventory",
+                evidence={"status": "error", "reason": "ambiguous", "source_lead_hours": 41},
+                index_payloads={},
+            )
+        return inner(**kwargs)
+
+    report = _select_extended(tmp_path, probe=probe)
+    assert report["status"] == "selected"
+    assert report["models"]["GFS"]["extended_to_hour"] == 36
+    assert "could not be validated" in report["models"]["GFS"]["extension_stopped"]
+    assert report["horizon_hours"] == list(range(1, 37))
+    assert report["coverage"]["prepared_hours"] == 36
+
+
+def test_default_window_keeps_the_historical_36_hour_selection_shape(tmp_path):
+    probe = MetadataProbe()
+    report = _select(tmp_path, probe=probe)
+    assert report["horizon_hours"] == list(range(1, 37))
+    assert report["coverage"]["requested_hours"] == 36
+    assert report["coverage"]["prepared_hours"] == 36
+    assert all(row["extended_to_hour"] == 36 for row in report["models"].values())
+    assert len(probe.calls) == 36 * 3 + 12
+    with pytest.raises(ValueError, match="36..42"):
+        _select_extended(tmp_path / "bad", probe=MetadataProbe(), coverage_hours=43)

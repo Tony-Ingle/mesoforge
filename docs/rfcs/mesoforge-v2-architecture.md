@@ -106,9 +106,10 @@ clouds, QPF, PoP, precipitation type, snow, and other useful fields as their
 scientific contracts are implemented. Conditions derive from underlying forecast
 fields rather than an unexplained standalone prediction. The code-grounded canvas
 inventory and deterministic condition layer are in section 6.7. The read-only
-saved-grid preview, initial presentation rules, multi-hour transition detection and
-period summaries are implemented. The next proposed slice is the reusable
-latest-complete prepared snapshot of section 5.6, not another meteorological field.
+saved-grid preview, initial presentation rules, multi-hour transition detection,
+period summaries and the latest-complete prepared snapshot of section 5.6 are
+implemented. The next proposed slice is recorded in [README.md](../../README.md),
+not another meteorological field.
 
 **Owner model direction, 2026-09-10:** the long-term model mix includes HRRR,
 RAP, NAM 3 km, NAM, GFS, RRFS / REFS, and NBM, with useful deterministic and
@@ -576,28 +577,69 @@ lat/lon request
   GitHub Actions decides when to invoke issuance and delivery; MesoForge decides what
   the run means (section 2.3). The decision-window policy of section 6.7.14 continues
   to define the canonical scheduled forecast.
-- Snapshot cadence, how long a snapshot may serve, retention of superseded snapshots
-  and the storage location of the pointer are open (section 17).
+- Snapshot cadence, continuous operation on the VPS, retention of superseded
+  snapshots and a shared (non-filesystem) pointer location are open (section 17).
 
-**Current implementation versus this design (inspected at `aedbde2`).**
-`forward_run` performs verification, discovery (`select_model_set`), acquisition and
-preparation (`prepare_selected`, NBM PoP) and issuance (`run_batch`) in one locked
-invocation; the 2026-09-17 demonstration needed about 13 minutes before it could
-issue. Reusable pieces already exist: preparation retains complete native messages
-and writes `manifest.json` only through an atomic rename after all four models pass;
-`preparation.json` describes a finished prepared run and its attachments;
-`load_prepared`, `run_batch --data-dir` and `prepare_local_grids` consume such a run
-with no network access; `ensure_coverage` cuts views for new coordinates from the
-retained raw messages without reacquiring a cycle. What is missing is the published
-pointer, a refresh command separate from issuance, automatic inclusion of the
-p-type/cloud/thunder attachments that are still explicit manual steps, and a fallback
-in NBM selection, which currently stops at a still-publishing newest cycle instead of
-trying the next older one. The concrete constraint is temporal: a selection and its
-prepared window are bound to the decision clock hour (`target_reference_time` is the
-decision hour, hours 1–36 follow it, the selection expires at the first valid hour and
-issuance refuses a first valid time in the past), so a prepared run can serve requests
-only until its hour ends. How a snapshot should serve the following hour is an open
-owner decision, not something this text settles.
+**Implemented slice (2026-09-18).** The refresh and the snapshot-consuming forecast
+exist as separate commands; the operator/compatibility `forward_run` path is unchanged.
+
+- *Prepared window and coverage policy* (`mesoforge-prepared-coverage-policy.v1`,
+  `mesoforge.guidance.coverage`): a prepared window is hours 1..N after its reference
+  time, 36 ≤ N ≤ 42. Cycle acceptance still uses the first 36 hours exactly as before;
+  hours 37..N are probed only on the accepted cycle, and N is the largest hour every
+  deterministic model reaches. Prepared datasets were already keyed by absolute valid
+  time, so a later reference hour R is served by a *reference view*
+  (`PreparedPointForecast.reference_view`) that reads hours R+1..R+36 from the same
+  files: source cycles, leads and evidence are exactly what was prepared, and the
+  forecast records `prepared_window` (prepared reference, prepared hours, offset)
+  beside its own `target_reference_time`. The 42-hour target is 36 forecast hours plus
+  six hours of refresh grace; it is not forced. HRRR and GFS are limited by their
+  48-hour adapter envelope (42 hours needs a cycle no older than six hours), RAP by
+  its 51-hour extended cycles, IFS keeps native three-hourly slots. NBM hourly core
+  products are requested lead by lead up to the same 48-hour envelope and their actual
+  availability is recorded per valid time.
+- *Usability rule*: a snapshot serves R only if HRRR and GFS hold all of R+1..R+36. The
+  NBM-based active products (hourly PoP, sky, thunder) and the shadow/evidence
+  attachments report covered and missing valid times per product; they never shorten
+  the 36-hour forecast and never block publication, matching the explicit per-hour
+  unavailability the current policies already produce. An unusable snapshot yields
+  `no_current_snapshot`.
+- *Refresh* (`python -m mesoforge.application.refresh_guidance --config … --root …`):
+  discovery → `prepare_selected` with NBM PoP → p-type → cloud → thunder → visibility
+  evidence (optional, non-blocking) → offline load and one validation column per
+  configured coordinate → `snapshot.json` (`mesoforge.prepared-snapshot.v1`) →
+  atomic `latest_complete.json` (`mesoforge.latest-complete-pointer.v1`, written to a
+  temporary file and `os.replace`d, never pointing at partial work, never moving to an
+  older reference time). A failed step leaves the previous pointer unchanged and
+  retains `failure.json`. The manifest distinguishes native deterministic
+  contributors (HRRR/GFS active; RAP/IFS shadow evidence), the blended meta-model NBM
+  with its active-current-policy products, and evidence-only inputs; it names the
+  current field-policy identities, references every preparation artifact by path and
+  digest, and carries refresh timings and bytes.
+- *NBM candidate fallback* (owner-approved compatibility behaviour): when the newest
+  NBM cycle fails identity/range validation, typically because it is still
+  publishing, PoP selection rejects it, records `rejected_candidates`, and tries the
+  next older cycle; completeness is judged on the required 36 hours and extension hours
+  are explicit gaps. Validation itself is unchanged.
+- *Shadow shortfalls*: evidence-only products never block publication. The refresh
+  prepares with `require_complete_shadows=False`; the active HRRR/GFS objects and each
+  zero-weight shadow use separate pinned views of the same discovery (the shadow views
+  do not latch on a first failure), so a provider failure on a RAP/IFS object is
+  recorded per object and per missing hour instead of aborting the preparation. The
+  issuance-bound forward run keeps the strict default.
+- *Forecast from snapshot* (`python -m mesoforge.application.forecast_from_snapshot
+  --root … (--lat --lon | --config) [--reference-time] [--issue]`): resolves the
+  pointer, verifies manifest and retained-artifact digests, derives the reference hour
+  as the request's current UTC hour, checks absolute coverage, builds the local grid
+  with the existing policies and returns the 36-hour forecast with `prepared_snapshot`
+  provenance (snapshot ID, publication time, request/reference times, contributor
+  cycles, field policies, coverage). It makes no provider calls. `--issue` reuses the
+  same path with the decision-window guard applied before the grid build.
+- *Still bound*: the refresh must still complete inside its decision hour (the
+  existing selection expiry), coordinates outside the refreshed collection's footprint
+  are refused rather than prepared on demand, conditions/transitions/period previews
+  remain read-only over saved issuances, and the local-grid build (about one to four
+  seconds per column, 49 columns) dominates request time.
 
 ## 6. First-release flows
 
@@ -1765,11 +1807,10 @@ accounts, long-term retention, or public SLOs.
 
 The full inspected canvas, including completed p-type and subsequent native evidence,
 is inventoried in section 6.7. Its read-only saved-grid preview, bounded initial
-wording policy, multi-hour transition detection and period summaries are implemented.
-The next proposed slice is separating the background guidance refresh from forecast
-generation through a reusable latest-complete prepared snapshot (section 5.6). It is
-proposed, not approved; further rules, field promotion and dynamic blending require
-separate approval.
+wording policy, multi-hour transition detection and period summaries are implemented,
+and the background guidance refresh is separated from forecast generation through
+the latest-complete prepared snapshot (section 5.6). Further rules, field promotion,
+dynamic blending and a coherence engine require separate approval.
 
 File/module/table/code/test/change-size estimates are non-binding planning aids per slice.
 Material overrun triggers review when it reveals changed design, not because of a line
@@ -1836,11 +1877,12 @@ all-in-one proof-harness requirement.
    The approved preparation/station defaults in section 2.3 do not settle these choices.
 5. Retention costs/durations and advertised capability levels.
 6. Private authentication/operator authorization.
-7. Prepared-snapshot operation (section 5.6): refresh cadence, how long a snapshot may
-   serve requests once its first valid hour has passed (shorter remaining horizon,
-   extra prepared leads, or preparing the next hour ahead), whether NBM selection may
-   demote a still-publishing newest cycle and fall back, pointer/storage location and
-   retention of superseded snapshots.
+7. Prepared-snapshot operation (section 5.6): refresh cadence on the VPS, retention
+   of superseded snapshots, a shared pointer location beyond the local filesystem,
+   whether the refresh may finish outside its decision hour, and whether an ad-hoc
+   coordinate outside the refreshed footprint may trigger an offline regional rebuild.
+   Resolved on 2026-09-18: absolute valid-time coverage with a 42-hour target window
+   and the NBM still-publishing fallback.
 8. Field-specific blend policies (section 5.5): the per-field mathematics, dynamic
    weight inputs and their evidence thresholds, and the order in which current
    scaffolding is replaced. No equation, multiplier or default is approved.
@@ -1888,6 +1930,8 @@ all-in-one proof-harness requirement.
 | Blend weights | Per-field policies with field-valid mathematics; dynamic inputs (lead, availability, freshness, verified skill, site, later regime) are conceptual; current fixed weights and single-source rules are scaffolding |
 | AI edits | Persisted as bounded, interpretable edits to the MesoForge field after deterministic correction; contributors are cited evidence, not selections |
 | Refresh versus request | Background refresh publishes an atomic latest-complete prepared snapshot and keeps the previous good one; ad-hoc and scheduled forecasts consume it; the orchestrator decides when, MesoForge decides what; mixed source cycles are valid when available before the issuance cutoff |
+| Snapshot coverage | Usability is absolute valid-time coverage of R+1..R+36 for the active deterministic contributors (`mesoforge-prepared-coverage-policy.v1`, 42-hour target window, never forced); NBM-based products report their own coverage; the request hour is the reference hour |
+| Cross-field coherence | Field-specific blends must stay mutually coherent (p-type/precipitation/thermal structure, thunder/convective support, gust/wind, RH/T/Td, later fog); snapshots keep every contributor field and its availability so a later coherence engine can evaluate them |
 | Issuance | Immutable baseline, corrected fields, proposal/recipe and final fields when implemented; mutable pointer/status only |
 | Facts | Normalized facts and on-demand evaluation; no Cartesian lattice |
 | Errors | Derive on demand; no first-release `error_facts` |

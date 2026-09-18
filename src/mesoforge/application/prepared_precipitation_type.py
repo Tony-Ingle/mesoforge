@@ -27,6 +27,7 @@ from mesoforge.application.prepared_temperature import (
 )
 from mesoforge.application.spatial_coverage import native_bbox_bounds
 from mesoforge.guidance.acquisition_v2 import Phase2LeadAcquisition
+from mesoforge.guidance.coverage import window_hours
 from mesoforge.guidance.http_fetch import FetchError
 from mesoforge.guidance.index_parsing import GribIndexError
 from mesoforge.guidance.interfaces import Clock, HttpTransport, Sleeper
@@ -130,6 +131,7 @@ def prepare_type_run(
     if not selection.get("surface_fields"):
         raise ValueError("P-type attaches to an existing surface-grid preparation")
     target = _hour(datetime.fromisoformat(selection["target_reference_time"]))
+    hours = window_hours(selection)
     cycles = dict(selection["selected_cycles"])
     if original.get("pop_guidance", {}).get("selected_cycle"):
         cycles["NBM"] = original["pop_guidance"]["selected_cycle"]
@@ -170,7 +172,7 @@ def prepare_type_run(
             events, inputs, views = [], [], None
             native_axes = None
             slices = []
-            for hour in range(1, 37):
+            for hour in hours:
                 valid = target + timedelta(hours=hour)
                 lead = int((valid - cycle).total_seconds() / 3600) if cycle else None
                 event = {
@@ -263,12 +265,12 @@ def prepare_type_run(
                                 {
                                     name: (
                                         ("event", "y", "x"),
-                                        np.full((36, len(y[ys]), len(x[xs])), np.nan),
+                                        np.full((len(hours), len(y[ys]), len(x[xs])), np.nan),
                                         dict(field.attrs),
                                     )
                                     for name, field in dataset.data_vars.items()
                                 },
-                                coords={"event": list(range(36)), "y": y[ys], "x": x[xs]},
+                                coords={"event": list(range(len(hours))), "y": y[ys], "x": x[xs]},
                                 attrs={"crs_wkt2": crs.to_wkt()},
                             )
                             for ys, xs in slices

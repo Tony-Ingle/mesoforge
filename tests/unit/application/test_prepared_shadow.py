@@ -194,9 +194,10 @@ def test_decoded_source_time_mismatch_is_rejected(name):
         normalize_shadow_temperature({4: source}, model="RAP", cycle=CYCLE, target=TARGET)
 
 
-@pytest.mark.parametrize("lead", [True, 3, 40])
+@pytest.mark.parametrize("lead", [True, 3, 46])
 def test_unrequested_or_noninteger_leads_are_rejected(lead):
-    with pytest.raises(ValueError, match="target hours 1 through 36"):
+    # Leads may reach the extended prepared window (hour 42), never beyond it.
+    with pytest.raises(ValueError, match="target hours 1 through 42"):
         normalize_shadow_temperature({lead: frame()}, model="RAP", cycle=CYCLE, target=TARGET)
 
 

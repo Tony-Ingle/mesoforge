@@ -69,8 +69,9 @@ def test_native_window_boundaries_and_nonzero_cycle_hour_are_not_guessed_from_le
         source.thunder_url("NBM_6H", CYCLE, 5)
     with pytest.raises(ValueError, match="complete native"):
         source.thunder_url("NBM_1H", CYCLE, True)
-    with pytest.raises(ValueError, match="through 36"):
-        source.thunder_url("NBM_1H", CYCLE, 37)
+    # Hourly core files are requested lead by lead within the shared 48-hour envelope.
+    with pytest.raises(ValueError, match="through 48"):
+        source.thunder_url("NBM_1H", CYCLE, 49)
     # NBM's inventory, not a lead%3 assumption, establishes published intervals.
     source.thunder_url("NBM_3H", CYCLE.replace(hour=13), 5)
 

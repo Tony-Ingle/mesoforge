@@ -25,10 +25,12 @@ This pipeline is the canonical long-term MesoForge architecture (owner direction
                      ├─ RAP
                      ├─ GFS
                      ├─ IFS
-                     ├─ NBM
+                     ├─ NBM / benchmarks
                      └─ ensembles
                          ↓
                 FIELD-SPECIFIC BLENDS
+                         ↓
+               CROSS-FIELD COHERENCE
                          ↓
                 MesoForge baseline grid
                          ↓
@@ -38,15 +40,26 @@ AI sees baseline + every contributor + surrounding context
                          ↓
        bounded spatial / temporal field edits
                          ↓
+               CROSS-FIELD VALIDATION
+                         ↓
                 final MesoForge grid
                          ↓
                   spot forecast
 ```
 
 **The blend is the forecast.** MesoForge maintains one coherent baseline forecast
-grid made from field-specific blends. Individual models are contributors, evidence,
-provenance and context. They are not competing final forecasts presented to the user,
-and no stage of the pipeline "picks a model."
+grid made from field-specific blends. Individual models, and blended products such as
+NBM, are contributors, benchmarks, evidence, provenance and AI context. They are not
+competing final forecasts presented to the user, and no stage of the pipeline "picks
+a model."
+
+NBM is today's active scaffolding for hourly PoP, sky and thunder only because
+MesoForge has no probabilistic, cloud or convective blend of its own yet. Long term,
+MesoForge PoP comes from its own calibrated probabilistic blend, sky/cloud from its
+own field-specific blend and thunder from its own coherent probabilistic/convective
+blend; NBM stays a benchmark/shadow/evidence source unless verification explicitly
+supports using it as one weighted meta-model contributor. That replacement happens
+in deliberate later blend milestones, not by removing the current behaviour.
 
 ### Field-specific blends
 
@@ -149,10 +162,15 @@ is complete
 ```
 
 The refresh is slow and runs independently of any forecast request. An ad-hoc
-forecast should not normally wait for GRIB downloads or the next clock-hour decision
-window. For issued/scheduled forecasts, an external orchestrator such as GitHub
-Actions decides **when** to invoke MesoForge; MesoForge owns **what** a forecast run
-means. Model discovery, blending and weather science never live in workflow YAML.
+forecast does not wait for GRIB downloads or the next clock-hour decision window: it
+uses the current UTC hour as its reference time and the newest complete snapshot whose
+absolute valid times still cover the next 36 hours (a snapshot prepares up to 42
+hours so it can serve later hours; usability is judged on coverage, not on the hour
+it was prepared). `latest complete` is a prepared contributor/evidence snapshot, not
+"the NBM forecast" or "the HRRR forecast": MesoForge constructs its baseline from it.
+For issued/scheduled forecasts, an external orchestrator such as GitHub Actions
+decides **when** to invoke MesoForge; MesoForge owns **what** a forecast run means.
+Model discovery, blending and weather science never live in workflow YAML.
 
 Issuance time, source model cycles and source availability are separately recorded
 facts. A forecast issued at 17:37 local time may validly use HRRR 18Z, RAP 21Z,
@@ -165,13 +183,28 @@ issuance's information cutoff.
 
 Implemented today: the local context/editable grid, real model acquisition,
 current-cycle discovery, the active field policies and shadow/evidence contributors
-listed above, immutable issuance, temperature verification, read-only site analysis,
-deterministic conditions, transitions and period summaries. Still future: generalized
-dynamic field-specific blending, data-driven model weighting, an operational
-continuously refreshed prepared snapshot (a forward run still discovers, downloads
-and prepares guidance inline before it can issue), applied deterministic site
-corrections, AI/GFE spatial editing, and the final promotion/evaluation mechanisms.
-This direction does not authorize implementing those stages inside unrelated work.
+listed above, a background refresh that publishes a complete prepared contributor
+snapshot, a network-free forecast/issuance path that consumes it (with a 36-hour
+window served from up to 42 prepared hours), immutable issuance, temperature
+verification, read-only site analysis, deterministic conditions, transitions and
+period summaries. Still future: the generalized field-specific blend engine,
+data-driven verified weighting, a generalized cross-field coherence engine, applied
+deterministic site corrections, AI/GFE spatial editing, continuous refresh on the VPS,
+GitHub Actions scheduling, and the final promotion/evaluation mechanisms. This
+direction does not authorize implementing those stages inside unrelated work.
+
+### Cross-field coherence
+
+Field-specific blends are not unrelated products: the baseline and final grids must be
+internally coherent. Thunder must be reconciled with precipitation and convective
+support; precipitation type with precipitation occurrence and the relevant thermal
+structure; snowfall/SWE with snow-type support; freezing-rain and ice fields with
+p-type and thermodynamics; gust with sustained wind; RH stays coupled to temperature
+and dew point; fog will eventually depend on visibility plus supporting moisture and
+cloud evidence. Today only the existing pairwise checks exist (dew point ≤ temperature,
+gust versus sustained wind, RH derived from T/Td). A generalized coherence engine is
+future work; until then the snapshot keeps every contributor field, its native
+semantics and its per-hour availability so later coherence evaluation can read them.
 
 ## What is established, and what is proposed
 
@@ -400,11 +433,11 @@ skips coordinates that already hold a version for the discovered decision window
 The orchestrator decides only when MesoForge runs; discovery, blending and every
 other scientific rule stay inside MesoForge. That deployment and scheduling remain
 deferred; preparation must stay outside forecast HTTP requests regardless of how
-runs are started. Today the forward run itself still performs discovery, acquisition
-and preparation before issuing (roughly 11–13 minutes in the local demonstrations,
-and it must finish within the reference UTC hour); moving that work into a
-background refresh that publishes a latest complete prepared snapshot is future
-work, described in the [north star](#guidance-refresh-is-separate-from-forecast-requests).
+runs are started. The background refresh and the snapshot-consuming forecast/issuance
+commands now exist locally (see [README.md](README.md#refresh-guidance-and-forecast-from-the-latest-complete-snapshot));
+the compatibility forward run still performs discovery, acquisition and preparation
+inline before issuing. Running the refresh continuously on the VPS and triggering
+issuance from GitHub Actions remain future work.
 
 ## Long-term model direction
 

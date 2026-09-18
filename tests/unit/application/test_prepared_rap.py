@@ -326,7 +326,7 @@ def test_legacy_full_window_manifest_remains_reusable(
     )["supported_hours"] == list(range(1, 37))
 
 
-@pytest.mark.parametrize("hours", [(), (3, 3), (6, 3), (True,), (0,), (37,)])
+@pytest.mark.parametrize("hours", [(), (3, 3), (6, 3), (True,), (0,), (43,)])
 def test_bounded_preparation_rejects_invalid_hours_before_io(tmp_path, hours):
     with pytest.raises(ValueError, match="sorted unique nonempty"):
         prepared_rap.prepare_rap([], tmp_path / "missing-control", tmp_path, target_horizons=hours)

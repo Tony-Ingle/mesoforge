@@ -39,6 +39,10 @@ from mesoforge.guidance.sources.probabilistic import (
     normalized_native_grid,
 )
 
+# The hourly NBM core files are requested lead by lead; availability past 36 h is
+# provider evidence recorded per lead, never assumed. The bound keeps URL building
+# inside the same 48-hour envelope as the HRRR/GFS adapters.
+NBM_MAXIMUM_LEAD = 48
 FLAGS = {
     "rain": ("CRAIN", 33),
     "snow": ("CSNOW", 36),
@@ -137,8 +141,10 @@ def type_url(model: str, cycle: datetime, lead: int) -> str:
         if cycle.hour % 6 or lead > 120:
             raise ValueError("Bounded GFS p-type requires a six-hour cycle and hourly lead <=120")
         return f"https://noaa-gfs-bdp-pds.s3.amazonaws.com/gfs.{day}/{hh}/atmos/gfs.t{hh}z.pgrb2.0p25.f{lead:03d}"
-    if lead > 36:
-        raise ValueError("Bounded NBM p-type experiment supports leads through 36")
+    if lead > NBM_MAXIMUM_LEAD:
+        raise ValueError(
+            f"Bounded NBM hourly core products support leads through {NBM_MAXIMUM_LEAD}"
+        )
     return f"https://noaa-nbm-grib2-pds.s3.amazonaws.com/blend.{day}/{hh}/core/blend.t{hh}z.core.f{lead:03d}.co.grib2"
 
 

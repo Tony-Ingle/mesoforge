@@ -40,6 +40,7 @@ from mesoforge.guidance.acquisition_v2 import (
     acquire_gfs_lead,
     acquire_hrrr_phase2_lead,
 )
+from mesoforge.guidance.coverage import is_prepared_window
 from mesoforge.guidance.interfaces import Clock, HttpResponse, HttpTransport, Sleeper
 from mesoforge.guidance.normalization import (
     build_lambert_conformal_crs,
@@ -82,10 +83,11 @@ def _hour(value: datetime) -> datetime:
 def _leads(
     target: datetime, cycle: datetime, target_horizon_hours: tuple[int, ...] = _HORIZONS
 ) -> tuple[int, ...]:
-    if target_horizon_hours not in ((1, 2, 3), _HORIZONS) or any(
-        type(hour) is not int for hour in target_horizon_hours
-    ):
-        raise ValueError("Prepared temperature horizons must be 1..36 or the retained 1..3 slice")
+    if target_horizon_hours != (1, 2, 3) and not is_prepared_window(target_horizon_hours):
+        raise ValueError(
+            "Prepared temperature horizons must be a 1..36 to 1..42 window "
+            "or the retained 1..3 slice"
+        )
     age = int((_hour(target) - _hour(cycle)).total_seconds() / 3600)
     if age < 0 or age + target_horizon_hours[-1] > 48 or cycle.hour not in (0, 6, 12, 18):
         raise ValueError("Source cycles must be 00/06/12/18Z, at or before target, with leads <=48")

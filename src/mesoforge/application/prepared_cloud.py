@@ -27,6 +27,7 @@ from mesoforge.application.prepared_temperature import (
     _write_bytes,
 )
 from mesoforge.application.spatial_coverage import native_bbox_bounds
+from mesoforge.guidance.coverage import window_hours
 from mesoforge.guidance.http_fetch import FetchError
 from mesoforge.guidance.index_parsing import GribIndexError
 from mesoforge.guidance.interfaces import Clock, HttpTransport, Sleeper
@@ -113,6 +114,7 @@ def prepare_cloud_run(
     if not selection.get("surface_fields"):
         raise ValueError("Cloud evidence requires an existing surface preparation")
     target = _hour(datetime.fromisoformat(selection["target_reference_time"]))
+    hours = window_hours(selection)
     cycles = dict(selection["selected_cycles"])
     if original.get("pop_guidance", {}).get("selected_cycle"):
         cycles["NBM"] = original["pop_guidance"]["selected_cycle"]
@@ -139,7 +141,7 @@ def prepare_cloud_run(
             if cycle > target:
                 raise ValueError("Cloud cycle cannot follow the prepared reference time")
             offset = int((target - cycle).total_seconds() / 3600)
-            leads = list(range(offset + 1, offset + 37))
+            leads = [offset + hour for hour in hours]
             directory = output_directory / model
             (directory / "raw").mkdir(parents=True)
             replay: dict[int, RetainedInput] = {}
@@ -282,7 +284,7 @@ def prepare_cloud_run(
                 if not region_fields:
                     continue
                 view = xr.concat(region_fields, dim="event", coords="minimal", compat="equals")
-                view = view.assign_coords(event=list(range(36)))
+                view = view.assign_coords(event=list(range(len(leads))))
                 assert native_axes is not None
                 view.attrs = {"crs_wkt2": native_axes[2].to_wkt()}
                 filename = f"regions/{index}.nc"

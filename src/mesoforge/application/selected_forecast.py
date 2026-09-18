@@ -44,6 +44,7 @@ from mesoforge.guidance.acquisition_v2 import (
     acquire_gfs_lead,
     acquire_hrrr_phase2_lead,
 )
+from mesoforge.guidance.coverage import REQUIRED_HOURS, is_prepared_window
 from mesoforge.guidance.interfaces import Clock, HttpTransport, Sleeper
 from mesoforge.guidance.precipitation import is_bucket_reset_hour
 from mesoforge.guidance.runtime import SystemClock, SystemSleeper
@@ -56,7 +57,6 @@ from mesoforge.guidance.sources.current_availability import (
 from mesoforge.guidance.sources.rap import maximum_lead
 
 _ROOT = Path(__file__).resolve().parents[3]
-_HOURS = list(range(1, 37))
 
 
 def _time(value: str) -> datetime:
@@ -87,17 +87,20 @@ def load_selection(
         qpf = report.get("qpf_fields", False)
         contributors = selection_contributors(report)
         models = contributors.model_map()
+        # Historical selections carry exactly 1..36; extended windows carry 1..N, N <= 42.
+        declared = report["horizon_hours"]
+        hours = tuple(declared) if is_prepared_window(declared) else ()
         if (
             report["status"] != "selected"
             or report["field"] != "air_temperature_2m"
-            or report["horizon_hours"] != _HOURS
+            or not hours
             or report["contributor_configuration"] != contributors.model_dump(mode="json")
             or set(report["selected_cycles"]) != set(models)
             or set(report["models"]) != set(models)
             or target != decision.replace(minute=0, second=0, microsecond=0)
             or _time(report["first_valid_time"]) != first
             or _time(report["expires_at"]) != first
-            or _time(report["last_valid_time"]) != target + timedelta(hours=36)
+            or _time(report["last_valid_time"]) != target + timedelta(hours=len(hours))
             or not decision <= _time(report["started_at"]) <= _time(report["completed_at"])
             or not _time(report["completed_at"]) <= clock.now() < first
         ):
@@ -111,14 +114,14 @@ def load_selection(
             cycle = _hour(_time(report["selected_cycles"][model]))
             age = int((target - cycle).total_seconds() / 3600)
             native_step = 3 if model == "IFS" else 1
-            required = [age + hour for hour in _HOURS if (age + hour) % native_step == 0]
+            required = [age + hour for hour in hours if (age + hour) % native_step == 0]
             maximum = maximum_lead(cycle) if model == "RAP" else max(definition.supported_leads)
             selected = [c for c in row["candidates"] if c["status"] == "metadata_complete"]
             if (
                 row["status"] != "metadata_complete"
                 or row["selected_cycle"] != _iso(cycle)
                 or cycle.hour not in definition.cycle_hours
-                or not 0 <= age <= min(24, max(definition.supported_leads) - 36)
+                or not 0 <= age <= min(24, max(definition.supported_leads) - REQUIRED_HOURS)
                 or any(
                     lead > maximum or lead not in definition.supported_leads for lead in required
                 )
@@ -322,8 +325,15 @@ def prepare_selected(
     clock: Clock | None = None,
     sleeper: Sleeper | None = None,
     include_pop: bool = False,
+    require_complete_shadows: bool = True,
 ) -> dict[str, Any]:
-    """Prepare one selected source set and share regional views across the collection."""
+    """Prepare one selected source set and share regional views across the collection.
+
+    With ``require_complete_shadows`` (the default, used by issuance) a RAP/IFS shadow
+    that fails to retain every selected native hour aborts the preparation. The
+    background refresh passes ``False``: zero-weight evidence acquired after the
+    decision cutoff may be short, and the shortfall is recorded per model instead.
+    """
     clock, sleeper = clock or SystemClock(), sleeper or SystemSleeper()
     selection, configuration, probes = load_selection(selection_path, clock=clock)
     if include_pop and not selection.get("surface_fields"):
@@ -374,13 +384,35 @@ def prepare_selected(
         if transport is None
         else None
     )
+    base_transport = transport if transport is not None else owned
+    decision = _time(selection["decision_time"])
+    # The active HRRR/GFS objects and each zero-weight shadow get their own pinned view
+    # of the same discovery: a shadow provider failure can never abort the control set.
     pinned = SelectedObjectTransport(
-        transport if transport is not None else owned,  # type: ignore[arg-type]
-        probes,
-        decision_time=_time(selection["decision_time"]),
+        base_transport,  # type: ignore[arg-type]
+        [probe for probe in probes if probe["model"] in ("HRRR", "GFS")],
+        decision_time=decision,
         clock=clock,
     )
-    shadows = {}
+    shadow_pins = {
+        model: SelectedObjectTransport(
+            base_transport,  # type: ignore[arg-type]
+            [probe for probe in probes if probe["model"] == model],
+            decision_time=decision,
+            clock=clock,
+            latch_failures=require_complete_shadows,
+        )
+        for model in ("RAP", "IFS")
+    }
+
+    def validations() -> list[dict[str, Any]]:
+        return [
+            *pinned.validations,
+            *(row for pin in shadow_pins.values() for row in pin.validations),
+        ]
+
+    shadows: dict[str, Any] = {}
+    shadow_shortfalls: dict[str, Any] = {}
     try:
         acquired = _acquire_control(
             selection, configuration, output_directory / "acquired", pinned, clock, sleeper
@@ -400,6 +432,7 @@ def prepare_selected(
                     sleeper,
                 ),
             )
+        horizons = tuple(selection["horizon_hours"])
         manifest = prepare_temperature_guidance(
             source,
             configuration=configuration,
@@ -409,6 +442,7 @@ def prepare_selected(
             transport=pinned,
             clock=clock,
             sleeper=sleeper,
+            target_horizon_hours=horizons,
             area=areas[0],
             fallback_areas=tuple(areas[1:]),
             acquired_inputs=acquired,
@@ -437,8 +471,9 @@ def prepare_selected(
                 valid_locations,
                 source,
                 output_directory / model,
+                target_horizons=horizons,
                 cycle_override=_time(selection["selected_cycles"][model]),
-                transport=pinned,
+                transport=shadow_pins[model],
                 clock=clock,
                 sleeper=sleeper,
                 **surface_kwargs,
@@ -447,13 +482,32 @@ def prepare_selected(
                 int((_time(valid) - target).total_seconds() / 3600)
                 for valid in selection["models"][model]["valid_times"]
             ]
-            if (
-                report["selected_cycle"] != selection["selected_cycles"][model]
-                or report["supported_hours"] != expected
-            ):
+            if report["selected_cycle"] != selection["selected_cycles"][model]:
                 raise ValueError(
-                    f"{model}: preparation did not retain every selected native hour; no issuance"
+                    f"{model}: preparation did not retain the selected cycle; no issuance"
                 )
+            if require_complete_shadows:
+                shadow_pins[model].assert_complete()
+            if report["supported_hours"] != expected:
+                if require_complete_shadows:
+                    raise ValueError(
+                        f"{model}: preparation did not retain every selected native hour; "
+                        "no issuance"
+                    )
+                # Evidence acquired after the decision cutoff; the gap stays explicit.
+                shadow_shortfalls[model] = {
+                    "expected_hours": expected,
+                    "supported_hours": list(report["supported_hours"]),
+                    "missing_hours": {
+                        str(hour): reason
+                        for hour, reason in report.get("missing_hours", {}).items()
+                        if int(hour) in expected
+                    },
+                    "object_failures": [
+                        {key: row.get(key) for key in ("url", "source_lead_hours", "reason")}
+                        for row in shadow_pins[model].failures
+                    ],
+                }
             shadows[model] = report
         pinned.assert_complete()
         if clock.now() >= _time(selection["expires_at"]):
@@ -463,7 +517,7 @@ def prepare_selected(
         evidence = {
             "selection_sha256": hashlib.sha256(selection_bytes).hexdigest(),
             "selection": selection,
-            "object_validation": pinned.validations,
+            "object_validation": validations(),
             "preparation_code_sha256": {
                 name: hashlib.sha256((_ROOT / "src/mesoforge" / name).read_bytes()).hexdigest()
                 for name in ("application/selected_forecast.py", "guidance/selected_objects.py")
@@ -498,6 +552,7 @@ def prepare_selected(
             "current_model_set": evidence,
             "coverage": coverage,
             "shadows": shadows,
+            **({"shadow_shortfalls": shadow_shortfalls} if shadow_shortfalls else {}),
             "downloaded_bytes": pinned.downloaded_bytes,
             **(
                 {"acquisition_body_budget_bytes": acquisition_budget}
@@ -538,9 +593,7 @@ def prepare_selected(
     except Exception as exc:
         _write_bytes(
             output_directory / "failure.json",
-            json.dumps(
-                {"error": str(exc), "object_validation": pinned.validations}, indent=2
-            ).encode(),
+            json.dumps({"error": str(exc), "object_validation": validations()}, indent=2).encode(),
         )
         raise
     finally:

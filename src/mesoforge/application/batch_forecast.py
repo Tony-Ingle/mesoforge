@@ -52,6 +52,8 @@ def create_issuer() -> ForecastIssuanceService:
         "application/issuance.py",
         "application/forward_run.py",
         "application/forward_verification.py",
+        "application/forecast_from_snapshot.py",
+        "application/prepared_snapshot.py",
         "application/hourly_report.py",
         "application/surface_forecast.py",
         "application/local_surface_grid.py",

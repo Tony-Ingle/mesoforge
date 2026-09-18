@@ -34,10 +34,15 @@ from mesoforge.application.spatial_coverage import UnsupportedCoordinateError, p
 from mesoforge.common.errors import MesoForgeError
 from mesoforge.forecasting.recipes import ContributorConfiguration
 from mesoforge.guidance.acquisition_v2 import Phase2LeadAcquisition
+from mesoforge.guidance.coverage import (
+    MAXIMUM_PREPARED_HOURS,
+    REQUIRED_HOURS,
+    is_prepared_window,
+)
 from mesoforge.guidance.interfaces import Clock, HttpTransport, Sleeper
 from mesoforge.guidance.runtime import SystemClock, SystemSleeper
 
-_HOURS = tuple(range(1, 37))
+_HOURS = tuple(range(1, REQUIRED_HOURS + 1))
 
 
 @dataclass(frozen=True)
@@ -74,22 +79,25 @@ def retained_surface_mode(directory: Path) -> bool:
     )
 
 
-def _target(control_directory: Path, *, model: str) -> datetime:
+def _target(control_directory: Path, *, model: str) -> tuple[datetime, tuple[int, ...]]:
+    """The control snapshot's reference time and its complete prepared window (1..N)."""
     manifest = json.loads((_source(control_directory) / "manifest.json").read_text())
-    if manifest.get("data_kind") != "real_prepared_guidance" or manifest.get(
-        "target_horizon_hours"
-    ) != list(_HOURS):
+    if manifest.get("data_kind") != "real_prepared_guidance" or not is_prepared_window(
+        manifest.get("target_horizon_hours")
+    ):
         raise ValueError(
-            f"{model} shadow preparation requires an existing real 1..36 control snapshot"
+            f"{model} shadow preparation requires an existing real 1..36 to 1..42 control snapshot"
         )
-    return _hour(datetime.fromisoformat(manifest["target_reference_time"]))
+    return _hour(datetime.fromisoformat(manifest["target_reference_time"])), tuple(
+        manifest["target_horizon_hours"]
+    )
 
 
 def _raw_inputs(source: Path, manifest: dict[str, Any], *, model: str) -> dict[int, bytes]:
     """Check every retained byte before rebuilding or reporting offline reuse."""
     inputs: dict[int, bytes] = {}
     target = _hour(datetime.fromisoformat(manifest["target_reference_time"]))
-    requested = manifest.get("requested_target_horizons", list(_HOURS))
+    requested = manifest.get("requested_target_horizons", manifest["target_horizon_hours"])
     for row in manifest["inputs"]:
         lead = row["source_lead_hours"]
         cycle = _hour(datetime.fromisoformat(row["cycle"]))
@@ -140,12 +148,22 @@ def prepare_shadow(
     model = adapter.model
     if (
         not target_horizons
-        or any(type(hour) is not int or hour not in _HOURS for hour in target_horizons)
+        or any(
+            type(hour) is not int or not 1 <= hour <= MAXIMUM_PREPARED_HOURS
+            for hour in target_horizons
+        )
         or tuple(sorted(set(target_horizons))) != target_horizons
     ):
-        raise ValueError("target_horizons must be a sorted unique nonempty subset of 1..36")
+        raise ValueError(
+            "target_horizons must be a sorted unique nonempty subset of "
+            f"1..{MAXIMUM_PREPARED_HOURS}"
+        )
+    target, control_hours = _target(control_directory, model=model)
+    if any(hour not in control_hours for hour in target_horizons):
+        raise ValueError(
+            f"target_horizons must lie within the control window 1..{control_hours[-1]}"
+        )
     clock, sleeper = clock or SystemClock(), sleeper or SystemSleeper()
-    target = _target(control_directory, model=model)
     areas = plan_regions([_coordinates(location) for location in locations])
     if not areas:
         raise ValueError("At least one coordinate is required")
@@ -162,7 +180,9 @@ def prepare_shadow(
         if (
             manifest.get("source_metadata") != adapter.source_metadata
             or manifest["target_reference_time"] != _iso(target)
-            or manifest.get("requested_target_horizons", list(_HOURS)) != list(target_horizons)
+            or manifest.get("target_horizon_hours") != list(control_hours)
+            or manifest.get("requested_target_horizons", list(control_hours))
+            != list(target_horizons)
             or report["requested_areas"] != [area.model_dump() for area in areas]
             or (cycle_override is not None and manifest["selected_cycle"] != _iso(cycle_override))
             or bool(manifest.get("surface_fields")) != surface_fields
@@ -195,8 +215,9 @@ def prepare_shadow(
         if (
             manifest.get("source_metadata") != adapter.source_metadata
             or manifest.get("target_reference_time") != _iso(target)
-            or manifest.get("target_horizon_hours") != list(_HOURS)
-            or manifest.get("requested_target_horizons", list(_HOURS)) != list(target_horizons)
+            or manifest.get("target_horizon_hours") != list(control_hours)
+            or manifest.get("requested_target_horizons", list(control_hours))
+            != list(target_horizons)
         ):
             raise ValueError(f"Retained {model} capabilities or control window differ")
         payloads = _raw_inputs(retained, manifest, model=model)
@@ -305,11 +326,11 @@ def prepare_shadow(
                     ]
     supported = [
         hour
-        for hour in _HOURS
+        for hour in control_hours
         if cycle is not None and int((target - cycle).total_seconds() / 3600) + hour in decoded
     ]
     missing = {hour: reason for hour, reason in missing.items() if hour not in supported}
-    for hour in _HOURS:
+    for hour in control_hours:
         if hour not in supported:
             missing.setdefault(
                 hour,
@@ -320,7 +341,7 @@ def prepare_shadow(
     manifest = {
         "data_kind": "real_prepared_guidance",
         "target_reference_time": _iso(target),
-        "target_horizon_hours": list(_HOURS),
+        "target_horizon_hours": list(control_hours),
         "requested_target_horizons": list(target_horizons),
         "selected_cycle": _iso(cycle) if cycle is not None else None,
         "created_at": _iso(clock.now()),

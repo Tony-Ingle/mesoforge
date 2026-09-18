@@ -36,6 +36,7 @@ from mesoforge.catalog.configuration import _lists_to_tuples
 from mesoforge.catalog.domains import BoundingBox
 from mesoforge.catalog.sources import NbmSourceSettings
 from mesoforge.guidance.acquisition_v2 import Phase2LeadAcquisition
+from mesoforge.guidance.coverage import is_prepared_window
 from mesoforge.guidance.interfaces import Clock, HttpTransport, Sleeper
 from mesoforge.guidance.nbm_geometry import compute_nbm_grid
 from mesoforge.guidance.runtime import SystemClock, SystemSleeper
@@ -154,7 +155,9 @@ def normalize_pop_messages(
 ) -> list[xr.Dataset]:
     """Decode each native probability once, then crop shared regional views."""
     target, cycle = _hour(target_reference_time), _hour(source_cycle)
-    if cycle > target or target_horizon_hours not in ((1, 2, 3), _HOURS):
+    if cycle > target or (
+        target_horizon_hours != (1, 2, 3) and not is_prepared_window(target_horizon_hours)
+    ):
         raise ValueError("PoP requires an existing hourly target window and a cycle at/before it")
     age = int((target - cycle).total_seconds() / 3600)
     leads = tuple(age + hour for hour in target_horizon_hours)

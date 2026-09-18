@@ -36,16 +36,20 @@ Forecast philosophy guardrails ([VISION.md](VISION.md#north-star-the-blend-is-th
 3. Future AI edits the MesoForge grid through bounded, interpretable field edits made
    after deterministic site correction; it does not choose a model. Contributors may
    be cited as the evidence for an edit.
-4. Slow model discovery, acquisition and preparation should not ultimately live inside
-   an ordinary forecast request. The intended shape is a background refresh publishing
-   an atomic latest-complete prepared snapshot that forecasts consume. An external
-   scheduler decides when MesoForge runs, never what a run means; keep weather science
-   out of workflow YAML. Source cycles need not match the issuance hour, only precede
-   the issuance's information cutoff.
+4. Slow model discovery, acquisition and preparation never live inside an ordinary
+   forecast request. `refresh_guidance` publishes an atomic latest-complete prepared
+   contributor snapshot; `forecast_from_snapshot` consumes it with no provider access
+   and judges usability by absolute valid-time coverage of the next 36 hours. Keep
+   that split. An external scheduler decides when MesoForge runs, never what a run
+   means; keep weather science out of workflow YAML. Source cycles need not match the
+   issuance hour, only precede the snapshot's cutoff and the issuance.
 5. This direction is not permission to implement future stages. Current fixed weights,
    NBM-only sources, the HRRR/GFS p-type agreement rule and zero-weight shadows are
-   approved scaffolding: do not change them, add dynamic weighting, snapshots,
-   corrections or AI editing unless the owner's current task asks for it.
+   approved scaffolding: do not change them, add dynamic weighting, a coherence
+   engine, corrections or AI editing unless the owner's current task asks for it.
+   Field-specific blends must stay mutually coherent (p-type with precipitation and
+   thermal structure, thunder with convective support, gust with wind, RH with T/Td);
+   do not design snapshot or field formats that hide the evidence such checks need.
 
 This direction does not authorize future stages during unrelated tasks or settle
 unapproved domain dimensions, grid spacing, tapering or storage choices.
