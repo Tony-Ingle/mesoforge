@@ -1,9 +1,10 @@
 # MesoForge
 
-MesoForge is intended to be an automatically updating, location-aware forecasting
-engine exposed through an API, with issued forecast history and measured performance
-against suitable observations. That is the product direction; the current implementation
-is described below. Start with [VISION.md](VISION.md) for release boundaries and
+MesoForge is an automated digital forecast desk for configured latitude/longitude
+locations. Its target is one field-specific MesoForge forecast with measured
+verification and later bounded corrections/editing, not a generic public weather API.
+The current implementation is described below. Start with the canonical
+[VISION.md](VISION.md) for product direction and
 [AGENTS.md](AGENTS.md) for working rules.
 
 ## Current status
@@ -115,7 +116,7 @@ remain intact. Existing `_v2` names describe Phase 2 contracts.
 **How to read the current policies.** The long-term rule is that *the blend is the
 forecast*: one coherent MesoForge grid from field-specific blends, with every model
 kept as contributor evidence rather than offered as a competing forecast
-([VISION.md](VISION.md#north-star-the-blend-is-the-forecast)). The fixed HRRR/GFS
+([VISION.md](VISION.md#north-star)). The fixed HRRR/GFS
 weights, the NBM-only PoP/sky/thunder sources, the HRRR/GFS p-type agreement rule and
 the zero-weight RAP/IFS shadows described above are today's scaffolding for that
 blend, not its final form, and they stay in force until explicitly replaced. The slow
@@ -125,13 +126,15 @@ publishes a complete prepared contributor snapshot (up to 42 hours) and a
 network-free command serves 36-hour forecasts and issuances from it for the current
 UTC hour; the compatibility forward run still prepares inline. Continuous refresh on
 the VPS, GitHub Actions scheduling, the generalized blend engine and a cross-field
-coherence engine remain future work
+coherence engine remain future work. Today's published snapshot contains prepared
+contributors; blending and local-grid construction still happen when it is consumed.
+It is not the vision's future continuously maintained MesoForge baseline snapshot
 ([RFC §5.5–5.6](docs/rfcs/mesoforge-v2-architecture.md#55-field-specific-blend-layer)).
 
 Future direction: add bounded spatial editing to the coherent context/editable baseline.
 Versioned deterministic tools would validate bounded GFE-style AI edit recipes, keeping
 numerical, bias-corrected and final fields separate before exact-point interpolation.
-One-off requests stay untracked. See [VISION.md](VISION.md#intended-coordinate-driven-operation)
+One-off development requests stay untracked. See [VISION.md](VISION.md#4-configured-locations-are-the-product)
 and the [active RFC](docs/rfcs/mesoforge-v2-architecture.md). The first local surface grid
 and nested domains are implemented; the editing lifecycle remains future work. The
 ECMWF six-hour probability assessment remains explicitly incompatible as described
@@ -572,22 +575,29 @@ day/night and station; it applies no correction and currently reports
 so that analysis scales without opening each multi-megabyte evidence payload, while
 older facts stay readable without migration. Two owner-approved policies now govern
 future learning: [which issuance represents a decision window and what evidence a
-correction proposal needs](#decision-window-and-evidence-policies). Next proposed
-step: simply keep accumulating forward verification history across days, leads and
-weather; no lead bucket is close to the evidence policy. Presentation polish
-waits unless a concrete missing capability blocks use. Visibility/fog still needs
-separate causal evidence and policy.
+correction proposal needs](#decision-window-and-evidence-policies). The next proposed
+architecture milestone is a generalized field-specific blend engine, initially
+representing the existing policies and proving equivalence before retiring their
+old execution paths. The snapshot correctness limitations below need a bounded fix
+before expanding automated accumulation. More independent verification evidence is
+still needed before deriving weights or corrections; visibility/fog needs separate
+causal evidence and policy.
 
 ## Existing forecast path
 
-The current coordinate entry point is [forward_run.py](src/mesoforge/application/forward_run.py).
-It composes automatic previous-hour verification with selected-model preparation and
-immutable batch issuance. [point_forecast.py](src/mesoforge/application/point_forecast.py)
+The separated coordinate path is [refresh_guidance.py](src/mesoforge/application/refresh_guidance.py)
+for provider preparation/publication, then
+[forecast_from_snapshot.py](src/mesoforge/application/forecast_from_snapshot.py) for
+provider-free local blending and optional immutable issuance. The compatibility
+[forward_run.py](src/mesoforge/application/forward_run.py) still combines previous-hour
+verification, selected-model preparation and batch issuance in one invocation.
+[point_forecast.py](src/mesoforge/application/point_forecast.py)
 and [surface_forecast.py](src/mesoforge/application/surface_forecast.py) supply native
 extraction and retained scientific operators to each node of
 [local_surface_grid.py](src/mesoforge/application/local_surface_grid.py). The surface point
-is read from that grid's center. Long-term model coverage is described in
-[VISION.md](VISION.md#long-term-model-direction).
+is read from that grid's center. Contributor roles and field semantics follow
+[VISION.md](VISION.md#7-every-field-has-its-own-blend); the current adapter capabilities
+live in [the contributor catalog](src/mesoforge/catalog/contributors.py).
 
 The following is the separate retained **Phase 2 station path**, which supplies
 reusable science and contracts; it is not the current coordinate lifecycle's entry point:
@@ -2708,8 +2718,9 @@ loads the finished preparation offline, computes one validation column per confi
 coordinate, writes `snapshots/<id>/snapshot.json` (`mesoforge.prepared-snapshot.v1`)
 and only then replaces `latest_complete.json`
 (`mesoforge.latest-complete-pointer.v1`) atomically. A failed step leaves the previous
-pointer unchanged and retains `failure.json`; the pointer never moves to an older
-reference time. The manifest separates native deterministic contributors (HRRR/GFS
+pointer unchanged and retains `failure.json`; a sequential publication rejects an
+older reference time. Concurrent publication is not serialized (see limitations
+below). The manifest separates native deterministic contributors (HRRR/GFS
 active; RAP/IFS shadow evidence), the blended meta-model NBM with its
 active-current-policy products (hourly PoP, sky, thunder) and evidence-only inputs,
 names the current field-policy identities, and references every preparation artifact
@@ -2720,7 +2731,9 @@ with `require_complete_shadows=False`: the active HRRR/GFS objects and each zero
 shadow use their own pinned view of the same discovery, a shadow provider failure
 (for example an ECMWF open-data 503) stays recorded per object under
 `shadow_shortfalls` instead of aborting the preparation, and the snapshot marks that
-shadow `partial`/`unavailable`. The compatibility forward run keeps the strict default.
+shadow `partial`/`unavailable`. This tolerance applies after discovery: discovery
+still requires all four models and can fail when a shadow is unavailable. The
+compatibility forward run keeps the strict preparation default.
 
 **Forecast from the snapshot** (no provider access; the request hour is the
 reference time):
@@ -2782,7 +2795,7 @@ which failed without publishing anything and retained their `failure.json`):
   recorded), and 07Z returned `no_current_snapshot` in 1.2 s with the exact reason
   (`first missing 2026-09-19T19:00:00Z` for HRRR and GFS), exit 3.
 
-Validation on September 18, 2026: the offline unit/contract/property suites (the
+Previously reported validation on September 18, 2026: the offline unit/contract/property suites (the
 same three pre-existing failures deselected), the forward-run, batch-issuance and
 storage integration tests (71) against pgserver and moto, ruff, mypy, the nine import
 contracts, documentation checks and `git diff --check` passed.
@@ -2796,13 +2809,39 @@ snapshot directories are retained without any pruning policy; ad-hoc (non-issued
 forecasts have no conditions/transitions/period preview because those layers read
 saved issuances only.
 
+**Review limitations confirmed September 24, 2026 (runtime unchanged):**
+
+- Atomic replacement prevents partial pointer reads, but the read/check/replace
+  sequence is not locked. Concurrent refresh writers can publish an older reference
+  over a newer one; the existing sequential publication test does not cover this.
+- `forecast_from_snapshot` currently copies a blanket claim that every input preceded
+  the original model-set decision cutoff. NBM PoP selection uses a later decision
+  clock, and other attachments do not prove that original cutoff. Retained per-source
+  evidence must be used; the blanket claim is not established. The inspected real
+  snapshot did not demonstrate actual future-information leakage.
+- Shadow failure isolation is partial: preparation shortfalls are tolerated, but
+  strict four-model discovery and the shared extension envelope still depend on
+  RAP/IFS. NBM per-hour gaps remain explicitly permitted under the current policy.
+- A metadata lookup failure in the `--issue` duplicate-version guard escapes the
+  coordinate loop, preventing later locations from running. Unlike `forward_run`,
+  the snapshot command also has no run-level overlap lock; its check-then-issue
+  guard is not a concurrency uniqueness guarantee.
+
+These need a bounded correctness pass before unattended snapshot operation; this
+documentation audit does not repair runtime behavior. The reviewed grid optimization
+passed four focused regression tests and an independent concurrent-transform probe;
+eight focused snapshot/discovery/fallback tests passed. Separate offline reproductions
+confirmed the publication race and location-lookup failure. No acquisition, new
+issuance, service startup or full acceptance rerun was performed for this audit.
+
 #### Local-grid build cost
 
 The snapshot-consuming path reuses one transformer per native CRS instead of
 rebuilding it for every projection and coverage check, and hands the ephemeral grid
 and its freshly built columns to the result instead of copying them a second time.
-Neither changes a forecast value; both are opt-in at the call site, so retained
-grids and callbacks that return shared structures keep the previous copies.
+Neither changes a forecast value. Projection caching applies to existing projection
+callers; only the ownership/copy optimization is opt-in, so retained grids and
+callbacks that return shared structures keep the previous copies.
 
 Measured on snapshot `20260918T004459Z-fcb1b488` (Minneapolis, 7x7 nodes, 36 hours,
 all attachments): the local-grid build fell from **178.6 s to 25.4 s (7.0x)** and the
@@ -4637,14 +4676,15 @@ later; a surface-temperature rule or simple liquid conversion is insufficient.
 The [canvas inventory and proposed condition preview](docs/rfcs/mesoforge-v2-architecture.md#67-forecast-canvas-and-deterministic-conditions)
 are documented; the [read-only structured preview](#read-only-structured-condition-preview)
 now implements the bounded saved-field description and initial presentation policy.
-Multi-hour transitions, other gated condition rules and derived accretion remain
-future work.
+Bounded multi-hour transitions and period grouping are now implemented as described
+above; other gated condition rules and derived accretion remain future work.
 
 ## References
 
-- [VISION.md](VISION.md): product intent, release boundary, and proposal status.
+- [VISION.md](VISION.md): canonical product direction and current/future distinction.
 - [AGENTS.md](AGENTS.md): working rules and document responsibilities.
-- [V2 architecture RFC](docs/rfcs/mesoforge-v2-architecture.md): detailed proposed design.
+- [V2 architecture RFC](docs/rfcs/mesoforge-v2-architecture.md): technical contracts,
+  implemented slices and remaining design proposals.
 - [Phase 0](docs/data-contracts/phase-0.md), [Phase 1](docs/data-contracts/phase-1.md),
   [Phase 2](docs/data-contracts/phase-2.md), and [vocabulary](docs/data-contracts/vocabulary.md):
   technical references for the existing implementation. The Phase 1 lifecycle

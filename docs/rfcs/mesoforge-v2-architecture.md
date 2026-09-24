@@ -1,6 +1,12 @@
 # RFC: MesoForge V2 architecture
 
-Status: Proposed for owner architecture review
+Status: Active technical reference with implemented slices and remaining proposals
+
+[VISION.md](../../VISION.md) is the canonical product direction. This RFC retains
+scientific contracts, implementation details and unresolved design choices. Earlier
+private-API release planning below is historical scope, not a competing product
+vision or an instruction to implement public/registration services. Explicitly marked
+implemented sections describe current code; remaining designs require approval.
 
 Decision owner: MesoForge owner
 
@@ -10,8 +16,8 @@ Architecture author: Codex
 > inputs used when this RFC was written, not current branch or working-tree state.
 > The later preserved Phase 3 donor is
 > `43f56bc0c67ab782c94fb6349d65523793e1a836`; see the
-> [archive index](../archive/README.md). This RFC remains proposed: its decision log
-> records design choices under review, not blanket owner approval. The entry-point
+> [archive index](../archive/README.md). Remaining designs are proposed: the decision log
+> does not imply blanket owner approval. The entry-point
 > summary is [VISION.md](../../VISION.md).
 
 Source baseline: `origin/main` at `ce0e0d77e645d31ca33caaac2d20f4f8748dc90e`
@@ -32,15 +38,17 @@ and bounded AI tool recipes may later adjust those fields, and interpolation at 
 exact coordinate produces the delivered spot forecast. A point-value blending API
 is an early capability, not the complete product architecture.
 
-**Owner direction clarified, 2026-09-17 — the blend is the forecast.** The canonical
-pipeline is: native contributors (HRRR, RAP, GFS, IFS, NBM, ensembles) →
-field-specific blends → MesoForge baseline grid → deterministic site learning → an AI
+**Canonical owner vision, 2026-09-18 — the blend is the forecast.** The target
+background pipeline is native contributors → prepared contributor state →
+field-specific blends → cross-field coherence → immutable MesoForge baseline snapshot.
+A configured-location run pins one baseline → derives/extracts its local domain →
+applies deterministic site correction → an AI
 desk that sees the baseline, every contributor and the surrounding context → bounded
 spatial/temporal field edits → final MesoForge grid → spot forecast. Individual models
 are contributors, evidence, provenance and context, never competing final forecasts
 and never a "selected model." Section 5.5 describes the field-specific blend layer;
 section 5.6 separates the slow background guidance refresh from forecast requests.
-[VISION.md](../../VISION.md#north-star-the-blend-is-the-forecast) holds the
+[VISION.md](../../VISION.md#north-star) holds the
 owner-facing statement. This clarifies direction; current fixed weights and
 single-source rules remain in force as implementation scaffolding, and no future
 stage is approved by this text.
@@ -56,7 +64,7 @@ shared spatial cache. Nearby locations reuse source data. Local MesoForge foreca
 fields are derived products, distinct from complete native model datasets; registration
 does not require a separate source download or native-dataset copy for each location.
 
-The **First Usable Release** provides only:
+The original **private-baseline development slice** was scoped to:
 
 - a private, operator-controlled API on a bounded supported region;
 - deterministic baseline forecasts for arbitrary supported coordinates;
@@ -65,10 +73,11 @@ The **First Usable Release** provides only:
 - basic bounded performance queries over normalized facts.
 
 Learning, bias correction, learned model weighting, a bounded AI forecaster, email, and
-public multi-user/account capabilities are **Future Roadmap** items. They do not gate a
-first-release slice, acceptance, or usefulness.
+delivery are later stages. Generic public API and multi-user/account products are
+outside the canonical product scope. These later stages do not gate the useful
+numerical development slices already implemented.
 
-The first release is useful without learned history: it turns shared model guidance into a
+The implemented numerical foundation is useful without learned history: it turns shared model guidance into a
 reproducible, unit-correct point forecast; preserves what was issued; matches later
 observations; and exposes measured baseline performance. A new location reports no learned
 history and makes no learned-skill claim. The system never invents samples, confidence,
@@ -81,7 +90,12 @@ non-binding estimate, not a required PR count.
 
 ## 2. Release boundary
 
-### 2.1 First Usable Release
+### 2.1 Historical private-baseline release proposal
+
+The following bounded API/registration plan predates the canonical configured-location
+vision. Preserve its safety/scientific reasoning; do not treat its endpoint list,
+registration service or exit checklist as current implementation or the next milestone.
+The target operating model is sections 5.1 and 6.6; current commands are in section 5.6.
 
 1. Operators configure service coverage, model/product mix, fields, cadence, horizons,
    deterministic baseline weights, and safety bounds. Each user-facing location needs
@@ -162,11 +176,12 @@ New real models still require suitable acquisition/normalization adapters and
 capability registration; lineage-aware weighting and automatic promotion are not
 implemented.
 
-NAM/NAM 3 km are transition candidates. The September 9 NWS SCN 26-47/26-48
-updates schedule NAM and its nests' retirement and RRFS/REFS replacement for
-October 14, 2026 at 12:00 UTC, subject to weather-related delay. The source links
-and verification date are in [VISION.md](../../VISION.md#long-term-model-direction).
-Earlier donor descriptions and older NOAA target dates do not override those notices.
+Historical provider-planning reference, last checked September 10, 2026: NWS
+[SCN 26-47](https://www.weather.gov/media/notification/pdf_2026/SCN26-47_Updated_Retire_NAM_SREF_HREF_HiresW_NAM_MOS.aab.pdf)
+and [SCN 26-48](https://www.weather.gov/media/notification/pdf_2026/scn26-048_Updated_RRFS_and_REFS_Implementation_aad.pdf)
+described the NAM/NAM-nest retirement and RRFS/REFS replacement path. These historical
+references are retained from the earlier vision; this audit did not reverify operational
+dates. Recheck official notices before implementing transition-dependent adapters.
 
 Retain raw model files/messages actually acquired, including currently unused
 fields, separately from prepared subsets. Later field/product trimming requires
@@ -178,8 +193,7 @@ fields, levels, leads, or models, nor settle indefinite-retention guarantees.
 - bounded GFE-style spatial/temporal AI edit recipes executed by deterministic,
   versioned tools, with adjustment performance measured against the bias-corrected baseline;
 - email or other delivery;
-- public/multi-user access, accounts, ownership, privacy controls, sharing, export,
-  deletion, billing, and public SLOs;
+- operator access and delivery controls where needed for configured locations;
 - broader geography, model mix, fields, horizons, retention guarantees, and analytics.
 
 Learning, AI and delivery build on the numerical and verification foundation in separately
@@ -274,6 +288,12 @@ registration, verification, AI, and delivery milestone.
 - **Forecast:** MesoForge values with contributors, configuration, units, quality,
   missingness, cutoffs and lineage; the deterministic baseline remains identifiable
   separately from later corrected and adjusted products.
+- **Prepared contributor snapshot (implemented):** normalized source evidence and
+  manifests published by `refresh_guidance`; the current consumer still calculates
+  the local blend/grid. It is not a blended baseline.
+- **MesoForge baseline snapshot (future):** immutable field-specific blends after
+  baseline coherence, maintained before location runs and linked to their exact
+  contributor state. A location run pins it throughout correction/editing/issuance.
 - **Issued forecast snapshot:** one immutable persisted forecast version. Refresh creates a
   new version and never edits an earlier one.
 - **Forecast state:** a small mutable pointer/status for the current issued snapshot; it
@@ -385,11 +405,16 @@ workers     -> application services -> scientific/domain contracts
 application services -> storage interfaces
 storage adapters      -> storage interfaces + contracts
 
-Future guidance path (background, independent of requests):
-new cycles -> discover/acquire/decode/prepare -> validate -> atomic latest-complete snapshot
+Current command split (no scheduler):
+refresh_guidance -> prepared contributor snapshot / latest_complete
+forecast_from_snapshot -> pin prepared evidence -> local blend/grid -> optional issuance
 
-Future configured-location path:
-latest-complete snapshot -> field-specific blends -> local grid baseline
+Target background engine:
+new eligible guidance -> prepared contributor state -> field-specific blends
+field-specific blends -> baseline coherence -> immutable MesoForge baseline snapshot
+
+Target configured-location path:
+pin baseline snapshot -> derive/extract local grid baseline
 local grid baseline -> deterministic bias correction
 bias-corrected fields + every contributor + context/evidence -> AI tool recipe
 saved recipe + corrected fields -> deterministic tools/validation -> final fields
@@ -494,7 +519,7 @@ There is no universal weight vector.
 | QPF, SWE, snowfall, ice amounts | Blend only amounts with identical exact accumulation intervals; preserve interval semantics and native definitions (snow versus snow-and-sleet, liquid versus flat ice) |
 | PoP, thunder and other probabilities | Combine/calibrate real probabilistic guidance for one identical event (threshold, period, spatial support); never infer probability from deterministic QPF |
 | Precipitation type | Weighted categorical/probabilistic support for rain, snow, freezing rain, sleet and mixed states across all suitable sources, replacing the interim requirement that two particular deterministic models agree |
-| Derived fields (RH, speed/direction, sky category, Kuchera) | Derived from the blended parents by a versioned method, not blended independently |
+| Derived fields (RH, speed/direction, sky category) | Derived from compatible blended parents by a versioned method, not blended independently. Current Kuchera remains separate native-source evidence using its own profile/SWE contract |
 
 **Dynamic-weight inputs (conceptual).** A policy may eventually let weights depend on
 field, forecast lead, which contributors are actually available, the age/freshness of
@@ -511,8 +536,9 @@ blend, including zero-weight contributors. Verification must be able to answer: 
 did the baseline say, what did each contributor say, what did deterministic
 correction change, what did the AI change, and did the AI improve the forecast?
 
-**Stage order.** Native contributors → field-specific baseline blend → deterministic
-verified site/regime correction → AI forecast-desk adjustment → final grid →
+**Target stage order.** Prepared contributors → field-specific baseline blend →
+baseline coherence → publish/pin immutable baseline → local domain → deterministic
+verified site/regime correction → bounded AI adjustment → final validation → final grid →
 verification. Persistent statistical bias is removed by the deterministic correction
 first, so the AI is judged against the bias-corrected baseline and earns no credit
 for rediscovering a mean bias (section 11).
@@ -536,10 +562,12 @@ already stores, for every cell and hour, both the blended `fields` and the
 per-contributor evidence, so a more general blend changes the column calculation and
 its policy identity, not the grid representation.
 
-### 5.6 Background guidance refresh and the latest complete prepared snapshot
+### 5.6 Implemented guidance refresh and the latest complete prepared snapshot
 
-**Owner direction, 2026-09-17; proposed design.** Model acquisition/preparation and
-forecast generation are separate activities with separate clocks.
+**Implemented command boundary, 2026-09-18.** Model acquisition/preparation and
+forecast generation have separate clocks. The diagram below describes today's
+prepared-contributor snapshot, not the target preblended baseline of section 5.1.
+Continuous background operation and production scheduling are not implemented.
 
 ```text
 BACKGROUND GUIDANCE REFRESH
@@ -550,8 +578,8 @@ new model cycles become available
   -> publish an atomic `latest complete` prepared snapshot
   -> retain the previous good snapshot until the replacement is complete
 
-AD-HOC FORECAST
-lat/lon request
+LOCAL FORECAST COMMAND
+configured coordinates (or development lat/lon request)
   -> use the newest complete prepared snapshot already available
   -> construct/read the local MesoForge baseline grid
   -> later: deterministic correction + AI desk
@@ -609,8 +637,9 @@ exist as separate commands; the operator/compatibility `forward_run` path is unc
   evidence (optional, non-blocking) → offline load and one validation column per
   configured coordinate → `snapshot.json` (`mesoforge.prepared-snapshot.v1`) →
   atomic `latest_complete.json` (`mesoforge.latest-complete-pointer.v1`, written to a
-  temporary file and `os.replace`d, never pointing at partial work, never moving to an
-  older reference time). A failed step leaves the previous pointer unchanged and
+  temporary file and `os.replace`d, with a sequential older-reference check).
+  Concurrent monotonic publication is not guaranteed; see the review limitations
+  below. A failed pre-publication step leaves the previous pointer unchanged and
   retains `failure.json`. The manifest distinguishes native deterministic
   contributors (HRRR/GFS active; RAP/IFS shadow evidence), the blended meta-model NBM
   with its active-current-policy products, and evidence-only inputs; it names the
@@ -621,12 +650,14 @@ exist as separate commands; the operator/compatibility `forward_run` path is unc
   publishing, PoP selection rejects it, records `rejected_candidates`, and tries the
   next older cycle; completeness is judged on the required 36 hours and extension hours
   are explicit gaps. Validation itself is unchanged.
-- *Shadow shortfalls*: evidence-only products never block publication. The refresh
+- *Shadow shortfalls during preparation*: the refresh
   prepares with `require_complete_shadows=False`; the active HRRR/GFS objects and each
   zero-weight shadow use separate pinned views of the same discovery (the shadow views
   do not latch on a first failure), so a provider failure on a RAP/IFS object is
   recorded per object and per missing hour instead of aborting the preparation. The
-  issuance-bound forward run keeps the strict default.
+  issuance-bound forward run keeps the strict default. Discovery still requires all
+  four models, and shadow coverage can limit the extension envelope; this is only
+  partial isolation of optional evidence failures.
 - *Forecast from snapshot* (`python -m mesoforge.application.forecast_from_snapshot
   --root … (--lat --lon | --config) [--reference-time] [--issue]`): resolves the
   pointer, verifies manifest and retained-artifact digests, derives the reference hour
@@ -643,6 +674,18 @@ exist as separate commands; the operator/compatibility `forward_run` path is unc
   ownership of the ephemeral grid instead of copying it, which cut a measured
   49-node, 36-hour build from 178.6 s to 25.4 s with byte-identical output; the
   remainder is per-column evidence copying and the required canonical grid digest.
+
+**Confirmed review limitations at `5eb1ae6` (2026-09-24; no runtime fix in this audit):**
+publication's read/check/replace sequence permits a concurrent older writer to win;
+the snapshot consumer's blanket original-decision cutoff claim is not enforced for
+later NBM/field attachments; and its issuance metadata lookup can abort the coordinate
+loop rather than isolate a failure. Snapshot issuance also lacks the compatibility
+forward-run overlap lock. These are current limitations, not revised scientific
+policies or reasons to weaken completeness/identity checks. The retained real sample
+had later PoP discovery but no demonstrated post-original-cutoff source object.
+See [README's snapshot review](../../README.md#refresh-guidance-and-forecast-from-the-latest-complete-snapshot)
+for the bounded reproductions and test scope. Resolve these before relying on
+unattended operation or a universal decision-time evidence claim.
 
 ## 6. First-release flows
 
@@ -734,8 +777,10 @@ retention precede the per-location work. For each configured/registered location
    using the version originally issued and the applicable time, quality, spatial
    support, and cutoff rules. Record unavailable verification explicitly and
    proceed with the new forecast when no suitable observation is available.
-3. Regrid and blend the newest complete prepared snapshot (section 5.6) into coherent
-   local MesoForge fields using the field-specific blend policies (section 5.5). Save
+3. Pin one immutable MesoForge baseline snapshot maintained by the target background
+   engine, then derive/extract the local fields. Today section 5.6 pins prepared
+   contributors and calculates the local blend at consumption time; preblending and
+   generalized baseline coherence remain future work. Save
    the original numerical baseline, every contributor's values and the
    source/transform/configuration identity. No acquisition or regional grid preparation
    occurs inside a forecast HTTP request.
@@ -770,8 +815,9 @@ stages, not prerequisites for numerical issuance or first-release acceptance.
 The inventory records inspected code at that checkpoint. Subsequent owner approvals
 enabled the saved-ID read-only preview, temporary NBM active sky cover, and the bounded
 presentation policy in §6.7.8. Those explicit approvals do not approve other source
-weights, field promotion, intensity/fog/transition rules or the remaining proposed
-architecture. This section supersedes older field-status and next-field descriptions
+weights, field promotion, intensity/fog rules or the remaining proposed
+architecture. Transitions and periods were subsequently implemented in sections
+6.7.10–6.7.11. This section supersedes older field-status and next-field descriptions
 elsewhere in this RFC.
 
 #### 6.7.1 What the saved canvas actually contains
@@ -1132,7 +1178,7 @@ Specific phrase families and prerequisites:
 | Temporary p-type agreement; no interval-wide type persistence rule | Confident type-throughout-interval claims and transitions | Keep endpoint type/state and disagreement. §6.7.8 rendering applicability is separate; agreement policy and native unknown states remain unchanged |
 | NBM sole-source hourly PoP; no calibrated multi-source policy | Claims of optimized/multi-source/type-specific probability | Existing native event may be displayed numerically; more probability sources/calibration are not prerequisites for that limited use |
 | NBM thunder event threshold/footprint not fully established | Deterministic exact-point thunder claims | §6.7.8 probability wording retains provider-event uncertainty; no new product or deterministic proxy substitution |
-| Amount/intensity classes, transitions and fog rules remain unapproved | Intensity, multi-hour evolution and fog claims | Use only approved sky and §6.7.8 precipitation/thunder/wind wording; omit unsupported components with explicit reasons |
+| Amount/intensity classes and fog rules remain unapproved | Intensity and fog claims | Approved endpoint transitions and period grouping exist in §6.7.10–6.7.11; do not extend them to intensity or unsupported temporal claims |
 | Condition verification/calibrated confidence absent | Skill claims, calibrated whole-condition confidence and automatic rule promotion | `confidence: not_calibrated`; independent behavioral tests are not forecast-skill evidence |
 
 The bounded preview, temporary NBM sky and §6.7.8 presentation thresholds have now
@@ -1152,7 +1198,7 @@ NBM-only cloud enables deterministic sky wording while the broader measured
 multi-source architecture remains the intended direction. The next increment adds
 the explicitly approved precipitation/wind/thunder policy in §6.7.8 under ruleset
 `saved-active-fields-condition-preview.v3` and template `compositional-conditions-text.v1`.
-Fog and multi-hour transitions remain gated.
+Fog remains gated; later endpoint transitions and periods are described in §6.7.10–6.7.11.
 
 The **read-only condition preview for one saved issued forecast ID** reuses the
 existing verified storage reader and one pure cell/hour function over its saved local
@@ -1347,9 +1393,9 @@ dominant categories, totals or representative conditions.
   increasing clouds; wording ending with clearing); otherwise separate sentences.
 
 Limitations: no combination across different windows, no period-level condition
-statements, and no thunder/wind evolution. The next work returns to the learning
-loop (forward verification accumulation, then deterministic site/regime bias
-learning) rather than further presentation.
+statements, and no thunder/wind evolution. Forward accumulation and read-only site
+analysis now exist (§6.7.12–6.7.14); applied correction remains future work. The next
+architecture increment is tracked in README rather than this historical milestone.
 
 #### 6.7.9 Issuance payload measurement and proposed normalization
 
@@ -1691,7 +1737,11 @@ provisional duration gates first release. The correctness minimum is transaction
 objects long enough to complete/roll back publication and never advertise scheduled-deleted
 objects. Any promised window must be configured, monitored, and accurately exposed.
 
-## 10. Private API
+## 10. Historical private API proposal
+
+These `/v1` routes are unimplemented design sketches, not current commands or a
+commitment to a generic public API. Current development/readback endpoints are in
+[README](../../README.md); configured-location forecasting is the canonical product.
 
 FastAPI is the initial private/operator-controlled adapter, not a public SaaS contract.
 
@@ -1792,7 +1842,11 @@ is not acceptance.
 
 Nothing is deleted now.
 
-## 13. Delivery and review gates
+## 13. Historical delivery slices and retained review principles
+
+The original slice table below is a historical development plan. Current priorities
+follow VISION and the owner's current task; it does not authorize registration or
+public-product work. The scientific/replay review principles remain applicable.
 
 | Estimated vertical slice | Class | Outcome |
 |---|---|---|
@@ -1802,7 +1856,7 @@ Nothing is deleted now.
 | Basic bounded evaluation | First release | On-demand operator metrics without lattice |
 | Learning/bias/weights | Roadmap | Real history yields evaluated approved candidates |
 | Bounded AI | Roadmap | Structured audited proposals cannot alter baseline |
-| Delivery/public product | Roadmap | Separately approved email, then account/privacy/billing concerns |
+| Configured-location delivery | Future | Separately approved delivery; generic public/account product excluded |
 
 These are sensible review units, not a mandatory seven-PR sequence. Adjacent slices may be
 combined/split for reviewability. The first slice has no dependency on learning, AI, email,
@@ -1890,10 +1944,14 @@ all-in-one proof-harness requirement.
    weight inputs and their evidence thresholds, and the order in which current
    scaffolding is replaced. No equation, multiplier or default is approved.
 9. Separately later: correction methods/promotion, site-knowledge representation,
-   bounded AI tool algorithms/validation and evaluation policies, delivery, and public
-   accounts/privacy/billing/SLOs. The long-term direction does not approve these details.
+   bounded AI tool algorithms/validation and evaluation policies, and configured-location
+   delivery. Generic public/account products are outside the vision; the long-term
+   direction does not approve later implementation details.
 
-## 18. First Usable Release exit criteria
+## 18. Historical private-baseline exit criteria
+
+This preserves the original proposed release checklist. It is not a claim that these
+features exist or the acceptance gate for the next generalized blend-engine slice.
 
 1. Owner approval precedes implementation and covers material review-trigger decisions.
 2. The support matrix is explicit; representative cold/warm benchmarks record reads, bytes,
@@ -1927,12 +1985,12 @@ all-in-one proof-harness requirement.
 |---|---|
 | Rebuild | Selective rebuild from `main`; cohesive tested ports |
 | First release | Private baseline, registered history, observations/verification, bounded evaluation |
-| Roadmap | Local forecast fields, site/regime bias correction, bounded GFE-style AI tools, delivery and public accounts in separately approved stages |
+| Roadmap | Generalized blends and maintained baseline snapshots, site/regime correction, bounded AI tools and configured-location delivery; generic public accounts excluded |
 | Guidance | Ingest once into shared source cache; derive local MesoForge fields using larger context and smaller editable domains, then interpolate the exact point |
 | Forecast identity | The blend is the forecast: one coherent baseline grid from field-specific blend policies; models are contributors/evidence, preserved beside the blend, never a selected final forecast |
 | Blend weights | Per-field policies with field-valid mathematics; dynamic inputs (lead, availability, freshness, verified skill, site, later regime) are conceptual; current fixed weights and single-source rules are scaffolding |
 | AI edits | Persisted as bounded, interpretable edits to the MesoForge field after deterministic correction; contributors are cited evidence, not selections |
-| Refresh versus request | Background refresh publishes an atomic latest-complete prepared snapshot and keeps the previous good one; ad-hoc and scheduled forecasts consume it; the orchestrator decides when, MesoForge decides what; mixed source cycles are valid when available before the issuance cutoff |
+| Refresh versus request | Today refresh publishes prepared contributors and the consumer builds the grid; target background blending/coherence publishes an immutable MesoForge baseline pinned by each configured-location run. Scheduler controls timing, not science |
 | Snapshot coverage | Usability is absolute valid-time coverage of R+1..R+36 for the active deterministic contributors (`mesoforge-prepared-coverage-policy.v1`, 42-hour target window, never forced); NBM-based products report their own coverage; the request hour is the reference hour |
 | Cross-field coherence | Field-specific blends must stay mutually coherent (p-type/precipitation/thermal structure, thunder/convective support, gust/wind, RH/T/Td, later fog); snapshots keep every contributor field and its availability so a later coherence engine can evaluate them |
 | Issuance | Immutable baseline, corrected fields, proposal/recipe and final fields when implemented; mutable pointer/status only |

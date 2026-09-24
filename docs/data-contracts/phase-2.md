@@ -1,5 +1,11 @@
 # Phase 2 multi-model baseline contract
 
+> Scope: this remains the scientific contract for the retained Phase 2 station path.
+> Its v1 architecture and fixed stations do not govern new coordinate-driven V2 work.
+> [VISION](../../VISION.md) is the canonical product direction; the
+> [active RFC](../rfcs/mesoforge-v2-architecture.md) distinguishes implemented V2
+> behavior from proposed design. The historical contract below is preserved.
+
 This is the authoritative fixed-scope contract for the Phase 2 implementation. The canonical architecture remains
 [`docs/architecture/v1.md`](../architecture/v1.md); when its future-state roadmap is
 broader than this document, this document governs what Phase 2 actually implements.

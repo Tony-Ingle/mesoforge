@@ -26,7 +26,7 @@ Site knowledge must be versioned and inspectable, not assumed LLM memory.
 The local surface baseline now uses one grid with context and smaller editable
 domains; bias correction and AI editing are not implemented yet.
 
-Forecast philosophy guardrails ([VISION.md](VISION.md#north-star-the-blend-is-the-forecast)):
+Forecast philosophy guardrails ([canonical VISION](VISION.md#north-star)):
 
 1. The final forecast is the MesoForge field-specific blend and its later stages.
    There is no universal weight set; each field keeps mathematics valid for it
@@ -36,13 +36,14 @@ Forecast philosophy guardrails ([VISION.md](VISION.md#north-star-the-blend-is-th
 3. Future AI edits the MesoForge grid through bounded, interpretable field edits made
    after deterministic site correction; it does not choose a model. Contributors may
    be cited as the evidence for an edit.
-4. Slow model discovery, acquisition and preparation never live inside an ordinary
-   forecast request. `refresh_guidance` publishes an atomic latest-complete prepared
-   contributor snapshot; `forecast_from_snapshot` consumes it with no provider access
-   and judges usability by absolute valid-time coverage of the next 36 hours. Keep
-   that split. An external scheduler decides when MesoForge runs, never what a run
-   means; keep weather science out of workflow YAML. Source cycles need not match the
-   issuance hour, only precede the snapshot's cutoff and the issuance.
+4. Keep provider work outside ordinary forecast requests. Today `refresh_guidance`
+   publishes prepared contributor snapshots; `forecast_from_snapshot` checks absolute
+   coverage and builds the local blend without provider access. That is not yet the
+   vision's continuously maintained, blended/coherent baseline snapshot. Keep prepared
+   evidence, future baseline snapshots and issued forecasts distinct; pin inputs for
+   a run. Preserve each source's actual cutoff/availability evidence rather than
+   assuming one cutoff covers later attachments. Schedulers decide when, not weather
+   science. See README for current concurrency and provenance limitations.
 5. This direction is not permission to implement future stages. Current fixed weights,
    NBM-only sources, the HRRR/GFS p-type agreement rule and zero-weight shadows are
    approved scaffolding: do not change them, add dynamic weighting, a coherence
@@ -50,6 +51,9 @@ Forecast philosophy guardrails ([VISION.md](VISION.md#north-star-the-blend-is-th
    Field-specific blends must stay mutually coherent (p-type with precipitation and
    thermal structure, thunder with convective support, gust with wind, RH with T/Td);
    do not design snapshot or field formats that hide the evidence such checks need.
+6. Replace scaffolding when its generalized replacement proves equivalent; do not
+   permanently stack another execution path above it. Future AI has finite budgets
+   and must preserve the last fully validated forecast state.
 
 This direction does not authorize future stages during unrelated tasks or settle
 unapproved domain dimensions, grid spacing, tapering or storage choices.
@@ -112,8 +116,8 @@ unapproved domain dimensions, grid spacing, tapering or storage choices.
 
 ## Document responsibilities
 
-- [VISION.md](VISION.md) explains the product goal, release boundaries, and what is
-  proposed versus approved. It is not an implementation specification.
+- [VISION.md](VISION.md) is the canonical product direction. It separates today's
+  foundation from future architecture; it is not an implementation specification.
 - [README.md](README.md) describes current code, setup/run/test commands and their
   verification status, active links, and one proposed next milestone.
 - [The V2 RFC](docs/rfcs/mesoforge-v2-architecture.md) is the detailed proposed design
@@ -130,7 +134,5 @@ unapproved domain dimensions, grid spacing, tapering or storage choices.
   contents and add a status notice. Retain ambiguous or required paths with a notice.
   Use existing documentation checks; do not introduce a new governance/checking system.
 
-At the 2026-09-09 consolidation, no nested repository `AGENTS.md` or
-`AGENTS.override.md` files were found. Recheck when scope changes; this observation
-does not override future applicable instructions. Global Codex configuration is
-outside this document's responsibility and was not changed.
+Recheck nested instructions when scope changes. Global Codex configuration is outside
+this document's responsibility.
