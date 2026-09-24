@@ -54,7 +54,10 @@ Forecast philosophy guardrails ([canonical VISION](VISION.md#north-star)):
    thermal structure, thunder with convective support, gust with wind, RH with T/Td);
    do not design snapshot or field formats that hide the evidence such checks need.
 6. Replace scaffolding when its generalized replacement proves equivalent; do not
-   permanently stack another execution path above it. Future AI has finite budgets
+   permanently stack another execution path above it. Current V2 temperature, dew
+   point, wind, gust, QPF and derived RH dispatch through `forecasting/field_blend.py`
+   using the existing recipe/tables/kernels; do not reintroduce parallel numerical
+   orchestration. Other field policies remain unchanged. Future AI has finite budgets
    and must preserve the last fully validated forecast state.
 
 This direction does not authorize future stages during unrelated tasks or settle

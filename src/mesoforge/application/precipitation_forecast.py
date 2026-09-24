@@ -13,9 +13,6 @@ import xarray as xr
 
 from mesoforge.alignment.station_frame import StationAlignmentError, align_station_to_model
 from mesoforge.alignment.temporal import TemporalAlignmentError, find_exact_interval_index
-from mesoforge.catalog.configuration import Phase2BlendConfiguration
-from mesoforge.forecasting.precipitation_blend import blend_qpf
-from mesoforge.forecasting.scalar_blend import Contribution
 
 QPF = "liquid_equivalent_precipitation_amount_1h"
 _ACTIVE = ("HRRR", "GFS")
@@ -155,7 +152,7 @@ def _extract(
     return field
 
 
-def extract_precipitation_hour(
+def extract_precipitation_contributors(
     *,
     datasets: dict[str, tuple[xr.Dataset, pyproj.CRS, dict[str, Any] | None]],
     models: list[str],
@@ -163,9 +160,8 @@ def extract_precipitation_hour(
     longitude: float,
     horizon: int,
     target_reference_time: np.datetime64,
-    configuration: Phase2BlendConfiguration,
-) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
-    """Blend only matching hourly depths; approved fallbacks retain exclusions."""
+) -> dict[str, dict[str, Any]]:
+    """Extract matching hourly depths and evidence; field_blend owns blending."""
     native = {
         model: _extract(
             model,
@@ -177,49 +173,4 @@ def extract_precipitation_hour(
         )
         for model in dict.fromkeys((*_ACTIVE, *models))
     }
-    usable = {
-        model: native[model]["value"] for model in _ACTIVE if native[model]["value"] is not None
-    }
-    table = configuration.qpf_table
-    row = table.row_for(available_models=tuple(usable), horizon=horizon) if usable else None
-    weights = (
-        {
-            model: weight
-            for model, weight in zip(("HRRR", "NBM", "GFS"), row.weights, strict=True)
-            if weight > 0
-        }
-        if row
-        else {}
-    )
-    value = (
-        blend_qpf(
-            tuple(
-                Contribution(model=model, value=usable[model], weight=weight)
-                for model, weight in weights.items()
-            )
-        )
-        if row
-        else None
-    )
-    result = {
-        key: native["HRRR"][key]
-        for key in (
-            "unit",
-            "temporal_semantics",
-            "interval_start",
-            "interval_end",
-            "interval_closure",
-        )
-    }
-    result.update(
-        value=value,
-        weights=weights,
-        policy=table.table_id,
-        row_id=str(row.row_id) if row else None,
-        row_sha256=str(row.digest) if row else None,
-        status="unavailable" if value is None else "available" if len(usable) == 2 else "fallback",
-        missing_reasons=[
-            reason for model in _ACTIVE for reason in native[model]["missing_reasons"]
-        ],
-    )
-    return result, native
+    return native

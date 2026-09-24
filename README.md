@@ -125,8 +125,12 @@ provider work is now separate from forecast requests: a
 publishes a complete prepared contributor snapshot (up to 42 hours) and a
 network-free command serves 36-hour forecasts and issuances from it for the current
 UTC hour; the compatibility forward run still prepares inline. Continuous refresh on
-the VPS, GitHub Actions scheduling, the generalized blend engine and a cross-field
-coherence engine remain future work. Today's published snapshot contains prepared
+the VPS, GitHub Actions scheduling and a cross-field coherence engine remain future
+work. The current numerical fields use one [field-policy dispatcher](src/mesoforge/forecasting/field_blend.py):
+temperature, dew point, vector wind, gust and interval QPF, with RH derived from
+blended temperature/dew point. It reuses the existing recipe, Phase 2 tables and
+scientific kernels without changing weights, fallbacks or policy identities.
+Today's published snapshot contains prepared
 contributors; blending and local-grid construction still happen when it is consumed.
 It is not the vision's future continuously maintained MesoForge baseline snapshot
 ([RFC §5.5–5.6](docs/rfcs/mesoforge-v2-architecture.md#55-field-specific-blend-layer)).
@@ -576,12 +580,12 @@ so that analysis scales without opening each multi-megabyte evidence payload, wh
 older facts stay readable without migration. Two owner-approved policies now govern
 future learning: [which issuance represents a decision window and what evidence a
 correction proposal needs](#decision-window-and-evidence-policies). The next proposed
-architecture milestone is a generalized field-specific blend engine, initially
-representing the existing policies and proving equivalence before retiring their
-old execution paths. The snapshot correctness limitations below need a bounded fix
-before expanding automated accumulation. More independent verification evidence is
-still needed before deriving weights or corrections; visibility/fog needs separate
-causal evidence and policy.
+architecture milestone is background MesoForge baseline snapshots, using the now
+implemented field-specific dispatcher. Blended-baseline publication and generalized
+coherence remain unimplemented. Prepared-snapshot concurrency and cutoff fixes are
+implemented as described below. More independent verification evidence is still
+needed before deriving weights or corrections; visibility/fog needs separate causal
+evidence and policy.
 
 ## Existing forecast path
 
@@ -593,11 +597,33 @@ provider-free local blending and optional immutable issuance. The compatibility
 verification, selected-model preparation and batch issuance in one invocation.
 [point_forecast.py](src/mesoforge/application/point_forecast.py)
 and [surface_forecast.py](src/mesoforge/application/surface_forecast.py) supply native
-extraction and retained scientific operators to each node of
+extraction to [FieldBlendEngine.blend_field](src/mesoforge/forecasting/field_blend.py)
+at each node of
 [local_surface_grid.py](src/mesoforge/application/local_surface_grid.py). The surface point
 is read from that grid's center. Contributor roles and field semantics follow
 [VISION.md](VISION.md#7-every-field-has-its-own-blend); the current adapter capabilities
 live in [the contributor catalog](src/mesoforge/catalog/contributors.py).
+
+The immutable field registry binds each migrated field to the existing policy
+object and specialized kernel. Temperature remains 70/30 with both sources required;
+dew point, wind/gust and QPF retain approved subset rows (70/30 through hour 18,
+60/40 afterward when both models qualify). Source wind/gust QC remains coupled;
+QPF requires exact hourly intervals and RH stays a diagnostic. Native contributors
+are preserved, including shadows. NBM PoP/sky/thunder, p-type and evidence-only
+fields retain their separate current policies. No stored schema or historical
+forecast is rewritten. See [RFC §5.5](docs/rfcs/mesoforge-v2-architecture.md#55-field-specific-blend-layer).
+
+The 2026-09-24 migration replayed retained Minneapolis snapshot
+`20260918T004459Z-fcb1b488`: all 49×36 cells, the exact point, conditions, transitions
+and period summaries matched canonically, apart from changed execution-source
+hashes and their dependent checksums. Another 2,124 old/new boundary-case comparisons
+were exact. Grid/blend time was 26.025 → 25.609 seconds; load time was cache-sensitive.
+The 72 PostgreSQL/MinIO integration tests passed, including immutable readback and
+historical point-only payloads. The broader offline unit/contract/property run had
+3,361 passes and the same three failures independently reproduced at starting
+commit `c57233f`: one batch mock-signature expectation and two typed-boundary
+inventory checks. They were not changed or waived by this milestone. No provider
+acquisition or full expensive acceptance run was performed.
 
 The following is the separate retained **Phase 2 station path**, which supplies
 reusable science and contracts; it is not the current coordinate lifecycle's entry point:

@@ -40,15 +40,15 @@ from mesoforge.application.spatial_coverage import (
     point_in_grid,
     validate_coordinate,
 )
-from mesoforge.application.surface_forecast import FIELD_UNITS, extract_surface_hour
+from mesoforge.application.surface_forecast import FIELD_UNITS, extract_surface_inputs
 from mesoforge.application.thunder import THUNDER, ThunderView, extract_thunder_contributors
 from mesoforge.application.visibility import VisibilityView, extract_visibility_contributors
 from mesoforge.catalog.configuration import Phase2BlendConfiguration, _lists_to_tuples
 from mesoforge.catalog.domains import BoundingBox
+from mesoforge.forecasting.field_blend import BlendState, FieldBlendEngine
 from mesoforge.forecasting.recipes import (
     DEFAULT_CONFIGURATION,
     ContributorConfiguration,
-    evaluate_recipe,
     with_qpf_fields,
     with_surface_fields,
 )
@@ -699,6 +699,9 @@ class PreparedPointForecast:
             ),
             None,
         )
+        engine = FieldBlendEngine(
+            contributors=self._configuration, phase2=self._surface_configuration
+        )
         hours: list[dict[str, Any]] = []
         for horizon in self._horizons:
             valid_time = self._target_reference_time + np.timedelta64(horizon, "h")
@@ -818,10 +821,26 @@ class PreparedPointForecast:
                     continue
                 source["temperature"]["value"] = aligned[horizon].value
             reasons = [reason for source in sources for reason in source["missing_reasons"]]
-            temperature = evaluate_recipe(
-                self._configuration.control_recipe,
-                {source["model"]: source["temperature"]["value"] for source in sources},
-            ).value
+            state = BlendState(
+                horizon=horizon,
+                contributors={
+                    source["model"]: {_VARIABLE: source["temperature"]["value"]}
+                    for source in sources
+                },
+            )
+            surface_contributors: dict[str, dict[str, Any]] = {}
+            if self._surface_configuration is not None:
+                selection = (self._manifest or {}).get("current_model_set", {}).get("selection")
+                state, surface_contributors = extract_surface_inputs(
+                    datasets=surface_datasets,
+                    temperature_sources=[*sources, *shadow_sources],
+                    latitude=latitude,
+                    longitude=longitude,
+                    horizon=horizon,
+                    target_reference_time=self._target_reference_time,
+                    selection=selection,
+                )
+            temperature = engine.blend_field(_VARIABLE, state)["value"]
             hours.append(
                 {
                     "horizon_hours": horizon,
@@ -833,18 +852,11 @@ class PreparedPointForecast:
                 }
             )
             if self._surface_configuration is not None:
-                selection = (self._manifest or {}).get("current_model_set", {}).get("selection")
-                hours[-1]["surface"] = extract_surface_hour(
-                    datasets=surface_datasets,
-                    temperature_sources=[*sources, *shadow_sources],
-                    temperature_k=temperature,
-                    latitude=latitude,
-                    longitude=longitude,
-                    horizon=horizon,
-                    target_reference_time=self._target_reference_time,
-                    configuration=self._surface_configuration,
-                    selection=selection,
-                )
+                hours[-1]["surface"] = {
+                    "fields": engine.surface_fields(state),
+                    "source_validation": state.source_validation,
+                    "contributors": surface_contributors,
+                }
                 if self._pop_guidance is not None:
                     pop, native_pop = extract_probability_hour(
                         pop_view,

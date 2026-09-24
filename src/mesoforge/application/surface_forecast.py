@@ -12,13 +12,12 @@ import pyproj
 import xarray as xr
 
 from mesoforge.alignment.station_frame import StationAlignmentError, align_station_to_model
-from mesoforge.application.precipitation_forecast import QPF, extract_precipitation_hour
-from mesoforge.catalog.configuration import Phase2BlendConfiguration
+from mesoforge.application.precipitation_forecast import QPF, extract_precipitation_contributors
 from mesoforge.catalog.contributors import SURFACE_MODEL_FIELDS
 from mesoforge.forecasting.baseline import derive_wind_speed_and_direction
+from mesoforge.forecasting.field_blend import BlendState
 from mesoforge.forecasting.surface import (
     SurfaceBlendError,
-    blend_surface,
     relative_humidity_percent,
 )
 
@@ -31,18 +30,16 @@ FIELD_UNITS = {
 }
 
 
-def extract_surface_hour(
+def extract_surface_inputs(
     *,
     datasets: dict[str, tuple[xr.Dataset, pyproj.CRS, dict[str, Any] | None]],
     temperature_sources: list[dict[str, Any]],
-    temperature_k: float | None,
     latitude: float,
     longitude: float,
     horizon: int,
     target_reference_time: np.datetime64,
-    configuration: Phase2BlendConfiguration,
     selection: dict[str, Any] | None,
-) -> dict[str, Any]:
+) -> tuple[BlendState, dict[str, dict[str, Any]]]:
     """Extract each available native field at the same exact coordinate/valid time.
 
     All datasets are already loaded. Native IFS gaps remain gaps; this function
@@ -177,25 +174,17 @@ def extract_surface_hour(
                 ],
             }
         contributor["native_supported_fields"] = list(SURFACE_MODEL_FIELDS.get(model, ()))
-    result = blend_surface(
-        temperature_k=temperature_k,
-        contributors=values,
-        horizon=horizon,
-        configuration=configuration,
-    )
-    result["contributors"] = contributors
-    qpf, native_qpf = extract_precipitation_hour(
+    native_qpf = extract_precipitation_contributors(
         datasets=datasets,
         models=list(contributors),
         latitude=latitude,
         longitude=longitude,
         horizon=horizon,
         target_reference_time=target_reference_time,
-        configuration=configuration,
     )
-    result["fields"][QPF] = qpf
+    state = BlendState(horizon=horizon, contributors=values, precipitation=native_qpf)
     for model, contributor in contributors.items():
         contributor["fields"][QPF] = native_qpf[model]
         if model in ("HRRR", "GFS") and model in datasets and QPF in datasets[model][0]:
             contributor["native_supported_fields"].append(QPF)
-    return result
+    return state, contributors

@@ -543,24 +543,60 @@ verification. Persistent statistical bias is removed by the deterministic correc
 first, so the AI is judged against the bias-corrected baseline and earns no credit
 for rediscovering a mean bias (section 11).
 
-**Current scaffolding (inspected at `aedbde2`).** The implemented policies are fixed
+**Current scaffolding (generalized dispatch implemented).** The policies are fixed
 and remain in force; none of them is the final philosophy:
 
 | Field | Current representation | Where it lives |
 |---|---|---|
-| Temperature | Named recipe `temperature_control_v1`, HRRR/GFS 70/30, `require_all`; issuance refuses any other control recipe | `forecasting/recipes.py`, `validate_current_control` in `application/batch_forecast.py` |
-| Dew point, U/V, gust, QPF | Retained Phase 2 fallback tables keyed by available-model set and lead band (70/30 h1–18, 60/40 h19–36); active set and table column order are constants | `blend_configuration` in `configs/phase2-grasston.yaml`, `forecasting/surface.py` |
+| Temperature | Named recipe `temperature_control_v1`, version `1`, HRRR/GFS 70/30, `require_all`; issuance refuses any other control recipe | `forecasting/recipes.py`, dispatched by `forecasting/field_blend.py`; `validate_current_control` in `application/batch_forecast.py` |
+| Dew point, U/V, gust, QPF | Retained Phase 2 fallback tables keyed by available-model set and lead band (70/30 h1–18, 60/40 h19–36); active HRRR/GFS set and table column order preserved | `blend_configuration` in `configs/phase2-grasston.yaml`, dispatched by `forecasting/field_blend.py` |
+| RH | `bolton-1980-relative-humidity-liquid-water.v1`, diagnostic from blended temperature/dew point | `forecasting/surface.py` kernel, dispatched by `forecasting/field_blend.py` |
 | PoP, sky, thunder | Temporary single-source NBM passthrough policies with weight 1 and no substitute | `pop_policy` in the same configuration; policy constants in `forecasting/cloud_cover.py` and `forecasting/thunder.py` |
 | Precipitation type | Temporary HRRR/GFS categorical agreement rule | `application/precipitation_type.py` |
 | Visibility, SWE, snowfall, Kuchera, ice | Evidence only; "no approved policy" placeholders with a null active value | the corresponding `application/*` and `forecasting/*` modules |
 | RAP, IFS, other NBM/GEFS/REFS/ECMWF products | Zero-weight shadows/evidence | contributor registry and attachments |
 
-Weights therefore exist in three unrelated shapes (a named recipe, configuration
-tables, and per-module policy constants). Converging them into one field-policy
-abstraction is future work and is not required before section 5.6. The saved grid
-already stores, for every cell and hour, both the blended `fields` and the
-per-contributor evidence, so a more general blend changes the column calculation and
-its policy identity, not the grid representation.
+**Implemented numerical blend core.** `forecasting/field_blend.py` contains one
+immutable `FIELD_REGISTRY` for temperature, dew point, wind, gust, QPF and derived RH.
+Each definition states its semantic kind, output units, existing policy binding,
+execution handler, missingness contract and present dependencies. `FieldBlendEngine`
+binds the existing `ContributorConfiguration` and `Phase2BlendConfiguration` once
+for a column. `policy_for` returns the original recipe/table/diagnostic identity;
+there is no duplicate policy schema, copied weight table or new policy ID.
+
+`blend_field(field_id, BlendState)` is the common production dispatch boundary.
+State contains already extracted native values for one cell/hour, exact QPF bounds,
+cached dependency results and source-validation evidence. Specialized handlers call
+the retained scalar, vector, gust, QPF and RH kernels. Native input dictionaries are
+not modified. Wind/gust share the same accepted U/V/gust contributor tuple; gust
+depends on blended sustained speed. Dew point retains native and blended-temperature
+checks; RH is derived, never independently weighted. Dependencies are the few
+explicit handler calls needed today, not a generalized coherence/graph engine.
+
+Temperature remains 70/30 with both inputs required at all 36 hours. Dew point,
+wind and gust reuse `phase2-scalar-vector-fallback.v1`; QPF reuses the distinct
+`phase2-qpf-fallback.v1`. Their HRRR/GFS rows and singleton fallbacks are unchanged.
+`gust-blend-policy.v1` still governs source and final floors. QPF extraction checks
+exact one-hour `(start,end]` intervals, native units/corners and retained parents
+before dispatch; incompatible interval metadata cannot be combined. Zero remains
+a valid amount. All policy row identities/digests, exclusions and shadow evidence
+stay available beside the resulting fields.
+
+The old `blend_surface` orchestration and application-level QPF blend block are
+removed. Application code extracts evidence; the engine produces migrated fields.
+`surface_fields` only assembles the existing saved shape, including the legacy
+surface-temperature label `unchanged-temperature-control` and cloud placeholder;
+the containing forecast still retains the actual temperature recipe and weights.
+Temperature-only historical prepared artifacts still use the same recipe kernel
+through dispatch. No historical payload, grid schema, policy ID or read path changes.
+Execution-source hashes and resulting new-grid digests change intentionally.
+
+NBM PoP/sky/thunder, p-type agreement and all evidence-only products remain on their
+existing field-specific paths, outside this migration. The separate retained Phase 2
+station assembler remains a compatible consumer of the scientific kernels and its
+three-model contracts. Comparison recipes still use the generic scalar recipe kernel.
+Continuous blended-baseline publication, generalized coherence, dynamic weights and
+corrections remain future work; section 5.6 still publishes prepared contributors.
 
 ### 5.6 Implemented guidance refresh and the latest complete prepared snapshot
 
@@ -989,11 +1025,12 @@ not the status string alone. Report rounding is never input to a condition decis
 
 Code anchors for these inventory facts:
 
-- [`extract_surface_hour`](../../src/mesoforge/application/surface_forecast.py),
-  [`blend_surface` / `relative_humidity_percent`](../../src/mesoforge/forecasting/surface.py),
+- [`extract_surface_inputs`](../../src/mesoforge/application/surface_forecast.py),
+  [`FieldBlendEngine.blend_field`](../../src/mesoforge/forecasting/field_blend.py),
+  [`relative_humidity_percent`](../../src/mesoforge/forecasting/surface.py),
   [named recipes](../../src/mesoforge/forecasting/recipes.py), and
   [applicable retained rows](../../configs/phase2-grasston.yaml).
-- [`extract_precipitation_hour`](../../src/mesoforge/application/precipitation_forecast.py),
+- [`extract_precipitation_contributors`](../../src/mesoforge/application/precipitation_forecast.py),
   [`extract_probability_hour`](../../src/mesoforge/application/probability_forecast.py),
   [probability compatibility](../../src/mesoforge/application/probability_contributors.py),
   [native probability products](../../src/mesoforge/guidance/sources/probabilistic.py),
@@ -1966,7 +2003,7 @@ all-in-one proof-harness requirement.
 ## 18. Historical private-baseline exit criteria
 
 This preserves the original proposed release checklist. It is not a claim that these
-features exist or the acceptance gate for the next generalized blend-engine slice.
+features exist or an acceptance gate for future baseline-snapshot work.
 
 1. Owner approval precedes implementation and covers material review-trigger decisions.
 2. The support matrix is explicit; representative cold/warm benchmarks record reads, bytes,

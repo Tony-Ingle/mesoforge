@@ -13,7 +13,9 @@ import xarray as xr
 
 from mesoforge.application.point_forecast import PreparedPointForecast, prepare_demo_files
 from mesoforge.application.probability_forecast import extract_probability_hour
-from mesoforge.application.surface_forecast import FIELD_UNITS, extract_surface_hour
+from mesoforge.application.surface_forecast import FIELD_UNITS, extract_surface_inputs
+from mesoforge.forecasting.field_blend import FieldBlendEngine
+from mesoforge.forecasting.recipes import DEFAULT_CONFIGURATION
 from tests.unit.application.test_prepared_temperature import phase2_configuration
 
 TARGET = np.datetime64("2026-09-11T12:00:00", "ns")
@@ -171,17 +173,21 @@ def _temperature_source(model, dataset, horizon):
 
 
 def _extract(configuration, datasets, sources, *, horizon=1, selection=None):
-    return extract_surface_hour(
+    state, contributors = extract_surface_inputs(
         datasets=datasets,
         temperature_sources=sources,
-        temperature_k=293.15,
         latitude=44.5,
         longitude=-93.5,
         horizon=horizon,
         target_reference_time=TARGET,
-        configuration=configuration,
         selection=selection,
     )
+    engine = FieldBlendEngine(contributors=DEFAULT_CONFIGURATION, phase2=configuration)
+    return {
+        "fields": engine.surface_fields(state),
+        "source_validation": state.source_validation,
+        "contributors": contributors,
+    }
 
 
 @pytest.mark.parametrize(
@@ -197,7 +203,7 @@ def test_valid_time_alignment_preserves_temperature_and_uses_approved_surface_we
     datasets, sources = _case(horizon)
     result = _extract(configuration, datasets, sources, horizon=horizon)
     fields = result["fields"]
-    assert fields[T]["value"] == 293.15  # Existing 70/30 temperature supplied unchanged.
+    assert fields[T]["value"] == 293.15  # Existing 70/30 temperature policy remains unchanged.
     for variable, expected in ((DEW, dew), (U, u), (V, v), (GUST, gust)):
         assert fields[variable]["value"] == pytest.approx(expected)
         assert fields[variable]["weights"] == weights
