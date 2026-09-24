@@ -43,7 +43,9 @@ Forecast philosophy guardrails ([canonical VISION](VISION.md#north-star)):
    evidence, future baseline snapshots and issued forecasts distinct; pin inputs for
    a run. Preserve each source's actual cutoff/availability evidence rather than
    assuming one cutoff covers later attachments. Schedulers decide when, not weather
-   science. See README for current concurrency and provenance limitations.
+   science. Snapshot issuance must prove its per-input information bounds at the
+   request's analysis cutoff; preserve explicit limitations on historical reads.
+   See README for publication/issuance locking and remaining operational limits.
 5. This direction is not permission to implement future stages. Current fixed weights,
    NBM-only sources, the HRRR/GFS p-type agreement rule and zero-weight shadows are
    approved scaffolding: do not change them, add dynamic weighting, a coherence

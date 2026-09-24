@@ -270,8 +270,10 @@ def test_selection_changed_after_validation_is_rejected_before_acquisition(
     path, _ = selection
     load = selected_forecast.load_selection
 
-    def changed_after_read(selection_path, *, clock):
-        validated = load(selection_path, clock=clock)
+    def changed_after_read(selection_path, *, clock, require_complete_shadows=True):
+        validated = load(
+            selection_path, clock=clock, require_complete_shadows=require_complete_shadows
+        )
         changed = deepcopy(validated[0])
         changed["reason"] = "Changed after the validated read"
         selection_path.write_text(json.dumps(changed), encoding="utf-8")
@@ -343,6 +345,8 @@ def test_inventory_changed_during_copy_is_revalidated_before_acquisition(
         ("RAP missing hour", False, None),
         ("IFS missing hour", False, None),
         ("IFS missing hour (tolerated)", False, None),
+        ("RAP discovery (tolerated)", False, None),
+        ("IFS discovery (tolerated)", False, None),
         ("IFS cycle", False, None),
     ],
 )
@@ -353,6 +357,7 @@ def test_preparation_reuses_one_selected_source_set_and_rejects_partial_shadows(
 
     # The background refresh tolerates a short zero-weight shadow and records the gap.
     tolerated = bool(failure) and failure.endswith("(tolerated)")
+    undiscovered = failure.split()[0] if failure and "discovery" in failure else None
 
     pop_descriptor = {
         "status": pop_status,
@@ -461,6 +466,26 @@ def test_preparation_reuses_one_selected_source_set_and_rejects_partial_shadows(
             shadow["selected_cycle"] = "2026-09-11T00:00:00Z"
         shadow_mocks[model] = Mock(return_value=shadow)
         monkeypatch.setattr(selected_forecast, f"prepare_{model.lower()}", shadow_mocks[model])
+    if undiscovered:
+        del selection_report["selected_cycles"][undiscovered]
+        selection_report["optional_shadow_models"] = ["IFS", "RAP"]
+        selection_report["models"][undiscovered] = {
+            "status": "unavailable",
+            "selected_cycle": None,
+            "candidates": [],
+            "reason": "Fixture discovery outage",
+        }
+        selection_report["shadow_discovery_shortfalls"] = {
+            undiscovered: {
+                "stage": "discovery",
+                "status": "unavailable",
+                "reason": "Fixture discovery outage",
+                "decision_time": selection_report["decision_time"],
+            }
+        }
+        selection_path.write_text(json.dumps(selection_report), encoding="utf-8")
+        with pytest.raises(ValueError, match="unapproved"):
+            selected_forecast.load_selection(selection_path, clock=FixedClock(NOW))
     location_rows = [LOCATIONS[0], {"lat": 95.0, "lon": -93.0}, LOCATIONS[1]]
 
     def coverage(locations, source, **kwargs):
@@ -509,8 +534,17 @@ def test_preparation_reuses_one_selected_source_set_and_rejects_partial_shadows(
             assert prepare_pop.call_args.kwargs["transport"] is arguments["transport"]
         else:
             assert "pop_guidance" not in result
-        assert set(result["shadow_directories"]) == {"RAP", "IFS"}
-        if tolerated:
+        assert set(result["shadow_directories"]) == {"RAP", "IFS"} - {undiscovered}
+        if undiscovered:
+            shortfall = result["shadow_shortfalls"][undiscovered]
+            assert shortfall["stage"] == "discovery"
+            assert shortfall["supported_hours"] == []
+            assert shortfall["missing_hours"] == {
+                str(hour): "Fixture discovery outage" for hour in range(1, 37)
+            }
+            assert result["shadows"][undiscovered]["selected_cycle"] is None
+            assert not (output / undiscovered).exists()
+        elif tolerated:
             shortfall = result["shadow_shortfalls"]["IFS"]
             assert shortfall["supported_hours"] == shortfall["expected_hours"][1:]
             assert shortfall["missing_hours"] == {
@@ -529,12 +563,15 @@ def test_preparation_reuses_one_selected_source_set_and_rejects_partial_shadows(
                 shadow_pin.assert_complete.assert_not_called()
             else:
                 shadow_pin.assert_complete.assert_called_once()
-    assert pin.call_count == 3
-    assert [len(call.args[1]) for call in pin.call_args_list] == [72, 36, 12]
+    assert pin.call_count == (2 if undiscovered else 3)
+    assert [len(call.args[1]) for call in pin.call_args_list] == [
+        count
+        for model, count in (("control", 72), ("RAP", 36), ("IFS", 12))
+        if model != undiscovered
+    ]
     assert [call.kwargs.get("latch_failures", True) for call in pin.call_args_list] == [
         True,
-        not tolerated,
-        not tolerated,
+        *([not tolerated] * (1 if undiscovered else 2)),
     ]
     if not pop_status:
         prepare_pop.assert_not_called()
@@ -547,7 +584,12 @@ def test_preparation_reuses_one_selected_source_set_and_rejects_partial_shadows(
     prepare_control.assert_called_once()
     assert prepare_control.call_args.kwargs["hrrr_cycle"].isoformat() == "2026-09-11T06:00:00+00:00"
     assert prepare_control.call_args.kwargs["gfs_cycle"].isoformat() == "2026-09-11T06:00:00+00:00"
-    for index, (model, prepare) in enumerate(shadow_mocks.items(), start=1):
+    index = 0
+    for model, prepare in shadow_mocks.items():
+        if model == undiscovered:
+            prepare.assert_not_called()
+            continue
+        index += 1
         if failure == "RAP missing hour" and model == "IFS":
             prepare.assert_not_called()
             continue

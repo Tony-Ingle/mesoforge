@@ -608,15 +608,16 @@ configured coordinates (or development lat/lon request)
 - Snapshot cadence, continuous operation on the VPS, retention of superseded
   snapshots and a shared (non-filesystem) pointer location are open (section 17).
 
-**Implemented slice (2026-09-18).** The refresh and the snapshot-consuming forecast
-exist as separate commands; the operator/compatibility `forward_run` path is unchanged.
+**Implemented slice (2026-09-18; correctness updated 2026-09-24).** The refresh and the
+snapshot-consuming forecast exist as separate commands; the operator/compatibility
+`forward_run` path is unchanged.
 
 - *Prepared window and coverage policy* (`mesoforge-prepared-coverage-policy.v1`,
   `mesoforge.guidance.coverage`): a prepared window is hours 1..N after its reference
   time, 36 ≤ N ≤ 42. Cycle acceptance still uses the first 36 hours exactly as before;
   hours 37..N are probed only on the accepted cycle, and N is the largest hour every
-  deterministic model reaches. Prepared datasets were already keyed by absolute valid
-  time, so a later reference hour R is served by a *reference view*
+  selected deterministic model reaches. Prepared datasets were already keyed by absolute
+  valid time, so a later reference hour R is served by a *reference view*
   (`PreparedPointForecast.reference_view`) that reads hours R+1..R+36 from the same
   files: source cycles, leads and evidence are exactly what was prepared, and the
   forecast records `prepared_window` (prepared reference, prepared hours, offset)
@@ -637,9 +638,10 @@ exist as separate commands; the operator/compatibility `forward_run` path is unc
   evidence (optional, non-blocking) → offline load and one validation column per
   configured coordinate → `snapshot.json` (`mesoforge.prepared-snapshot.v1`) →
   atomic `latest_complete.json` (`mesoforge.latest-complete-pointer.v1`, written to a
-  temporary file and `os.replace`d, with a sequential older-reference check).
-  Concurrent monotonic publication is not guaranteed; see the review limitations
-  below. A failed pre-publication step leaves the previous pointer unchanged and
+  temporary file and `os.replace`d). A stable OS lock file per local root serializes
+  reference-time comparison and publication across processes; an older reference
+  cannot replace a newer one, and equal-reference replacement remains permitted.
+  Failed publication leaves the previous pointer unchanged and
   retains `failure.json`. The manifest distinguishes native deterministic
   contributors (HRRR/GFS active; RAP/IFS shadow evidence), the blended meta-model NBM
   with its active-current-policy products, and evidence-only inputs; it names the
@@ -650,14 +652,17 @@ exist as separate commands; the operator/compatibility `forward_run` path is unc
   publishing, PoP selection rejects it, records `rejected_candidates`, and tries the
   next older cycle; completeness is judged on the required 36 hours and extension hours
   are explicit gaps. Validation itself is unchanged.
-- *Shadow shortfalls during preparation*: the refresh
-  prepares with `require_complete_shadows=False`; the active HRRR/GFS objects and each
+- *Optional shadow discovery/preparation*: the refresh opts into
+  `require_complete_shadows=False` for both discovery and preparation. HRRR/GFS
+  discovery stays strict. Unavailable or unprovable RAP/IFS cycles are explicit
+  `shadow_discovery_shortfalls`; their acquisition is omitted, and the snapshot records
+  null cycles, unavailable shadows and missing valid times. Future refreshes may restore
+  them normally. No source is substituted or promoted. The active HRRR/GFS objects and each
   zero-weight shadow use separate pinned views of the same discovery (the shadow views
   do not latch on a first failure), so a provider failure on a RAP/IFS object is
   recorded per object and per missing hour instead of aborting the preparation. The
-  issuance-bound forward run keeps the strict default. Discovery still requires all
-  four models, and shadow coverage can limit the extension envelope; this is only
-  partial isolation of optional evidence failures.
+  standalone selection and issuance-bound forward run keep the strict default.
+  Successfully selected shadow coverage can still limit the extension envelope.
 - *Forecast from snapshot* (`python -m mesoforge.application.forecast_from_snapshot
   --root … (--lat --lon | --config) [--reference-time] [--issue]`): resolves the
   pointer, verifies manifest and retained-artifact digests, derives the reference hour
@@ -665,7 +670,22 @@ exist as separate commands; the operator/compatibility `forward_run` path is unc
   with the existing policies and returns the 36-hour forecast with `prepared_snapshot`
   provenance (snapshot ID, publication time, request/reference times, contributor
   cycles, field policies, coverage). It makes no provider calls. `--issue` reuses the
-  same path with the decision-window guard applied before the grid build.
+  existing forward-run PostgreSQL advisory lock through metadata lookup, grid build
+  and storage. Concurrent snapshot issuers wait and recheck committed versions before
+  creating an issuance; a second primary attempt skips the existing coordinate/reference
+  version, while `--reissue` explicitly permits another version. A lookup failure is isolated as
+  `issuance_lookup_failed` and later coordinates continue.
+- *Information provenance*: additive `source_information` in the existing v1 manifest
+  pins retained source/region manifests and hashes, each input's availability/acquisition
+  clocks and recorded source-specific discovery cutoff. Attachments do not inherit the
+  original model-set cutoff. An actual retrieval time may be a labeled conservative
+  known-by bound when provider publication time is absent. Snapshot issuance sets
+  `forecast_analysis_cutoff` to request time and rejects unavailable timing proof or
+  inputs/discovery/completion/publication after that cutoff. Reference time, source
+  cycles, publication and actual issuance remain distinct. Historical snapshots without
+  the additive field remain readable through reconstruction of retained evidence, with
+  limitations reported rather than fabricated timestamps; historical issuances stay
+  immutable. This does not implement the broader future cutoff/storage architecture.
 - *Still bound*: the refresh must still complete inside its decision hour (the
   existing selection expiry), coordinates outside the refreshed collection's footprint
   are refused rather than prepared on demand, conditions/transitions/period previews
@@ -675,17 +695,12 @@ exist as separate commands; the operator/compatibility `forward_run` path is unc
   49-node, 36-hour build from 178.6 s to 25.4 s with byte-identical output; the
   remainder is per-column evidence copying and the required canonical grid digest.
 
-**Confirmed review limitations at `5eb1ae6` (2026-09-24; no runtime fix in this audit):**
-publication's read/check/replace sequence permits a concurrent older writer to win;
-the snapshot consumer's blanket original-decision cutoff claim is not enforced for
-later NBM/field attachments; and its issuance metadata lookup can abort the coordinate
-loop rather than isolate a failure. Snapshot issuance also lacks the compatibility
-forward-run overlap lock. These are current limitations, not revised scientific
-policies or reasons to weaken completeness/identity checks. The retained real sample
-had later PoP discovery but no demonstrated post-original-cutoff source object.
-See [README's snapshot review](../../README.md#refresh-guidance-and-forecast-from-the-latest-complete-snapshot)
-for the bounded reproductions and test scope. Resolve these before relying on
-unattended operation or a universal decision-time evidence claim.
+The independent audit at `5eb1ae6` reproduced the pointer race and location-lookup
+failure and found the unsupported universal cutoff claim and strict optional-shadow
+discovery. The bounded fixes above preserve forecast science and current field policies.
+The retained real sample had later PoP discovery but no demonstrated historical leakage.
+See [README's snapshot correctness notes](../../README.md#refresh-guidance-and-forecast-from-the-latest-complete-snapshot)
+for locking details, compatibility and remaining operational limits.
 
 ## 6. First-release flows
 

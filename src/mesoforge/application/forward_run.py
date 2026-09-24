@@ -22,19 +22,19 @@ from mesoforge.application.batch_forecast import (
 from mesoforge.application.current_model_set import select_model_set
 from mesoforge.application.forward_verification import verify_previous
 from mesoforge.application.hourly_report import build_hourly_report, render_hourly_report
-from mesoforge.application.issuance import ForecastIssuanceService
+from mesoforge.application.issuance import (
+    FORWARD_RUN_LOCK,
+    ForecastIssuanceService,
+    acquire_issuance_run_lock,
+)
 from mesoforge.application.prepared_temperature import BoundedHttpTransport
 from mesoforge.application.selected_forecast import run_selected_batch
 from mesoforge.application.spatial_coverage import validate_coordinate
 from mesoforge.catalog.configuration import load_configuration_source
-from mesoforge.common.identifiers import Digest
 from mesoforge.guidance.runtime import SystemClock, SystemSleeper
-from mesoforge.storage.postgres.database import resolve_database_dsn
-from mesoforge.storage.postgres.idempotency_lock import AdvisoryLockBusy, PostgresIdempotencyLock
+from mesoforge.storage.postgres.idempotency_lock import AdvisoryLockBusy
 
 _ROOT = Path(__file__).resolve().parents[3]
-# Every forward run shares one storage, so one process-wide key serializes all of them.
-FORWARD_RUN_LOCK = Digest.of_bytes(b"mesoforge.forward-run.v1")
 OVERLAP_PROTECTION = {
     "mechanism": "postgresql_session_advisory_lock",
     "lock_key": str(FORWARD_RUN_LOCK),
@@ -79,8 +79,7 @@ def _save(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _acquire_run_lock() -> AbstractContextManager[None]:
-    dsn = resolve_database_dsn("MESOFORGE_DATABASE_DSN")
-    return PostgresIdempotencyLock(dsn).try_acquire(FORWARD_RUN_LOCK)
+    return acquire_issuance_run_lock()
 
 
 def _report_builder(

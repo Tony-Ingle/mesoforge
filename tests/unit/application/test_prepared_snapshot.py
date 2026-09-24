@@ -7,6 +7,7 @@ nothing is downloaded and no provider availability is claimed.
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -182,7 +183,30 @@ def prepared_window_fixture(directory: Path, *, hours: int = PREPARED_HOURS) -> 
         dataset.attrs["data_kind"] = "synthetic_demonstration"
         shadow = directory / "prepared" / model
         shadow.mkdir(parents=True)
-        _write_prepared_file(shadow, model, dataset)
+        prepared_file = _write_prepared_file(shadow, model, dataset)
+        # Explicit synthetic timing evidence for issuance-cutoff tests. These arrays
+        # are generated above; no real provider availability is asserted.
+        (shadow / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "data_kind": "synthetic_demonstration",
+                    "prepared_files": {model: prepared_file},
+                    "inputs": [
+                        {
+                            "model": model,
+                            "cycle": _iso(TARGET),
+                            "source_lead_hours": lead,
+                            "grib_available_at": _iso(TARGET),
+                            "index_available_at": _iso(TARGET),
+                            "grib_retrieved_at": _iso(FixtureClock().now()),
+                            "index_retrieved_at": _iso(FixtureClock().now()),
+                        }
+                        for lead in leads
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
         shadows[model] = str(shadow)
         shadow_reports[model] = {"selected_cycle": _iso(TARGET), "supported_hours": list(leads)}
     selection_dir = directory / "selection"
@@ -366,7 +390,7 @@ def test_pointer_is_replaced_atomically_and_never_moves_backwards(tmp_path: Path
     published_at = datetime(2026, 9, 17, 22, 15, tzinfo=UTC)
     pointer = snapshots.publish_latest_complete(root, manifest, "0" * 64, published_at=published_at)
     assert pointer["previous_snapshot_id"] is None
-    assert [p.name for p in root.iterdir()] == [snapshots.POINTER_FILE]  # no temp file left
+    assert {p.name for p in root.iterdir()} == {snapshots.POINTER_FILE, ".latest_complete.lock"}
     newer = deepcopy(manifest)
     newer.update(snapshot_id="b")
     newer["coverage"]["reference_time"] = "2026-09-17T23:00:00Z"
@@ -513,7 +537,11 @@ def test_multiple_coordinates_share_one_snapshot_and_failures_stay_isolated(publ
 
 def test_issuance_from_snapshot_records_request_and_snapshot_provenance(published) -> None:
     root, result = published
-    clock = FixedClock(DECISION)
+    # Historical numerical reference, new issuance after the actual fixture publication.
+    request = datetime.fromisoformat(snapshots.read_pointer(root)["published_at"]) + timedelta(
+        seconds=1
+    )
+    clock = FixedClock(request)
     issuer = ForecastIssuanceService(
         InMemoryObjectStore(),
         InMemoryUnitOfWorkFactory(),
@@ -521,17 +549,26 @@ def test_issuance_from_snapshot_records_request_and_snapshot_provenance(publishe
         clock=clock.now,
     )
     outcome = fast.forecast_from_snapshot(
-        root, [FIRST], request_time=DECISION, issue=True, issuer=issuer
+        root,
+        [FIRST],
+        request_time=request,
+        reference_time=TARGET,
+        issue=True,
+        issuer=issuer,
+        run_lock=nullcontext,
     )
     row = outcome["results"][0]
     assert row["status"] == "ok" and "issued" in row
     issued = issuer.read(UUID(row["issued"]["issued_forecast_id"]))
-    assert issued["issued_at"] == _iso(DECISION)
+    assert issued["issued_at"] == _iso(request)
     assert issued["target_reference_time"] == _iso(TARGET)
     provenance = issued["forecast"]["prepared_snapshot"]
     assert provenance["snapshot_id"] == result["snapshot_id"]
     assert provenance["published_at"] == snapshots.read_pointer(root)["published_at"]
-    assert provenance["request_time"] == _iso(DECISION)
+    assert provenance["request_time"] == _iso(request)
+    assert provenance["forecast_analysis_cutoff"] == _iso(request)
+    assert provenance["information_cutoff"]["status"] == "proven"
+    assert provenance["decision_time"] == _iso(DECISION)
     assert provenance["contributor_cycles"] == {
         "HRRR": _iso(TARGET),
         "GFS": _iso(GFS_CYCLE),
@@ -541,11 +578,24 @@ def test_issuance_from_snapshot_records_request_and_snapshot_provenance(publishe
     assert provenance["field_policies"]["precipitation_type"]["policy"].startswith("temporary")
     assert [hour["horizon_hours"] for hour in issued["forecast"]["hours"]] == list(range(1, 37))
     repeated = fast.forecast_from_snapshot(
-        root, [FIRST], request_time=DECISION, issue=True, issuer=issuer
+        root,
+        [FIRST],
+        request_time=request,
+        reference_time=TARGET,
+        issue=True,
+        issuer=issuer,
+        run_lock=nullcontext,
     )
     assert repeated["results"][0]["status"] == "skipped_already_issued"
     reissued = fast.forecast_from_snapshot(
-        root, [FIRST], request_time=DECISION, issue=True, issuer=issuer, reissue=True
+        root,
+        [FIRST],
+        request_time=request,
+        reference_time=TARGET,
+        issue=True,
+        issuer=issuer,
+        run_lock=nullcontext,
+        reissue=True,
     )
     assert "issued" in reissued["results"][0]
     with pytest.raises(ValueError, match="after the request hour"):

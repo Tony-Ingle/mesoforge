@@ -46,13 +46,15 @@ def select_model_set(
     surface_fields: bool = False,
     qpf_fields: bool = False,
     coverage_hours: int = REQUIRED_HOURS,
+    require_complete_shadows: bool = True,
 ) -> dict[str, Any]:
     """Newest metadata-complete cycles, or an explicit failure with retained evidence.
 
     Cycle acceptance always uses the first 36 hours. With ``coverage_hours`` above 36,
     hours 37..coverage_hours are probed on the accepted cycle only; the window ends at
-    the last hour every model reaches, and unavailable extension leads never reject
-    a cycle or fail the selection.
+    the last hour every selected model reaches, and unavailable extension leads never
+    reject a cycle or fail the selection. Background refresh may explicitly tolerate
+    undiscoverable zero-weight RAP/IFS shadows; required HRRR/GFS remain strict.
     """
     if qpf_fields and not surface_fields:
         raise ValueError("QPF selection requires surface_fields")
@@ -131,6 +133,16 @@ def select_model_set(
 
     if surface_fields:
         report["surface_fields"] = True
+    optional_shadows = {"RAP", "IFS"} if not require_complete_shadows else set()
+    if optional_shadows:
+        report["optional_shadow_models"] = sorted(optional_shadows)
+        report["selection_rule"] = (
+            "Newest metadata-complete HRRR/GFS cycles at the fixed decision cutoff are "
+            "required. RAP/IFS remain zero-weight shadows: discovery failures are retained "
+            "as explicit shortfalls and never substitute or promote a model. Every selected "
+            "model must cover its required native valid times; the prepared extension ends "
+            "at the last hour every selected model reaches."
+        )
     if qpf_fields:
         report["qpf_fields"] = True
         report["qpf_policy"] = (
@@ -233,6 +245,8 @@ def select_model_set(
                     candidate["probes"].append(retain(exc.evidence, exc.index_payloads))
                     candidate.update(status="error", reason=str(exc))
                     model_report.update(status="error", reason=str(exc))
+                    if model in optional_shadows:
+                        break
                     report.update(status="error", selected_cycles={}, reason=str(exc))
                     save()
                     return report
@@ -335,13 +349,27 @@ def select_model_set(
                 )
                 break
             save()
+            if model_report["status"] == "error":
+                break  # Do not disguise an integrity error as an older usable shadow.
+        if model in optional_shadows and model_report["status"] != "metadata_complete":
+            reason = (
+                model_report.get("reason")
+                or "No complete usable shadow cycle at the decision cutoff"
+            )
+            model_report["reason"] = reason
+            report.setdefault("shadow_discovery_shortfalls", {})[model] = {
+                "stage": "discovery",
+                "status": model_report["status"],
+                "reason": reason,
+                "decision_time": _iso(decision),
+            }
         save()
     if expired():
         return report
     missing = [
         model
         for model, result in report["models"].items()
-        if result["status"] != "metadata_complete"
+        if result["status"] != "metadata_complete" and model not in optional_shadows
     ]
     if missing:
         report.update(
@@ -352,10 +380,15 @@ def select_model_set(
         report.update(
             status="selected",
             selected_cycles={
-                model: row["selected_cycle"] for model, row in report["models"].items()
+                model: row["selected_cycle"]
+                for model, row in report["models"].items()
+                if row["status"] == "metadata_complete"
             },
             reason=(
-                "All four models are metadata-complete at the decision cutoff; "
+                "Required models are metadata-complete at the decision cutoff; "
+                "optional shadow shortfalls are retained. Preparation is required."
+                if optional_shadows
+                else "All four models are metadata-complete at the decision cutoff; "
                 "preparation is required."
             ),
         )
@@ -365,12 +398,17 @@ def select_model_set(
 
 def _finalize_window(report: dict[str, Any], target: datetime) -> None:
     """Close the window at the last hour every model reached; prune unused extension evidence."""
-    prepared_hours = min(row["extended_to_hour"] for row in report["models"].values())
+    selected = {
+        model: row
+        for model, row in report["models"].items()
+        if row["status"] == "metadata_complete"
+    }
+    prepared_hours = min(row["extended_to_hour"] for row in selected.values())
     horizons = prepared_horizons(prepared_hours)
     report["horizon_hours"] = list(horizons)
     report["last_valid_time"] = _iso(target + timedelta(hours=prepared_hours))
     report["coverage"]["prepared_hours"] = prepared_hours
-    for model, row in report["models"].items():
+    for model, row in selected.items():
         cycle = datetime.fromisoformat(row["selected_cycle"])
         age = int((target - cycle).total_seconds() / 3600)
         native_step = IFS_CAPABILITIES["native_step_hours"] if model == "IFS" else 1

@@ -13,7 +13,10 @@ import argparse
 import json
 import sys
 import time
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -25,14 +28,20 @@ from mesoforge.application.batch_forecast import (
     location_display_timezone,
 )
 from mesoforge.application.hourly_report import build_hourly_report, render_hourly_report
-from mesoforge.application.issuance import ForecastIssuanceService
+from mesoforge.application.issuance import (
+    FORWARD_RUN_LOCK,
+    ForecastIssuanceService,
+    acquire_issuance_run_lock,
+)
 from mesoforge.application.point_forecast import ReferenceCoverageError
 from mesoforge.application.prepared_snapshot import (
     SnapshotError,
+    check_information_cutoff,
     coverage_for,
     derive_reference_time,
     load_preparation,
     resolve_latest_complete,
+    source_information,
     verify_prepared_run,
 )
 from mesoforge.application.spatial_coverage import (
@@ -44,8 +53,9 @@ from mesoforge.application.weather_transitions import validate_display_timezone
 
 _ROOT = Path(__file__).resolve().parents[3]
 PROVENANCE_RULE = (
-    "Every input was available before the snapshot's decision cutoff and before this "
-    "issuance; contributing cycles need not match the reference hour."
+    "Source discovery cutoffs are independent; attachments do not inherit the original "
+    "model decision cutoff. Issuance requires retained availability and acquisition "
+    "evidence at or before the forecast analysis cutoff; source cycles may differ."
 )
 
 
@@ -59,6 +69,7 @@ def forecast_from_snapshot(
     issue: bool = False,
     issuer: ForecastIssuanceService | None = None,
     reissue: bool = False,
+    run_lock: Callable[[], AbstractContextManager[None]] | None = None,
 ) -> dict[str, Any]:
     """Serve every location from one snapshot load; failures stay per location."""
     validate_display_timezone(display_timezone)
@@ -67,6 +78,8 @@ def forecast_from_snapshot(
         raise ValueError("Request time must include a timezone")
     requested_at = requested_at.astimezone(UTC)
     derived = derive_reference_time(requested_at)
+    if reference_time is not None and reference_time.tzinfo is None:
+        raise ValueError("Reference time must include a timezone")
     reference = derived if reference_time is None else reference_time.astimezone(UTC)
     if reference.minute or reference.second or reference.microsecond:
         raise ValueError("Reference time must be an exact UTC hour")
@@ -84,10 +97,32 @@ def forecast_from_snapshot(
     try:
         pointer, manifest, directory = resolve_latest_complete(root)
         preparation = verify_prepared_run(manifest)
+        information = source_information(preparation)
+        if "source_information" in manifest and manifest["source_information"] != information:
+            raise SnapshotError("Retained source information differs from the snapshot manifest")
     except (SnapshotError, OSError, KeyError, ValueError) as exc:
         result.update(status="no_current_snapshot", reason=str(exc), results=[])
         return result
     timings["resolve_and_verify_seconds"] = time.perf_counter() - started
+    cutoff_problems = check_information_cutoff(
+        information,
+        analysis_cutoff=requested_at,
+        published_at=pointer["published_at"],
+        completed_at=manifest.get("completed_at"),
+    )
+    result["information_cutoff"] = {
+        "forecast_analysis_cutoff": result["request_time"],
+        "status": "proven" if not cutoff_problems else "unproven",
+        "limitations": cutoff_problems,
+        "source_information": information,
+    }
+    if issue and cutoff_problems:
+        result.update(
+            status="no_current_snapshot",
+            reason="Input availability at the forecast analysis cutoff cannot be proven",
+            results=[],
+        )
+        return result
     coverage = coverage_for(manifest, reference)
     result.update(
         snapshot={
@@ -129,103 +164,133 @@ def forecast_from_snapshot(
         issuer = create_issuer()
     batch_run_id = uuid4()
     rows: list[dict[str, Any]] = []
-    for index, location in enumerate(locations):
-        row: dict[str, Any] = {"index": index, "location": location}
-        try:
-            latitude, longitude = _coordinates(location)
-            validate_coordinate(latitude, longitude)
-            zone = location_display_timezone(location) or display_timezone
-        except ValueError as exc:
-            row.update(status="error", error={"code": "invalid_location", "message": str(exc)})
-            rows.append(row)
-            continue
-        row["display_timezone"] = zone
-        if issue:
-            # The decision-window guard runs before the expensive grid build.
-            assert issuer is not None
-            existing = issuer.find_versions(
-                latitude=latitude, longitude=longitude, target_reference_time=reference
-            )
-            if existing and not reissue:
-                row.update(
-                    status="skipped_already_issued",
-                    skipped={
-                        "reason": "A version exists for this coordinate and reference hour; "
-                        "pass --reissue to add one",
-                        "existing_issued_forecast_ids": [
-                            str(record.issued_forecast_id) for record in existing
-                        ],
-                    },
-                )
+    # Hold the existing forward-run storage lock through lookup, build and publish.
+    # A following process rechecks committed metadata before creating any new object.
+    lock = (run_lock or partial(acquire_issuance_run_lock, wait=True))() if issue else nullcontext()
+    if issue:
+        result["issuance_guard"] = {
+            "mechanism": "postgresql_session_advisory_lock",
+            "lock_key": str(FORWARD_RUN_LOCK),
+            "behavior": "wait_then_recheck_coordinate_reference_versions",
+            "explicit_reissue": reissue,
+        }
+    with lock:
+        for index, location in enumerate(locations):
+            row: dict[str, Any] = {"index": index, "location": location}
+            try:
+                latitude, longitude = _coordinates(location)
+                validate_coordinate(latitude, longitude)
+                zone = location_display_timezone(location) or display_timezone
+            except ValueError as exc:
+                row.update(status="error", error={"code": "invalid_location", "message": str(exc)})
                 rows.append(row)
                 continue
-        try:
-            clock = time.perf_counter()
-            forecast = view.forecast(latitude=latitude, longitude=longitude)
-            row["local_grid_build_seconds"] = time.perf_counter() - clock
-            forecast["prepared_snapshot"] = {
-                "snapshot_id": manifest["snapshot_id"],
-                "published_at": pointer["published_at"],
-                "manifest_sha256": pointer["manifest_sha256"],
-                "prepared_reference_time": manifest["coverage"]["reference_time"],
-                "decision_time": manifest["coverage"]["decision_time"],
-                "request_time": result["request_time"],
-                "reference_time": result["reference_time"],
-                "reference_time_source": result["reference_time_source"],
-                "coverage": {
-                    "first_valid_time": manifest["coverage"]["first_valid_time"],
-                    "last_valid_time": manifest["coverage"]["last_valid_time"],
-                    "prepared_hours": manifest["coverage"]["prepared_hours"],
-                    "policy": manifest["coverage"]["policy"]["id"],
-                    "nbm_active_products": coverage["nbm_active_products"],
-                },
-                "contributor_cycles": result["snapshot"]["contributor_cycles"],
-                "nbm_product_cycles": result["snapshot"]["nbm_product_cycles"],
-                "field_policies": manifest["field_policies"],
-                "provenance_rule": PROVENANCE_RULE,
-            }
-            clock = time.perf_counter()
-            forecast["hourly_report"] = build_hourly_report(forecast, display_timezone=zone)
-            row["hourly_report_seconds"] = time.perf_counter() - clock
-        except UnsupportedCoordinateError as exc:
-            row.update(
-                status="error", error={"code": "unsupported_coordinate", "message": str(exc)}
-            )
-        except CoverageRequiredError as exc:
-            row.update(
-                status="error",
-                error={
-                    "code": "coverage_required",
-                    "message": (
-                        f"{exc}; the snapshot covers only the refreshed collection's footprint"
-                    ),
-                },
-            )
-        except Exception as exc:
-            row.update(
-                status="error",
-                error={"code": "forecast_failed", "message": f"{type(exc).__name__}: {exc}"},
-            )
-        else:
-            row["forecast"] = forecast
-            row["status"] = "ok"
+            row["display_timezone"] = zone
             if issue:
+                # The decision-window guard runs before the expensive grid build.
                 assert issuer is not None
                 try:
-                    clock = time.perf_counter()
-                    issued = issuer.issue(forecast, batch_run_id=batch_run_id, location_index=index)
-                    row["issuance_seconds"] = time.perf_counter() - clock
+                    existing = issuer.find_versions(
+                        latitude=latitude, longitude=longitude, target_reference_time=reference
+                    )
                 except Exception:
                     row.update(
                         status="error",
                         error={
-                            "code": "issuance_failed",
-                            "message": "Could not persist this forecast; nothing was issued.",
+                            "code": "issuance_lookup_failed",
+                            "message": "Could not check existing issuances for this location; "
+                            "nothing was issued.",
                         },
                     )
-                else:
-                    row["issued"] = issued.model_dump(mode="json")
-        rows.append(row)
+                    rows.append(row)
+                    continue
+                if existing and not reissue:
+                    row.update(
+                        status="skipped_already_issued",
+                        skipped={
+                            "reason": "A version exists for this coordinate and reference hour; "
+                            "pass --reissue to add one",
+                            "existing_issued_forecast_ids": [
+                                str(record.issued_forecast_id) for record in existing
+                            ],
+                        },
+                    )
+                    rows.append(row)
+                    continue
+            try:
+                clock = time.perf_counter()
+                forecast = view.forecast(latitude=latitude, longitude=longitude)
+                row["local_grid_build_seconds"] = time.perf_counter() - clock
+                forecast["prepared_snapshot"] = {
+                    "snapshot_id": manifest["snapshot_id"],
+                    "issuance_mode": ("explicit_reissue" if reissue else "primary")
+                    if issue
+                    else None,
+                    "published_at": pointer["published_at"],
+                    "manifest_sha256": pointer["manifest_sha256"],
+                    "prepared_reference_time": manifest["coverage"]["reference_time"],
+                    "decision_time": manifest["coverage"]["decision_time"],
+                    "request_time": result["request_time"],
+                    "forecast_analysis_cutoff": result["request_time"],
+                    "information_cutoff": result["information_cutoff"],
+                    "reference_time": result["reference_time"],
+                    "reference_time_source": result["reference_time_source"],
+                    "coverage": {
+                        "first_valid_time": manifest["coverage"]["first_valid_time"],
+                        "last_valid_time": manifest["coverage"]["last_valid_time"],
+                        "prepared_hours": manifest["coverage"]["prepared_hours"],
+                        "policy": manifest["coverage"]["policy"]["id"],
+                        "nbm_active_products": coverage["nbm_active_products"],
+                    },
+                    "contributor_cycles": result["snapshot"]["contributor_cycles"],
+                    "nbm_product_cycles": result["snapshot"]["nbm_product_cycles"],
+                    "field_policies": manifest["field_policies"],
+                    "provenance_rule": PROVENANCE_RULE,
+                }
+                clock = time.perf_counter()
+                forecast["hourly_report"] = build_hourly_report(forecast, display_timezone=zone)
+                row["hourly_report_seconds"] = time.perf_counter() - clock
+            except UnsupportedCoordinateError as exc:
+                row.update(
+                    status="error", error={"code": "unsupported_coordinate", "message": str(exc)}
+                )
+            except CoverageRequiredError as exc:
+                row.update(
+                    status="error",
+                    error={
+                        "code": "coverage_required",
+                        "message": (
+                            f"{exc}; the snapshot covers only the refreshed collection's footprint"
+                        ),
+                    },
+                )
+            except Exception as exc:
+                row.update(
+                    status="error",
+                    error={"code": "forecast_failed", "message": f"{type(exc).__name__}: {exc}"},
+                )
+            else:
+                row["forecast"] = forecast
+                row["status"] = "ok"
+                if issue:
+                    assert issuer is not None
+                    try:
+                        clock = time.perf_counter()
+                        issued = issuer.issue(
+                            forecast, batch_run_id=batch_run_id, location_index=index
+                        )
+                        row["issuance_seconds"] = time.perf_counter() - clock
+                    except Exception:
+                        row.update(
+                            status="error",
+                            error={
+                                "code": "issuance_failed",
+                                "message": "Could not persist this forecast; nothing was issued.",
+                            },
+                        )
+                    else:
+                        row["issued"] = issued.model_dump(mode="json")
+            rows.append(row)
     timings["total_seconds"] = time.perf_counter() - started
     result.update(
         status="ok",

@@ -84,6 +84,7 @@ def default_steps(*, coverage_hours: int) -> RefreshSteps:
                 surface_fields=True,
                 qpf_fields=True,
                 coverage_hours=coverage_hours,
+                require_complete_shadows=False,
             )
         finally:
             transport.close()
@@ -185,6 +186,7 @@ def refresh_guidance(
                 "selected_cycles",
                 "horizon_hours",
                 "coverage",
+                "shadow_discovery_shortfalls",
             )
         }
         preparation = log.run(

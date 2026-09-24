@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -16,8 +17,23 @@ from mesoforge.contracts.issued_forecasts import IssuedForecastRecord
 from mesoforge.storage.interfaces import ArtifactObjectStore, IssuanceUnitOfWork
 from mesoforge.storage.json import CanonicalJsonSerializer
 from mesoforge.storage.postgres.database import resolve_database_dsn
+from mesoforge.storage.postgres.idempotency_lock import PostgresIdempotencyLock
 from mesoforge.storage.postgres.repositories import PostgresUnitOfWork
 from mesoforge.storage.s3 import S3ArtifactObjectStore
+
+# Preserve the existing forward-run key so both issuance entry points coordinate.
+FORWARD_RUN_LOCK = Digest.of_bytes(b"mesoforge.forward-run.v1")
+
+
+def acquire_issuance_run_lock(*, wait: bool = False) -> AbstractContextManager[None]:
+    """Serialize the decision-window lookup and issuance across PostgreSQL sessions.
+
+    Forward runs retain their non-blocking overlap behavior. Snapshot issuance waits
+    and then rechecks saved versions, so a concurrent follower skips a prior primary
+    issuance unless the caller explicitly requested a reissue.
+    """
+    lock = PostgresIdempotencyLock(resolve_database_dsn("MESOFORGE_DATABASE_DSN"))
+    return lock.acquire(FORWARD_RUN_LOCK) if wait else lock.try_acquire(FORWARD_RUN_LOCK)
 
 
 def _now() -> datetime:
@@ -99,6 +115,13 @@ class ForecastIssuanceService:
         if issued_at.tzinfo is None:
             raise ValueError("Issuance time must be timezone-aware")
         issued_at = issued_at.astimezone(UTC)
+        cutoff = forecast.get("prepared_snapshot", {}).get("forecast_analysis_cutoff")
+        if cutoff is not None:
+            analysis_cutoff = datetime.fromisoformat(cutoff)
+            if analysis_cutoff.tzinfo is None or analysis_cutoff.utcoffset() is None:
+                raise ValueError("Forecast analysis cutoff must be timezone-aware")
+            if analysis_cutoff > issued_at:
+                raise ValueError("Forecast analysis cutoff cannot follow issuance time")
         issued_forecast_id = uuid4()
         target = datetime.fromisoformat(forecast["target_reference_time"])
         if target.tzinfo is None:

@@ -75,7 +75,7 @@ def selection_contributors(report: dict[str, Any]) -> ContributorConfiguration:
 
 
 def load_selection(
-    selection_path: Path, *, clock: Clock
+    selection_path: Path, *, clock: Clock, require_complete_shadows: bool = True
 ) -> tuple[dict[str, Any], Phase2Configuration, list[dict[str, Any]]]:
     """Validate complete current evidence and every retained selected inventory."""
     report = json.loads(selection_path.read_bytes())
@@ -87,6 +87,20 @@ def load_selection(
         qpf = report.get("qpf_fields", False)
         contributors = selection_contributors(report)
         models = contributors.model_map()
+        omitted = set(models) - set(report["selected_cycles"])
+        optional = report.get("optional_shadow_models", [])
+        shortfalls = report.get("shadow_discovery_shortfalls", {})
+        if (
+            optional not in ([], ["IFS", "RAP"])
+            or set(shortfalls) != omitted
+            or omitted
+            and (
+                require_complete_shadows
+                or not omitted <= set(optional)
+                or not omitted <= {"RAP", "IFS"}
+            )
+        ):
+            raise ValueError("Selection has unapproved or unexplained missing contributors")
         # Historical selections carry exactly 1..36; extended windows carry 1..N, N <= 42.
         declared = report["horizon_hours"]
         hours = tuple(declared) if is_prepared_window(declared) else ()
@@ -95,7 +109,7 @@ def load_selection(
             or report["field"] != "air_temperature_2m"
             or not hours
             or report["contributor_configuration"] != contributors.model_dump(mode="json")
-            or set(report["selected_cycles"]) != set(models)
+            or set(report["selected_cycles"]) != set(models) - omitted
             or set(report["models"]) != set(models)
             or target != decision.replace(minute=0, second=0, microsecond=0)
             or _time(report["first_valid_time"]) != first
@@ -111,6 +125,22 @@ def load_selection(
         probes = []
         for model, definition in models.items():
             row = report["models"][model]
+            if model in omitted:
+                shortfall = shortfalls[model]
+                if (
+                    definition.status != "shadow"
+                    or row["status"] not in {"unavailable", "error"}
+                    or row["selected_cycle"] is not None
+                    or any(c["status"] == "metadata_complete" for c in row["candidates"])
+                    or shortfall["stage"] != "discovery"
+                    or shortfall["status"] != row["status"]
+                    or not isinstance(shortfall["reason"], str)
+                    or not shortfall["reason"]
+                    or shortfall["reason"] != row["reason"]
+                    or _time(shortfall["decision_time"]) != decision
+                ):
+                    raise ValueError(f"{model}: invalid shadow discovery shortfall")
+                continue
             cycle = _hour(_time(report["selected_cycles"][model]))
             age = int((target - cycle).total_seconds() / 3600)
             native_step = 3 if model == "IFS" else 1
@@ -332,10 +362,12 @@ def prepare_selected(
     With ``require_complete_shadows`` (the default, used by issuance) a RAP/IFS shadow
     that fails to retain every selected native hour aborts the preparation. The
     background refresh passes ``False``: zero-weight evidence acquired after the
-    decision cutoff may be short, and the shortfall is recorded per model instead.
+    decision cutoff may be short or undiscovered, with an explicit per-model shortfall.
     """
     clock, sleeper = clock or SystemClock(), sleeper or SystemSleeper()
-    selection, configuration, probes = load_selection(selection_path, clock=clock)
+    selection, configuration, probes = load_selection(
+        selection_path, clock=clock, require_complete_shadows=require_complete_shadows
+    )
     if include_pop and not selection.get("surface_fields"):
         raise ValueError("PoP preparation requires the existing surface-grid forecast")
     selection_bytes = selection_path.read_bytes()
@@ -361,7 +393,11 @@ def prepare_selected(
     discovery.mkdir()
     _write_bytes(discovery / "selection.json", selection_bytes)
     shutil.copytree(selection_path.parent / "inventories", discovery / "inventories")
-    copied, _, _ = load_selection(discovery / "selection.json", clock=clock)
+    copied, _, _ = load_selection(
+        discovery / "selection.json",
+        clock=clock,
+        require_complete_shadows=require_complete_shadows,
+    )
     if copied != selection:
         raise ValueError("Retained discovery copy differs from the validated selection")
     control = output_directory / "control"
@@ -403,6 +439,7 @@ def prepare_selected(
             latch_failures=require_complete_shadows,
         )
         for model in ("RAP", "IFS")
+        if model in selection["selected_cycles"]
     }
 
     def validations() -> list[dict[str, Any]]:
@@ -450,6 +487,24 @@ def prepare_selected(
         )
         valid_locations = [{"lat": lat, "lon": lon} for lat, lon in coordinates]
         for model, prepare in (("RAP", prepare_rap), ("IFS", prepare_ifs)):
+            if model not in selection["selected_cycles"]:
+                shortfall = selection["shadow_discovery_shortfalls"][model]
+                missing = {str(hour): shortfall["reason"] for hour in horizons}
+                shadow_shortfalls[model] = {
+                    **shortfall,
+                    "expected_hours": list(horizons),
+                    "supported_hours": [],
+                    "missing_hours": missing,
+                    "object_failures": [],
+                }
+                shadows[model] = {
+                    "selected_cycle": None,
+                    "supported_hours": [],
+                    "missing_hours": missing,
+                    "retained_raw_bytes": 0,
+                    "discovery_shortfall": shortfall,
+                }
+                continue
             surface_kwargs: dict[str, Any] = {}
             if selection.get("surface_fields"):
                 selected_candidate = next(
@@ -534,11 +589,11 @@ def prepare_selected(
             "actual acquisition and issuance occur later and retain their own timestamps."
         )
         # This source belongs to this new, unpublished preparation. Finalize its
-        # evidence atomically only after all four models pass, before regional reuse.
+        # evidence atomically after required objects pass, before regional reuse.
         completed_manifest = source / "manifest.complete.json"
         _write_bytes(completed_manifest, json.dumps(manifest, indent=2).encode())
         completed_manifest.replace(source / "manifest.json")
-        shadow_directories = {model: str(output_directory / model) for model in shadows}
+        shadow_directories = {model: str(output_directory / model) for model in shadow_pins}
         _, coverage = ensure_coverage(
             locations,
             source,

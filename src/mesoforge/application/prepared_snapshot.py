@@ -9,9 +9,14 @@ replaced atomically only after validation, so a failed refresh never moves it.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
+import sys
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -26,6 +31,7 @@ from mesoforge.application.spatial_preparation import PreparedRegions, load_prep
 from mesoforge.forecasting.cloud_cover import CLOUD_ACTIVE_POLICY
 from mesoforge.forecasting.recipes import DEFAULT_CONFIGURATION
 from mesoforge.forecasting.thunder import ACTIVE_POLICY as THUNDER_ACTIVE_POLICY
+from mesoforge.guidance.acquisition_v2 import parse_provider_availability
 from mesoforge.guidance.coverage import COVERAGE_POLICY, REQUIRED_HOURS, window_hours
 
 SNAPSHOT_SCHEMA = "mesoforge.prepared-snapshot.v1"
@@ -229,7 +235,8 @@ def build_snapshot_manifest(
                 _iso(target + timedelta(hours=hour)) for hour in shadow["supported_hours"]
             ],
             "products": ["air_temperature_2m", "surface_fields"],
-            "directory": preparation["shadow_directories"][model],
+            "directory": preparation["shadow_directories"].get(model),
+            "discovery_shortfall": selection.get("shadow_discovery_shortfalls", {}).get(model),
             "status": "partial"
             if model in shortfalls and shadow["supported_hours"]
             else "unavailable"
@@ -314,6 +321,7 @@ def build_snapshot_manifest(
         "contributors": contributors,
         "evidence": evidence,
         "field_policies": current_field_policies(selection),
+        "source_information": source_information(preparation),
         "attachments": {
             key: {
                 "present": key in preparation,
@@ -350,6 +358,192 @@ def build_snapshot_manifest(
         "refresh": {"steps": steps, "downloaded_bytes": downloaded_bytes},
     }
     return manifest
+
+
+def _information_time(value: Any) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError("Missing retained timestamp")
+    instant = datetime.fromisoformat(value)
+    if instant.tzinfo is None or instant.utcoffset() is None:
+        raise ValueError("Retained timestamps must include a timezone")
+    return instant.astimezone(UTC)
+
+
+def source_information(preparation: dict[str, Any]) -> dict[str, Any]:
+    """Summarize retained clocks without assigning attachments the original cutoff.
+
+    Provider availability can be earlier than acquisition. A retrieval timestamp is
+    a conservative known-by bound when Last-Modified is absent, not a fabricated
+    publication time. Missing historical evidence remains an explicit limitation.
+    The original manifests/hashes retain message identities and native semantics.
+    """
+    selection = preparation["current_model_set"]["selection"]
+    sources: list[dict[str, Any]] = []
+    limitations: list[str] = []
+
+    def add(name: str, path: Path, cutoff: Any = None, digest: str | None = None) -> None:
+        row: dict[str, Any] = {
+            "source": name,
+            "manifest_file": str(path),
+            "selection_cutoff": cutoff,
+            "selection_cutoff_basis": "recorded discovery decision" if cutoff else None,
+            "inputs": [],
+        }
+        sources.append(row)
+        if not path.is_file():
+            limitations.append(f"{name}: retained input manifest unavailable")
+            return
+        payload = path.read_bytes()
+        actual_digest = hashlib.sha256(payload).hexdigest()
+        if digest is not None and digest != actual_digest:
+            raise SnapshotError(f"{name}: information-evidence manifest digest mismatch")
+        row["manifest_sha256"] = actual_digest
+        retained = json.loads(payload)
+        discovered = (retained.get("selection_evidence") or {}).get("selection", {})
+        if discovered.get("decision_time") is not None:
+            row["selection_cutoff"] = discovered["decision_time"]
+            row["selection_cutoff_basis"] = "recorded discovery decision"
+        row["prepared_at"] = retained.get("created_at")
+        records = [*retained.get("inputs", []), *retained.get("qpf_inputs", [])]
+        # Empty manifests with explicit failed requests represent missing guidance,
+        # not an input with an invented availability timestamp.
+        events = retained.get("events", [])
+        all_events_missing = bool(events) and all(event.get("missing_reasons") for event in events)
+        if not records and not (
+            all_events_missing
+            or not events
+            and (retained.get("missing_hours") or retained.get("request_failures"))
+        ):
+            limitations.append(f"{name}: no retained input timing evidence")
+        for index, record in enumerate(records):
+            item = {
+                key: record.get(key)
+                for key in (
+                    "model",
+                    "cycle",
+                    "source_lead_hours",
+                    "lead",
+                    "request",
+                    "source_grib_url",
+                    "source_index_url",
+                    "raw_sha256",
+                    "index_sha256",
+                    "grib_available_at",
+                    "index_available_at",
+                    "grib_retrieved_at",
+                    "index_retrieved_at",
+                )
+            }
+            item["record_index"] = index
+            item["availability_basis"] = {
+                kind: "provider Last-Modified"
+                if parse_provider_availability(record.get(f"{kind}_last_modified")) is not None
+                else "acquisition known-by bound"
+                for kind in ("grib", "index")
+            }
+            for key in (
+                "grib_available_at",
+                "index_available_at",
+                "grib_retrieved_at",
+                "index_retrieved_at",
+            ):
+                try:
+                    _information_time(item[key])
+                except ValueError:
+                    limitations.append(f"{name} input {index}: unavailable/invalid {key}")
+            row["inputs"].append(item)
+
+    def prepared(name: str, directory: Path) -> None:
+        path = _control_manifest(directory)
+        add(name, path, selection["decision_time"])
+        coverage = directory / "coverage.json"
+        if not coverage.is_file() or not path.is_file():
+            return
+        payload = coverage.read_bytes()
+        row = sources[-1]
+        row["coverage_sha256"] = hashlib.sha256(payload).hexdigest()
+        source = json.loads(path.read_bytes())
+        row["region_manifests"] = []
+        for region in json.loads(payload)["regions"]:
+            region_directory = Path(region["directory"])
+            if not region_directory.is_absolute():
+                region_directory = directory / region_directory
+            region_path = region_directory / "manifest.json"
+            region_bytes = region_path.read_bytes()
+            retained = json.loads(region_bytes)
+            if any(retained.get(key) != source.get(key) for key in ("inputs", "qpf_inputs")):
+                raise SnapshotError(f"{name}: loaded regional input evidence differs from source")
+            row["region_manifests"].append(
+                {
+                    "manifest_file": str(region_path),
+                    "manifest_sha256": hashlib.sha256(region_bytes).hexdigest(),
+                }
+            )
+
+    prepared("control", Path(preparation["directory"]))
+    for model, directory in preparation.get("shadow_directories", {}).items():
+        prepared(model, Path(directory))
+    for key in GUIDANCE_KEYS:
+        descriptor = preparation.get(key)
+        if not descriptor:
+            continue
+        if isinstance(descriptor, list):
+            descriptors = descriptor
+        elif "directory" in descriptor:
+            descriptors = [descriptor]
+        else:
+            descriptors = descriptor.get("sources", [])
+        for descriptor in descriptors:
+            name = f"{key}:{descriptor.get('source_id', descriptor.get('model', 'NBM'))}"
+            add(
+                name,
+                Path(descriptor["directory"]) / "manifest.json",
+                digest=descriptor.get("manifest_sha256"),
+            )
+    return {
+        "status": "complete" if not limitations else "unproven",
+        "sources": sources,
+        "limitations": limitations,
+        "rule": "Each input retains its own discovery cutoff and acquisition/availability "
+        "evidence; attachment inputs are not asserted available at the control decision.",
+    }
+
+
+def check_information_cutoff(
+    information: dict[str, Any],
+    *,
+    analysis_cutoff: datetime,
+    published_at: str,
+    completed_at: str | None,
+) -> list[str]:
+    """Return explicit reasons why this saved input set cannot support an issuance."""
+    problems = list(information["limitations"])
+    cutoff = _information_time(analysis_cutoff.isoformat())
+
+    def check(label: str, value: Any) -> None:
+        try:
+            instant = _information_time(value)
+        except ValueError:
+            problems.append(f"{label}: unavailable/invalid timestamp")
+        else:
+            if instant > cutoff:
+                problems.append(f"{label}: {value} follows forecast analysis cutoff {_iso(cutoff)}")
+
+    check("snapshot publication", published_at)
+    check("snapshot completion", completed_at)
+    for source in information["sources"]:
+        name = source["source"]
+        if source["selection_cutoff"] is not None:
+            check(f"{name} discovery cutoff", source["selection_cutoff"])
+        for item in source["inputs"]:
+            for key in (
+                "grib_available_at",
+                "index_available_at",
+                "grib_retrieved_at",
+                "index_retrieved_at",
+            ):
+                check(f"{name} input {item['record_index']} {key}", item[key])
+    return list(dict.fromkeys(problems))
 
 
 def _control_products(preparation: dict[str, Any]) -> list[str]:
@@ -469,42 +663,84 @@ def read_pointer(root: Path) -> dict[str, Any] | None:
     return pointer
 
 
+@contextmanager
+def _publication_lock(root: Path) -> Iterator[None]:
+    """Serialize publishers on the shared local root, including separate processes.
+
+    Keep this file permanently: unlinking it would let two writers lock different
+    inodes. OS locks are released if a publisher exits or crashes. Readers continue
+    to use the atomically replaced pointer without taking the writer lock.
+    """
+    with (root / ".latest_complete.lock").open("a+b") as lock:
+        if sys.platform == "win32":
+            import msvcrt
+
+            # Byte-range locks may extend beyond EOF, so an empty stable file is
+            # sufficient. LK_LOCK itself stops retrying after ten seconds.
+            lock.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                        raise
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def publish_latest_complete(
     root: Path, manifest: dict[str, Any], manifest_sha256: str, *, published_at: datetime
 ) -> dict[str, Any]:
-    """Atomically replace the pointer; never point at partial work or move backwards."""
+    """Compare and atomically publish under one process-shared writer lock."""
     if manifest.get("schema_version") != SNAPSHOT_SCHEMA:
         raise SnapshotError("Only validated prepared-snapshot manifests can be published")
     if not manifest["completeness"]["required_deterministic"]:
         raise SnapshotError(
             "Refusing to publish a snapshot whose required contributors are incomplete"
         )
-    current = read_pointer(root)
-    reference = manifest["coverage"]["reference_time"]
-    if current is not None and current["reference_time"] > reference:
-        raise SnapshotError(
-            f"Refusing to publish reference {reference} over newer {current['reference_time']}"
-        )
-    pointer = {
-        "schema_version": POINTER_SCHEMA,
-        "snapshot_id": manifest["snapshot_id"],
-        "snapshot_directory": f"{SNAPSHOTS_DIRECTORY}/{manifest['snapshot_id']}",
-        "manifest_file": MANIFEST_FILE,
-        "manifest_sha256": manifest_sha256,
-        "reference_time": reference,
-        "first_valid_time": manifest["coverage"]["first_valid_time"],
-        "last_valid_time": manifest["coverage"]["last_valid_time"],
-        "published_at": _iso(published_at),
-        "previous_snapshot_id": current["snapshot_id"] if current else None,
-    }
-    temporary = root / f".{POINTER_FILE}.{uuid4().hex}.tmp"
-    payload = json.dumps(pointer, indent=2).encode()
-    with temporary.open("xb") as stream:
-        stream.write(payload)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, root / POINTER_FILE)
-    return pointer
+    with _publication_lock(root):
+        current = read_pointer(root)
+        reference = manifest["coverage"]["reference_time"]
+        if current is not None and current["reference_time"] > reference:
+            raise SnapshotError(
+                f"Refusing to publish reference {reference} over newer {current['reference_time']}"
+            )
+        pointer = {
+            "schema_version": POINTER_SCHEMA,
+            "snapshot_id": manifest["snapshot_id"],
+            "snapshot_directory": f"{SNAPSHOTS_DIRECTORY}/{manifest['snapshot_id']}",
+            "manifest_file": MANIFEST_FILE,
+            "manifest_sha256": manifest_sha256,
+            "reference_time": reference,
+            "first_valid_time": manifest["coverage"]["first_valid_time"],
+            "last_valid_time": manifest["coverage"]["last_valid_time"],
+            "published_at": _iso(published_at),
+            "previous_snapshot_id": current["snapshot_id"] if current else None,
+        }
+        temporary = root / f".{POINTER_FILE}.{uuid4().hex}.tmp"
+        try:
+            payload = json.dumps(pointer, indent=2).encode()
+            with temporary.open("xb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, root / POINTER_FILE)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return pointer
 
 
 def resolve_latest_complete(root: Path) -> tuple[dict[str, Any], dict[str, Any], Path]:

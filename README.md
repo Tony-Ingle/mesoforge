@@ -2708,19 +2708,20 @@ compatibility forward run above is unchanged; these two reuse its functions.
 python -m mesoforge.application.refresh_guidance --config locations.json --root %LOCALAPPDATA%\MesoForge\guidance
 ```
 
-It discovers the newest complete HRRR/GFS/RAP/IFS cycles with a **42-hour target
+It discovers required HRRR/GFS and optional RAP/IFS cycles with a **42-hour target
 window** (`mesoforge-prepared-coverage-policy.v1`, `--coverage-hours 36..42`; cycle
 acceptance still uses the first 36 hours, hours 37–42 are acquired only where the
-accepted cycle publishes them, and the window ends at the last hour every model
+accepted cycle publishes them, and the window ends at the last hour every selected model
 reaches), runs `prepare_selected` with NBM PoP, attaches native p-type, cloud and
 thunder, attaches visibility evidence (optional; a failure is recorded, not fatal),
 loads the finished preparation offline, computes one validation column per configured
 coordinate, writes `snapshots/<id>/snapshot.json` (`mesoforge.prepared-snapshot.v1`)
 and only then replaces `latest_complete.json`
-(`mesoforge.latest-complete-pointer.v1`) atomically. A failed step leaves the previous
-pointer unchanged and retains `failure.json`; a sequential publication rejects an
-older reference time. Concurrent publication is not serialized (see limitations
-below). The manifest separates native deterministic contributors (HRRR/GFS
+(`mesoforge.latest-complete-pointer.v1`) atomically. A failed step does not replace the
+current pointer and retains `failure.json`. A stable OS file lock serializes
+compare-and-publish across processes sharing the local guidance root; publication
+rejects an older reference time even when refreshes overlap. The manifest separates
+native deterministic contributors (HRRR/GFS
 active; RAP/IFS shadow evidence), the blended meta-model NBM with its
 active-current-policy products (hourly PoP, sky, thunder) and evidence-only inputs,
 names the current field-policy identities, and references every preparation artifact
@@ -2731,9 +2732,12 @@ with `require_complete_shadows=False`: the active HRRR/GFS objects and each zero
 shadow use their own pinned view of the same discovery, a shadow provider failure
 (for example an ECMWF open-data 503) stays recorded per object under
 `shadow_shortfalls` instead of aborting the preparation, and the snapshot marks that
-shadow `partial`/`unavailable`. This tolerance applies after discovery: discovery
-still requires all four models and can fail when a shadow is unavailable. The
-compatibility forward run keeps the strict preparation default.
+shadow `partial`/`unavailable`. Discovery uses the same explicit optional-shadow
+policy: failure to find or prove a usable RAP/IFS cycle records
+`shadow_discovery_shortfalls`, omits its acquisition, and allows valid HRRR/GFS
+guidance to publish. HRRR/GFS discovery remains strict; neither weights nor sources
+are substituted. A later refresh may restore the shadow normally. The standalone
+selection command and compatibility forward run retain their strict defaults.
 
 **Forecast from the snapshot** (no provider access; the request hour is the
 reference time):
@@ -2751,11 +2755,12 @@ records `prepared_window` beside its `target_reference_time`), builds the local 
 with the existing policies and returns the 36-hour point forecast plus the hourly
 report. NBM-based products report their own covered and missing valid times and never
 shorten the forecast. Insufficient coverage returns `no_current_snapshot` (exit 3).
-`--issue` reuses the same path, applies the decision-window guard before the grid
-build, and saves the `prepared_snapshot` provenance (snapshot ID, publication time,
-request and reference times, contributor cycles, field policies, coverage) inside the
-immutable issuance. Coordinates outside the refreshed collection's footprint are
-refused (`coverage_required`); the snapshot is not extended on demand.
+`--issue` reuses the same path under the existing PostgreSQL forward-run advisory
+lock, rechecks the decision-window guard before the grid build, and saves the
+`prepared_snapshot` provenance (snapshot ID, publication time, request/analysis cutoff
+and reference times, per-source information evidence, cycles, field policies,
+coverage) inside the immutable issuance. Coordinates outside the refreshed collection's
+footprint are refused (`coverage_required`); the snapshot is not extended on demand.
 
 **Real demonstration, September 18, 2026** (evidence under
 `%LOCALAPPDATA%\MesoForge\guidance` and `%LOCALAPPDATA%\MesoForge\baselines\20260918-snapshot-demo`,
@@ -2809,30 +2814,53 @@ snapshot directories are retained without any pruning policy; ad-hoc (non-issued
 forecasts have no conditions/transitions/period preview because those layers read
 saved issuances only.
 
-**Review limitations confirmed September 24, 2026 (runtime unchanged):**
+**Snapshot/issuance correctness (September 24, 2026):** the bounded fixes address the
+four findings from the independent audit at `5eb1ae6`; that audit found an unsupported
+universal cutoff claim, not demonstrated historical leakage.
 
-- Atomic replacement prevents partial pointer reads, but the read/check/replace
-  sequence is not locked. Concurrent refresh writers can publish an older reference
-  over a newer one; the existing sequential publication test does not cover this.
-- `forecast_from_snapshot` currently copies a blanket claim that every input preceded
-  the original model-set decision cutoff. NBM PoP selection uses a later decision
-  clock, and other attachments do not prove that original cutoff. Retained per-source
-  evidence must be used; the blanket claim is not established. The inspected real
-  snapshot did not demonstrate actual future-information leakage.
-- Shadow failure isolation is partial: preparation shortfalls are tolerated, but
-  strict four-model discovery and the shared extension envelope still depend on
-  RAP/IFS. NBM per-hour gaps remain explicitly permitted under the current policy.
-- A metadata lookup failure in the `--issue` duplicate-version guard escapes the
-  coordinate loop, preventing later locations from running. Unlike `forward_run`,
-  the snapshot command also has no run-level overlap lock; its check-then-issue
-  guard is not a concurrency uniqueness guarantee.
+- **Publication:** `.latest_complete.lock` is a permanent lock file per local guidance
+  root, using Windows byte-range locking or POSIX `flock`. The reference-time comparison
+  and atomic `os.replace` occur under that process-shared lock. Reference time remains
+  the ordering rule; equal-reference replacements remain allowed. Failed publication
+  leaves the current pointer and immutable snapshots intact. Readers need no lock.
+- **Information evidence:** additive `source_information` in the existing v1 manifest
+  pins each retained source manifest/hash, availability/acquisition timestamps and its
+  own discovery cutoff where recorded. Attachments do not inherit the original
+  HRRR/GFS/RAP/IFS decision cutoff. If provider publication time is unavailable, an
+  actual retrieval time can establish a conservative known-by bound; it is labeled
+  accordingly, never presented as a fabricated publication time.
+- **Issuance cutoff:** `forecast_analysis_cutoff` is the fixed request time, distinct
+  from the floored forecast reference, source cycles, snapshot publication and actual
+  issuance. New issuance rejects unproven input timing or inputs, discovery evidence,
+  completion or publication after that cutoff. Historical v1 snapshots are still
+  readable: the consumer reconstructs information evidence from retained manifests
+  and reports any limitations explicitly. Existing immutable issuances are untouched.
+- **Location and concurrency isolation:** metadata lookup failure returns
+  `issuance_lookup_failed` for that coordinate and later locations continue. Snapshot
+  issuance takes the existing `mesoforge.forward-run.v1` PostgreSQL session advisory
+  lock through lookup/build/storage. Concurrent snapshot issuers wait, then recheck
+  committed versions; a second primary attempt skips the existing coordinate/reference
+  version. `--reissue` remains explicit and records `explicit_reissue`. The compatibility
+  forward run uses the same lock; different coordinate lists also serialize.
 
-These need a bounded correctness pass before unattended snapshot operation; this
-documentation audit does not repair runtime behavior. The reviewed grid optimization
-passed four focused regression tests and an independent concurrent-transform probe;
-eight focused snapshot/discovery/fallback tests passed. Separate offline reproductions
-confirmed the publication race and location-lookup failure. No acquisition, new
-issuance, service startup or full acceptance rerun was performed for this audit.
+Optional RAP/IFS discovery shortfalls are explicit as described above; NBM per-hour
+missingness and all existing active field policies remain unchanged. These changes
+do not implement the future continuously maintained blended baseline snapshot.
+
+Validation for this correctness change: **182 focused offline tests passed**, plus
+**72 PostgreSQL/MinIO integration tests** covering snapshot concurrency, forward runs,
+batch issuance and storage. Separate spawned processes exercised both pointer ordering
+and same-window issuance. The full `tests/unit tests/contracts tests/property` run
+reported **3,345 passed and three pre-existing failures**: the current-forecast-batch
+mock signature and the two typed-boundary inventories described above. All three were
+reproduced at starting commit `6104a36` in a separate temporary checkout; none was
+skipped or weakened. Final cutoff edge-case tests also passed after review.
+Ruff, formatting, mypy, all nine import contracts, lock consistency, documentation,
+repository hygiene and `git diff --check` passed. Checks used the isolated locked
+Windows environment and dedicated test storage; temporary services were stopped.
+No live provider acquisition or full acceptance run was performed. POSIX locking is
+implemented but was not executed on this Windows host; no distributed-filesystem
+locking guarantee is claimed.
 
 #### Local-grid build cost
 

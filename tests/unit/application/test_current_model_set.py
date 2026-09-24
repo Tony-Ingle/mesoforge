@@ -184,7 +184,7 @@ class MetadataProbe:
         return TemperatureProbeResult(available, reason, evidence, payload, {index_url: payload})
 
 
-def _select(tmp_path, *, probe=None, clock=None, decision_time=DECISION):
+def _select(tmp_path, *, probe=None, clock=None, decision_time=DECISION, **kwargs):
     clock = FixedClock(NOW) if clock is None else clock
     return select_model_set(
         tmp_path / "selection",
@@ -194,6 +194,7 @@ def _select(tmp_path, *, probe=None, clock=None, decision_time=DECISION):
         clock=clock,
         sleeper=RecordingSleeper(clock),
         probe=MetadataProbe() if probe is None else probe,
+        **kwargs,
     )
 
 
@@ -280,6 +281,61 @@ def test_no_complete_required_model_returns_no_partially_selected_model_set(tmp_
         assert all(cycle.hour in (3, 9, 15, 21) for cycle, _ in calls)
     if model == "IFS":
         assert all(lead % 3 == 0 for _, lead in calls)
+
+
+@pytest.mark.parametrize("model", ["HRRR", "GFS", "RAP", "IFS"])
+@pytest.mark.parametrize("integrity_error", [False, True])
+def test_refresh_discovery_tolerates_only_missing_zero_weight_shadows(
+    tmp_path, model, integrity_error
+):
+    inner = MetadataProbe()
+    inner.missing = lambda name, cycle, lead: name == model
+
+    def probe(**kwargs):
+        if kwargs["model"] == model and integrity_error:
+            raise ProviderEvidenceError(
+                "unprovable provider identity",
+                evidence={"model": model, "status": "error", "reason": "unprovable"},
+                index_payloads={},
+            )
+        return inner(**kwargs)
+
+    report = _select(tmp_path, probe=probe, require_complete_shadows=False, coverage_hours=42)
+    if model in {"HRRR", "GFS"}:
+        assert report["status"] == ("error" if integrity_error else "unavailable")
+        assert report["selected_cycles"] == {}
+        return
+    assert report["status"] == "selected"
+    assert set(report["selected_cycles"]) == set(LATEST) - {model}
+    assert report["models"][model]["selected_cycle"] is None
+    assert report["models"][model]["candidates"]
+    shortfall = report["shadow_discovery_shortfalls"][model]
+    assert shortfall["stage"] == "discovery"
+    assert shortfall["status"] == ("error" if integrity_error else "unavailable")
+    assert shortfall["reason"]
+    assert shortfall["decision_time"] == _iso(DECISION)
+    assert report["horizon_hours"] == list(range(1, 43))
+    assert report["contributor_configuration"] == IFS_CONFIGURATION.model_dump(mode="json")
+    assert json.loads((tmp_path / "selection/selection.json").read_bytes()) == report
+    restored = _select(tmp_path / "next", require_complete_shadows=False)
+    assert restored["status"] == "selected"
+    assert set(restored["selected_cycles"]) == set(LATEST)
+    assert "shadow_discovery_shortfalls" not in restored
+
+
+def test_background_refresh_opts_into_optional_shadow_discovery(monkeypatch, tmp_path):
+    from mesoforge.application import refresh_guidance
+
+    selection = Mock(return_value={"status": "selected"})
+    transport = Mock()
+    monkeypatch.setattr(refresh_guidance, "select_model_set", selection)
+    monkeypatch.setattr(refresh_guidance, "BoundedHttpTransport", Mock(return_value=transport))
+    assert refresh_guidance.default_steps(coverage_hours=42).discover(tmp_path) == {
+        "status": "selected"
+    }
+    assert selection.call_args.kwargs["require_complete_shadows"] is False
+    assert selection.call_args.kwargs["coverage_hours"] == 42
+    transport.close.assert_called_once()
 
 
 @pytest.mark.parametrize(
