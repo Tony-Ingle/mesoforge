@@ -115,13 +115,14 @@ class ForecastIssuanceService:
         if issued_at.tzinfo is None:
             raise ValueError("Issuance time must be timezone-aware")
         issued_at = issued_at.astimezone(UTC)
-        cutoff = forecast.get("prepared_snapshot", {}).get("forecast_analysis_cutoff")
-        if cutoff is not None:
-            analysis_cutoff = datetime.fromisoformat(cutoff)
-            if analysis_cutoff.tzinfo is None or analysis_cutoff.utcoffset() is None:
-                raise ValueError("Forecast analysis cutoff must be timezone-aware")
-            if analysis_cutoff > issued_at:
-                raise ValueError("Forecast analysis cutoff cannot follow issuance time")
+        for lineage in ("prepared_snapshot", "baseline_snapshot"):
+            cutoff = forecast.get(lineage, {}).get("forecast_analysis_cutoff")
+            if cutoff is not None:
+                analysis_cutoff = datetime.fromisoformat(cutoff)
+                if analysis_cutoff.tzinfo is None or analysis_cutoff.utcoffset() is None:
+                    raise ValueError("Forecast analysis cutoff must be timezone-aware")
+                if analysis_cutoff > issued_at:
+                    raise ValueError("Forecast analysis cutoff cannot follow issuance time")
         issued_forecast_id = uuid4()
         target = datetime.fromisoformat(forecast["target_reference_time"])
         if target.tzinfo is None:

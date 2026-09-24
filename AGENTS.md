@@ -36,16 +36,17 @@ Forecast philosophy guardrails ([canonical VISION](VISION.md#north-star)):
 3. Future AI edits the MesoForge grid through bounded, interpretable field edits made
    after deterministic site correction; it does not choose a model. Contributors may
    be cited as the evidence for an edit.
-4. Keep provider work outside ordinary forecast requests. Today `refresh_guidance`
-   publishes prepared contributor snapshots; `forecast_from_snapshot` checks absolute
-   coverage and builds the local blend without provider access. That is not yet the
-   vision's continuously maintained, blended/coherent baseline snapshot. Keep prepared
-   evidence, future baseline snapshots and issued forecasts distinct; pin inputs for
-   a run. Preserve each source's actual cutoff/availability evidence rather than
-   assuming one cutoff covers later attachments. Schedulers decide when, not weather
-   science. Snapshot issuance must prove its per-input information bounds at the
-   request's analysis cutoff; preserve explicit limitations on historical reads.
-   See README for publication/issuance locking and remaining operational limits.
+4. Keep provider work outside ordinary forecast requests. `refresh_guidance` publishes
+   prepared contributor state; `build_baseline` runs current field policies/checks and
+   publishes an immutable numerical baseline before location jobs. Normal configured
+   runs use `forecast_from_baseline`, pin one baseline and extract its saved domain;
+   never reblend on a coverage miss. `forecast_from_snapshot` remains an explicit
+   development/replay path. Keep `latest_complete`, `latest_baseline` and issued
+   forecasts distinct. Preserve exact source/attachment cutoff evidence, background
+   analysis cutoff and later issuance times; do not fabricate proof for historical
+   inputs. Current publication is on demand, not a continuous hosted worker or a
+   generalized coherence engine. Schedulers decide when, not weather science.
+   See README for configured-domain coverage and publication/issuance locking.
 5. This direction is not permission to implement future stages. Current fixed weights,
    NBM-only sources, the HRRR/GFS p-type agreement rule and zero-weight shadows are
    approved scaffolding: do not change them, add dynamic weighting, a coherence

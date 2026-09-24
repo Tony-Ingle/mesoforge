@@ -1,4 +1,8 @@
-"""One on-demand run: verify saved hours, then prepare and issue current forecasts."""
+"""Compatibility/development lifecycle: verify, prepare and blend inline.
+
+Normal configured-location jobs consume a background-built baseline through
+``forecast_from_baseline``; this retained path supports explicit replay/comparison.
+"""
 
 from __future__ import annotations
 

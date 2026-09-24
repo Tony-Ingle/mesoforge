@@ -1,4 +1,8 @@
-"""Ensure shared spatial coverage and issue immutable 36-hour temperature forecasts."""
+"""Preparation/development batch helpers and shared immutable issuance wiring.
+
+Normal configured-location generation reads ``forecast_from_baseline``. Explicit
+prepared-guidance tools retain this inline path for development and replay.
+"""
 
 from __future__ import annotations
 
@@ -53,6 +57,9 @@ def create_issuer() -> ForecastIssuanceService:
         "application/forward_run.py",
         "application/forward_verification.py",
         "application/forecast_from_snapshot.py",
+        "application/forecast_from_baseline.py",
+        "application/baseline_snapshot.py",
+        "application/baseline_codec.py",
         "application/prepared_snapshot.py",
         "application/hourly_report.py",
         "application/surface_forecast.py",

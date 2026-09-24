@@ -664,14 +664,14 @@ def read_pointer(root: Path) -> dict[str, Any] | None:
 
 
 @contextmanager
-def _publication_lock(root: Path) -> Iterator[None]:
+def _publication_lock(root: Path, *, lock_file: str = ".latest_complete.lock") -> Iterator[None]:
     """Serialize publishers on the shared local root, including separate processes.
 
     Keep this file permanently: unlinking it would let two writers lock different
     inodes. OS locks are released if a publisher exits or crashes. Readers continue
     to use the atomically replaced pointer without taking the writer lock.
     """
-    with (root / ".latest_complete.lock").open("a+b") as lock:
+    with (root / lock_file).open("a+b") as lock:
         if sys.platform == "win32":
             import msvcrt
 
@@ -699,6 +699,20 @@ def _publication_lock(root: Path) -> Iterator[None]:
                 yield
             finally:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _replace_pointer(root: Path, filename: str, pointer: dict[str, Any]) -> None:
+    """Atomically replace one pointer; the caller holds its publication lock."""
+    temporary = root / f".{filename}.{uuid4().hex}.tmp"
+    try:
+        payload = json.dumps(pointer, indent=2).encode()
+        with temporary.open("xb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, root / filename)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def publish_latest_complete(
@@ -730,16 +744,7 @@ def publish_latest_complete(
             "published_at": _iso(published_at),
             "previous_snapshot_id": current["snapshot_id"] if current else None,
         }
-        temporary = root / f".{POINTER_FILE}.{uuid4().hex}.tmp"
-        try:
-            payload = json.dumps(pointer, indent=2).encode()
-            with temporary.open("xb") as stream:
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, root / POINTER_FILE)
-        finally:
-            temporary.unlink(missing_ok=True)
+        _replace_pointer(root, POINTER_FILE, pointer)
         return pointer
 
 

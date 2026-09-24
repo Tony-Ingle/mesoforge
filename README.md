@@ -9,14 +9,17 @@ The current implementation is described below. Start with the canonical
 
 ## Current status
 
-The [on-demand forward run](#run-verification-and-current-issuance-together) produces
-real **36-hour surface forecasts**: temperature, dew point, derived RH, vector
+The [background baseline build](#background-mesoforge-baseline-snapshots) produces
+real **36-hour surface forecasts** before configured-location jobs: temperature,
+dew point, derived RH, vector
 wind speed/direction, gust, hourly liquid-equivalent precipitation (QPF) and native
 NBM probability of precipitation (PoP).
-Surface issuance builds a small coordinate-derived
+Background generation builds a small coordinate-derived
 [local baseline grid](#local-surface-baseline-grid) with a larger context domain and
-smaller editable subset, and extracts its exact center point.
-It verifies eligible previous temperature forecasts,
+smaller editable subset. A location job pins one immutable baseline, reads its saved
+domain and exact center, and optionally saves an immutable issuance without blending
+again. The earlier [compatibility forward run](#run-verification-and-current-issuance-together)
+verifies eligible previous temperature forecasts,
 discovers current model cycles, prepares shared guidance for the configured coordinate
 collection, and saves new immutable issuances. Failed locations do not stop later ones;
 unavailable verification does not prevent a new forecast. Latitude/longitude are the
@@ -78,8 +81,9 @@ only required geographic inputs; names are optional display metadata.
   preserve actual provider availability, identities, cycles/leads and acquisition times.
   A [background refresh](#refresh-guidance-and-forecast-from-the-latest-complete-snapshot)
   publishes a complete prepared contributor snapshot (36–42 hours) behind an atomic
-  `latest_complete` pointer, and a network-free command serves 36-hour forecasts and
-  issuances from it for the current UTC hour.
+  `latest_complete` pointer. A separate provider-free build publishes MesoForge's
+  numerical canvas behind `latest_baseline`; configured-location forecasts pin that
+  baseline and read its precomputed current-UTC-hour view without running field blends.
   [Coordinate-derived coverage](#automatic-spatial-coverage) reuses native-grid guidance
   across locations; raw messages support offline rebuilding. The separate local
   MesoForge grid reuses these loaded sources and retains its own transformation identity.
@@ -122,18 +126,20 @@ the zero-weight RAP/IFS shadows described above are today's scaffolding for that
 blend, not its final form, and they stay in force until explicitly replaced. The slow
 provider work is now separate from forecast requests: a
 [background refresh](#refresh-guidance-and-forecast-from-the-latest-complete-snapshot)
-publishes a complete prepared contributor snapshot (up to 42 hours) and a
-network-free command serves 36-hour forecasts and issuances from it for the current
-UTC hour; the compatibility forward run still prepares inline. Continuous refresh on
+publishes a complete prepared contributor snapshot (up to 42 hours), then a separate
+[baseline build](#background-mesoforge-baseline-snapshots) materializes the current
+forecast canvas for configured locations and usable reference hours. Location jobs
+consume that saved numerical state; the compatibility forward run still prepares inline.
+Continuous refresh on
 the VPS, GitHub Actions scheduling and a cross-field coherence engine remain future
 work. The current numerical fields use one [field-policy dispatcher](src/mesoforge/forecasting/field_blend.py):
 temperature, dew point, vector wind, gust and interval QPF, with RH derived from
 blended temperature/dew point. It reuses the existing recipe, Phase 2 tables and
 scientific kernels without changing weights, fallbacks or policy identities.
-Today's published snapshot contains prepared
-contributors; blending and local-grid construction still happen when it is consumed.
-It is not the vision's future continuously maintained MesoForge baseline snapshot
-([RFC §5.5–5.6](docs/rfcs/mesoforge-v2-architecture.md#55-field-specific-blend-layer)).
+Prepared evidence, the numerical baseline and an issued location forecast are distinct
+artifacts. Current baseline publication is an on-demand background command; a hosted
+worker reacting continuously to guidance changes is still future work
+([RFC §5.7](docs/rfcs/mesoforge-v2-architecture.md#57-implemented-background-baseline-snapshots)).
 
 Future direction: add bounded spatial editing to the coherent context/editable baseline.
 Versioned deterministic tools would validate bounded GFE-style AI edit recipes, keeping
@@ -579,26 +585,31 @@ day/night and station; it applies no correction and currently reports
 so that analysis scales without opening each multi-megabyte evidence payload, while
 older facts stay readable without migration. Two owner-approved policies now govern
 future learning: [which issuance represents a decision window and what evidence a
-correction proposal needs](#decision-window-and-evidence-policies). The next proposed
-architecture milestone is background MesoForge baseline snapshots, using the now
-implemented field-specific dispatcher. Blended-baseline publication and generalized
-coherence remain unimplemented. Prepared-snapshot concurrency and cutoff fixes are
-implemented as described below. More independent verification evidence is still
+correction proposal needs](#decision-window-and-evidence-policies). On-demand background
+baseline publication now uses the field-specific dispatcher and current checks;
+generalized cross-field coherence is the next proposed architecture milestone and
+remains unimplemented. Prepared and baseline publication retain separate concurrency
+and cutoff boundaries as described below. More independent verification evidence is still
 needed before deriving weights or corrections; visibility/fog needs separate causal
 evidence and policy.
 
 ## Existing forecast path
 
 The separated coordinate path is [refresh_guidance.py](src/mesoforge/application/refresh_guidance.py)
-for provider preparation/publication, then
-[forecast_from_snapshot.py](src/mesoforge/application/forecast_from_snapshot.py) for
-provider-free local blending and optional immutable issuance. The compatibility
+for provider preparation/publication,
+[build_baseline.py](src/mesoforge/application/build_baseline.py) for offline numerical
+generation/publication, then
+[forecast_from_baseline.py](src/mesoforge/application/forecast_from_baseline.py) for
+pinned local-domain extraction and optional immutable issuance. The old
+[forecast_from_snapshot.py](src/mesoforge/application/forecast_from_snapshot.py) is an
+explicit development/replay/equivalence tool, not the normal configured-location path.
+The compatibility
 [forward_run.py](src/mesoforge/application/forward_run.py) still combines previous-hour
 verification, selected-model preparation and batch issuance in one invocation.
 [point_forecast.py](src/mesoforge/application/point_forecast.py)
 and [surface_forecast.py](src/mesoforge/application/surface_forecast.py) supply native
 extraction to [FieldBlendEngine.blend_field](src/mesoforge/forecasting/field_blend.py)
-at each node of
+at each background-built node of
 [local_surface_grid.py](src/mesoforge/application/local_surface_grid.py). The surface point
 is read from that grid's center. Contributor roles and field semantics follow
 [VISION.md](VISION.md#7-every-field-has-its-own-blend); the current adapter capabilities
@@ -2725,8 +2736,10 @@ the full issuance payloads (the read-cost limit measured earlier).
 
 ### Refresh guidance and forecast from the latest complete snapshot
 
-The slow provider work and the forecast request are now separate commands. The
-compatibility forward run above is unchanged; these two reuse its functions.
+Provider preparation and numerical-baseline publication are separate commands.
+`latest_complete` means prepared contributor evidence; normal location generation
+consumes the separate `latest_baseline` described below. The compatibility forward
+run above remains an explicit development/replay path.
 
 **Background refresh** (network, roughly 10–15 minutes here):
 
@@ -2765,8 +2778,91 @@ guidance to publish. HRRR/GFS discovery remains strict; neither weights nor sour
 are substituted. A later refresh may restore the shadow normally. The standalone
 selection command and compatibility forward run retain their strict defaults.
 
-**Forecast from the snapshot** (no provider access; the request hour is the
-reference time):
+#### Background MesoForge baseline snapshots
+
+The normal command sequence is now:
+
+```text
+refresh_guidance -> prepared contributor state / latest_complete
+build_baseline -> immutable numerical baseline / latest_baseline
+forecast_from_baseline -> pinned domain and point -> optional immutable issuance
+```
+
+After guidance refresh, run the provider-free background build outside Git, then
+consume its baseline for the same coordinate-only configuration:
+
+```powershell
+python -m mesoforge.application.build_baseline --guidance-root "$env:LOCALAPPDATA\MesoForge\guidance" --baseline-root "$env:LOCALAPPDATA\MesoForge\numerical-baselines" --config locations.json
+python -m mesoforge.application.forecast_from_baseline --root "$env:LOCALAPPDATA\MesoForge\numerical-baselines" --config locations.json
+# Requires the existing PostgreSQL/MinIO configuration; preserves immutable versions.
+python -m mesoforge.application.forecast_from_baseline --root "$env:LOCALAPPDATA\MesoForge\numerical-baselines" --config locations.json --issue
+```
+
+The build pins one prepared snapshot, validates its retained inputs and information
+cutoff, loads source arrays once, and runs the existing complete canvas for every
+configured domain. It writes `baselines/<id>/baseline.json`
+(`mesoforge.baseline-snapshot.v1`), compressed domain artifacts, shared metadata and
+cutoff evidence before publishing `latest_baseline.json`. Field policies, native
+contributors, shadows, missingness and current derivations/checks are unchanged.
+No provider call, new coherence engine or forecast-history write occurs during build.
+
+The spatial representation is a collection of exact configured 7×7 domains using
+today's 6 km spacing and nested masks, not a new common/continental grid. Each domain
+is still derived only from latitude/longitude. One baseline shares its contributor
+state and metadata across locations. New centers require another background build;
+being inside a prepared bounding box alone does not make an unbuilt baseline domain
+available. Location failures remain explicit and do not stop later locations.
+
+By default the build materializes every usable reference hour in the prepared
+36–42-hour envelope, at most seven 36-hour views. This preserves reference-relative
+lead bands: shifting a window can move an hour across the existing 18/19-hour policy
+boundary, so reading a view must not just slice and relabel a different blend.
+`build_baseline --reference-time 2026-09-18T00:00:00Z` limits a bounded replay build;
+the flag may be repeated. `forecast_from_baseline --reference-time …` selects a saved
+replay view. Normal reads use the current UTC hour; absent temporal coverage returns
+`no_current_baseline`, and an unbuilt coordinate returns `coverage_required`. Neither
+case triggers blending or acquisition in the location job.
+
+The compact baseline references exact checksummed source JSON objects and pools
+repeated metadata once across its views. It reconstructs the existing rich grid
+without changing numerical values. The existing issued payload still stores that
+rich shape; full issuance-storage normalization is not part of this change.
+An issuance retains baseline ID/digest, prepared-state ID, policies, source cycles,
+background cutoff, publication, reference and actual issuance times. The baseline is
+pinned once for a location collection; a later publication cannot change that run.
+
+The two pointers are independent: a new contributor state may publish even if its
+baseline build fails, while the previous baseline remains current. Baseline publication
+reuses the persistent OS file lock plus atomic replacement. Ordering compares prepared
+reference time, prepared publication time, background analysis cutoff and build start;
+a slower older publisher cannot move the pointer backward. Failures preserve previous
+immutable baselines and the existing pointer. Retrying a build produces a new artifact.
+
+Current operation is manual/on-demand. A daemon, scheduled hosted worker, incremental
+recomputation, generalized coherence, corrections and AI editing remain future work.
+The implementation and current limits are detailed in
+[RFC §5.7](docs/rfcs/mesoforge-v2-architecture.md#57-implemented-background-baseline-snapshots).
+
+Validated on 2026-09-24 using the retained September 18 contributor state: two
+coordinates × seven reference views reproduced all 49×36 grids and exact points
+canonically, with matching conditions/transitions/periods and zero location-time
+blend/provider calls. The 14-view baseline occupies **227.75 MB**, referencing existing
+source metadata; extracted rich issuance payloads still occupy about **365 MB each**.
+Measured baseline load was 0.8–1.3 s and extraction 17–19 s, versus 25.5–27.6 s to
+build a grid from loaded guidance. Two real PostgreSQL/MinIO issuances took 67.35 s;
+repeat execution reused both, and both payloads read back exactly. These were explicit
+historical-reference demonstrations with actual September 24 issuance clocks.
+
+Checks run: **31 new artifact/cutoff unit cases**, **257 retained scientific/grid/rendering
+tests**, and **46 PostgreSQL/MinIO integration/storage tests** passed. The broader offline
+selection had **3,388 passed and the same three previously documented failures** below;
+four additional cutoff cases passed separately after that selection was collected.
+Ruff, formatting, mypy, import contracts, lock consistency, docs, hygiene and whitespace
+checks passed. Temporary services were stopped. Large rich-payload serialization and
+conditions integrity checks remain costs; no full storage normalization was attempted.
+
+**Development/replay from prepared evidence** (the older path; no provider access,
+but it still performs local blending and is not the normal location command):
 
 ```text
 python -m mesoforge.application.forecast_from_snapshot --root %LOCALAPPDATA%\MesoForge\guidance --lat 44.98859 --lon -93.25557 --name Minneapolis --display-timezone America/Chicago
@@ -2870,8 +2966,9 @@ universal cutoff claim, not demonstrated historical leakage.
   forward run uses the same lock; different coordinate lists also serialize.
 
 Optional RAP/IFS discovery shortfalls are explicit as described above; NBM per-hour
-missingness and all existing active field policies remain unchanged. These changes
-do not implement the future continuously maintained blended baseline snapshot.
+missingness and all existing active field policies remain unchanged. That correctness
+slice preceded the separate [on-demand numerical baseline](#background-mesoforge-baseline-snapshots).
+Continuous hosted maintenance remains future work.
 
 Validation for this correctness change: **182 focused offline tests passed**, plus
 **72 PostgreSQL/MinIO integration tests** covering snapshot concurrency, forward runs,

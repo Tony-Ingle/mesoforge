@@ -121,8 +121,8 @@ scientific contracts are implemented. Conditions derive from underlying forecast
 fields rather than an unexplained standalone prediction. The code-grounded canvas
 inventory and deterministic condition layer are in section 6.7. The read-only
 saved-grid preview, initial presentation rules, multi-hour transition detection,
-period summaries and the latest-complete prepared snapshot of section 5.6 are
-implemented. The next proposed slice is recorded in [README.md](../../README.md),
+period summaries, the prepared snapshot of section 5.6 and the on-demand numerical
+baseline of section 5.7 are implemented. The next proposed slice is recorded in [README.md](../../README.md),
 not another meteorological field.
 
 **Owner model direction, 2026-09-10:** the long-term model mix includes HRRR,
@@ -289,11 +289,12 @@ registration, verification, AI, and delivery milestone.
   missingness, cutoffs and lineage; the deterministic baseline remains identifiable
   separately from later corrected and adjusted products.
 - **Prepared contributor snapshot (implemented):** normalized source evidence and
-  manifests published by `refresh_guidance`; the current consumer still calculates
-  the local blend/grid. It is not a blended baseline.
-- **MesoForge baseline snapshot (future):** immutable field-specific blends after
-  baseline coherence, maintained before location runs and linked to their exact
-  contributor state. A location run pins it throughout correction/editing/issuance.
+  manifests published by `refresh_guidance`; it is not a blended baseline.
+- **MesoForge baseline snapshot (implemented on demand):** the current numerical
+  canvas calculated before location runs, linked to exact prepared state and current
+  field policies/checks. Section 5.7 defines the configured-domain representation.
+  Continuous hosted maintenance and generalized coherence remain future work. A
+  location run pins the baseline throughout extraction and later stages.
 - **Issued forecast snapshot:** one immutable persisted forecast version. Refresh creates a
   new version and never edits an earlier one.
 - **Forecast state:** a small mutable pointer/status for the current issued snapshot; it
@@ -407,7 +408,9 @@ storage adapters      -> storage interfaces + contracts
 
 Current command split (no scheduler):
 refresh_guidance -> prepared contributor snapshot / latest_complete
-forecast_from_snapshot -> pin prepared evidence -> local blend/grid -> optional issuance
+build_baseline -> current blends/checks -> immutable baseline / latest_baseline
+forecast_from_baseline -> pin baseline -> saved local domain -> optional issuance
+development/replay: forecast_from_snapshot -> prepared evidence -> local blend/grid
 
 Target background engine:
 new eligible guidance -> prepared contributor state -> field-specific blends
@@ -596,14 +599,17 @@ existing field-specific paths, outside this migration. The separate retained Pha
 station assembler remains a compatible consumer of the scientific kernels and its
 three-model contracts. Comparison recipes still use the generic scalar recipe kernel.
 Continuous blended-baseline publication, generalized coherence, dynamic weights and
-corrections remain future work; section 5.6 still publishes prepared contributors.
+corrections remain future work. Section 5.6 publishes prepared contributors;
+section 5.7 now runs these policies before location jobs and publishes an on-demand
+numerical baseline.
 
 ### 5.6 Implemented guidance refresh and the latest complete prepared snapshot
 
-**Implemented command boundary, 2026-09-18.** Model acquisition/preparation and
-forecast generation have separate clocks. The diagram below describes today's
-prepared-contributor snapshot, not the target preblended baseline of section 5.1.
-Continuous background operation and production scheduling are not implemented.
+**Implemented contributor boundary, 2026-09-18.** Model acquisition/preparation and
+forecast generation have separate clocks. The prepared snapshot below remains source
+evidence. The separate numerical-baseline publication added in section 5.7 does not
+change its schema or overload its pointer. Continuous background operation and
+production scheduling are not implemented.
 
 ```text
 BACKGROUND GUIDANCE REFRESH
@@ -614,10 +620,14 @@ new model cycles become available
   -> publish an atomic `latest complete` prepared snapshot
   -> retain the previous good snapshot until the replacement is complete
 
-LOCAL FORECAST COMMAND
-configured coordinates (or development lat/lon request)
-  -> use the newest complete prepared snapshot already available
-  -> construct/read the local MesoForge baseline grid
+BACKGROUND BASELINE BUILD (section 5.7)
+  -> pin the prepared snapshot
+  -> build current numerical canvas for configured domains and covered reference views
+  -> publish separate latest_baseline after complete success
+
+CONFIGURED LOCATION FORECAST
+  -> pin the newest complete numerical baseline already available
+  -> read the saved local context/editable domain and exact point
   -> later: deterministic correction + AI desk
   -> return forecast
 ```
@@ -637,16 +647,18 @@ configured coordinates (or development lat/lon request)
   if those are the newest complete eligible inputs. The rule is that every input used
   was legitimately available before that issuance's information cutoff. Issuance time,
   source cycles and source availability stay separately recorded facts.
-- Issued/scheduled forecasts use the same snapshot. An external orchestrator such as
+- Issued/configured forecasts consume one pinned numerical baseline referencing the
+  prepared snapshot (section 5.7). A future external orchestrator such as
   GitHub Actions decides when to invoke issuance and delivery; MesoForge decides what
   the run means (section 2.3). The decision-window policy of section 6.7.14 continues
   to define the canonical scheduled forecast.
 - Snapshot cadence, continuous operation on the VPS, retention of superseded
   snapshots and a shared (non-filesystem) pointer location are open (section 17).
 
-**Implemented slice (2026-09-18; correctness updated 2026-09-24).** The refresh and the
-snapshot-consuming forecast exist as separate commands; the operator/compatibility
-`forward_run` path is unchanged.
+**Contributor slice (2026-09-18; correctness updated 2026-09-24).** The refresh and
+prepared-snapshot replay remain separate commands. Normal configured-location
+generation now uses section 5.7; the operator/compatibility `forward_run` remains
+an explicit development path.
 
 - *Prepared window and coverage policy* (`mesoforge-prepared-coverage-policy.v1`,
   `mesoforge.guidance.coverage`): a prepared window is hours 1..N after its reference
@@ -699,7 +711,7 @@ snapshot-consuming forecast exist as separate commands; the operator/compatibili
   recorded per object and per missing hour instead of aborting the preparation. The
   standalone selection and issuance-bound forward run keep the strict default.
   Successfully selected shadow coverage can still limit the extension envelope.
-- *Forecast from snapshot* (`python -m mesoforge.application.forecast_from_snapshot
+- *Development/replay from prepared snapshot* (`python -m mesoforge.application.forecast_from_snapshot
   --root … (--lat --lon | --config) [--reference-time] [--issue]`): resolves the
   pointer, verifies manifest and retained-artifact digests, derives the reference hour
   as the request's current UTC hour, checks absolute coverage, builds the local grid
@@ -710,7 +722,8 @@ snapshot-consuming forecast exist as separate commands; the operator/compatibili
   and storage. Concurrent snapshot issuers wait and recheck committed versions before
   creating an issuance; a second primary attempt skips the existing coordinate/reference
   version, while `--reissue` explicitly permits another version. A lookup failure is isolated as
-  `issuance_lookup_failed` and later coordinates continue.
+  `issuance_lookup_failed` and later coordinates continue. This retained comparison/
+  compatibility path performs blends and is no longer the normal location path.
 - *Information provenance*: additive `source_information` in the existing v1 manifest
   pins retained source/region manifests and hashes, each input's availability/acquisition
   clocks and recorded source-specific discovery cutoff. Attachments do not inherit the
@@ -725,8 +738,9 @@ snapshot-consuming forecast exist as separate commands; the operator/compatibili
 - *Still bound*: the refresh must still complete inside its decision hour (the
   existing selection expiry), coordinates outside the refreshed collection's footprint
   are refused rather than prepared on demand, conditions/transitions/period previews
-  remain read-only over saved issuances, and the local-grid build still dominates
-  request time. It reuses one projection transformer per native CRS and takes
+  remain read-only over saved issuances. The old replay path's local-grid build
+  dominates its runtime; normal location jobs now read the background baseline.
+  Grid construction reuses one projection transformer per native CRS and takes
   ownership of the ephemeral grid instead of copying it, which cut a measured
   49-node, 36-hour build from 178.6 s to 25.4 s with byte-identical output; the
   remainder is per-column evidence copying and the required canonical grid digest.
@@ -737,6 +751,95 @@ discovery. The bounded fixes above preserve forecast science and current field p
 The retained real sample had later PoP discovery but no demonstrated historical leakage.
 See [README's snapshot correctness notes](../../README.md#refresh-guidance-and-forecast-from-the-latest-complete-snapshot)
 for locking details, compatibility and remaining operational limits.
+
+### 5.7 Implemented background baseline snapshots
+
+The manual/on-demand `build_baseline` boundary materializes MesoForge's numerical
+forecast before configured-location jobs. It does not acquire guidance, issue history,
+or implement continuous hosting. Artifact lineage is explicit:
+
+```text
+native source evidence
+  -> prepared contributor snapshot (latest_complete)
+  -> immutable MesoForge numerical baseline (latest_baseline)
+  -> issued configured-location forecast
+```
+
+**Spatial and temporal representation.** The baseline is a collection of the exact
+configured context/editable domains, derived from latitude/longitude with the current
+7×7, 6 km geometry. It is not a new common grid or an interpolable continental raster.
+Background construction reuses the loaded prepared regions and existing local-grid
+builder, including center-based source-region selection and current native-grid
+extraction before blending. This preserves nonlinear checks, missingness and evidence
+that a new blend-first/regrid-later order could change. Duplicate configured centers
+share a domain; nearby domains share prepared source state and metadata even when their
+coordinate-centered lattice nodes do not coincide.
+
+Default construction materializes every usable exact-hour reference view covered by
+the contributor state: at most seven 36-hour views in a 42-hour preparation. They are
+separate views because existing field rows depend on the forecast reference-relative
+lead. Slicing a saved field and relabeling hour 19 as hour 18 would change its approved
+row. Explicit repeatable `--reference-time` options restrict a development/replay build.
+Neither spatial extent nor extra native coverage authorizes unbuilt coordinates/views:
+those require a new background build, not a request-time fallback to `FieldBlendEngine`.
+The geometry remains an implementation default rather than a permanent product limit.
+
+**Numerical scope.** Temperature, dew point, U/V wind, gust, interval QPF and derived RH
+use the section 5.5 dispatcher. Temporary NBM PoP/sky/thunder and HRRR/GFS p-type retain
+their current source/policy paths. Currently attached visibility and winter/probability
+evidence retain their roles, native timing and explicit gaps. Existing T/Td consistency,
+RH derivation, source wind/gust validation and final gust handling run during the
+background build. No generalized coherence engine or field promotion is claimed.
+
+**Durable representation.** `mesoforge.baseline-snapshot.v1` manifests identify the
+exact prepared snapshot/digest, background analysis cutoff, build/completion times,
+reference windows, per-domain geometry and field availability, active policy identities,
+field registry/dependencies, current derivation/check identities, transformation/code/
+configuration identity, completeness and artifact digests. Immutable compressed domain
+artifacts retain numerical state. The baseline-specific codec references exact source
+JSON subtrees by document hash and JSON pointer and pools other repeated metadata once
+across domains/reference views. It reconstructs the current rich local-grid schema
+without changing values or provenance. Source documents are verified during readback;
+they must remain retained with the baseline. This does not normalize the existing
+issued-forecast storage payload, which still expands to its historical rich shape.
+
+**Two independent publications.** `latest_complete.json` still means prepared evidence;
+`latest_baseline.json` means a complete built numerical forecast. The baseline builder
+never changes the contributor pointer. A failed build can leave new prepared state B
+available while numerical baseline A remains current; retrying B creates a new immutable
+baseline. Baseline publication reuses the persistent OS file-lock and atomic replacement
+mechanism from section 5.6 with a separate lock/pointer. Compare-and-publish orders by
+prepared reference, prepared publication time, background analysis cutoff, then build
+start. Separate processes cannot move the pointer backward. Publication failure preserves
+the previous pointer and immutable artifacts. Unsupported configured locations are
+recorded separately; unexpected build failures do not publish an incomplete artifact.
+
+**Consumption and pinning.** `forecast_from_baseline --root … --config locations.json`
+is the normal configured-location boundary. It resolves once, pins one immutable ID,
+verifies baseline/source digests and cutoff proof, chooses the saved current-UTC-hour
+reference view and reads each requested domain/center. No native model arrays are loaded
+and no basic field blend is invoked by a location job. A later pointer publication does
+not change its pinned reader. Missing reference coverage returns `no_current_baseline`;
+an unbuilt center returns `coverage_required`, with later coordinates still processed.
+Optional `--issue` reuses the existing PostgreSQL/MinIO path and decision-window lock,
+records baseline and prepared-state lineage, and preserves explicit reissue semantics.
+The earlier `forecast_from_snapshot` remains for explicit development, historical
+compatibility and equivalence replay only.
+
+**Information bounds.** Build eligibility uses the source/attachment-specific evidence
+from section 5.6 against the background analysis cutoff, including prepared publication
+and completion. Missing historical proof fails the build rather than inventing a time.
+The baseline retains that proof and exact source identities. A later location job checks
+that the pinned baseline was built and published by its own analysis cutoff. Prepared
+reference, native cycles, source availability/discovery/acquisition, background cutoff,
+baseline publication and actual issuance remain separate facts. Historical prepared
+snapshots and issuances remain readable through their existing paths without rewrites.
+
+This is on-demand background computation, not a daemon, schedule or continuously
+maintained hosted service. Incremental affected-field recomputation, generalized
+cross-field coherence, site correction and AI editing remain future work. Registry and
+policy dependency identities are retained for those later stages. Commands and measured
+validation belong in [README](../../README.md#background-mesoforge-baseline-snapshots).
 
 ## 6. First-release flows
 
@@ -757,10 +860,10 @@ the API checks region/readiness and a packaging-aware work estimator populated b
 representative benchmark. Unsupported combinations or work beyond measured read, decode,
 memory, output, or timeout bounds receive stable `422`.
 
-The request consumes the newest complete prepared snapshot (section 5.6) and never
-waits for acquisition or for a clock-hour decision window. The API reads enclosing
-objects, extracts the point, applies the field-specific blend policies (section 5.5),
-and returns values, units, contributors/exclusions, freshness,
+The request consumes a pinned complete numerical baseline (section 5.7) and never
+waits for acquisition or for a clock-hour decision window. The API reads the covered
+local domain and extracts the point from fields already blended in the background,
+then returns values, units, contributors/exclusions, freshness,
 cutoff, missingness, baseline configuration, and compact lineage. It does not persist
 registered history. The benchmark may support every required field across 36 horizons or
 only measured subsets; the advertised matrix follows evidence.
@@ -828,10 +931,9 @@ retention precede the per-location work. For each configured/registered location
    using the version originally issued and the applicable time, quality, spatial
    support, and cutoff rules. Record unavailable verification explicitly and
    proceed with the new forecast when no suitable observation is available.
-3. Pin one immutable MesoForge baseline snapshot maintained by the target background
-   engine, then derive/extract the local fields. Today section 5.6 pins prepared
-   contributors and calculates the local blend at consumption time; preblending and
-   generalized baseline coherence remain future work. Save
+3. Pin one immutable MesoForge baseline snapshot, then derive/extract the local fields.
+   Section 5.7 implements on-demand background construction and saved-domain extraction;
+   continuous hosted maintenance and generalized baseline coherence remain future work. Save
    the original numerical baseline, every contributor's values and the
    source/transform/configuration identity. No acquisition or regional grid preparation
    occurs inside a forecast HTTP request.
@@ -1917,8 +2019,8 @@ accounts, long-term retention, or public SLOs.
 The full inspected canvas, including completed p-type and subsequent native evidence,
 is inventoried in section 6.7. Its read-only saved-grid preview, bounded initial
 wording policy, multi-hour transition detection and period summaries are implemented,
-and the background guidance refresh is separated from forecast generation through
-the latest-complete prepared snapshot (section 5.6). Further rules, field promotion,
+and background guidance refresh, numerical-baseline generation and location consumption
+are separate boundaries (sections 5.6–5.7). Further rules, field promotion,
 dynamic blending and a coherence engine require separate approval.
 
 File/module/table/code/test/change-size estimates are non-binding planning aids per slice.

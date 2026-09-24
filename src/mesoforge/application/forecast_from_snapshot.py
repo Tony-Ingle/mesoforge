@@ -1,10 +1,11 @@
-"""Fast forecasts from the published latest-complete prepared snapshot; no provider access.
+"""Development/replay forecasts from a prepared snapshot; no provider access.
 
 The request picks its own reference hour (the current UTC hour), checks that the
 snapshot's absolute valid times cover hours 1..36 after it, builds the current
 MesoForge baseline grid with the existing field policies and returns the 36-hour
 point forecast. Nothing here discovers, downloads or prepares guidance, and an
 insufficient snapshot is reported as ``no_current_snapshot`` rather than shortened.
+Normal configured-location operation uses ``forecast_from_baseline`` instead.
 """
 
 from __future__ import annotations
@@ -160,6 +161,66 @@ def forecast_from_snapshot(
         result.update(status="no_current_snapshot", reason=str(exc), results=[])
         result["timings"] = timings
         return result
+    lineage = {
+        "prepared_snapshot": {
+            "snapshot_id": manifest["snapshot_id"],
+            "issuance_mode": ("explicit_reissue" if reissue else "primary") if issue else None,
+            "published_at": pointer["published_at"],
+            "manifest_sha256": pointer["manifest_sha256"],
+            "prepared_reference_time": manifest["coverage"]["reference_time"],
+            "decision_time": manifest["coverage"]["decision_time"],
+            "request_time": result["request_time"],
+            "forecast_analysis_cutoff": result["request_time"],
+            "information_cutoff": result["information_cutoff"],
+            "reference_time": result["reference_time"],
+            "reference_time_source": result["reference_time_source"],
+            "coverage": {
+                "first_valid_time": manifest["coverage"]["first_valid_time"],
+                "last_valid_time": manifest["coverage"]["last_valid_time"],
+                "prepared_hours": manifest["coverage"]["prepared_hours"],
+                "policy": manifest["coverage"]["policy"]["id"],
+                "nbm_active_products": coverage["nbm_active_products"],
+            },
+            "contributor_cycles": result["snapshot"]["contributor_cycles"],
+            "nbm_product_cycles": result["snapshot"]["nbm_product_cycles"],
+            "field_policies": manifest["field_policies"],
+            "provenance_rule": PROVENANCE_RULE,
+        }
+    }
+    result.update(
+        _deliver_locations(
+            view,
+            locations,
+            reference_time=reference,
+            display_timezone=display_timezone,
+            issue=issue,
+            issuer=issuer,
+            reissue=reissue,
+            run_lock=run_lock,
+            lineage=lineage,
+            build_timing_key="local_grid_build_seconds",
+        )
+    )
+    timings["total_seconds"] = time.perf_counter() - started
+    result["timings"] = timings
+    return result
+
+
+def _deliver_locations(
+    view: Any,
+    locations: list[Any],
+    *,
+    reference_time: datetime,
+    display_timezone: str,
+    issue: bool,
+    issuer: ForecastIssuanceService | None,
+    reissue: bool,
+    run_lock: Callable[[], AbstractContextManager[None]] | None,
+    lineage: dict[str, dict[str, Any]],
+    build_timing_key: str,
+) -> dict[str, Any]:
+    """Deliver pinned forecasts with one shared location-isolation/issuance boundary."""
+    result: dict[str, Any] = {}
     if issue and issuer is None:
         issuer = create_issuer()
     batch_run_id = uuid4()
@@ -191,7 +252,9 @@ def forecast_from_snapshot(
                 assert issuer is not None
                 try:
                     existing = issuer.find_versions(
-                        latitude=latitude, longitude=longitude, target_reference_time=reference
+                        latitude=latitude,
+                        longitude=longitude,
+                        target_reference_time=reference_time,
                     )
                 except Exception:
                     row.update(
@@ -220,33 +283,8 @@ def forecast_from_snapshot(
             try:
                 clock = time.perf_counter()
                 forecast = view.forecast(latitude=latitude, longitude=longitude)
-                row["local_grid_build_seconds"] = time.perf_counter() - clock
-                forecast["prepared_snapshot"] = {
-                    "snapshot_id": manifest["snapshot_id"],
-                    "issuance_mode": ("explicit_reissue" if reissue else "primary")
-                    if issue
-                    else None,
-                    "published_at": pointer["published_at"],
-                    "manifest_sha256": pointer["manifest_sha256"],
-                    "prepared_reference_time": manifest["coverage"]["reference_time"],
-                    "decision_time": manifest["coverage"]["decision_time"],
-                    "request_time": result["request_time"],
-                    "forecast_analysis_cutoff": result["request_time"],
-                    "information_cutoff": result["information_cutoff"],
-                    "reference_time": result["reference_time"],
-                    "reference_time_source": result["reference_time_source"],
-                    "coverage": {
-                        "first_valid_time": manifest["coverage"]["first_valid_time"],
-                        "last_valid_time": manifest["coverage"]["last_valid_time"],
-                        "prepared_hours": manifest["coverage"]["prepared_hours"],
-                        "policy": manifest["coverage"]["policy"]["id"],
-                        "nbm_active_products": coverage["nbm_active_products"],
-                    },
-                    "contributor_cycles": result["snapshot"]["contributor_cycles"],
-                    "nbm_product_cycles": result["snapshot"]["nbm_product_cycles"],
-                    "field_policies": manifest["field_policies"],
-                    "provenance_rule": PROVENANCE_RULE,
-                }
+                row[build_timing_key] = time.perf_counter() - clock
+                forecast.update({key: dict(value) for key, value in lineage.items()})
                 clock = time.perf_counter()
                 forecast["hourly_report"] = build_hourly_report(forecast, display_timezone=zone)
                 row["hourly_report_seconds"] = time.perf_counter() - clock
@@ -291,12 +329,10 @@ def forecast_from_snapshot(
                     else:
                         row["issued"] = issued.model_dump(mode="json")
             rows.append(row)
-    timings["total_seconds"] = time.perf_counter() - started
     result.update(
         status="ok",
         batch_run_id=str(batch_run_id) if issue else None,
         results=rows,
-        timings=timings,
         summary={
             "ok": sum(row["status"] == "ok" for row in rows),
             "issued": sum("issued" in row for row in rows),
@@ -320,6 +356,22 @@ def _public(result: dict[str, Any]) -> dict[str, Any]:
             public["prepared_window"] = forecast.get("prepared_window")
         rows.append(public)
     return {**result, "results": rows}
+
+
+def _write_outputs(result: dict[str, Any], output_dir: Path, *, title: str) -> None:
+    """Retain the complete result and readable report for either pinned input path."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "result.json").write_text(
+        json.dumps(result, indent=2, default=str, allow_nan=False) + "\n", encoding="utf-8"
+    )
+    lines = [f"# {title}", ""]
+    for row in result.get("results", []):
+        if row.get("status") in ("ok", "skipped_already_issued") and "forecast" in row:
+            lines += [f"## Location {row['index']}: {json.dumps(row['location'])}", ""]
+            if "issued" in row:
+                lines += [f"Issued forecast: {row['issued']['issued_forecast_id']}", ""]
+            lines += [render_hourly_report(row["forecast"]["hourly_report"]), ""]
+    (output_dir / "hourly-report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -374,18 +426,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     if args.output_dir is not None:
-        args.output_dir.mkdir(parents=True, exist_ok=True)
-        (args.output_dir / "result.json").write_text(
-            json.dumps(result, indent=2, default=str, allow_nan=False) + "\n", encoding="utf-8"
-        )
-        lines = ["# Forecast from prepared snapshot", ""]
-        for row in result.get("results", []):
-            if row.get("status") in ("ok", "skipped_already_issued") and "forecast" in row:
-                lines += [f"## Location {row['index']}: {json.dumps(row['location'])}", ""]
-                if "issued" in row:
-                    lines += [f"Issued forecast: {row['issued']['issued_forecast_id']}", ""]
-                lines += [render_hourly_report(row["forecast"]["hourly_report"]), ""]
-        (args.output_dir / "hourly-report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        _write_outputs(result, args.output_dir, title="Forecast from prepared snapshot")
     print(json.dumps(_public(result), indent=2, default=str))
     if result["status"] == "no_current_snapshot":
         return 3
