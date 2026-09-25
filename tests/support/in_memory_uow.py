@@ -197,6 +197,21 @@ class _InMemoryArtifactRepository:
                 return manifest
         return None
 
+    def find_mrms_extractions(
+        self, *, product_time: object, limit: int = 1000
+    ) -> tuple[ArtifactManifest, ...]:
+        from datetime import UTC, datetime
+
+        if not isinstance(product_time, datetime) or product_time.tzinfo is None:
+            raise ValueError("MRMS lookup requires an aware product time")
+        return tuple(
+            manifest
+            for manifest in self._store.values()
+            if manifest.artifact_type == "mrms-coordinate-extraction"
+            and (manifest.attributes or {}).get("product_time")
+            in (None, product_time.astimezone(UTC).isoformat())
+        )[:limit]
+
 
 class _InMemoryConfigurationSnapshot:
     def __init__(self, configuration_snapshot_id: str, configuration_digest: str) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -173,3 +174,44 @@ def verify_previous(
         "windows": windows,
         "results": list(outcomes.values()),
     }
+
+
+def verify_previous_fields(
+    latitude: float,
+    longitude: float,
+    *,
+    now: datetime,
+    qpf_lookback_hours: int = 72,
+    qpf_max_opportunities: int = 36,
+) -> dict[str, Any]:
+    """Independent prior-field attempts; neither failure gates a new issuance.
+
+    Temperature keeps its existing coordinator and scientific behavior. QPF has
+    an explicitly bounded operational lookback; older work uses bounded backfill.
+    """
+    from mesoforge.application.automatic_qpf_verification import verify_previous_qpf
+
+    results = {}
+    operations: tuple[tuple[str, Callable[[], dict[str, Any]]], ...] = (
+        ("temperature", lambda: verify_previous(latitude, longitude, now=now)),
+        (
+            "qpf",
+            lambda: verify_previous_qpf(
+                latitude,
+                longitude,
+                now=now,
+                lookback_hours=qpf_lookback_hours,
+                max_opportunities=qpf_max_opportunities,
+            ),
+        ),
+    )
+    for field, operation in operations:
+        try:
+            results[field] = operation()
+        except Exception as exc:
+            results[field] = {
+                "status": "error",
+                "retryable": True,
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+    return results

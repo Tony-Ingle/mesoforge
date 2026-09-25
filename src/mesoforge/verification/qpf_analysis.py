@@ -488,9 +488,28 @@ def _location(row: Mapping[str, Any]) -> str:
     return ",".join(_signature(row[key]).decode("ascii") for key in ("latitude", "longitude"))
 
 
+def _distribution(numbers: Sequence[float]) -> dict[str, Any]:
+    """Compact empirical summaries, without rainfall/quality classification thresholds."""
+    ordered = sorted(numbers)
+    return {
+        "numeric_count": len(ordered),
+        "minimum": ordered[0] if ordered else None,
+        "maximum": ordered[-1] if ordered else None,
+        "mean": math.fsum(ordered) / len(ordered) if ordered else None,
+        "quantiles": {
+            str(percentile): ordered[max(0, math.ceil(percentile * len(ordered) / 100) - 1)]
+            if ordered
+            else None
+            for percentile in (25, 50, 75, 90)
+        },
+        "quantile_method": "empirical nearest rank; descriptive, not category thresholds",
+    }
+
+
 def _quality_summary(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     products = sorted(
-        {product for row in samples for product in row["observation"].get("quality_support", {})}
+        {"GaugeInflIndex_01H_Pass2", "RadarAccumulationQualityIndex_01H"}
+        | {product for row in samples for product in row["observation"].get("quality_support", {})}
     )
     summary = {}
     for product in products:
@@ -498,17 +517,104 @@ def _quality_summary(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             row["observation"].get("quality_support", {}).get(product, {}).get("value") or {}
             for row in samples
         ]
-        numbers = [value["value"] for value in values if _finite(value.get("value"))]
+        numbers = [
+            value["value"]
+            for value in values
+            if value.get("state") in ("positive", "zero") and _finite(value.get("value"))
+        ]
         summary[product] = {
             "states": dict(
                 sorted(Counter(value.get("state", "unavailable") for value in values).items())
             ),
-            "numeric_count": len(numbers),
-            "minimum": min(numbers) if numbers else None,
-            "maximum": max(numbers) if numbers else None,
+            **_distribution(numbers),
+            "units": sorted({value["units"] for value in values if value.get("units")}),
+            "population": "canonical samples; repeated native analyses are not independent",
             "threshold_policy": "none; retained support evidence is not calibrated confidence",
         }
     return summary
+
+
+def _readiness(
+    samples: Sequence[Mapping[str, Any]],
+    concentration: Mapping[str, Any],
+    comparisons: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Report evidence coverage, never authorize an experiment or infer model skill."""
+    observed = [float(row["observation"]["amount_mm"]) for row in samples]
+    positive = sum(value > 0 for value in observed)
+    zero = len(observed) - positive
+    groups = {
+        bucket: sum(row["lead_bucket"] == bucket for row in samples) for bucket in LEAD_BUCKETS
+    }
+    coverage = {
+        model: {
+            "compatible_samples": len(comparison["sample_ids"]),
+            "incompatible_or_missing_samples": comparison["excluded_incompatible_or_missing"],
+            "fraction_of_canonical_samples": len(comparison["sample_ids"]) / len(samples)
+            if samples
+            else None,
+        }
+        for model, comparison in comparisons["pairwise"].items()
+    }
+    gaps: list[dict[str, Any]] = []
+    if not samples:
+        gaps.append({"reason": "no_canonical_samples"})
+    else:
+        for dimension in ("location", "decision_date_utc", "valid_date_utc"):
+            if concentration[dimension]["distinct"] == 1:
+                gaps.append({"reason": "single_" + dimension})
+        if not positive:
+            gaps.append({"reason": "no_positive_observed_amounts"})
+        if not zero:
+            gaps.append({"reason": "no_zero_observed_amounts"})
+        for bucket, count in groups.items():
+            if not count:
+                gaps.append({"reason": "no_samples_in_provisional_lead_group", "group": bucket})
+        for model, item in coverage.items():
+            if item["incompatible_or_missing_samples"]:
+                gaps.append({"reason": "incomplete_contributor_coverage", "contributor": model})
+    return {
+        "canonical_samples": len(samples),
+        "positive_observed_qpf_samples": positive,
+        "zero_observed_qpf_samples": zero,
+        "occurrence_definition": "Positive means >0 mm, not an approved measurable threshold.",
+        "measurable_sample_count": None,
+        "measurable_count_unavailable_reason": "No measurable-precipitation threshold is approved.",
+        "configured_locations": concentration["location"],
+        "decision_dates_utc": concentration["decision_date_utc"],
+        "valid_dates_utc": concentration["valid_date_utc"],
+        "exact_lead_hours": concentration["lead_hours"],
+        "provisional_lead_groups": groups,
+        "observed_qpf_mm": _distribution(observed),
+        "contributor_coverage": coverage,
+        "shared_sample_comparison": {
+            "contributors": comparisons["joint"]["contributors"],
+            "canonical_samples": len(comparisons["joint"]["sample_ids"]),
+            "metrics_reference": "contributor_comparison.joint",
+        },
+        "time_concentration": {
+            "first_interval_start": min(
+                (_iso(row["interval_start"]) for row in samples), default=None
+            ),
+            "last_interval_end": max((_iso(row["interval_end"]) for row in samples), default=None),
+            "native_analysis_events": concentration["native_analysis_event"],
+            "positive_observed_valid_dates_utc": dict(
+                sorted(
+                    Counter(
+                        _instant(row["interval_end"]).date().isoformat()
+                        for row in samples
+                        if row["observation"]["amount_mm"] > 0
+                    ).items()
+                )
+            ),
+            "episode_classification": "not implemented; date/time concentration only",
+            "independence_claim": False,
+        },
+        "heavy_rain_assessment": "not classified; no heavy-rain threshold is approved",
+        "factual_gaps": gaps,
+        "experiment_readiness": "requires scientific/owner review; no automatic threshold",
+        "authorizes_weight_changes": False,
+    }
 
 
 def analyze_qpf_facts(
@@ -535,8 +641,24 @@ def analyze_qpf_facts(
                 "contributor": _metrics(cohort, model),
             }
         joint = [row for row in selected if all(_compatible(row, model) for model in models)]
+        comparisons = {
+            "pairwise": pairwise,
+            "joint": {
+                "contributors": models,
+                "sample_ids": [row["sample_id"] for row in joint],
+                "mesoforge": _metrics(joint),
+                "models": {model: _metrics(joint, model) for model in models},
+            },
+        }
+        concentration = _concentration(selected)
         stages[stage] = {
             "overall": _metrics(selected),
+            "by_exact_lead_hours": {
+                _signature(lead).decode("ascii"): _metrics(
+                    [row for row in selected if row["lead_hours"] == lead]
+                )
+                for lead in sorted({row["lead_hours"] for row in selected})
+            },
             "by_lead_bucket": {
                 bucket: _metrics([row for row in selected if row["lead_bucket"] == bucket])
                 for bucket in LEAD_BUCKETS
@@ -545,17 +667,10 @@ def analyze_qpf_facts(
                 location: _metrics([row for row in selected if _location(row) == location])
                 for location in sorted({_location(row) for row in selected})
             },
-            "concentration": _concentration(selected),
+            "concentration": concentration,
             "quality_support": _quality_summary(selected),
-            "contributor_comparison": {
-                "pairwise": pairwise,
-                "joint": {
-                    "contributors": models,
-                    "sample_ids": [row["sample_id"] for row in joint],
-                    "mesoforge": _metrics(joint),
-                    "models": {model: _metrics(joint, model) for model in models},
-                },
-            },
+            "contributor_comparison": comparisons,
+            "readiness": _readiness(selected, concentration, comparisons),
         }
     return {
         "schema_version": SCHEMA_VERSION,

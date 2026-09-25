@@ -18,10 +18,11 @@ from uuid import uuid4
 import pytest
 
 from mesoforge.application.artifacts import ArtifactService
+from mesoforge.application.automatic_qpf_verification import accumulate_window
 from mesoforge.application.configuration import ConfigurationService
 from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.issued_qpf_verification import IssuedQpfVerificationService
-from mesoforge.application.prepared_mrms import register_bundle
+from mesoforge.application.prepared_mrms import MRMSHourResolver, register_bundle
 from mesoforge.catalog.configuration import load_configuration_source
 from mesoforge.common.identifiers import ArtifactId
 from mesoforge.storage.postgres.idempotency_lock import PostgresIdempotencyLock
@@ -221,3 +222,64 @@ def test_analysis_attributes_equal_verified_payloads_without_writes_or_forecast_
     assert fast == payload
     assert complete_storage_inventory(env.dsn, env.objects) == before
     forbidden.assert_not_called()
+
+
+def test_automatic_accumulation_concurrent_repeat_reuses_source_and_exact_facts(
+    infrastructure: SimpleNamespace,
+    tmp_path: Path,
+) -> None:
+    """Concurrent coordinators reuse native evidence and PostgreSQL fact locks."""
+    env = infrastructure
+    configuration = env.verifier.configuration()
+    transport = Mock(side_effect=AssertionError("Retained MRMS must not download again"))
+    resolver = MRMSHourResolver(
+        tmp_path / "mrms-cache",
+        artifacts=env.artifacts,
+        unit_of_work_factory=env.factory,
+        configuration_snapshot_id=configuration.configuration_snapshot_id,
+        configuration_digest=configuration.configuration_digest,
+        idempotency_lock=PostgresIdempotencyLock(env.dsn),
+        transport=transport,
+    )
+    before = complete_storage_inventory(env.dsn, env.objects)
+    barrier = Barrier(2)
+
+    def resolve(**kwargs):
+        barrier.wait(timeout=20)
+        return resolver.resolve_hour(**kwargs)
+
+    kwargs = {
+        "service": env.verifier,
+        "latitude": LAT,
+        "longitude": LON,
+        "start_valid_time": VALID,
+        "end_valid_time": VALID + timedelta(hours=1),
+        "max_issuances": 2,
+        "max_opportunities": 4,
+    }
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(lambda _: accumulate_window(resolve_hour=resolve, **kwargs), range(2))
+        )
+    ids = [{row["verification_id"] for row in result["results"]} for result in results]
+    assert ids[0] == ids[1] and len(ids[0]) == 2  # Baseline/final stay independent.
+    assert all(result["summary"] == {"matched": 2} for result in results)
+    assert all(result["acquisition"]["provider_calls"] == 0 for result in results)
+    after = complete_storage_inventory(env.dsn, env.objects)
+    assert len(after["objects"]) == len(before["objects"]) + 2
+    assert_forecasts_unchanged(before, after, env.objects)
+    forbidden = Mock(side_effect=AssertionError("Complete opportunities must bypass resolution"))
+    repeated = accumulate_window(resolve_hour=forbidden, **kwargs)
+    assert repeated["summary"] == {"already_existing": 2}
+    forbidden.assert_not_called()
+    assert complete_storage_inventory(env.dsn, env.objects) == after
+    # Another coordinate extracts from the SAME registered raw hour; no new raw artifacts.
+    other = resolver.resolve_hour(latitude=LAT + 0.001, longitude=LON, product_time=VALID)
+    assert other["acquisition"]["raw_reused"] is True
+    assert other["acquisition"]["provider_calls"] == 0
+    assert other["extraction_artifact_id"] != str(env.extraction_id)
+    latest = complete_storage_inventory(env.dsn, env.objects)
+    assert len(latest["objects"]) == len(after["objects"]) + 1
+    assert_forecasts_unchanged(before, latest, env.objects)
+    transport.assert_not_called()
+    transport.get.assert_not_called()

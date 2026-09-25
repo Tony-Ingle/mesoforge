@@ -34,7 +34,7 @@ reblend fields, rerun baseline coherence or download guidance.
 | Issuance | Immutable PostgreSQL/S3-backed versions, exact readback and explicit reissues |
 | Presentation | Hourly reports; deterministic conditions, transitions and period summaries from saved grids |
 | Temperature verification | Automatic coordinate-driven METAR discovery/acquisition, matching, immutable facts and analysis |
-| QPF verification | Explicit MRMS preparation, exact-hour immutable facts, canonical samples and paired contributor scoring |
+| QPF verification | Bounded automatic MRMS accumulation before issuance, exact-hour facts, canonical samples and paired scoring |
 
 ### Current numerical policies
 
@@ -65,8 +65,8 @@ new enforcement rules. Conditions do not promote evidence-only fields.
 There is no continuously hosted guidance/baseline worker, scheduler or VPS deployment.
 There is no applied learned site correction, AI forecast desk, delivery/email service,
 adaptive production weighting or calibrated multi-source precipitation blend.
-Automatic QPF work discovery/accumulation is not implemented; QPF verification is
-currently an explicit retained-evidence command.
+QPF accumulation runs on demand with configured issuance or explicit bounded
+backfill; it is not a continuous MRMS poller or archive mirror.
 
 This is a configured-location system, not an arbitrary-coordinate public API.
 A newly configured coordinate or uncovered reference hour needs a background rebuild.
@@ -241,6 +241,18 @@ A coordinate/reference hour already issued is skipped. `--reissue` explicitly sa
 another immutable version; it never overwrites the previous one. Baseline identity,
 contributor-state lineage, source cycles and actual cutoffs travel with the forecast.
 
+Before taking the issuance lock, the pinned-baseline command independently attempts
+previous temperature and QPF verification for each location. Provider/verification
+failures are reported under `previous_verification`; they do not block issuance or
+later locations. Forecast extraction still performs no model acquisition/reblending.
+The QPF default is a 72-hour lookback, at most 100 issuance reads and 36 unresolved
+stage/hour attempts per location. Tune `--qpf-lookback-hours` (1–744) and
+`--qpf-max-opportunities`; omitted work is reported. `--skip-verification` is an
+explicit issuance-only replay option. Without `--issue`, no verification runs.
+Recent decisions and valid hours take priority, so absent older MRMS files cannot
+exhaust every forward run. For omitted historical work, narrow the explicit
+backfill window or raise its bounds. Fully answered versions require no payload read.
+
 `--output-dir` must be outside the repository. It retains full `result.json` and
 readable `hourly-report.md`; stdout intentionally omits huge forecast payloads.
 Use UTC timestamps with offsets. Display time zones do not change forecast science.
@@ -339,10 +351,34 @@ retained small demonstrations do not establish production weight superiority.
 normalized as numeric zero even though it means trace. Historical records are not
 rewritten. That path is not the approved hourly-QPF verification reference.
 
-## Explicit MRMS hourly-QPF verification
+## MRMS hourly-QPF accumulation and analysis
 
-QPF measurement currently runs separately from automatic temperature verification.
-It does not change forecasts, weights, PoP or precipitation type.
+Normal baseline issuance attempts QPF accumulation beside the unchanged temperature
+coordinator. The explicit retained-evidence commands remain available. None changes
+forecasts, weights, PoP or precipitation type.
+
+An incomplete hour is deferred. After its end, the documented approximate one-hour
+MRMS Pass-2 latency determines earliest lookup, not guaranteed availability. HTTP
+absence/provider failure stays retryable without an `observation_missing` fact.
+Acquired native missing/no-coverage values remain explicit immutable evidence.
+No availability timestamp is inferred from nominal latency.
+
+For bounded historical work on saved issuances, specify every bound:
+
+```text
+uv run --locked python -m mesoforge.application.automatic_qpf_verification --config LOCATIONS_JSON --start-valid-time 2026-09-14T12:00:00Z --end-valid-time 2026-09-14T17:00:00Z --max-issuances 10 --max-opportunities 10 --archive
+```
+
+Bounds/caps are per location; times select hourly ends in `[start,end)`, and work
+counts each unresolved issued-version/stage/hour. Baseline/final-issued stages stay
+separate. The command includes read-only analysis. Narrow the window or raise an
+explicit cap for reported omissions. Normal accumulation uses operational MRMS;
+`--archive` explicitly selects historical retrieval. Set `MESOFORGE_MRMS_DIR` to an
+external raw-cache root, or use the platform-local MesoForge observations directory.
+A PostgreSQL hour lock shares retained sources across stages, versions and locations;
+coordinate extractions and completed facts are reused. Conflicting retained MRMS
+revisions require explicit review, not silent selection. Failed partial acquisition
+keeps completed source packets for retry.
 
 The approved reference is NOAA MRMS `MultiSensor_QPE_01H_Pass2`, contract
 `mrms.multisensor-qpe-01h-pass2.v1`. NOAA product documentation defines indicated
@@ -392,6 +428,13 @@ location/date concentration and compatible contributors on identical samples.
 Current RAP/IFS hourly QPF is unavailable for this comparison. `--payload-only`
 reads verified fact payloads instead of compact analytical attributes for an
 independent audit. Acquisition, verification and read-only analysis are separate.
+
+Per-stage `readiness` is a factual inventory: positive/zero samples, observed amount
+distribution, locations/dates, exact/provisional leads, contributor coverage and
+MRMS quality distributions. Positive means >0 mm; no additional measurable/heavy-rain
+threshold or automatic readiness gate is approved. Date/time concentration is
+reported without claiming hourly samples are independent storms or ranking models
+on different sample populations.
 
 ## Repository map and development checks
 
@@ -458,15 +501,22 @@ contracts, not forecast skill or production readiness.
 
 ### Verification status of this guide
 
-Command arguments were checked against current parsers; safe `--help` invocations
-were exercised for the main commands during documentation consolidation. Setup,
-provider acquisition, services, forecast issuance and scientific/integration suites
-were **not rerun for this documentation-only change**. Examples are usage instructions,
-not a claim that their chosen paths, archive hours or local services exist.
+Command arguments were checked against current parsers during documentation
+consolidation. Automatic QPF accumulation was subsequently checked with 118 focused
+tests, 71 PostgreSQL/MinIO integration tests, and a retained-data lifecycle replay:
+two locations issued, one invalid coordinate isolated, repeat facts/issuances reused,
+and no provider calls. Ruff, formatting, mypy, import contracts, lock consistency,
+documentation/links and repository hygiene were checked. Temporary services were
+stopped. Examples remain usage instructions, not a claim that their chosen paths,
+archive hours or local services exist; fresh provider acquisition was not exercised.
 
 Known broader-suite failures carried forward from the previous code checkpoint are
 one batch mock-signature failure and two identifier/code-revision inventory failures.
-They are not waived or fixed by documentation changes. Check current test results
+All three reproduced at the starting revision. The broader run had 3,504 passes and
+those three failures plus a Windows MRMS-cache rename failure. The latter prompted a
+bounded publication retry with passing transient/persistent-failure regression tests;
+the whole broader suite was not repeated after that fix.
+The three pre-existing failures remain unwaived and unchanged. Check current test results
 when changing code; a saved commit does not certify the whole application.
 
 ## Data attribution

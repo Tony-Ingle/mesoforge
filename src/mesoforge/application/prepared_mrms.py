@@ -9,6 +9,9 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
+import time
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from importlib.metadata import version
 from pathlib import Path
@@ -147,7 +150,10 @@ def load_bundle(raw_dir: Path) -> tuple[dict[str, Any], dict[str, bytes]]:
             or record["filename"] != source_url(product, instant).rsplit("/", 1)[1]
         ):
             raise ValueError("Retained MRMS source locator differs from its fixed-hour identity")
-        data = (raw_dir / record["filename"]).read_bytes()
+        retained_path = record.get("retained_path", record["filename"])
+        if retained_path not in (record["filename"], f"{product}/{record['filename']}"):
+            raise ValueError("Invalid retained MRMS relative source path")
+        data = (raw_dir / retained_path).read_bytes()
         if (
             str(Digest.of_bytes(data)) != record["content_digest"]
             or len(data) != record["byte_size"]
@@ -218,12 +224,34 @@ def register_bundle(
     """Use existing immutable source/artifact activities, without creating verification facts."""
     _coordinate(latitude, longitude)
     metadata, payloads = load_bundle(raw_dir)
+    return _register_payloads(
+        metadata,
+        payloads,
+        latitude=latitude,
+        longitude=longitude,
+        artifacts=artifacts,
+        configuration_snapshot_id=configuration_snapshot_id,
+        configuration_digest=configuration_digest,
+    )
+
+
+def _register_payloads(
+    metadata: dict[str, Any],
+    payloads: dict[str, bytes],
+    *,
+    latitude: float,
+    longitude: float,
+    artifacts: ArtifactService,
+    configuration_snapshot_id: ConfigurationSnapshotId,
+    configuration_digest: Digest,
+) -> dict[str, Any]:
+    """The same transformation serves retained filesystem and object-store inputs."""
     identity = _identity()
     refs = {}
     for product in PRODUCTS:
         source = metadata["sources"][product]
         acquired = datetime.fromisoformat(source["acquired_at"])
-        original = metadata["acquisition_code_identity"]
+        original = source.get("acquisition_code_identity", metadata["acquisition_code_identity"])
         manifest = artifacts.register_source(
             SourceRegistrationRequest(
                 source_authority="noaa.ncep.mrms",
@@ -276,6 +304,11 @@ def register_bundle(
         configuration_digest=configuration_digest,
         code_revision=identity["git_commit"],
         environment_digest=Digest.of_bytes(_JSON.serialize(identity)),
+        attributes={
+            "product_time": metadata["product_time"],
+            "latitude": latitude,
+            "longitude": longitude,
+        },
     )
 
     def transform(*inputs: bytes) -> dict[str, Any]:
@@ -339,6 +372,274 @@ def replay_registered(artifact_id: ArtifactId, *, artifacts: ArtifactService) ->
         "storage_writes": 0,
         "extraction": reproduced,
     }
+
+
+class MRMSResolutionError(ValueError):
+    """Resolution failed, with actual acquisition cost retained for reporting."""
+
+    provider_calls: int = 0
+    acquired_bytes: int = 0
+
+
+class MRMSUnavailableError(MRMSResolutionError):
+    """A fixed provider object is absent now; a later attempt may find it."""
+
+
+class MRMSProviderError(MRMSResolutionError):
+    """The provider failed; this is not a native missing/no-coverage observation."""
+
+
+class MRMSContractError(MRMSResolutionError):
+    """Retained or acquired evidence cannot satisfy the approved source contract."""
+
+
+class _MeasuredTransport:
+    def __init__(self, transport: HttpTransport | None) -> None:
+        self.transport = transport
+        self.calls = 0
+        self.byte_size = 0
+
+    def get(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        timeout: tuple[float, float] | None = None,
+    ) -> Any:
+        self.calls += 1
+        try:
+            if self.transport is None:
+                self.transport = default_transport()
+            response = self.transport.get(url, headers=headers, timeout=timeout)
+        except Exception as exc:
+            raise MRMSProviderError(f"MRMS provider request failed: {url}: {exc}") from exc
+        self.byte_size += len(response.content)
+        if response.status_code == 404:
+            raise MRMSUnavailableError(f"MRMS fixed object is not available yet (HTTP 404): {url}")
+        if response.status_code != 200:
+            raise MRMSProviderError(f"MRMS provider returned HTTP {response.status_code}: {url}")
+        return response
+
+    def head(self, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("Bounded MRMS resolution does not perform discovery/HEAD requests")
+
+
+def _commit_raw_packet(staging: Path, packet: Path) -> None:
+    """Atomically retain a packet, tolerating only brief Windows sharing failures."""
+    delays = (0.0, 0.05, 0.1, 0.2, 0.4)
+    for attempt, delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
+        if packet.exists():
+            raise FileExistsError(f"Refusing to replace retained MRMS packet: {packet}")
+        try:
+            staging.rename(packet)
+            return
+        except OSError as exc:
+            # Antivirus/indexer handles can briefly deny an otherwise valid rename.
+            # Never retry other errors or alter/remove either directory to force it.
+            if getattr(exc, "winerror", None) not in (5, 32, 33) or attempt == len(delays) - 1:
+                raise
+
+
+class MRMSHourResolver:
+    """Reuse one immutable source hour across coordinates, jobs and bounded retries.
+
+    PostgreSQL's existing cross-process advisory lock coordinates the hour. Raw
+    product packets are committed by directory rename, so an interrupted/failed
+    later product never discards a completed earlier source. PostgreSQL/MinIO
+    remain authoritative for registered extraction/raw identities; local packets
+    are a resumable acquisition cache outside the repository.
+    """
+
+    def __init__(
+        self,
+        raw_root: Path,
+        *,
+        artifacts: ArtifactService,
+        unit_of_work_factory: Callable[[], Any],
+        configuration_snapshot_id: ConfigurationSnapshotId,
+        configuration_digest: Digest,
+        idempotency_lock: Any,
+        transport: HttpTransport | None = None,
+        clock: Clock | None = None,
+        archive: bool = False,
+    ) -> None:
+        if raw_root.resolve().is_relative_to(_ROOT):
+            raise ValueError("Raw MRMS sources must be retained outside the repository")
+        self.raw_root = raw_root
+        self.artifacts = artifacts
+        self.factory = unit_of_work_factory
+        self.configuration_snapshot_id = configuration_snapshot_id
+        self.configuration_digest = configuration_digest
+        self.lock = idempotency_lock
+        self.transport = transport
+        self.clock = clock or SystemClock()
+        self.archive = archive
+
+    def _retained(self, product_time: datetime) -> list[dict[str, Any]]:
+        with self.factory() as uow:
+            candidates = uow.artifacts.find_mrms_extractions(product_time=product_time, limit=1000)
+        if len(candidates) == 1000:
+            raise MRMSContractError("Retained MRMS lookup limit reached; resolve explicitly")
+        matching = []
+        identities = set()
+        for manifest in candidates:
+            _, payload = self.artifacts.load_verified_payload(manifest.artifact_id)
+            value = _JSON.deserialize(payload)
+            if (
+                manifest.artifact_schema_version != _EXTRACTION_SCHEMA
+                or value.get("schema_version") != _EXTRACTION_SCHEMA
+            ):
+                raise MRMSContractError("Unsupported retained MRMS extraction schema")
+            if datetime.fromisoformat(value["source_bundle"]["product_time"]) != product_time:
+                continue
+            identities.add(tuple(value["raw_sources"][p]["content_digest"] for p in PRODUCTS))
+            matching.append(
+                {
+                    "extraction_artifact_id": str(manifest.artifact_id),
+                    "content_digest": str(manifest.content_digest),
+                    "byte_size": len(payload),
+                    "extraction": value,
+                }
+            )
+        if len(identities) > 1:
+            raise MRMSContractError("Conflicting retained MRMS source revisions; select explicitly")
+        return matching
+
+    def _acquire(self, product_time: datetime, transport: _MeasuredTransport) -> Path:
+        directory = self.raw_root / product_time.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+        directory.mkdir(parents=True, exist_ok=True)
+        if (directory / "manifest.json").exists():
+            existing = json.loads((directory / "manifest.json").read_bytes())
+            if datetime.fromisoformat(existing["product_time"]) != product_time:
+                raise MRMSContractError("Retained MRMS cache belongs to another source hour")
+            return directory
+        sources = {}
+        for product in PRODUCTS:
+            packet = directory / product
+            if not packet.exists():
+                # Incomplete staging directories retain any received evidence, but
+                # are never mistaken for a complete source packet on retry.
+                staging = Path(tempfile.mkdtemp(prefix=f".{product}-", dir=directory))
+                raw, acquired = fetch_product(
+                    product,
+                    product_time,
+                    transport=cast(HttpTransport, transport),
+                    clock=self.clock,
+                    archive=self.archive,
+                )
+                (staging / acquired["filename"]).write_bytes(raw)
+                record = {
+                    **acquired,
+                    "content_digest": str(Digest.of_bytes(raw)),
+                    "byte_size": len(raw),
+                    "retained_path": f"{product}/{acquired['filename']}",
+                    "acquisition_code_identity": _identity(),
+                }
+                # Acquisition identity survives a malformed GRIB for inspection.
+                (staging / "source.json").write_bytes(_JSON.serialize(record))
+                parsed = inspect_mrms(raw, product=product)
+                if datetime.fromisoformat(parsed["product_time"]) != product_time:
+                    raise MRMSContractError("MRMS indicated time differs from requested hour")
+                record["parsed_metadata"] = parsed
+                (staging / "source.json").write_bytes(_JSON.serialize(record))
+                _commit_raw_packet(staging, packet)
+            sources[product] = json.loads((packet / "source.json").read_bytes())
+        metadata = {
+            "schema_version": _BUNDLE_SCHEMA,
+            "product_time": product_time.astimezone(UTC).isoformat(),
+            "acquisition_code_identity": _identity(),
+            "sources": sources,
+        }
+        temporary = directory / "manifest.pending.json"
+        temporary.write_bytes(_JSON.serialize(metadata))
+        temporary.replace(directory / "manifest.json")
+        return directory
+
+    def resolve_hour(
+        self,
+        *,
+        latitude: float,
+        longitude: float,
+        product_time: datetime,
+        cutoff: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Resolve exactly one hour; cutoff limits requested time, not receipt identity."""
+        _coordinate(latitude, longitude)
+        source_url(PRODUCTS[0], product_time, archive=self.archive)
+        now = cutoff or self.clock.now()
+        if now.tzinfo is None or product_time > now:
+            raise ValueError("MRMS resolution needs an aware cutoff at or after product time")
+        product_time = product_time.astimezone(UTC)
+        key = Digest.of_bytes(f"mrms.retained-hour.v1:{product_time.isoformat()}".encode())
+        # Recheck after waiting: a competing process may have completed this hour.
+        with self.lock.acquire(key):
+            measured = None
+            try:
+                retained = self._retained(product_time)
+                for result in retained:
+                    coordinate = result["extraction"]["qpe"]["extraction"]["forecast_coordinate"]
+                    if coordinate == {"latitude": latitude, "longitude": longitude}:
+                        return {
+                            **result,
+                            "acquisition": {
+                                "provider_calls": 0,
+                                "acquired_bytes": 0,
+                                "raw_reused": True,
+                                "extraction_reused": True,
+                                "extraction_bytes": result["byte_size"],
+                            },
+                        }
+                if retained:
+                    previous = retained[0]["extraction"]
+                    payloads = {}
+                    for product, reference in previous["raw_sources"].items():
+                        manifest, raw = self.artifacts.load_verified_payload(
+                            ArtifactId(reference["artifact_id"])
+                        )
+                        if str(manifest.content_digest) != reference["content_digest"]:
+                            raise MRMSContractError("Retained MRMS raw reference checksum differs")
+                        payloads[product] = raw
+                    result = _register_payloads(
+                        previous["source_bundle"],
+                        payloads,
+                        latitude=latitude,
+                        longitude=longitude,
+                        artifacts=self.artifacts,
+                        configuration_snapshot_id=self.configuration_snapshot_id,
+                        configuration_digest=self.configuration_digest,
+                    )
+                else:
+                    measured = _MeasuredTransport(self.transport)
+                    directory = self._acquire(product_time, measured)
+                    result = register_bundle(
+                        directory,
+                        latitude=latitude,
+                        longitude=longitude,
+                        artifacts=self.artifacts,
+                        configuration_snapshot_id=self.configuration_snapshot_id,
+                        configuration_digest=self.configuration_digest,
+                    )
+                return {
+                    **result,
+                    "acquisition": {
+                        "provider_calls": measured.calls if measured else 0,
+                        "acquired_bytes": measured.byte_size if measured else 0,
+                        "raw_reused": measured is None or measured.calls == 0,
+                        "extraction_reused": False,
+                        "extraction_bytes": result["byte_size"],
+                    },
+                }
+            except (MRMSUnavailableError, MRMSProviderError) as exc:
+                exc.provider_calls = measured.calls if measured else 0
+                exc.acquired_bytes = measured.byte_size if measured else 0
+                raise
+            except Exception as exc:
+                failure = MRMSContractError(f"MRMS source/extraction contract failed: {exc}")
+                failure.provider_calls = measured.calls if measured else 0
+                failure.acquired_bytes = measured.byte_size if measured else 0
+                raise failure from exc
 
 
 def main(argv: list[str] | None = None) -> int:

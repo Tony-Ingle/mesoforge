@@ -96,9 +96,11 @@ forecast_from_baseline
 These steps have independent success/failure boundaries. Publishing new evidence
 does not invalidate the previous numerical baseline if building its replacement fails.
 
-Temperature observation acquisition/verification is separately callable through
-`automatic_verification`. QPF verification uses explicit retained MRMS extraction
-arguments. Normal baseline issuance does not yet orchestrate both automatically.
+Temperature observation acquisition/verification remains separately callable through
+`automatic_verification`. Normal baseline issuance also attempts prior temperature
+and bounded QPF verification independently before its issuance lock. QPF accumulation
+resolves retained/fixed-hour MRMS evidence; explicit extraction-based commands remain.
+Neither observation failure gates a new numerical issuance.
 
 The older `forward_run` verifies temperature, discovers/prepares guidance and blends
 inline. Its module identifies it as a development/compatibility path. It is not the
@@ -513,8 +515,10 @@ analysis cutoff. Later publication of another baseline cannot change the pinned
 object. Each requested coordinate reads its saved domain and center forecast.
 
 There is no native-array load, FieldBlendEngine call, baseline coherence execution
-or provider request during normal extraction. Missing coverage requires a new
-background build, never a hidden on-request blend.
+or model-provider request during normal extraction. Missing coverage requires a new
+background build, never a hidden on-request blend. With issuance enabled, independent
+prior-verification attempts may access observation providers while the same baseline
+stays pinned. Reports keep these outcomes separate from the issued forecast payload.
 
 | Time | Meaning |
 |---|---|
@@ -530,6 +534,11 @@ duplicate lookup and publication. A concurrent follower waits, rechecks coordina
 plus reference hour, then skips an existing version unless `--reissue` was explicit.
 The immutable storage service can save multiple versions; the orchestration guard
 defines normal primary behavior rather than treating every repeated issue as equal.
+
+Prior verification runs outside that issuance lock and is isolated by field/location.
+The existing temperature coordinator is unchanged. QPF uses a default 72-hour
+lookback and bounded issuance/opportunity work; the operator can select explicit
+historical bounds separately. `--skip-verification` preserves issuance-only replay.
 
 Per-location coordinate, metadata lookup, extraction and issuance failures are
 explicit results; later configured locations continue. A lookup failure is not
@@ -650,9 +659,35 @@ offline and reproduces the extraction. Full MRMS grids are not copied into facts
 
 ### QPF facts, canonical samples and scoring
 
-`IssuedQpfVerificationService` is an **explicit command**, not automatic forward QPF
-accumulation. The caller supplies bounded retained MRMS extraction IDs; the verifier
-does not discover/download a history on its own.
+`IssuedQpfVerificationService` remains the exact-event fact/scoring boundary; it
+does not acquire observations. `automatic_qpf_verification` composes that service
+with retained MRMS resolution, both before configured issuance and in explicit
+bounded operator backfill. It never constructs a forecast or changes eligibility.
+
+The coordinator distinguishes future intervals, completed intervals inside the
+documented approximate one-hour Pass-2 latency, eligible lookup, retryable absence,
+native missing/no coverage, malformed/unusable evidence and existing exclusions.
+Nominal latency controls lookup pacing, not proof of availability. HTTP 404/provider
+failure creates no permanent missing-observation fact. Actual acquisition and
+extraction registration precede the actual verification cutoff used for new facts.
+
+`MRMSHourResolver` takes the existing PostgreSQL advisory lock keyed by product hour,
+rechecks registered evidence, reuses raw objects across coordinates and reuses exact
+coordinate extractions. Completed per-product raw cache packets survive a later
+product failure; the raw cache remains outside Git. Conflicting retained revisions
+are reported for explicit resolution. Existing fact transformation idempotency locks
+prevent concurrent duplicate facts. Retained native missing/no-coverage evidence is
+reused without pretending it was a provider failure.
+
+The normal QPF budget is 100 issuance reads and 36 unresolved stage/hour attempts per
+location within 72 hours. Operator backfill requires coordinates/config, start/end
+valid-hour bounds and explicit caps. Omitted work is reported; no unbounded MRMS
+archive mirror or scheduled poller exists. Temperature and QPF failures remain
+separate, and later configured coordinates still reach issuance.
+Work prioritizes newest decisions, then latest valid hours; unavailable older
+history cannot monopolize each forward cycle. Fully answered immutable versions
+reuse analytical attributes without consuming the issuance-read budget. Operators
+must narrow explicit historical windows or increase bounds for omitted work.
 
 | Boundary | Current contract |
 |---|---|
@@ -688,6 +723,11 @@ filled from another product. Missing/unmatched guidance earns no skill credit.
 Exact lead, provisional 1–6/7–18/19–36 groups, coordinate, reference/issuance/valid date,
 shared-event concentration and quality summaries accompany metrics. These are not
 claims of independent storm count or final QPF regimes.
+
+Readiness adds empirical amount/quality distributions, contributor shared-sample
+coverage and factual location/date/lead gaps for each stage. Numeric positive/zero
+counts do not invent a separate measurable or heavy-rain threshold. Time concentration
+is exposed without a storm classifier or automatic permission to change weights.
 
 Read-only analysis uses compact fact attributes plus issuance metadata. The optional
 payload-only path reads verified fact bytes instead for independent auditing. Neither
@@ -785,7 +825,7 @@ surface; saved issuance/conditions/analysis reads do not create forecast history
 See README for its supported commands and endpoint scope.
 
 There is no operational GHA schedule, VPS worker, continuous observation poller,
-automatic QPF accumulation, email or delivery service. Existing CI validates code;
+continuous MRMS ingestion, email or delivery service. Existing CI validates code;
 it is not the forecast scheduler. Hermes development orchestration remains paused.
 
 ## O. Current versus future
@@ -805,8 +845,8 @@ it is not the forecast scheduler. Hermes development orchestration remains pause
 | Visibility/winter/probability shadows | Partially implemented | Native/derived evidence present; several active policies absent |
 | Conditions, transitions and periods | Implemented | Deterministic saved-field presentation, conservative evidence gates |
 | Temperature automatic matching/verification | Implemented | Bounded station/METAR path; no public registration required |
-| MRMS hourly contract and QPF facts/analysis | Implemented | Explicit exact-event command with retained extraction inputs |
-| Automatic QPF observation accumulation | Future | Not connected to forward verification yet |
+| MRMS hourly contract and QPF facts/analysis | Implemented | Exact-event service, canonical stages and identical-sample comparison |
+| Automatic QPF observation accumulation | Implemented | Bounded on-demand attempts before issuance; explicit bounded backfill |
 | Site/regime correction | Future | Evidence analysis exists, no applied correction |
 | Bounded AI editing and final validation | Future | No LLM execution or edit controller |
 | Scheduled hosted operation and delivery | Future | Scheduler chooses when; MesoForge keeps all meteorology |
@@ -825,8 +865,8 @@ it is not the forecast scheduler. Hermes development orchestration remains pause
   requires compatible verification evidence, not convenient adapter availability.
 - Several evidence-only fields lack delivered/verification policies; thunder event
   support and precipitation-family coherence remain explicit scientific limitations.
-- Verification coverage is uneven: temperature is automated; QPF acquisition/facts
-  are explicit; other current canvas fields do not inherit verification merely
+- Verification coverage is uneven: temperature and QPF can accumulate on demand;
+  other current canvas fields do not inherit verification merely
   because retained Phase 2 metrics exist.
 - The test and CLI surface reflects successive migrations. Keep behavioral guarantees
   while avoiding new parallel execution paths and unrelated cleanup.

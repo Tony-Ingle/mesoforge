@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Protocol
 
 import sqlalchemy as sa
@@ -444,6 +444,33 @@ class PostgresArtifactRepository:
                 ),
             )
             .order_by(ArtifactRow.registered_at, ArtifactRow.id)
+        )
+        return tuple(_artifact_row_to_manifest(row) for row in rows)
+
+    def find_mrms_extractions(
+        self, *, product_time: datetime, limit: int = 1000
+    ) -> tuple[ArtifactManifest, ...]:
+        """Find one retained source hour across coordinates, including legacy extractions.
+
+        Older extraction manifests have no query attributes. Their immutable
+        payloads are checked by the caller; the bounded query does not rewrite them.
+        """
+        if product_time.tzinfo is None or not 1 <= limit <= 1000:
+            raise ValueError("MRMS lookup requires an aware product time and bounded limit")
+        rows = self._session.scalars(
+            sa.select(ArtifactRow)
+            .where(
+                ArtifactRow.artifact_type == "mrms-coordinate-extraction",
+                sa.or_(
+                    ArtifactRow.attributes.contains(
+                        {"product_time": product_time.astimezone(UTC).isoformat()}
+                    ),
+                    ArtifactRow.attributes.is_(None),
+                    sa.not_(ArtifactRow.attributes.has_key("product_time")),
+                ),
+            )
+            .order_by(ArtifactRow.registered_at, ArtifactRow.id)
+            .limit(limit)
         )
         return tuple(_artifact_row_to_manifest(row) for row in rows)
 

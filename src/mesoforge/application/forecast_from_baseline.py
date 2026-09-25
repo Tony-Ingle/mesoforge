@@ -1,7 +1,9 @@
 """Configured-location forecasts from one pinned, already blended baseline snapshot.
 
 This path reads the saved MesoForge numerical forecast; it does not load native
-guidance, blend fields, discover providers or prepare data. An uncovered reference
+guidance, blend fields, discover model providers or prepare model data. Before
+issuance, independent prior-temperature/QPF verification may acquire observations.
+An uncovered reference
 or coordinate requires a new background baseline build, not on-request blending.
 """
 
@@ -17,10 +19,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from mesoforge.application.batch_forecast import load_locations
+from mesoforge.application.batch_forecast import _coordinates, load_locations
 from mesoforge.application.forecast_from_snapshot import _deliver_locations, _public, _write_outputs
 from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.prepared_snapshot import SnapshotError, derive_reference_time
+from mesoforge.application.spatial_coverage import validate_coordinate
 from mesoforge.application.weather_transitions import validate_display_timezone
 
 _ROOT = Path(__file__).resolve().parents[3]
@@ -37,6 +40,10 @@ def forecast_from_baseline(
     issuer: ForecastIssuanceService | None = None,
     reissue: bool = False,
     run_lock: Callable[[], AbstractContextManager[None]] | None = None,
+    verify_prior: bool = True,
+    verification_runner: Callable[[float, float], dict[str, Any]] | None = None,
+    qpf_lookback_hours: int = 72,
+    qpf_max_opportunities: int = 36,
 ) -> dict[str, Any]:
     """Pin one complete baseline once, then isolate each location's delivery."""
     from mesoforge.application.baseline_snapshot import load_baseline
@@ -62,6 +69,7 @@ def forecast_from_baseline(
         "reference_time": reference.isoformat().replace("+00:00", "Z"),
         "reference_time_source": "request_hour" if reference_time is None else "explicit",
         "network_calls": 0,
+        "network_calls_scope": "model_guidance_only; observation attempts reported separately",
         "numerical_blend_execution": "background_baseline_only",
     }
     timings: dict[str, float] = {}
@@ -118,6 +126,29 @@ def forecast_from_baseline(
         "issuance_mode": baseline_lineage["issuance_mode"],
     }
     result["baseline"] = baseline_lineage
+    verification: dict[int, dict[str, Any]] = {}
+    if issue and verify_prior:
+        from mesoforge.application.forward_verification import verify_previous_fields
+
+        for index, location in enumerate(locations):
+            try:
+                lat, lon = _coordinates(location)
+                validate_coordinate(lat, lon)
+                verification[index] = (
+                    verification_runner(lat, lon)
+                    if verification_runner is not None
+                    else verify_previous_fields(
+                        lat,
+                        lon,
+                        now=requested_at,
+                        qpf_lookback_hours=qpf_lookback_hours,
+                        qpf_max_opportunities=qpf_max_opportunities,
+                    )
+                )
+            except Exception as exc:
+                verification[index] = {"status": "error", "retryable": True, "reason": str(exc)}
+        # Observation work is outside the issuance lock and cannot gate delivery.
+        # One immutable baseline stays pinned throughout all of these attempts.
     result.update(
         _deliver_locations(
             view,
@@ -132,6 +163,9 @@ def forecast_from_baseline(
             build_timing_key="baseline_extraction_seconds",
         )
     )
+    for row in result["results"]:
+        if row["index"] in verification:
+            row["previous_verification"] = verification[row["index"]]
     timings["total_seconds"] = time.perf_counter() - started
     result["timings"] = timings
     return result
@@ -155,6 +189,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--issue", action="store_true", help="Also save immutable issuances")
     parser.add_argument("--reissue", action="store_true", help="Issue even if a version exists")
     parser.add_argument(
+        "--skip-verification",
+        action="store_true",
+        help="Explicit issuance-only replay; no prior observation work",
+    )
+    parser.add_argument(
+        "--qpf-lookback-hours",
+        type=int,
+        default=72,
+        help="Bound automatic prior QPF valid-hour lookup (default 72)",
+    )
+    parser.add_argument(
+        "--qpf-max-opportunities",
+        type=int,
+        default=36,
+        help="Per-location unresolved QPF stage/hour work cap",
+    )
+    parser.add_argument(
         "--output-dir", type=Path, help="Retain result.json and reports outside Git"
     )
     args = parser.parse_args(argv)
@@ -175,6 +226,9 @@ def main(argv: list[str] | None = None) -> int:
             display_timezone=args.display_timezone,
             issue=args.issue,
             reissue=args.reissue,
+            verify_prior=not args.skip_verification,
+            qpf_lookback_hours=args.qpf_lookback_hours,
+            qpf_max_opportunities=args.qpf_max_opportunities,
         )
     except Exception as exc:
         print(

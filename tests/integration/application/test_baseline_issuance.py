@@ -59,6 +59,7 @@ def test_two_locations_issue_one_baseline_lineage_read_exactly_and_preserve_hist
         issue=True,
         issuer=service,
         reissue=True,
+        verify_prior=False,  # This historical readback fixture is explicitly issuance-only.
     )
     assert result["summary"] == {"ok": 2, "issued": 2, "skipped": 0, "failed": 1}
     assert result["results"][1]["error"]["code"] == "coverage_required"
@@ -77,7 +78,12 @@ def test_two_locations_issue_one_baseline_lineage_read_exactly_and_preserve_hist
     before = storage_tests.storage_inventory(migrated_dsn, object_store)
     assert [len(items) for items in before] == [3, 3, 3]
     repeat = forecast_from_baseline(
-        baseline_case["baseline"], locations, reference_time=TARGET, issue=True, issuer=service
+        baseline_case["baseline"],
+        locations,
+        reference_time=TARGET,
+        issue=True,
+        issuer=service,
+        verify_prior=False,
     )
     assert repeat["summary"] == {"ok": 0, "issued": 0, "skipped": 2, "failed": 1}
     assert storage_tests.storage_inventory(migrated_dsn, object_store) == before
@@ -102,3 +108,51 @@ def test_two_locations_issue_one_baseline_lineage_read_exactly_and_preserve_hist
     assert storage_tests.storage_inventory(migrated_dsn, object_store) == before
     forbidden.assert_not_called()
     no_writes.assert_not_called()
+
+
+def test_prior_verification_failure_does_not_block_baseline_issuance_or_later_locations(
+    baseline_case,
+    migrated_dsn: str,
+    object_store: S3ArtifactObjectStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Observation availability never gates the real immutable issuance transaction."""
+    service = ForecastIssuanceService(
+        object_store,
+        lambda: PostgresUnitOfWork(migrated_dsn),
+        code_identity={"test": "verification-isolated-baseline-integration"},
+    )
+    calls = []
+
+    def verify(latitude, longitude):
+        calls.append((latitude, longitude))
+        if latitude == FIRST["lat"]:
+            raise OSError("Prior observation storage/provider unavailable")
+        return {"qpf": {"status": "retryable", "reason": "MRMS object not yet published"}}
+
+    forbidden = baseline_tests.forbid_location_calculation(monkeypatch)
+    result = forecast_from_baseline(
+        baseline_case["baseline"],
+        [FIRST, {"lat": 999, "lon": 0}, LAST],
+        reference_time=TARGET,
+        issue=True,
+        issuer=service,
+        verification_runner=verify,
+    )
+    assert result["summary"] == {"ok": 2, "issued": 2, "skipped": 0, "failed": 1}
+    assert calls == [(FIRST["lat"], FIRST["lon"]), (LAST["lat"], LAST["lon"])]
+    assert result["results"][0]["previous_verification"]["status"] == "error"
+    assert result["results"][2]["previous_verification"]["qpf"]["status"] == "retryable"
+    for row in (result["results"][0], result["results"][2]):
+        saved = service.read(UUID(row["issued"]["issued_forecast_id"]))
+        assert saved["forecast"] == row["forecast"]
+        coords = (saved["latitude"], saved["longitude"])
+        assert saved["forecast"]["hours"] == baseline_case["expected"][coords]["hours"]
+    assert [
+        len(items) for items in storage_tests.storage_inventory(migrated_dsn, object_store)
+    ] == [
+        2,
+        2,
+        2,
+    ]
+    forbidden.assert_not_called()

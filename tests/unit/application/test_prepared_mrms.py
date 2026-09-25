@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import copy
+import errno
 import json
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,10 @@ from mesoforge.application.artifacts import ArtifactService
 from mesoforge.application.configuration import ConfigurationService
 from mesoforge.application.prepared_mrms import (
     PRODUCTS,
+    MRMSContractError,
+    MRMSHourResolver,
+    MRMSProviderError,
+    MRMSUnavailableError,
     acquire_bundle,
     load_bundle,
     register_bundle,
@@ -276,3 +282,261 @@ def test_invalid_requested_time_fails_before_network_or_raw_directory(
         )
     assert transport.calls == []
     assert not directory.exists()
+
+
+def resolver(raw_root: Path, infrastructure: tuple[Any, ...], **kwargs: Any) -> MRMSHourResolver:
+    artifacts, factory, _, snapshot = infrastructure
+    return MRMSHourResolver(
+        raw_root,
+        artifacts=artifacts,
+        unit_of_work_factory=factory,
+        configuration_snapshot_id=snapshot.configuration_snapshot_id,
+        configuration_digest=snapshot.configuration_digest,
+        idempotency_lock=kwargs.pop("idempotency_lock", InMemoryIdempotencyLock()),
+        clock=kwargs.pop("clock", FixedClock(ACQUIRED)),
+        **kwargs,
+    )
+
+
+def resolve(service: MRMSHourResolver, *, longitude: float = -93.265) -> dict[str, Any]:
+    return service.resolve_hour(latitude=45.005, longitude=longitude, product_time=TIME)
+
+
+def test_hour_resolution_reuses_sources_across_coordinates_and_process_instances(
+    tmp_path: Path, infrastructure: tuple[Any, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payloads = {product: make_mrms_message(product) for product in PRODUCTS}
+    transport = Transport(payloads)
+    first = resolve(resolver(tmp_path / "cache", infrastructure, transport=transport))
+    assert first["acquisition"] == {
+        "provider_calls": 3,
+        "acquired_bytes": sum(map(len, payloads.values())),
+        "raw_reused": False,
+        "extraction_reused": False,
+        "extraction_bytes": first["byte_size"],
+    }
+
+    def no_network() -> Any:
+        raise AssertionError("Registered hour reuse must not construct a provider transport")
+
+    monkeypatch.setattr("mesoforge.application.prepared_mrms.default_transport", no_network)
+    other_process = resolver(tmp_path / "other-cache", infrastructure)
+    second = resolve(other_process, longitude=-93.255)
+    repeated = resolve(other_process)
+    assert second["extraction"]["raw_sources"] == first["extraction"]["raw_sources"]
+    assert second["extraction_artifact_id"] != first["extraction_artifact_id"]
+    assert repeated["extraction_artifact_id"] == first["extraction_artifact_id"]
+    assert repeated["extraction"] == first["extraction"]
+    assert second["acquisition"]["provider_calls"] == repeated["acquisition"]["provider_calls"] == 0
+    assert second["acquisition"]["raw_reused"] is True
+    assert repeated["acquisition"]["extraction_reused"] is True
+    assert len(infrastructure[1].artifacts) == 5  # Three raw sources, two coordinates.
+    assert not (tmp_path / "other-cache").exists()
+
+
+def test_hour_absence_is_retryable_and_completed_raw_products_survive(
+    tmp_path: Path, infrastructure: tuple[Any, ...]
+) -> None:
+    class LaterTransport(Transport):
+        absent = True
+
+        def get(self, url: str, **kwargs: Any) -> FakeHttpResponse:
+            if self.absent and PRODUCTS[1] in url:
+                self.calls.append(url)
+                return FakeHttpResponse(404, {}, b"not yet")
+            return super().get(url, **kwargs)
+
+    payloads = {product: make_mrms_message(product) for product in PRODUCTS}
+    transport = LaterTransport(payloads)
+    raw_root = tmp_path / "cache"
+    with pytest.raises(MRMSUnavailableError, match="404") as failed:
+        resolve(resolver(raw_root, infrastructure, transport=transport))
+    assert failed.value.provider_calls == 2
+    assert failed.value.acquired_bytes == len(payloads[PRODUCTS[0]]) + len(b"not yet")
+    assert len(infrastructure[1].artifacts) == 0
+    packets = list(raw_root.glob(f"*/{PRODUCTS[0]}/source.json"))
+    assert len(packets) == 1
+    original = packets[0].read_bytes()
+
+    transport.absent = False
+    success = resolve(
+        resolver(
+            raw_root,
+            infrastructure,
+            transport=transport,
+            clock=FixedClock(ACQUIRED + timedelta(hours=1)),
+        )
+    )
+    assert success["acquisition"]["provider_calls"] == 2
+    assert success["acquisition"]["acquired_bytes"] == sum(
+        len(payloads[product]) for product in PRODUCTS[1:]
+    )
+    assert packets[0].read_bytes() == original
+    sources = success["extraction"]["source_bundle"]["sources"]
+    assert sources[PRODUCTS[0]]["acquired_at"] == ACQUIRED.isoformat()
+    assert sources[PRODUCTS[1]]["acquired_at"] == (ACQUIRED + timedelta(hours=1)).isoformat()
+    assert len(infrastructure[1].artifacts) == 4
+
+
+@pytest.mark.parametrize("response_code", [429, 503])
+def test_provider_failure_is_not_native_missing(
+    tmp_path: Path, infrastructure: tuple[Any, ...], response_code: int
+) -> None:
+    class FailingTransport(Transport):
+        def get(self, url: str, **kwargs: Any) -> FakeHttpResponse:
+            self.calls.append(url)
+            return FakeHttpResponse(response_code, {}, b"provider failure")
+
+    with pytest.raises(MRMSProviderError, match=str(response_code)) as failed:
+        resolve(resolver(tmp_path, infrastructure, transport=FailingTransport({})))
+    assert failed.value.provider_calls == 1
+    assert failed.value.acquired_bytes == len(b"provider failure")
+    assert len(infrastructure[1].artifacts) == 0
+
+
+def test_malformed_source_preserves_received_bytes_and_never_registers_an_observation(
+    tmp_path: Path, infrastructure: tuple[Any, ...]
+) -> None:
+    payload = b"\x1f\x8bnot a complete gzip/GRIB"
+    with pytest.raises(MRMSContractError) as failed:
+        resolve(resolver(tmp_path, infrastructure, transport=Transport({PRODUCTS[0]: payload})))
+    assert failed.value.provider_calls == 1
+    assert failed.value.acquired_bytes == len(payload)
+    originals = list(tmp_path.glob("*/*/*.grib2.gz"))
+    assert len(originals) == 1
+    assert originals[0].read_bytes() == payload
+    assert originals[0].with_name("source.json").exists()
+    assert len(infrastructure[1].artifacts) == 0
+
+
+def test_legacy_registered_hour_is_reused_after_advisory_lock_recheck(
+    tmp_path: Path, infrastructure: tuple[Any, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory, _, _ = bundle(tmp_path)
+    winner: dict[str, Any] = {}
+
+    class WinnerLock:
+        @contextmanager
+        def acquire(self, digest: Digest) -> Any:
+            winner.update(register(directory, infrastructure))
+            key = winner["extraction_artifact_id"]
+            # Historical extraction attributes were absent; preserve read compatibility.
+            infrastructure[1].artifacts[key] = (
+                infrastructure[1].artifacts[key].model_copy(update={"attributes": None})
+            )
+            yield
+
+    def no_network() -> Any:
+        raise AssertionError("The waiting process must recheck the winner's retained hour")
+
+    monkeypatch.setattr("mesoforge.application.prepared_mrms.default_transport", no_network)
+    result = resolve(resolver(tmp_path / "cache", infrastructure, idempotency_lock=WinnerLock()))
+    assert result["extraction_artifact_id"] == winner["extraction_artifact_id"]
+    assert result["acquisition"]["provider_calls"] == 0
+    assert result["acquisition"]["extraction_reused"] is True
+
+
+def test_conflicting_registered_source_revisions_require_explicit_resolution(
+    tmp_path: Path, infrastructure: tuple[Any, ...]
+) -> None:
+    first_dir, _, _ = bundle(tmp_path / "first", amount=2.0)
+    revised_dir, _, _ = bundle(tmp_path / "revision", amount=3.0)
+    register(first_dir, infrastructure)
+    register(revised_dir, infrastructure)
+    transport = Transport({})
+    with pytest.raises(MRMSContractError, match="Conflicting retained MRMS source revisions"):
+        resolve(resolver(tmp_path / "cache", infrastructure, transport=transport))
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize("winerror", [5, 32, 33])
+def test_transient_windows_packet_commit_retries_preserve_original_acquisition(
+    tmp_path: Path, infrastructure: tuple[Any, ...], monkeypatch: pytest.MonkeyPatch, winerror: int
+) -> None:
+    original_rename = Path.rename
+    attempts = []
+    staged_records = []
+    delays = []
+
+    def temporarily_denied(path: Path, target: Path) -> Path:
+        if target.name == PRODUCTS[0]:
+            attempts.append((path, target))
+            staged_records.append((path / "source.json").read_bytes())
+            if len(attempts) <= 2:
+                failure = OSError(errno.EACCES, "temporary Windows file sharing violation")
+                failure.winerror = winerror
+                raise failure
+        return original_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", temporarily_denied)
+    monkeypatch.setattr("mesoforge.application.prepared_mrms.time.sleep", delays.append)
+    payloads = {product: make_mrms_message(product) for product in PRODUCTS}
+    transport = Transport(payloads)
+    result = resolve(resolver(tmp_path, infrastructure, transport=transport))
+    assert len(attempts) == 3
+    assert delays == [0.05, 0.1]
+    assert staged_records[0] == staged_records[1] == staged_records[2]
+    packet = attempts[-1][1]
+    source = json.loads((packet / "source.json").read_bytes())
+    assert source["acquired_at"] == ACQUIRED.isoformat()
+    assert (packet / source["filename"]).read_bytes() == payloads[PRODUCTS[0]]
+    assert source["content_digest"] == str(Digest.of_bytes(payloads[PRODUCTS[0]]))
+    assert result["acquisition"]["provider_calls"] == 3
+    assert len(infrastructure[1].artifacts) == 4
+
+
+@pytest.mark.parametrize("winerror,expected_attempts", [(5, 5), (None, 1)])
+def test_persistent_packet_commit_failure_is_bounded_and_retains_unregistered_raw(
+    tmp_path: Path,
+    infrastructure: tuple[Any, ...],
+    monkeypatch: pytest.MonkeyPatch,
+    winerror: int | None,
+    expected_attempts: int,
+) -> None:
+    attempts = []
+    delays = []
+
+    def denied(path: Path, target: Path) -> Path:
+        attempts.append((path, target))
+        failure = OSError(errno.EACCES, "persistent filesystem failure")
+        if winerror is not None:
+            failure.winerror = winerror
+        raise failure
+
+    monkeypatch.setattr(Path, "rename", denied)
+    monkeypatch.setattr("mesoforge.application.prepared_mrms.time.sleep", delays.append)
+    raw = make_mrms_message(PRODUCTS[0])
+    with pytest.raises(MRMSContractError, match="persistent filesystem failure") as failed:
+        resolve(resolver(tmp_path, infrastructure, transport=Transport({PRODUCTS[0]: raw})))
+    assert len(attempts) == expected_attempts
+    assert len(delays) == expected_attempts - 1
+    assert failed.value.provider_calls == 1
+    assert len(infrastructure[1].artifacts) == 0
+    staging, target = attempts[-1]
+    assert staging.exists() and not target.exists()
+    source = json.loads((staging / "source.json").read_bytes())
+    assert source["acquired_at"] == ACQUIRED.isoformat()
+    assert (staging / source["filename"]).read_bytes() == raw
+
+
+def test_packet_commit_never_replaces_a_newly_existing_destination(
+    tmp_path: Path, infrastructure: tuple[Any, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    targets = []
+
+    def another_destination(path: Path, target: Path) -> Path:
+        target.mkdir()
+        (target / "preserve").write_bytes(b"original")
+        targets.append(target)
+        failure = OSError(errno.EACCES, "sharing violation")
+        failure.winerror = 5
+        raise failure
+
+    monkeypatch.setattr(Path, "rename", another_destination)
+    monkeypatch.setattr("mesoforge.application.prepared_mrms.time.sleep", lambda _: None)
+    raw = make_mrms_message(PRODUCTS[0])
+    with pytest.raises(MRMSContractError, match="Refusing to replace retained MRMS packet"):
+        resolve(resolver(tmp_path, infrastructure, transport=Transport({PRODUCTS[0]: raw})))
+    assert len(targets) == 1
+    assert (targets[0] / "preserve").read_bytes() == b"original"
+    assert len(infrastructure[1].artifacts) == 0

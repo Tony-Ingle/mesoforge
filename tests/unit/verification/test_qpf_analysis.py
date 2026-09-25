@@ -25,8 +25,9 @@ def fact(
     observation: float = 1.0,
     stage: str = "baseline",
     mode: str | None = "primary",
+    reference: datetime = REFERENCE,
 ) -> dict[str, Any]:
-    end = REFERENCE + timedelta(hours=horizon)
+    end = reference + timedelta(hours=horizon)
     start = end - timedelta(hours=1)
     return {
         "schema_version": "issued-qpf-verification.v1",
@@ -39,9 +40,9 @@ def fact(
         "stage": stage,
         "issued_forecast_id": version,
         "issued_forecast_digest": f"digest-{version}",
-        "issued_at": REFERENCE.isoformat(),
+        "issued_at": reference.isoformat(),
         "issuance_mode": mode,
-        "target_reference_time": REFERENCE.isoformat(),
+        "target_reference_time": reference.isoformat(),
         "latitude": 44.98859,
         "longitude": -93.25557,
         "interval_start": start.isoformat(),
@@ -91,7 +92,7 @@ def fact(
                 "reasons": [],
                 "interval_start": start.isoformat(),
                 "interval_end": end.isoformat(),
-                "source_cycle": REFERENCE.isoformat(),
+                "source_cycle": reference.isoformat(),
                 "source_lead_hours": horizon,
             }
             for model, amount in (("HRRR", 4.0), ("GFS", 2.0))
@@ -314,3 +315,99 @@ def test_explicit_reissue_does_not_become_primary_before_identical_legacy_versio
     result = canonicalize_qpf_facts([reissue, legacy])
     assert result["canonical_samples"] == 1
     assert result["samples"][0]["canonical_issued_forecast_id"] == "issued-legacy"
+
+
+def test_readiness_describes_canonical_diversity_and_same_sample_coverage_without_skill_gate() -> (
+    None
+):
+    rows = [
+        fact(artifact="a", horizon=1, forecast=0, observation=0),
+        fact(artifact="b", horizon=7, forecast=1, observation=0.5),
+        fact(artifact="c", horizon=19, forecast=1, observation=2),
+        fact(
+            artifact="d",
+            horizon=36,
+            forecast=10,
+            observation=8,
+            reference=REFERENCE + timedelta(days=1),
+        ),
+    ]
+    rows[-1]["latitude"] = 37.6872
+    rows[-1]["contributors"].pop("GFS")
+    for index, row in enumerate(rows):
+        row["observation"]["quality_support"]["GaugeInflIndex_01H_Pass2"]["value"] = {
+            "value": index / 4,
+            "state": "positive" if index else "zero",
+            "units": "1",
+        }
+    rows[-1]["observation"]["quality_support"]["GaugeInflIndex_01H_Pass2"]["value"] = {
+        "value": None,
+        "state": "missing",
+        "units": "1",
+        "native_value": -1,
+    }
+    original = copy.deepcopy(rows)
+    report = analyze_qpf_facts([*rows, rows[0]], contributors=("HRRR", "GFS", "RAP"))
+    assert rows == original
+    stage = report["stages"]["baseline"]
+    ready = stage["readiness"]
+    assert ready["canonical_samples"] == 4  # A repeated fact is not new evidence.
+    assert ready["positive_observed_qpf_samples"] == 3
+    assert ready["zero_observed_qpf_samples"] == 1
+    assert ready["measurable_sample_count"] is None
+    assert ready["configured_locations"]["distinct"] == 2
+    assert ready["configured_locations"]["largest_share"] == 0.75
+    assert ready["decision_dates_utc"]["distinct"] == 2
+    assert ready["valid_dates_utc"]["distinct"] == 3
+    assert ready["exact_lead_hours"]["counts"] == {"1": 1, "7": 1, "19": 1, "36": 1}
+    assert ready["provisional_lead_groups"] == {"1-6": 1, "7-18": 1, "19-36": 2}
+    amounts = ready["observed_qpf_mm"]
+    assert (amounts["minimum"], amounts["maximum"], amounts["mean"]) == (0, 8, 2.625)
+    assert amounts["quantiles"] == {"25": 0, "50": 0.5, "75": 2, "90": 8}
+    assert ready["contributor_coverage"]["GFS"]["compatible_samples"] == 3
+    assert ready["contributor_coverage"]["RAP"]["compatible_samples"] == 0
+    assert ready["shared_sample_comparison"]["canonical_samples"] == 0
+    assert ready["time_concentration"]["native_analysis_events"]["distinct"] == 4
+    assert ready["time_concentration"]["independence_claim"] is False
+    assert "no heavy-rain threshold" in ready["heavy_rain_assessment"]
+    assert ready["authorizes_weight_changes"] is False
+    assert stage["by_exact_lead_hours"]["7"]["mae_mm"] == 0.5
+    assert stage["by_exact_lead_hours"]["36"]["mean_error_mm"] == 2
+    quality = stage["quality_support"]
+    assert quality["GaugeInflIndex_01H_Pass2"]["states"] == {
+        "zero": 1,
+        "positive": 2,
+        "missing": 1,
+    }
+    assert quality["GaugeInflIndex_01H_Pass2"]["mean"] == 0.25
+    assert quality["RadarAccumulationQualityIndex_01H"]["states"] == {"unavailable": 4}
+    assert quality["RadarAccumulationQualityIndex_01H"]["numeric_count"] == 0
+    # Requested HRRR/GFS comparison uses exactly the three shared observations.
+    shared = analyze_qpf_facts(rows, contributors=("HRRR", "GFS"))["stages"]["baseline"]
+    joint = shared["contributor_comparison"]["joint"]
+    assert shared["readiness"]["shared_sample_comparison"]["canonical_samples"] == 3
+    assert joint["mesoforge"]["n"] == joint["models"]["HRRR"]["n"] == 3
+    assert joint["mesoforge"]["mae_mm"] == 0.5
+    assert joint["models"]["HRRR"]["mae_mm"] == 9.5 / 3
+    assert joint["models"]["GFS"]["mae_mm"] == 3.5 / 3
+
+
+def test_readiness_empty_or_single_hour_preserves_limitations_and_stage_separation() -> None:
+    unavailable = fact(artifact="art-final", stage="final_issued")
+    unavailable.update(status="excluded", reasons=["observation_no_coverage"], qpf_error_mm=None)
+    unavailable["observation"].update(state="no_coverage", amount_mm=None)
+    result = analyze_qpf_facts([fact(observation=0), unavailable])
+    ready = result["stages"]["baseline"]["readiness"]
+    assert ready["canonical_samples"] == 1
+    assert {item["reason"] for item in ready["factual_gaps"]} == {
+        "single_location",
+        "single_decision_date_utc",
+        "single_valid_date_utc",
+        "no_positive_observed_amounts",
+        "no_samples_in_provisional_lead_group",
+    }
+    final = result["stages"]["final_issued"]["readiness"]
+    assert final["canonical_samples"] == 0
+    assert final["observed_qpf_mm"]["minimum"] is None
+    assert final["time_concentration"]["first_interval_start"] is None
+    assert final["factual_gaps"] == [{"reason": "no_canonical_samples"}]
