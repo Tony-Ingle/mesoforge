@@ -224,11 +224,17 @@ class BaselineView:
         return forecast
 
 
-def load_baseline(root: Path) -> PinnedBaseline:
-    """Pin once; only selected domains are inflated, and no native arrays are loaded."""
-    pointer = read_pointer(root)
+def load_baseline(root: Path, *, pointer: dict[str, Any] | None = None) -> PinnedBaseline:
+    """Load latest once, or retain an exact publication returned by a background build.
+
+    A supplied pointer preserves that publication's digest and timestamp even when
+    another process has since advanced latest. Only selected domains are inflated.
+    """
+    pointer = read_pointer(root) if pointer is None else dict(pointer)
     if pointer is None:
         raise SnapshotError("No latest-baseline snapshot has been published")
+    if pointer.get("schema_version") != POINTER_SCHEMA:
+        raise SnapshotError("Unsupported latest-baseline pointer")
     manifest, directory = _resolve(root, pointer)
     prepared = manifest["prepared_snapshot"]
     if _sha256_file(Path(prepared["directory"]) / "snapshot.json") != prepared["manifest_sha256"]:

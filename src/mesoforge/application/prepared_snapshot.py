@@ -748,11 +748,15 @@ def publish_latest_complete(
         return pointer
 
 
-def resolve_latest_complete(root: Path) -> tuple[dict[str, Any], dict[str, Any], Path]:
-    """Read the pointer, then the manifest it names, verifying the manifest digest."""
-    pointer = read_pointer(root)
+def resolve_latest_complete(
+    root: Path, *, pointer: dict[str, Any] | None = None
+) -> tuple[dict[str, Any], dict[str, Any], Path]:
+    """Resolve latest or an exact retained publication, checking its manifest digest."""
+    pointer = read_pointer(root) if pointer is None else dict(pointer)
     if pointer is None:
         raise SnapshotError("No latest-complete prepared snapshot has been published")
+    if pointer.get("schema_version") != POINTER_SCHEMA:
+        raise SnapshotError("Unsupported latest-complete pointer schema")
     directory = (root / pointer["snapshot_directory"]).resolve()
     if not directory.is_relative_to(root.resolve()):
         raise SnapshotError("Pointer escapes the guidance root")

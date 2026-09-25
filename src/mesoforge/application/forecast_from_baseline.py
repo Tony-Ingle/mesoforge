@@ -33,6 +33,7 @@ def forecast_from_baseline(
     root: Path,
     locations: list[Any],
     *,
+    baseline_pointer: dict[str, Any] | None = None,
     reference_time: datetime | None = None,
     request_time: datetime | None = None,
     display_timezone: str = "UTC",
@@ -74,7 +75,11 @@ def forecast_from_baseline(
     }
     timings: dict[str, float] = {}
     try:
-        pinned = load_baseline(root)
+        pinned = (
+            load_baseline(root)
+            if baseline_pointer is None
+            else load_baseline(root, pointer=baseline_pointer)
+        )
         pointer, manifest = pinned.pointer, pinned.manifest
         for label, value in (
             ("baseline analysis cutoff", manifest["analysis_cutoff"]),

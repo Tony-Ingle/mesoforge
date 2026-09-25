@@ -102,15 +102,15 @@ def _json_float(value: str) -> float | str:
 
 def _coordinates(location: object) -> tuple[float, float]:
     message = (
-        "Each location requires finite numeric lat and lon, with an optional string name "
+        "Each location requires finite numeric lat and lon, with optional string id/name "
         "and an optional string display_timezone."
     )
     if (
         not isinstance(location, dict)
-        or not {"lat", "lon"} <= set(location) <= {"lat", "lon", "name", "display_timezone"}
+        or not {"lat", "lon"} <= set(location) <= {"lat", "lon", "id", "name", "display_timezone"}
         or any(
             key in location and not isinstance(location[key], str)
-            for key in ("name", "display_timezone")
+            for key in ("id", "name", "display_timezone")
         )
     ):
         raise ValueError(message)

@@ -39,7 +39,11 @@ from mesoforge.application.prepared_temperature import BoundedHttpTransport
 from mesoforge.application.prepared_thunder import prepare_thunder_run
 from mesoforge.application.prepared_visibility import prepare_visibility_run
 from mesoforge.application.selected_forecast import prepare_selected
-from mesoforge.application.spatial_coverage import validate_coordinate
+from mesoforge.application.spatial_coverage import (
+    CoverageRequiredError,
+    UnsupportedCoordinateError,
+    validate_coordinate,
+)
 from mesoforge.catalog.configuration import load_configuration_source
 from mesoforge.guidance.coverage import MAXIMUM_PREPARED_HOURS
 from mesoforge.guidance.runtime import SystemClock, SystemSleeper
@@ -289,10 +293,24 @@ def _validate(preparation: dict[str, Any], locations: list[Any]) -> dict[str, An
         if held[model] != list(selection["models"][model]["valid_times"]):
             raise SnapshotError(f"{model}: prepared valid times differ from the selection window")
     columns = []
-    for location in locations:
+    failures = []
+    for index, location in enumerate(locations):
         latitude, longitude = _coordinates(location)
         clock = time.perf_counter()
-        column = view.point_column(latitude=latitude, longitude=longitude)
+        try:
+            column = view.point_column(latitude=latitude, longitude=longitude)
+        except (CoverageRequiredError, UnsupportedCoordinateError) as exc:
+            failures.append(
+                {
+                    "index": index,
+                    "location": location,
+                    "code": "unsupported_coordinate"
+                    if isinstance(exc, UnsupportedCoordinateError)
+                    else "coverage_required",
+                    "reason": str(exc),
+                }
+            )
+            continue
         columns.append(
             {
                 "location": location,
@@ -304,10 +322,13 @@ def _validate(preparation: dict[str, Any], locations: list[Any]) -> dict[str, An
         )
         if len(column["hours"]) != 36:
             raise SnapshotError("Validation column does not hold 36 hours")
+    if not columns:
+        raise SnapshotError("No configured location has usable prepared coverage")
     return {
         "guidance_load_seconds": loaded,
         "reference_time": selection["target_reference_time"],
         "point_columns": columns,
+        "failed_locations": failures,
     }
 
 

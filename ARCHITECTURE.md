@@ -96,6 +96,23 @@ forecast_from_baseline
 These steps have independent success/failure boundaries. Publishing new evidence
 does not invalidate the previous numerical baseline if building its replacement fails.
 
+[`prospective_cycle`](src/mesoforge/application/prospective_cycle.py) is the on-demand
+development/operator composition of these boundaries. Its default registry is
+[`configs/locations.json`](configs/locations.json). It reads an aware runtime UTC
+clock, refreshes shared guidance once, builds the baseline, then pins the exact
+returned baseline for the configured batch. The location analysis clock is sampled
+after background completion and its UTC hour is floored using the existing rule.
+An explicit replay-reference override is separate from this normal current-time path.
+
+The runner does not merge the two artifacts/publication transactions or implement
+meteorology. Temperature/QPF verification and immutable issuance use the existing
+location boundary, with field/location failures isolated. Existing decision-window
+lookup and PostgreSQL advisory locking guard primary issuance. When all configured
+locations already have an issued version for the current hour and a valid current baseline
+exists, the runner can reuse it without background preparation and retry verification
+without creating duplicate primary forecasts. A background failure remains explicit;
+the previous good prepared/baseline pointers remain independent and available.
+
 Temperature observation acquisition/verification remains separately callable through
 `automatic_verification`. Normal baseline issuance also attempts prior temperature
 and bounded QPF verification independently before its issuance lock. QPF accumulation
@@ -186,7 +203,7 @@ Durable rationale: [artifact identity](docs/decisions/0002-artifact-identity-and
 
 ## E. Configured locations and spatial representation
 
-Latitude/longitude are the only required geographic inputs. Optional display name
+Latitude/longitude are the only required geographic inputs. Optional ID, display name
 and timezone do not change geographic identity. Users do not configure station IDs,
 counties, model cells, bounding boxes or editable polygons.
 
@@ -799,6 +816,11 @@ not imply a correction or AI inference was computed.
 Current operation is local/development and on demand. The normal commands have
 separate guidance and baseline roots plus configured PostgreSQL/object-store access
 for issuance/verification. Keep retained bytes and generated reports outside Git.
+The prospective operator command composes both roles in one invocation; it does
+not replace the separate Guidance/Baseline Worker and Forecast/Issuance Worker
+responsibilities. A future scheduler can invoke it at 08:00 and 20:00
+`America/Chicago`, using the named zone for DST. The runner obtains the date itself;
+the schedule does not supply dates, model cycles or meteorological decisions.
 
 ```mermaid
 flowchart LR
@@ -841,6 +863,7 @@ it is not the forecast scheduler. Hermes development orchestration remains pause
 | Background baseline / `latest_baseline` | Implemented | On-demand exact configured domains/reference views |
 | Continuous/incremental baseline processing | Future | No hosted worker or model-arrival trigger |
 | Baseline-consuming configured issuance | Implemented | Pin, extract, isolate failures and persist immutably |
+| Prospective operator cycle | Implemented | Current-clock composition of independent background and configured issuance boundaries; no scheduler |
 | NBM PoP/cloud/thunder and p-type agreement | Temporary scaffolding | Not the final multi-source scientific forecast |
 | Visibility/winter/probability shadows | Partially implemented | Native/derived evidence present; several active policies absent |
 | Conditions, transitions and periods | Implemented | Deterministic saved-field presentation, conservative evidence gates |

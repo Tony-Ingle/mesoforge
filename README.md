@@ -35,6 +35,7 @@ reblend fields, rerun baseline coherence or download guidance.
 | Presentation | Hourly reports; deterministic conditions, transitions and period summaries from saved grids |
 | Temperature verification | Automatic coordinate-driven METAR discovery/acquisition, matching, immutable facts and analysis |
 | QPF verification | Bounded automatic MRMS accumulation before issuance, exact-hour facts, canonical samples and paired scoring |
+| Prospective operator cycle | Current-clock discovery, background preparation/build, then one pinned baseline for configured issuance |
 
 ### Current numerical policies
 
@@ -148,18 +149,18 @@ point them only at dedicated disposable test storage, never application history.
 
 ## Configure locations
 
-Save a `locations.json` file, for example outside Git alongside run configuration:
+The initial prospective registry is [configs/locations.json](configs/locations.json):
 
-```json
-{
-  "locations": [
-    {"lat": 44.98859, "lon": -93.25557, "name": "Minneapolis"},
-    {"lat": 37.6872, "lon": -97.3301, "name": "Wichita"}
-  ]
-}
-```
+| ID | Name | Latitude | Longitude | Display timezone |
+| --- | --- | --- | --- | --- |
+| `minneapolis` | Minneapolis | 44.98861 | -93.25553 | `America/Chicago` |
+| `surley` | Surley | 44.97304 | -93.20901 | `America/Chicago` |
+| `grasston` | Grasston | 45.80268 | -93.07952 | `America/Chicago` |
 
-Latitude/longitude are the only required geographic inputs. Names and
+An alternate file uses the same `{"locations": [{"lat": ..., "lon": ...}]}`
+structure; pass its path with `--config`.
+
+Latitude/longitude are the only required geographic inputs. IDs, names and
 `display_timezone` are optional presentation metadata. Do not supply stations,
 counties, bounding boxes or model grid coordinates. Spatial preparation inspects
 the collection, shares suitable regions and separates distant regions internally.
@@ -168,9 +169,54 @@ The current baseline stores exact configured domains and covered reference-hour
 views. Its 7×7/6 km geometry is an implementation default, not a permanent product
 constraint. New domains are prepared in the background, never during HTTP GET.
 
+## Run one prospective cycle now
+
+With the existing PostgreSQL/object-storage settings configured, run from the
+repository root:
+
+```text
+uv run --locked python -m mesoforge.application.prospective_cycle
+```
+
+This defaults to `configs/locations.json`. No date, source cycle, reference hour,
+station or region argument is needed. The command reads the timezone-aware computer
+UTC clock, refreshes shared contributor guidance, builds the numerical baseline,
+then samples the clock again for location analysis. The reference time is that
+current UTC hour, rounded down; background processing does not silently leave a
+finished forecast anchored to an old manually supplied date.
+
+The batch pins one exact published baseline for all configured locations. It
+attempts prior temperature and QPF verification, then extracts and issues each
+forecast through the existing baseline path. Observation failures remain explicit
+and do not block issuance; a location failure does not stop later locations.
+Location jobs do not download guidance or rerun blending/coherence.
+
+The operator command composes the separate publication boundaries below. A failed
+refresh preserves `latest_complete`; a failed build preserves `latest_baseline`
+even if contributor publication advanced. It does not issue an uncovered or
+fabricated current forecast. The existing advisory-lock
+and decision-window checks prevent duplicate primary issuances. If every location
+already has an issued version for the current reference hour and the current baseline is
+valid, a repeat reuses that baseline, attempts verification and skips issuance
+without preparing guidance again.
+
+Use `--root RUNTIME_ROOT` to select retained guidance, baseline and report directories
+outside Git. The default is the user-local MesoForge prospective directory
+(`LOCALAPPDATA` on Windows; XDG data home on Linux). A compact console summary and
+run `result.json` record timestamps, pinned identities and per-location outcomes.
+Exit codes are 0 for a completed batch, 1 for isolated location failures, and 2
+for a configuration/background/batch failure.
+`--replay-reference-time ISO_UTC_HOUR` is an explicit replay/debug override, never
+needed for normal operation.
+
+The command is noninteractive and suitable for a future external scheduler invoking
+the same command at **08:00 and 20:00 `America/Chicago`**, including daylight-saving
+changes. Those times are an initial evidence-collection strategy, not forecast
+science. No schedule, GitHub Actions workflow or hosted worker is installed.
+
 ## Prepare guidance, build the baseline, issue forecasts
 
-The normal on-demand path has three separate boundaries:
+The operator command above composes these three independently callable boundaries:
 
 ```text
 refresh_guidance → prepared contributor state / latest_complete
@@ -501,21 +547,26 @@ contracts, not forecast skill or production readiness.
 
 ### Verification status of this guide
 
-Command arguments were checked against current parsers during documentation
-consolidation. Automatic QPF accumulation was subsequently checked with 118 focused
-tests, 71 PostgreSQL/MinIO integration tests, and a retained-data lifecycle replay:
-two locations issued, one invalid coordinate isolated, repeat facts/issuances reused,
-and no provider calls. Ruff, formatting, mypy, import contracts, lock consistency,
-documentation/links and repository hygiene were checked. Temporary services were
-stopped. Examples remain usage instructions, not a claim that their chosen paths,
-archive hours or local services exist; fresh provider acquisition was not exercised.
+Command arguments were checked against current parsers. The prospective operator
+milestone passed focused operator/snapshot/baseline/QPF checks and 25
+PostgreSQL/MinIO integration tests, including immutable readback, location/verification
+failure isolation and repeat-run storage identity. Ruff, formatting, mypy, import
+contracts, lock consistency, documentation/links and repository hygiene were checked.
+Examples remain usage instructions, not a claim that their chosen paths, archive
+hours or local services exist.
+
+A real computer-clock prospective run refreshed current guidance and issued all
+three configured locations against one baseline, with checksum-verified 36-hour
+readback. The same-hour repeat skipped all three issuances without provider
+acquisition or changes to PostgreSQL rows/MinIO objects. Both verification fields
+reported `nothing_to_verify` at these exact coordinates; the new forward hours had
+not matured. Temporary validation services were stopped afterward.
 
 Known broader-suite failures carried forward from the previous code checkpoint are
 one batch mock-signature failure and two identifier/code-revision inventory failures.
-All three reproduced at the starting revision. The broader run had 3,504 passes and
-those three failures plus a Windows MRMS-cache rename failure. The latter prompted a
-bounded publication retry with passing transient/persistent-failure regression tests;
-the whole broader suite was not repeated after that fix.
+All three reproduced at earlier checkpoints. The current broader offline run had
+3,529 passes and exactly those three failures. The previously corrected Windows
+MRMS-cache rename regression did not recur.
 The three pre-existing failures remain unwaived and unchanged. Check current test results
 when changing code; a saved commit does not certify the whole application.
 

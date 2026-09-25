@@ -454,6 +454,63 @@ def test_optional_visibility_failure_does_not_block_publication(tmp_path: Path) 
     assert snapshots.read_pointer(root)["snapshot_id"] == result["snapshot_id"]
 
 
+def test_refresh_retains_supported_columns_around_an_out_of_domain_location(tmp_path: Path) -> None:
+    outside = {"lat": 48.8566, "lon": 2.3522, "name": "Outside HRRR native domain"}
+    root = tmp_path / "guidance"
+    result = refresh_guidance.refresh_guidance(
+        write_config(tmp_path, [FIRST, outside, LAST]), root, steps=fixture_steps()
+    )
+    assert result["status"] == "published", result
+    _, manifest, _ = snapshots.resolve_latest_complete(root)
+    validation = manifest["validation"]
+    assert [row["location"] for row in validation["point_columns"]] == [FIRST, LAST]
+    assert all(row["hours"] == 36 for row in validation["point_columns"])
+    assert len(validation["failed_locations"]) == 1
+    failure = validation["failed_locations"][0]
+    assert failure["index"] == 1 and failure["location"] == outside
+    assert failure["code"] == "unsupported_coordinate"
+    assert "native model domain" in failure["reason"]
+
+    before = snapshots.read_pointer(root)
+    failed = refresh_guidance.refresh_guidance(
+        write_config(tmp_path, [outside]), root, steps=fixture_steps()
+    )
+    assert failed["status"] == "failed"
+    assert "No configured location has usable prepared coverage" in failed["error"]
+    assert snapshots.read_pointer(root) == before
+
+
+def test_coordinate_isolation_does_not_hide_scientific_validation_errors(
+    published, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    root, _ = published
+    _, manifest, _ = snapshots.resolve_latest_complete(root)
+    preparation = snapshots.verify_prepared_run(manifest)
+    actual = snapshots.load_preparation(preparation)
+
+    def view(reference):
+        selected = actual.reference_view(reference)
+
+        def column(*, latitude, longitude):
+            if latitude == LAST["lat"]:
+                raise ValueError("Retained contributor identity mismatch")
+            return selected.point_column(latitude=latitude, longitude=longitude)
+
+        return SimpleNamespace(point_column=column)
+
+    monkeypatch.setattr(
+        refresh_guidance,
+        "load_preparation",
+        lambda _: SimpleNamespace(
+            reference_view=view, prepared_valid_times=actual.prepared_valid_times
+        ),
+    )
+    with pytest.raises(ValueError, match="contributor identity mismatch"):
+        refresh_guidance._validate(preparation, [FIRST, LAST])
+
+
 def test_fast_path_serves_36_hours_from_the_snapshot_without_network(published) -> None:
     root, result = published
     outcome = fast.forecast_from_snapshot(

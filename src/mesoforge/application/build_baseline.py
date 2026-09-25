@@ -116,6 +116,7 @@ def build_baseline(
     baseline_root: Path,
     locations: list[Any],
     *,
+    prepared_pointer: dict[str, Any] | None = None,
     analysis_cutoff: datetime | None = None,
     reference_times: list[datetime] | None = None,
 ) -> dict[str, Any]:
@@ -132,7 +133,11 @@ def build_baseline(
     cutoff = analysis_cutoff or built
     if cutoff.tzinfo is None or cutoff.utcoffset() is None or cutoff > built:
         raise ValueError("Background analysis cutoff must be timezone-aware and not in the future")
-    pointer, prepared_manifest, prepared_directory = resolve_latest_complete(guidance_root)
+    pointer, prepared_manifest, prepared_directory = (
+        resolve_latest_complete(guidance_root)
+        if prepared_pointer is None
+        else resolve_latest_complete(guidance_root, pointer=prepared_pointer)
+    )
     preparation = verify_prepared_run(prepared_manifest)
     information = source_information(preparation)
     if prepared_manifest.get("source_information", information) != information:

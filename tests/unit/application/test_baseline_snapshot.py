@@ -159,6 +159,73 @@ def test_two_locations_share_one_pinned_baseline_and_uncovered_location_is_isola
     forbidden.assert_not_called()
 
 
+def test_background_build_uses_exact_refresh_publication_after_latest_advances(
+    baseline_case, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    guidance = tmp_path / "guidance"
+    shutil.copytree(baseline_case["guidance"], guidance)
+    selected = deepcopy(baseline_case["prepared"][0])
+    newer = deepcopy(baseline_case["prepared"][1])
+    newer["snapshot_id"] += "-concurrent"
+    directory = guidance / prepared.SNAPSHOTS_DIRECTORY / newer["snapshot_id"]
+    directory.mkdir()
+    _, digest = prepared.write_manifest(directory, newer)
+    prepared.publish_latest_complete(guidance, newer, digest, published_at=datetime.now(UTC))
+    assert prepared.read_pointer(guidance)["snapshot_id"] == newer["snapshot_id"]
+    forbidden = Mock(side_effect=AssertionError("Pinned build re-resolved latest guidance"))
+    monkeypatch.setattr(prepared, "read_pointer", forbidden)
+    built = background.build_baseline(
+        guidance,
+        tmp_path / "baseline",
+        [FIRST],
+        prepared_pointer=selected,
+        reference_times=[TARGET],
+    )
+    assert built["manifest"]["prepared_snapshot"]["snapshot_id"] == selected["snapshot_id"]
+    assert built["manifest"]["prepared_snapshot"]["published_at"] == selected["published_at"]
+    assert built["manifest"]["prepared_snapshot"]["manifest_sha256"] == selected["manifest_sha256"]
+    forbidden.assert_not_called()
+
+
+def test_exact_baseline_publication_stays_pinned_when_latest_advances_before_batch(
+    baseline_case, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "baseline"
+    shutil.copytree(baseline_case["baseline"], root)
+    selected = deepcopy(baseline_case["result"]["pointer"])
+    original = baselines.load_baseline(root, pointer=selected)
+    newer = deepcopy(original.manifest)
+    newer["baseline_snapshot_id"] += "-concurrent"
+    newer["built_at"] = datetime.now(UTC).isoformat()
+    directory = root / baselines.BASELINES_DIRECTORY / newer["baseline_snapshot_id"]
+    shutil.copytree(original.directory, directory)
+    # Clone only this test fixture's saved canvas to model a subsequent publication.
+    # All original immutable artifacts stay untouched.
+    (directory / baselines.MANIFEST_FILE).unlink()
+    _, digest = baselines.write_manifest(directory, newer)
+    published = baselines.publish_latest_baseline(
+        root, newer, digest, published_at=datetime.now(UTC)
+    )
+    assert published["baseline_snapshot_id"] != selected["baseline_snapshot_id"]
+    forbidden = forbid_location_calculation(monkeypatch)
+    monkeypatch.setattr(baselines, "read_pointer", forbidden)
+    outcome = forecast_from_baseline(
+        root, LOCATIONS, baseline_pointer=selected, reference_time=TARGET
+    )
+    assert outcome["summary"] == {"ok": 2, "issued": 0, "skipped": 0, "failed": 0}
+    for row in outcome["results"]:
+        forecast = row["forecast"]
+        assert (
+            forecast["baseline_snapshot"]["baseline_snapshot_id"]
+            == selected["baseline_snapshot_id"]
+        )
+        assert forecast["baseline_snapshot"]["published_at"] == selected["published_at"]
+        location = LOCATIONS[row["index"]]
+        expected = baseline_case["expected"][(location["lat"], location["lon"])]
+        assert canonical_json_bytes(forecast["hours"]) == canonical_json_bytes(expected["hours"])
+    forbidden.assert_not_called()
+
+
 @pytest.mark.parametrize("clock", ["built_at", "published_at"])
 def test_location_cutoff_before_baseline_build_or_publication_cannot_extract_or_issue(
     baseline_case, monkeypatch: pytest.MonkeyPatch, clock: str
