@@ -1,15 +1,26 @@
-# Phase 2 multi-model baseline contract
+# Retained Phase 2 scientific and replay contract
 
-> Scope: this remains the scientific contract for the retained Phase 2 station path.
-> Its v1 architecture and fixed stations do not govern new coordinate-driven V2 work.
-> [VISION](../../VISION.md) is the canonical product direction; the
-> [active RFC](../rfcs/mesoforge-v2-architecture.md) distinguishes implemented V2
-> behavior from proposed design. The historical contract below is preserved.
+> **Active, limited scope:** this contract governs the retained Phase 2 station
+> workflow and the scientific kernels/configuration rows reused by current V2 code.
+> It is not the whole-product architecture. Use [ARCHITECTURE](../../ARCHITECTURE.md)
+> for current implementation and [VISION](../../VISION.md) for product direction.
+> The legacy three-station population, full HRRR/NBM/GFS model set, identity correction,
+> phase flags and unpublished run states below apply only to that retained workflow.
+> V2 uses only its explicitly selected policies; the other rows do not authorize
+> new weights or sources. This path remains referenced by the Phase 2 CLI and checks.
 
-This is the authoritative fixed-scope contract for the Phase 2 implementation. The canonical architecture remains
-[`docs/architecture/v1.md`](../architecture/v1.md); when its future-state roadmap is
-broader than this document, this document governs what Phase 2 actually implements.
-The executable configuration is `configs/phase2-grasston.yaml`.
+The executable retained configuration is `configs/phase2-grasston.yaml`. Native
+grid/lineage contracts, scalar/vector equations, QPF interval rules, literal fallback
+tables and exact-artifact replay remain useful technical references. The historical
+[v1 architecture](../archive/mesoforge-v1-architecture.md) is design history, not
+current authority.
+
+**Verification boundary:** the METAR matching/metrics section describes retained
+Phase 2 behavior. It does not approve report-time tolerance for current issued-QPF
+verification. Current issued QPF uses the MRMS exact-hour analysis-reference contract
+and canonical samples described in [ARCHITECTURE](../../ARCHITECTURE.md). The known
+legacy `P0000` trace normalization defect remains documented in the
+[shared observation contract](phase-1.md#replay-and-scientific-limits).
 
 ## Fixed scope
 

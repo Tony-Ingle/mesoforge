@@ -2,11 +2,16 @@
 
 Status: Accepted
 
+> **Decision history.** This accepted ADR records the choice and context at the
+> time it was made. Current implementation and target architecture are described
+> in [ARCHITECTURE.md](../../ARCHITECTURE.md); phase-era scope statements below
+> are historical and do not limit the current product.
+
 ## Context
 
 MesoForge Phase 0 must establish a reproducible foundation for scientific
 data contracts, provenance, and storage before any guidance ingestion,
-forecasting, or AI-adjustment logic exists. The [reviewed v1 architecture](../architecture/v1.md)
+forecasting, or AI-adjustment logic exists. The [reviewed v1 architecture](../archive/mesoforge-v1-architecture.md)
 calls for domain logic that is independently testable and infrastructure
 that can be swapped without touching scientific code. A distributed
 services architecture would be premature: there is no operational load,

@@ -9,8 +9,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "validate_docs.py"
+
+
+def canonical_docs(root: Path) -> None:
+    for name in ("README.md", "VISION.md", "ARCHITECTURE.md", "AGENTS.md"):
+        (root / name).write_text(f"# {name}\n", encoding="utf-8")
 
 
 def run_validator() -> subprocess.CompletedProcess[str]:
@@ -33,6 +40,7 @@ def test_validator_passes_on_current_docs() -> None:
 
 
 def test_validator_requires_unique_adr_numbers(tmp_path: Path) -> None:
+    canonical_docs(tmp_path)
     decisions_dir = tmp_path / "docs" / "decisions"
     decisions_dir.mkdir(parents=True)
     (decisions_dir / "0001-a.md").write_text(
@@ -63,6 +71,7 @@ def test_validator_requires_unique_adr_numbers(tmp_path: Path) -> None:
 
 
 def test_validator_requires_accepted_status(tmp_path: Path) -> None:
+    canonical_docs(tmp_path)
     decisions_dir = tmp_path / "docs" / "decisions"
     decisions_dir.mkdir(parents=True)
     (decisions_dir / "0001-a.md").write_text(
@@ -88,6 +97,7 @@ def test_validator_requires_accepted_status(tmp_path: Path) -> None:
 
 
 def test_validator_requires_required_headings(tmp_path: Path) -> None:
+    canonical_docs(tmp_path)
     decisions_dir = tmp_path / "docs" / "decisions"
     decisions_dir.mkdir(parents=True)
     (decisions_dir / "0001-a.md").write_text(
@@ -112,6 +122,7 @@ def test_validator_requires_required_headings(tmp_path: Path) -> None:
 
 
 def test_validator_detects_broken_relative_links(tmp_path: Path) -> None:
+    canonical_docs(tmp_path)
     decisions_dir = tmp_path / "docs" / "decisions"
     decisions_dir.mkdir(parents=True)
     (decisions_dir / "0001-a.md").write_text(
@@ -134,3 +145,27 @@ def test_validator_detects_broken_relative_links(tmp_path: Path) -> None:
     )
     assert result.returncode != 0
     assert "link" in (result.stdout + result.stderr).lower()
+
+
+@pytest.mark.parametrize("name", ["README.md", "VISION.md", "ARCHITECTURE.md", "AGENTS.md"])
+def test_canonical_roots_are_required_and_their_links_are_checked(
+    tmp_path: Path, name: str
+) -> None:
+    canonical_docs(tmp_path)
+    path = tmp_path / name
+    path.write_text("# Canonical\n\n[Missing](missing-target.md)\n", encoding="utf-8")
+    linked = subprocess.run(
+        [sys.executable, str(SCRIPT), "--root", str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert f"{name}: broken relative link" in linked.stderr
+    path.unlink()
+    missing = subprocess.run(
+        [sys.executable, str(SCRIPT), "--root", str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert f"missing required doc: {name}" in missing.stderr

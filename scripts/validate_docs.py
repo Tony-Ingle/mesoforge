@@ -5,8 +5,8 @@ Checks:
 - every ADR under docs/decisions/ has a unique four-digit number prefix;
 - every ADR has ``Status: Accepted`` and the required section headings
   (``## Context``, ``## Decision``, ``## Consequences``);
-- required data-contract documents through Phase 2 exist;
-- relative markdown links inside README.md and docs/ resolve to real files.
+- the four canonical root documents and retained data contracts exist;
+- relative markdown links inside canonical root documents and docs/ resolve to files.
 
 Exits non-zero with a description of every problem found (not just the
 first) so failures are fixable in one pass.
@@ -20,7 +20,10 @@ import sys
 from pathlib import Path
 
 REQUIRED_ADR_HEADINGS = ("## Context", "## Decision", "## Consequences")
-REQUIRED_DOCS = (
+CANONICAL_DOCS = tuple(
+    Path(name) for name in ("README.md", "VISION.md", "ARCHITECTURE.md", "AGENTS.md")
+)
+REQUIRED_DOCS = CANONICAL_DOCS + (
     Path("docs/data-contracts/vocabulary.md"),
     Path("docs/data-contracts/phase-0.md"),
     Path("docs/data-contracts/phase-1.md"),
@@ -83,9 +86,7 @@ def validate_links(root: Path) -> list[str]:
     errors: list[str] = []
     docs_dir = root / "docs"
     markdown_paths = list(docs_dir.rglob("*.md")) if docs_dir.is_dir() else []
-    readme = root / "README.md"
-    if readme.is_file():
-        markdown_paths.append(readme)
+    markdown_paths.extend(root / path for path in CANONICAL_DOCS if (root / path).is_file())
 
     for md_path in sorted(markdown_paths):
         text = md_path.read_text(encoding="utf-8")

@@ -1,3 +1,9 @@
+> **HISTORICAL DOCUMENT — donor Phase 3 contract.** This preserves the old donor
+> design and its scientific reasoning. Its singleton, phase, proof and instruction
+> requirements do not govern current MesoForge. Use [ARCHITECTURE.md](../../ARCHITECTURE.md)
+> for current technical structure and the active [retained contracts](../data-contracts/phase-2.md)
+> only within their stated scope. The historical contents follow.
+
 # Phase 3 coordinate-keyed verification contract
 
 > **Historical reference (2026-09-09):** This is the preserved old Phase 3 contract,
@@ -5,14 +11,14 @@
 > historical phase. The old implementation is a read-only donor; it is not the
 > checked-out Phase 2 baseline. This path remains for existing links and technical
 > comparison. See [VISION.md](../../VISION.md), the
-> [proposed V2 RFC](../rfcs/mesoforge-v2-architecture.md), and the
-> [archive index](../archive/README.md). Incompatible singleton, lattice, and proof
+> [proposed V2 RFC](mesoforge-v2-architecture-rfc.md), and the
+> [archive index](README.md). Incompatible singleton, lattice, and proof
 > requirements do not silently govern new V2 work; V2 choices still need owner approval.
 
 This is the authoritative, implementation-enabling contract for Phase 3. The canonical
-architecture remains [`docs/architecture/v1.md`](../architecture/v1.md); where that
+architecture remains [`docs/architecture/v1.md`](mesoforge-v1-architecture.md); where that
 future-state document is broader, this contract governs Phase 3. The implemented
-[Phase 2 contract](phase-2.md) remains authoritative for inherited source, scientific,
+[Phase 2 contract](../data-contracts/phase-2.md) remains authoritative for inherited source, scientific,
 blend, storage, and provenance behavior unless this document explicitly replaces a key.
 
 Phase 3 establishes trustworthy identity and measurement for exactly one configured,

@@ -1,8 +1,12 @@
 # MesoForge Vocabulary
 
-This document defines terms exactly as MesoForge uses them through Phase 2. Where a
-term has a common but looser meaning elsewhere in meteorology or software
-engineering, the definition here is authoritative for this codebase.
+This is the active terminology reference for shared artifact, time, configuration
+and retained Phase 0–2 contracts. It does not define current product architecture;
+use [ARCHITECTURE](../../ARCHITECTURE.md) for that. The phase-specific run,
+station and forecast-issue terms below retain their original schema meaning.
+They do not rename the distinct current prepared contributor snapshot, numerical
+baseline snapshot, target reference time or actual issuance time. A later artifact's
+own versioned contract controls its additional semantics.
 
 ## Storage and identity
 

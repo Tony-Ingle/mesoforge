@@ -1,3 +1,9 @@
+> **HISTORICAL DOCUMENT — completed cleanup.** This records the September 2026
+> retirement decisions, consumer checks and validation evidence. It is not an active
+> checklist or authorization for further cleanup. Current direction, architecture
+> and usage are in [VISION](../../VISION.md), [ARCHITECTURE](../../ARCHITECTURE.md)
+> and [README](../../README.md). The historical contents follow.
+
 # MesoForge cleanup and selective-rebuild checklist
 
 **Status:** Standalone cleanup is finished and saved. Batch 2 retires Phase 1;
@@ -114,11 +120,11 @@ instruction conflict blocks this bounded batch. Existing edits are preserved.
 
 | Changed file | Removed definitions | Evidence and behavior preserved |
 | --- | --- | --- |
-| [configuration.py](src/mesoforge/catalog/configuration.py) | `_H01_H18`, `_H19_H36` | Private tuples appeared only at their definitions. Active horizon-band selection uses `horizon <= 18` and literal band names independently; weight validation, selection, and configuration identity are unchanged. |
-| [canonical_v2.py](src/mesoforge/guidance/canonical_v2.py) | `_INTERVAL_WIDTH_TOLERANCE_NS` | Private zero-tolerance constant appeared only at its definition. Exact interval validation still compares directly with `_INTERVAL_WIDTH_NS`; no tolerance or scientific policy changed. |
-| [hrrr_grib.py](tests/fixtures/hrrr_grib.py) | `make_lead_grib_bytes()`, `make_phase2_lead_grib_bytes()` | Unreferenced concatenation wrappers. Phase 1 and Phase 2 fixture transports use the retained temperature/dew-point/wind/gust/QPF message builders directly. |
-| [synthetic.py](tests/fixtures/synthetic.py) | `build_synthetic_vertical_definition()` and its unused `VerticalDefinition` import | No caller or fixture registration. Retain `SYNTHETIC_VERTICAL_ID`, which is still used, and all active dataset/grid/variable builders. The removed import performs no required registry initialization. |
-| [phase1_fixture_transports.py](tests/support/phase1_fixture_transports.py) | `NoOpSleeper` | No instantiation or registration. Retain `RecordingSleeper`, clocks, transport behavior, and all test assertions. |
+| [configuration.py](../../src/mesoforge/catalog/configuration.py) | `_H01_H18`, `_H19_H36` | Private tuples appeared only at their definitions. Active horizon-band selection uses `horizon <= 18` and literal band names independently; weight validation, selection, and configuration identity are unchanged. |
+| [canonical_v2.py](../../src/mesoforge/guidance/canonical_v2.py) | `_INTERVAL_WIDTH_TOLERANCE_NS` | Private zero-tolerance constant appeared only at its definition. Exact interval validation still compares directly with `_INTERVAL_WIDTH_NS`; no tolerance or scientific policy changed. |
+| [hrrr_grib.py](../../tests/fixtures/hrrr_grib.py) | `make_lead_grib_bytes()`, `make_phase2_lead_grib_bytes()` | Unreferenced concatenation wrappers. Phase 1 and Phase 2 fixture transports use the retained temperature/dew-point/wind/gust/QPF message builders directly. |
+| [synthetic.py](../../tests/fixtures/synthetic.py) | `build_synthetic_vertical_definition()` and its unused `VerticalDefinition` import | No caller or fixture registration. Retain `SYNTHETIC_VERTICAL_ID`, which is still used, and all active dataset/grid/variable builders. The removed import performs no required registry initialization. |
+| [phase1_fixture_transports.py](../../tests/support/phase1_fixture_transports.py) | `NoOpSleeper` | No instantiation or registration. Retain `RecordingSleeper`, clocks, transport behavior, and all test assertions. |
 
 Consumer review covered references/imports, package exports, dynamic/fixture
 discovery, scripts, configuration and workflow entry points. These test modules
@@ -191,9 +197,9 @@ from source inspection, not certification that every component is correct.
   three deleted old `.hermes/plans/` paths with archive copies already present;
   untracked `VISION.md`, `docs/archive/`, and this newly supplied `CLEANUP.md`.
   These are pre-existing documentation changes, not deletions performed by discovery.
-- Root [AGENTS.md](AGENTS.md) applies. No ancestor/nested instruction file or
+- Root [AGENTS.md](../../AGENTS.md) applies. No ancestor/nested instruction file or
   `AGENTS.override.md` was found; the global Codex `AGENTS.md` is empty. Read
-  [VISION.md](VISION.md) and [README.md](README.md). No instruction conflict blocks
+  [VISION.md](../../VISION.md) and [README.md](../../README.md). No instruction conflict blocks
   this discovery-only task; the checklist does not authorize execution of its batches.
 - The current request identifies the first forecast/API milestone as the target.
   The entry documents still label its exact support matrix, weights, prepared-input
@@ -204,12 +210,12 @@ from source inspection, not certification that every component is correct.
 
 | Boundary | Inspected behavior and consumers | Disposition now |
 | --- | --- | --- |
-| [Live runner](scripts/run_phase2_live.py), `main()` / `_load_configuration()` | Constructs `Phase2Request`; loads base → Phase 1 → Phase 2 YAML; composes production and replay adapters. No installed console-script entry point is declared in `pyproject.toml`. | **Keep** the working entry point and overlays. |
-| [Coordinator](src/mesoforge/application/phase2.py), `Phase2Coordinator.run()` / `_run_pinned()` | Discovery/acquisition → normalize → align → availability → blend → identity correction → METAR acquisition/matching → verification. Called by the live runner and Phase 2 acceptance suite. | **Keep**; invoking this entire path from HTTP would bring unwanted acquisition and verification into the request. |
-| [Production provider/science](src/mesoforge/application/phase2_production.py) | `discover()` actually acquires candidate cycles through `acquire_hrrr_phase2_lead`, `acquire_nbm_lead`, and `acquire_gfs_lead`. `_normalize()` invokes model-specific normalizers, retaining native-grid bbox/halo guidance. `_align()` matches target valid times to source leads and extracts the configured stations. `_evaluate()` / `_forecast_pair()` apply availability, configured weights, field operators, and contributor records. | **Keep**. Provider differences and artifact transactions are not demonstrated duplication. |
-| [Phase 2 adapters](src/mesoforge/application/phase2_adapters.py) and [replay contracts](src/mesoforge/application/phase2_replay.py) | The live/replay builders construct `Phase2ProductionAdapters`. Coordinator, adapters, and production science consume `Phase2PersistedRun`; replay loads verified persisted roots. Acceptance tests exercise these paths. | **Keep**; forwarding methods and old names do not establish dead code. |
-| [Phase 1 assembler](src/mesoforge/forecasting/baseline.py), `assemble_baseline_forecast()` | Called by `application/phase1_adapters.py`; also used by baseline contract and verification-matching tests. `make phase1-acceptance` remains in CI. | **Keep**; not unused. |
-| [Phase 2 assembler](src/mesoforge/forecasting/baseline_v2.py), `assemble_baseline_forecast_v2()` | Called by production `_forecast_pair()`. Fixes KCBG/KJMR/KROS, seven variables, and hours 1–36; represents unavailable/inconsistent output as NaN with state codes. `Phase2Request` also requires hours 1–36. | **Keep** for existing callers; this is not an arbitrary-coordinate API response contract. |
+| [Live runner](../../scripts/run_phase2_live.py), `main()` / `_load_configuration()` | Constructs `Phase2Request`; loads base → Phase 1 → Phase 2 YAML; composes production and replay adapters. No installed console-script entry point is declared in `pyproject.toml`. | **Keep** the working entry point and overlays. |
+| [Coordinator](../../src/mesoforge/application/phase2.py), `Phase2Coordinator.run()` / `_run_pinned()` | Discovery/acquisition → normalize → align → availability → blend → identity correction → METAR acquisition/matching → verification. Called by the live runner and Phase 2 acceptance suite. | **Keep**; invoking this entire path from HTTP would bring unwanted acquisition and verification into the request. |
+| [Production provider/science](../../src/mesoforge/application/phase2_production.py) | `discover()` actually acquires candidate cycles through `acquire_hrrr_phase2_lead`, `acquire_nbm_lead`, and `acquire_gfs_lead`. `_normalize()` invokes model-specific normalizers, retaining native-grid bbox/halo guidance. `_align()` matches target valid times to source leads and extracts the configured stations. `_evaluate()` / `_forecast_pair()` apply availability, configured weights, field operators, and contributor records. | **Keep**. Provider differences and artifact transactions are not demonstrated duplication. |
+| [Phase 2 adapters](../../src/mesoforge/application/phase2_adapters.py) and [replay contracts](../../src/mesoforge/application/phase2_replay.py) | The live/replay builders construct `Phase2ProductionAdapters`. Coordinator, adapters, and production science consume `Phase2PersistedRun`; replay loads verified persisted roots. Acceptance tests exercise these paths. | **Keep**; forwarding methods and old names do not establish dead code. |
+| [Phase 1 assembler](../../src/mesoforge/forecasting/baseline.py), `assemble_baseline_forecast()` | Called by `application/phase1_adapters.py`; also used by baseline contract and verification-matching tests. `make phase1-acceptance` remains in CI. | **Keep**; not unused. |
+| [Phase 2 assembler](../../src/mesoforge/forecasting/baseline_v2.py), `assemble_baseline_forecast_v2()` | Called by production `_forecast_pair()`. Fixes KCBG/KJMR/KROS, seven variables, and hours 1–36; represents unavailable/inconsistent output as NaN with state codes. `Phase2Request` also requires hours 1–36. | **Keep** for existing callers; this is not an arbitrary-coordinate API response contract. |
 
 Output is still an unpublished station baseline: PostgreSQL metadata and immutable
 S3-compatible artifacts, then JSON/CSV/Markdown exports from verified reads. The
@@ -225,8 +231,8 @@ because the requested feature is V2.
 **First implementation-cleanup batch: none.** No inspected file is approved for
 removal, and no demonstrated defect requires a refactor before the feature.
 
-Confirmed reuse seams are [align_station_to_model()](src/mesoforge/alignment/station_frame.py)
-and [blend_scalar()](src/mesoforge/forecasting/scalar_blend.py). The former accepts
+Confirmed reuse seams are [align_station_to_model()](../../src/mesoforge/alignment/station_frame.py)
+and [blend_scalar()](../../src/mesoforge/forecasting/scalar_blend.py). The former accepts
 latitude/longitude and a requested horizon tuple without a station ID; it uses
 exact valid-time/interval matching and bilinear native-grid extraction. Missing
 source hours are absent from its result; spatial extraction failures raise an error.
@@ -255,17 +261,17 @@ does not retire the old runner, assemblers, contracts, or migrations.
 
 Existing test sources inspected or identified for the affected boundaries (not run):
 
-- [Station-frame tests](tests/unit/alignment/test_station_frame.py): exact valid time,
+- [Station-frame tests](../../tests/unit/alignment/test_station_frame.py): exact valid time,
   absent source hour, exact precipitation interval; plus
-  [bilinear properties](tests/property/test_bilinear_interpolation.py).
-- [Scalar-blend tests](tests/unit/forecasting/test_scalar_blend.py): independently
+  [bilinear properties](../../tests/property/test_bilinear_interpolation.py).
+- [Scalar-blend tests](../../tests/unit/forecasting/test_scalar_blend.py): independently
   specified weighted mean, single-source result, invalid weights/values; plus
-  [scalar/vector properties](tests/property/test_scalar_vector_blend.py).
-- [Phase 2 assembly](tests/unit/forecasting/test_baseline_v2.py),
-  [composition](tests/unit/application/test_phase2_composition.py), and
-  [replay contracts](tests/unit/application/test_phase2_replay_contracts.py): retain
+  [scalar/vector properties](../../tests/property/test_scalar_vector_blend.py).
+- [Phase 2 assembly](../../tests/unit/forecasting/test_baseline_v2.py),
+  [composition](../../tests/unit/application/test_phase2_composition.py), and
+  [replay contracts](../../tests/unit/application/test_phase2_replay_contracts.py): retain
   existing shapes, request restrictions, and persisted-identity behavior if touched.
-- [Phase 2 acceptance](tests/acceptance/test_phase2_multimodel_baseline.py): fixture
+- [Phase 2 acceptance](../../tests/acceptance/test_phase2_multimodel_baseline.py): fixture
   provider bytes, real PostgreSQL/MinIO, failure matrix, late-cycle cutoffs, and replay.
   This is a heavier later regression check, not part of this discovery.
 
@@ -426,7 +432,7 @@ this checklist; it must not remain a permanent competing roadmap.
 
 ## Design basis
 
-The revised [V2 RFC](docs/rfcs/mesoforge-v2-architecture.md), especially sections
+The revised [V2 RFC](mesoforge-v2-architecture-rfc.md), especially sections
 12–13, proposes selective reuse, exclusion of old Phase 3 proof/report machinery,
 behavior-based retirement, and small delivery increments. This checklist adds a
 proposed maintenance workflow; it is not a source audit or architecture approval.

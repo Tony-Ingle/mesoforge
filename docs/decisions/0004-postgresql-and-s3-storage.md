@@ -2,6 +2,11 @@
 
 Status: Accepted
 
+> **Decision history.** This accepted ADR records the choice and context at the
+> time it was made. Current implementation and target architecture are described
+> in [ARCHITECTURE.md](../../ARCHITECTURE.md); phase-era scope statements below
+> are historical and do not limit the current product.
+
 ## Context
 
 Scientific array data (gridded fields, potentially large) and structured

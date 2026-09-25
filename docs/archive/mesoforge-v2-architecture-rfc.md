@@ -1,3 +1,11 @@
+> **HISTORICAL DOCUMENT**
+>
+> This RFC records the evolution of MesoForge V2 architecture. It is retained for
+> scientific/design history and is superseded as the canonical technical reference
+> by [ARCHITECTURE.md](../../ARCHITECTURE.md). Statements here must not be interpreted
+> as CURRENT implementation unless also documented in current canonical docs/code.
+> The historical contents follow unchanged apart from relative link maintenance.
+
 # RFC: MesoForge V2 architecture
 
 Status: Active technical reference with implemented slices and remaining proposals
@@ -16,7 +24,7 @@ Architecture author: Codex
 > inputs used when this RFC was written, not current branch or working-tree state.
 > The later preserved Phase 3 donor is
 > `43f56bc0c67ab782c94fb6349d65523793e1a836`; see the
-> [archive index](../archive/README.md). Remaining designs are proposed: the decision log
+> [archive index](README.md). Remaining designs are proposed: the decision log
 > does not imply blanket owner approval. The entry-point
 > summary is [VISION.md](../../VISION.md).
 
@@ -250,7 +258,7 @@ distance to the editable boundary is positive inside, zero on the boundary and
 negative outside. This supports a future smooth taper without applying edits or
 settling taper policy. Geometry parameters, axes, extents, membership masks and
 source/code identities are retained for deterministic replay. Measured defaults
-are recorded in [README.md](../../README.md#local-surface-baseline-grid); permanent
+are recorded in [README.md](../../ARCHITECTURE.md); permanent
 grid spacing, geometry, taper distances, weather-dependent sizing and storage
 layout remain open. This does not implement the full future lifecycle below.
 MesoForge derives location identity, nearby observation candidates, bounding boxes,
@@ -796,7 +804,7 @@ The independent audit at `5eb1ae6` reproduced the pointer race and location-look
 failure and found the unsupported universal cutoff claim and strict optional-shadow
 discovery. The bounded fixes above preserve forecast science and current field policies.
 The retained real sample had later PoP discovery but no demonstrated historical leakage.
-See [README's snapshot correctness notes](../../README.md#refresh-guidance-and-forecast-from-the-latest-complete-snapshot)
+See [README's snapshot correctness notes](../../ARCHITECTURE.md)
 for locking details, compatibility and remaining operational limits.
 
 ### 5.7 Implemented background baseline snapshots
@@ -888,7 +896,7 @@ This is on-demand background computation, not a daemon, schedule or continuously
 maintained hosted service. Incremental affected-field recomputation, broader scientific
 cross-field coherence, site correction and AI editing remain future work. Registry and
 policy dependency identities are retained for those later stages. Commands and measured
-validation belong in [README](../../README.md#background-mesoforge-baseline-snapshots).
+validation belong in [README](../../ARCHITECTURE.md).
 
 ## 6. First-release flows
 

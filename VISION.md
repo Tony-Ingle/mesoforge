@@ -2,6 +2,9 @@
 
 MesoForge is an automated digital forecast desk for configured locations.
 
+For current technical implementation and its boundary with this target vision,
+see [ARCHITECTURE.md](ARCHITECTURE.md). [README.md](README.md) covers current usage.
+
 Its purpose is to continuously ingest and prepare numerical weather guidance,
 maintain the best current MesoForge numerical forecast from that guidance,
 learn from verification, and eventually use a bounded AI meteorologist to
@@ -1153,6 +1156,9 @@ MesoForge already has substantial working foundations, including:
 * real model discovery and acquisition;
 * prepared numerical guidance;
 * reusable prepared contributor snapshots;
+* generalized field-specific blend execution with current approved policies;
+* on-demand immutable MesoForge baseline snapshots;
+* a generalized coherence framework enforcing current approved relationships;
 * native contributor evidence;
 * local context/editable grids;
 * current temporary blend/source policies;
@@ -1176,8 +1182,8 @@ They are not yet the complete MesoForge forecasting intelligence.
 In particular, the following remain future architecture:
 
 * continuously maintained generalized MesoForge baseline snapshots;
-* generalized field-specific blending;
-* generalized cross-field coherence;
+* advanced verification-informed field-specific weighting;
+* scientific enforcement of the remaining registered cross-field relationships;
 * applied deterministic site/regime corrections;
 * bounded AI forecast editing;
 * AI performance evaluation;
@@ -1186,18 +1192,18 @@ In particular, the following remain future architecture:
 
 ---
 
-# 30. Major Remaining Stages
+# 30. Major Architectural Stages
 
-The intended major progression is:
+The intended major progression includes implemented foundations and future stages:
 
 ```text
 fast and reusable prepared guidance
         ↓
-generalized field-specific MesoForge blend engine
+generalized field-specific MesoForge blend engine (implemented foundation)
         ↓
 continuously maintained coherent baseline snapshots
         ↓
-generalized cross-field coherence
+generalized cross-field coherence (framework implemented; broader science future)
         ↓
 deterministic site/regime correction
         ↓

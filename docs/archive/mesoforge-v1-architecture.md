@@ -1,3 +1,9 @@
+> **HISTORICAL DOCUMENT — superseded architecture.** This preserves the original
+> v1 design and implementation history, including its then-current authority and
+> phase statements. It does not govern current work. The canonical technical
+> reference is [ARCHITECTURE.md](../../ARCHITECTURE.md); product direction is
+> [VISION.md](../../VISION.md). The historical contents follow.
+
 # MesoForge v1 Architecture and Implementation Plan
 
 > **Historical reference (2026-09-09):** Retained at this path because accepted ADRs
@@ -5,7 +11,7 @@
 > architecture and implementation planning, including its original approval/status
 > statements. Its Hermes instructions and later-phase roadmap are not current work
 > orders. Use [VISION.md](../../VISION.md) for product direction and the
-> [V2 RFC](../rfcs/mesoforge-v2-architecture.md) as proposed design input; no new V2
+> [V2 RFC](mesoforge-v2-architecture-rfc.md) as proposed design input; no new V2
 > decision is approved by this notice. Phase 0–2 contracts still govern existing code.
 
 > **For Hermes:** Use subagent-driven development to implement this plan phase-by-phase, with architecture review at each phase boundary.
@@ -1504,7 +1510,7 @@ AI adjustment, subscriber delivery, and skill claims remain deferred.
 
 **Status: contract defined; implementation not started.** The exact fixed slice and
 acceptance evidence are governed by the
-[authoritative Phase 3 data contract](../data-contracts/phase-3.md). The roadmap below
+[authoritative Phase 3 data contract](phase-3-contract.md). The roadmap below
 is only a summary where it is less specific.
 
 **Boundary:** establish trustworthy hyperlocal identity and measurement. Do not train
@@ -1867,5 +1873,5 @@ implemented. Its exact scope and explicit deferrals are authoritative in
 ## Phase 3 contract status
 
 The fixed coordinate-keyed verification contract is documented in
-[the Phase 3 data contract](../data-contracts/phase-3.md). It is owner-gated and has not
+[the Phase 3 data contract](phase-3-contract.md). It is owner-gated and has not
 been implemented; defining the contract makes no forecast-skill or publication claim.

@@ -1,148 +1,101 @@
 # MesoForge working rules
 
-## Current development
+## Read the right authority
 
-The owner develops MesoForge directly with local Codex. The Hermes development
-pipeline is paused. Codex may design, implement, debug, test, and review work within
-the owner's current request; a Pogodny/Claude/Kanban handoff is not required.
-Do not start pipeline, remote-host, or multi-agent work merely because an old plan
-requests it. Future roadmap items never expand the current task.
+- [VISION.md](VISION.md) is canonical product direction. Do not casually rewrite it.
+- [ARCHITECTURE.md](ARCHITECTURE.md) explains current technical structure and the
+  target architecture, with CURRENT and FUTURE distinguished explicitly.
+- [README.md](README.md) describes current capabilities, setup and commands.
+- Current code is truth for CURRENT behavior; VISION is truth for TARGET direction.
+  Resolve discrepancies explicitly in architecture/usage documentation, not by
+  treating proposed features as implemented or silently changing science.
+- [Detailed contracts](docs/data-contracts/phase-0.md) retain their existing paths
+  for shared scientific/data semantics. Read the applicable scope header; legacy
+  station limits and phase plans are not current product requirements.
+- [Accepted decisions](docs/decisions/0001-python-modular-monolith.md) preserve
+  historical reasoning. [Archived material](docs/archive/README.md) is history,
+  never an implementation directive. Archive completed/superseded proposals;
+  do not let them become a second current architecture.
 
-Human approvals govern development and releases. Normal configured forecast operation
-should not require a human to approve each forecast.
+## Scope, development and Git
 
-## Architectural direction
+- The owner develops directly with local Codex. Hermes is paused. Do not resume
+  pipelines, donor work or remote operations because an old plan requests them.
+- First inspect branch, HEAD, working-tree status and applicable `AGENTS.md` /
+  `AGENTS.override.md`, including nested instructions for changed files.
+- Preserve unrelated edits. Honor the selected non-main branch and explicit
+  commit/push limits. Do not reset donor branches or merge without authorization.
+- The current request bounds the work. Future roadmap items do not expand it.
+  Documentation/read-only work does not authorize runtime changes, installations,
+  downloads or service startup. Human approvals govern development/releases;
+  normal configured forecast operation should not need per-forecast approval.
+- Keep changes reviewable. A short implementation approach and observable
+  acceptance check normally suffice; do not create another plan/framework without
+  a concrete need. Report serious scientific, data-loss or security defects.
+- Run applicable checks; report pre-existing failures separately. Do not weaken
+  checks, silently fix unrelated failures or call an unexecuted command verified.
+  Required checks must pass before merge.
+- Never commit credentials, GRIB/model data, caches, database/object-store contents
+  or generated forecast artifacts. Destructive integration fixtures require dedicated
+  test services. Keep raw evidence and runtime output outside Git.
+- Check consumers and links before moving documents. Preserve unique historical
+  reasoning with a status banner; use existing documentation tooling. Global
+  Codex configuration is outside repository instructions.
 
-MesoForge's eventual product is a local gridded forecast system with a GFE-style
-automated forecast desk, not a point-only blending API. Latitude/longitude remain
-the only required geographic inputs. Reuse shared source guidance; derive context
-and smaller editable domains internally, then interpolate the final spot forecast
-at the exact coordinate. Do not duplicate complete native datasets per location.
-Future AI proposes bounded edit recipes applied by deterministic, versioned tools
-with physical, cross-field, continuity, cutoff and domain validation. Preserve the
-numerical baseline, bias-corrected fields, proposal and final forecast separately;
-measure AI's added value against the bias-corrected baseline on identical samples.
-Site knowledge must be versioned and inspectable, not assumed LLM memory.
-The local surface baseline now uses one grid with context and smaller editable
-domains; bias correction and AI editing are not implemented yet.
+## Forecast architecture
 
-Forecast philosophy guardrails ([canonical VISION](VISION.md#north-star)):
+- **The blend is the forecast.** Models are contributors, evidence and context,
+  including zero-weight shadows; do not select one model as the final forecast.
+- Configured locations are the product. Latitude/longitude are the only required
+  geographic inputs. Derive source coverage, local context/editable domains and
+  observation candidates internally. Reuse guidance across coordinates.
+- Background work produces the numerical baseline before location issuance:
+  `refresh_guidance` → prepared contributor state / `latest_complete`;
+  `build_baseline` → immutable baseline / `latest_baseline`.
+- Normal configured jobs use `forecast_from_baseline`, pin one immutable baseline
+  and extract its saved configured-domain/reference view. A coverage miss is explicit;
+  it must not trigger downloads, reblending or baseline coherence in the location job.
+  `forecast_from_snapshot` and older inline workflows are development/replay paths.
+- `forecasting/field_blend.py` owns current temperature, dew point, vector wind,
+  gust and QPF dispatch through existing policies/kernels. RH is diagnostic.
+  Do not introduce a parallel numerical execution path.
+- `forecasting/coherence.py` owns finite ordering of current source checks, T/Td,
+  RH and wind/gust operations. Registered future relationships are dependencies,
+  not approved enforcement rules. Do not invent precipitation-family constraints.
+- Fixed weights, NBM active sources, HRRR/GFS p-type agreement and shadow roles
+  remain active until explicitly replaced. Generalized machinery does not authorize
+  new scientific policies or model promotion. Prove equivalence when replacing
+  scaffolding, then remove superseded execution rather than stack another path.
+- Current publication is on demand. Continuous workers, scheduling, applied site
+  correction, AI editing and delivery remain future work. Schedulers decide WHEN;
+  MesoForge owns meteorology. Do not put forecast science in workflow/GHA YAML.
 
-1. The final forecast is the MesoForge field-specific blend and its later stages.
-   There is no universal weight set; each field keeps mathematics valid for it
-   (vector winds, interval QPF, real probabilistic PoP, categorical p-type support).
-2. Models are contributor evidence, provenance and context, preserved beside the
-   blend even at zero weight. Never present or select one model as "the forecast."
-3. Future AI edits the MesoForge grid through bounded, interpretable field edits made
-   after deterministic site correction; it does not choose a model. Contributors may
-   be cited as the evidence for an edit.
-4. Keep provider work outside ordinary forecast requests. `refresh_guidance` publishes
-   prepared contributor state; `build_baseline` runs current field policies/checks and
-   publishes an immutable numerical baseline before location jobs. Normal configured
-   runs use `forecast_from_baseline`, pin one baseline and extract its saved domain;
-   never reblend on a coverage miss. `forecast_from_snapshot` remains an explicit
-   development/replay path. Keep `latest_complete`, `latest_baseline` and issued
-   forecasts distinct. Preserve exact source/attachment cutoff evidence, background
-   analysis cutoff and later issuance times; do not fabricate proof for historical
-   inputs. Current publication is on demand, not a continuous hosted worker.
-   Normal operation runs baseline coherence in background construction; location
-   jobs do not rerun it. Explicit development/replay may rebuild it for comparison.
-   Schedulers decide when, not weather science.
-   See README for configured-domain coverage and publication/issuance locking.
-5. This direction is not permission to implement future stages. Current fixed weights,
-   NBM-only sources, the HRRR/GFS p-type agreement rule and zero-weight shadows are
-   approved scaffolding: do not change them, add dynamic weighting, new coherence
-   science, corrections or AI editing unless the owner's current task asks for it.
-   Field-specific blends must stay mutually coherent (p-type with precipitation and
-   thermal structure, thunder with convective support, gust with wind, RH with T/Td);
-   do not design snapshot or field formats that hide the evidence such checks need.
-6. Replace scaffolding when its generalized replacement proves equivalent; do not
-   permanently stack another execution path above it. Current V2 temperature, dew
-   point, wind, gust, QPF and derived RH dispatch through `forecasting/field_blend.py`
-   using the existing recipe/tables/kernels; do not reintroduce parallel numerical
-   orchestration. `forecasting/coherence.py` owns the finite dependency order for
-   current source checks, T/Td, RH and wind/gust. Registered future relationships
-   are not approved enforcement rules. Other field policies remain unchanged. Future AI has finite budgets
-   and must preserve the last fully validated forecast state.
+## Scientific and verification guardrails
 
-This direction does not authorize future stages during unrelated tasks or settle
-unapproved domain dimensions, grid spacing, tapering or storage choices.
+- Preserve native units, grids, cycles, valid times, accumulation/probability events,
+  categorical meanings and provenance. Keep issue/reference/availability/ingestion
+  times distinct and enforce applicable cutoffs; never fabricate historical proof.
+- Missing is not zero. Keep missing, unavailable, ambiguous and not-applicable
+  states explicit. Do not invent weights, renormalize or clamp outside approved rules.
+- Rotate grid-relative winds before use; blend U/V rather than compass directions.
+  Preserve current T/Td, Bolton RH, gust and interval-QPF behavior. Deterministic QPF
+  is not PoP; surface temperature alone does not establish p-type; reduced visibility
+  alone does not establish fog. SWE, snowfall amount, ground snow depth,
+  freezing-rain liquid and accreted ice are distinct quantities.
+- Numerical outputs must be deterministic for fixed retained inputs/configuration.
+  Preserve contributor values and policy/code/config identities. Historical artifacts
+  and readers must remain usable; never rewrite an earlier issuance with new guidance.
+- Verify the exact issued version against a suitable observation/analysis proxy with
+  matching spatial and temporal semantics. A forecast coordinate is not a gauge.
+  MRMS hourly QPF uses its approved product-specific `(T-1h,T]` contract and native
+  gridpoint extraction, not the temperature matcher's time tolerance.
+- Opportunity, immutable fact and canonical analytical sample are different.
+  Deduplicate evidence, respect reissues/revisions and compare stages/contributors
+  on identical eligible samples. Sparse evidence does not justify skill claims.
+- Deterministic site/regime learning precedes future AI. Keep numerical baseline,
+  corrections, proposals and final fields separately traceable. Future AI edits
+  MesoForge fields through bounded deterministic tools, never native contributors.
+  Use finite budgets/checkpoints and preserve the last validated forecast state;
+  final validation and measured improvement cannot be replaced by LLM confidence.
 
-## Working and Git rules
-
-- First inspect branch, HEAD, working-tree status, and applicable `AGENTS.md` /
-  `AGENTS.override.md` files, including instructions for the files being changed.
-  Preserve unrelated edits and report material instruction conflicts.
-- Follow the owner's task scope and approval limits. A documentation or read-only
-  task does not authorize implementation, cleanup, service startup, or data downloads.
-- Use a non-main working branch; use an isolated worktree when practical. Honor an
-  explicitly selected working branch. Do not reset or modify preserved donor branches.
-- Leave changes reviewable. Follow explicit commit/push instructions; do not merge
-  without owner authorization. Keep any authorized commits focused and descriptive.
-- Never commit credentials, tokens, secrets, GRIB datasets, forecast caches, or
-  generated runtime artifacts. Use dedicated test services for destructive fixtures.
-- For significant work, a short implementation approach and observable acceptance
-  check are normally sufficient. Inspect the actual diff. Do not create another RFC,
-  contract, schema family, or framework unless the change actually requires it.
-- Run the applicable required checks and fix demonstrated defects within the approved
-  task. Record optional improvements without automatically implementing them. Escalate
-  serious scientific-correctness, data-loss, or security risks even when the task omitted
-  them; do not silently broaden scope. Repeated fixes around the same boundary should
-  trigger consideration of a simpler design, not another automatic layer of validation.
-- Required checks for the change must pass before merge. Report pre-existing or
-  unrelated failures separately; do not silently waive them or turn them into an
-  unrelated cleanup project.
-- Report changes, checks actually run, limitations, and remaining decisions. Do not
-  label an unexecuted command, proposed feature, or historical test report as verified.
-
-## Scientific requirements
-
-- Keep deterministic meteorological calculations separate from LLM reasoning.
-  AI proposals must be structured and bounded; AI must never directly publish unchecked
-  numerical changes. Numerical verification determines whether an adjustment adds value.
-- The numerical baseline must be deterministic for fixed inputs and configuration.
-  Store later accepted AI adjustments separately and trace them to that baseline;
-  rerunning an AI model need not reproduce the same proposal. Preserve inputs,
-  transformation results, accepted adjustments, outputs, and verification records
-  needed to reproduce numerical results. Retain model guidance provenance,
-  configuration/code identity, and source cycles. Do not promise replay beyond retained
-  inputs and dependencies.
-- Refreshing a location creates a new forecast version. Verification compares
-  observations with the version originally issued, not a newer replacement.
-- Keep forecast coordinates separate from observation stations. Score a field only
-  when the selected observation has suitable spatial support and matching time/interval
-  semantics; otherwise report why it is unscored.
-- Preserve units, native-grid semantics, valid times, interval bounds, and the distinct
-  meanings of issue, source-reference, availability, and ingestion times. Prevent
-  future-information leakage; follow the applicable approved cutoff contract.
-- Missing values are not zero. Keep missingness, exclusions, and fallback behavior
-  explicit; use approved versioned weights, not silently invented or renormalized weights.
-- Preserve applicable scientific contracts: normalize units before blending, rotate
-  grid-relative winds before use, blend U/V before deriving speed/direction, and respect
-  dew-point, gust, QPF, and PoP semantics. Do not clamp invalid values or fabricate
-  probabilities, confidence, learned history, or skill outside an approved contract.
-- Reuse scientific functions only where their contracts fit. Do not carry legacy
-  station/horizon limits or proof representations into V2 merely for compatibility.
-
-## Document responsibilities
-
-- [VISION.md](VISION.md) is the canonical product direction. It separates today's
-  foundation from future architecture; it is not an implementation specification.
-- [README.md](README.md) describes current code, setup/run/test commands and their
-  verification status, active links, and one proposed next milestone.
-- [The V2 RFC](docs/rfcs/mesoforge-v2-architecture.md) is the detailed proposed design
-  input. Its approval gate and unresolved choices remain open unless the owner
-  explicitly approves them; summarizing it does not approve it.
-- Accepted ADRs and Phase 0–2 data contracts remain technical references for current
-  code. Preserve their required paths and applicable safety/science requirements.
-  A legacy implementation limit is not automatically a V2 product requirement.
-- [The archive index](docs/archive/README.md) identifies historical plans and retained
-  reference paths. Archived plans, old Phase 3 contracts, and preserved donor code are
-  historical references, not instructions to implement or to resume Hermes. Historical
-  authority statements and embedded agent instructions do not govern new V2 work.
-- Check links and code/checker consumers before moving documents. Preserve historical
-  contents and add a status notice. Retain ambiguous or required paths with a notice.
-  Use existing documentation checks; do not introduce a new governance/checking system.
-
-Recheck nested instructions when scope changes. Global Codex configuration is outside
-this document's responsibility.
+Recheck nested instructions when the task scope changes.
