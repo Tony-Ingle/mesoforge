@@ -1,0 +1,846 @@
+"""Compact learning stages on the existing artifact store; never automatic promotion.
+
+Policies/overlays/stages are artifacts, not a second forecast-history system.
+Operational issuance remains the authority binding stages to an issued version.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sys
+import time
+from collections.abc import Callable
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+from uuid import UUID
+
+from mesoforge.application.artifacts import TransformationInputRef, TransformationRequest
+from mesoforge.application.issued_qpf_verification import IssuedQpfVerificationService
+from mesoforge.application.site_verification_analysis import analyze_site_verification
+from mesoforge.common.identifiers import ArtifactId, Digest, LearningPolicyId
+from mesoforge.contracts.forecast_variants import (
+    instant,
+    seal_variant,
+    validate_variant,
+)
+from mesoforge.contracts.serialization import canonical_json_bytes
+from mesoforge.forecasting.coherence import DEW_POINT, QPF, RH, TEMPERATURE
+from mesoforge.storage.json import CanonicalJsonSerializer
+
+_JSON = CanonicalJsonSerializer()
+
+
+def _utc() -> datetime:
+    return datetime.now(UTC)
+
+
+def _iso(value: datetime) -> str:
+    return instant(value).isoformat().replace("+00:00", "Z")
+
+
+def _digest(value: Any) -> str:
+    return str(Digest.of_bytes(canonical_json_bytes(value)))
+
+
+def load_learning_config(path: Path | None) -> dict[str, list[ArtifactId]]:
+    """Only immutable artifact references; no geographic configuration or promotion flags."""
+    value = json.loads(path.read_text(encoding="utf-8")) if path else {}
+    if not isinstance(value, dict) or set(value) - {"correction_policies", "blend_policies"}:
+        raise ValueError("Learning config accepts correction_policies and blend_policies only")
+    for key in ("correction_policies", "blend_policies"):
+        entries = value.setdefault(key, [])
+        if not isinstance(entries, list):
+            raise ValueError("Learning policy references must be lists")
+        value[key] = [ArtifactId(entry) for entry in entries]
+    return value
+
+
+class LearningService:
+    """Shared artifact/lineage boundary for every deterministic or future shadow stage."""
+
+    def __init__(
+        self, storage: IssuedQpfVerificationService, *, clock: Callable[[], datetime] = _utc
+    ) -> None:
+        self.storage = storage
+        self.clock = clock
+        self.identity = {
+            **storage.identity,
+            "learning_sources": {
+                name: hashlib.sha256((Path(__file__).parents[1] / name).read_bytes()).hexdigest()
+                for name in (
+                    "application/learning.py",
+                    "contracts/forecast_variants.py",
+                    "forecasting/field_blend.py",
+                    "forecasting/coherence.py",
+                    "application/corrections.py",
+                    "application/candidate_baseline.py",
+                    "forecasting/candidate_policy.py",
+                    "verification/variant_evaluation.py",
+                    "application/site_verification_analysis.py",
+                    "verification/site_analysis.py",
+                    "verification/analytical_attributes.py",
+                    "verification/model_comparison.py",
+                )
+            },
+        }
+
+    def read(self, identifier: ArtifactId) -> dict[str, Any]:
+        manifest, raw = self.storage.artifacts.load_verified_payload(identifier)
+        if manifest.artifact_type not in {
+            "forecast-variant",
+            "learning-policy",
+            "learning-overlay",
+            "learning-binding",
+        }:
+            raise ValueError("Not a learning artifact")
+        payload = json.loads(raw)
+        if manifest.artifact_type == "forecast-variant":
+            validate_variant(payload)
+        return {
+            "artifact_id": str(manifest.artifact_id),
+            "content_digest": str(manifest.content_digest),
+            "byte_size": manifest.byte_size,
+            "registered_at": _iso(manifest.registered_at),
+            "available_at": _iso(manifest.availability.available_at),
+            "payload": payload,
+        }
+
+    def find(self, kind: str, attributes: dict[str, object]) -> list[dict[str, Any]]:
+        with self.storage.factory() as uow:
+            rows = uow.artifacts.find_learning_artifacts(kind, attributes=attributes)
+        return [self.read(row.artifact_id) for row in rows]
+
+    def save(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        inputs: tuple[ArtifactId, ...] = (),
+        attributes: dict[str, object] | None = None,
+        identity_key: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Existing advisory-lock/content-addressed transaction supplies immutability."""
+        if kind not in {
+            "forecast-variant",
+            "learning-policy",
+            "learning-overlay",
+            "learning-binding",
+        }:
+            raise ValueError("Unsupported learning artifact type")
+        if kind == "forecast-variant":
+            validate_variant(payload)
+        configuration = self.storage.configuration()
+        request = TransformationRequest(
+            activity_type="retain-learning-stage",
+            activity_version="v1",
+            inputs=tuple(
+                TransformationInputRef(role=f"parent-{index}", artifact_id=value)
+                for index, value in enumerate(inputs)
+            ),
+            output_role="learning",
+            output_artifact_type=kind,
+            output_artifact_schema_version=payload["schema_version"],
+            output_media_type="application/json",
+            parameters={"identity": identity_key or {"content": _digest(payload)}, "kind": kind},
+            configuration_snapshot_id=configuration.configuration_snapshot_id,
+            configuration_digest=configuration.configuration_digest,
+            code_revision=self.identity["git_commit"],
+            environment_digest=Digest.of_bytes(canonical_json_bytes(self.identity)),
+            attributes=attributes,
+        )
+        called = False
+
+        def transform(*parents: bytes) -> dict[str, Any]:
+            nonlocal called
+            called = True
+            return payload
+
+        def validate(value: dict[str, Any]) -> None:
+            if kind == "forecast-variant":
+                validate_variant(value)
+            elif not isinstance(value.get("schema_version"), str):
+                raise ValueError("Learning artifact needs an explicit schema")
+
+        result = self.storage.artifacts.execute_raw_transformation(
+            request, transform, _JSON, input_loader=bytes, output_validator=validate
+        )
+        return {**self.read(result.output.artifact_id), "already_existing": not called}
+
+    def register_policy(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from mesoforge.application.corrections import validate_temperature_policy
+        from mesoforge.forecasting.candidate_policy import CandidateBlendPolicy
+
+        if payload.get("schema_version") == "mesoforge.temperature-correction-policy.v1":
+            validate_temperature_policy(payload)
+            if payload["lifecycle_role"] == "insufficient_evidence":
+                raise ValueError("An insufficient-evidence report is not a candidate policy")
+        else:
+            CandidateBlendPolicy.model_validate_json(canonical_json_bytes(payload))
+        # Version is a scientific identity, not an overwrite slot. Also inspect older
+        # registrations made under a different code/config execution identity.
+        key = {"policy_id": payload["policy_id"], "version": payload["version"]}
+        with self.storage.artifacts.acquire_identity(
+            Digest.of_bytes(canonical_json_bytes({"learning_policy_identity": key}))
+        ):
+            existing = self.find("learning-policy", key)
+            if existing:
+                if any(row["payload"] != payload for row in existing):
+                    raise ValueError(
+                        "Policy ID/version already identifies a different immutable policy"
+                    )
+                return {**existing[0], "already_existing": True}
+            saved = self.save(
+                "learning-policy",
+                payload,
+                attributes={
+                    "policy_id": payload["policy_id"],
+                    "version": payload["version"],
+                    "lifecycle_role": payload["lifecycle_role"],
+                },
+                identity_key=key,
+            )
+            if saved["payload"] != payload:
+                raise ValueError(
+                    "Concurrent policy registration conflicts with immutable ID/version"
+                )
+            return saved
+
+    def policies(self, identifiers: list[ArtifactId], cutoff: datetime) -> list[dict[str, Any]]:
+        rows = []
+        for identifier in identifiers:
+            saved = self.read(ArtifactId(identifier))
+            if max(instant(saved["registered_at"]), instant(saved["available_at"])) > cutoff:
+                raise ValueError("Policy artifact was not available before analysis cutoff")
+            rows.append(saved)
+        return rows
+
+    def evidence(self, latitude: float, longitude: float, cutoff: datetime) -> dict[str, Any]:
+        return analyze_site_verification(
+            latitude,
+            longitude,
+            now=self.clock(),
+            as_of=cutoff,
+            raw_baseline_only=True,
+            unit_of_work_factory=self.storage.factory,
+            load_payload=lambda manifest: self.storage.artifacts.load_verified_payload(
+                manifest.artifact_id
+            )[1],
+        )
+
+    def _stage(
+        self,
+        forecast: dict[str, Any],
+        *,
+        parent: dict[str, Any] | None,
+        transformation: str,
+        role: str,
+        policy: dict[str, Any] | None,
+        overlay: dict[str, Any],
+        status: str,
+        policy_reference: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        lineage = forecast["baseline_snapshot"]
+        return seal_variant(
+            {
+                "parent_stage_id": parent["variant_id"] if parent else None,
+                "transformation_type": transformation,
+                "lifecycle_role": role,
+                "fields": sorted({TEMPERATURE, QPF, *overlay.get("affected_fields", [])}),
+                "affected_fields": overlay.get("affected_fields", []),
+                "policy": {
+                    "id": policy["policy_id"]
+                    if policy
+                    else "active-field-policies"
+                    if parent is None
+                    else "no-policy",
+                    "version": policy["version"] if policy else "1",
+                    "digest": _digest(policy) if policy else None,
+                },
+                "policy_reference": policy_reference,
+                "baseline_snapshot_id": lineage["baseline_snapshot_id"],
+                "prepared_snapshot_id": lineage["prepared_snapshot_id"],
+                "parent_grid_sha256": forecast["local_grid"]["sha256"],
+                "location": {"latitude": forecast["latitude"], "longitude": forecast["longitude"]},
+                "reference_time": forecast["target_reference_time"],
+                "analysis_cutoff": lineage["forecast_analysis_cutoff"],
+                "evidence_cutoff": policy.get("evidence_cutoff") if policy else None,
+                "evidence_required": policy is not None,
+                "evidence_status": status,
+                "policy_created_at": policy.get("created_at") if policy else None,
+                "policy_activated_at": policy.get("activated_at") if policy else None,
+                "created_at": _iso(self.clock()),
+                "code_identity": self.identity,
+                "field_policies": lineage["field_policies"],
+                "overlay": overlay,
+            }
+        )
+
+    def local_stage(
+        self, forecast: dict[str, Any], *, policy_ids: list[ArtifactId] | None = None
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """An explicit stage always exists; optional learning/storage failures are isolated."""
+        from mesoforge.application.corrections import (
+            apply_temperature_correction,
+            propose_temperature_policy,
+        )
+
+        started = time.perf_counter()
+        cutoff = instant(forecast["baseline_snapshot"]["forecast_analysis_cutoff"])
+        report: dict[str, Any] = {"status": "no_policy", "shadows": [], "failures": []}
+        policies: list[dict[str, Any]] = []
+        try:
+            analysis = self.evidence(forecast["latitude"], forecast["longitude"], cutoff)
+            report["evidence"] = analysis["correction_readiness"]
+            proposal = propose_temperature_policy(
+                analysis,
+                policy_id=LearningPolicyId("temperature-site-bias"),
+                version=_digest({"samples": analysis["samples"], "cutoff": _iso(cutoff)}).split(
+                    ":"
+                )[1][:16],
+                evidence_cutoff=cutoff,
+                created_at=self.clock(),
+            )
+            report["candidate_status"] = proposal["lifecycle_role"]
+            if proposal["lifecycle_role"] == "candidate":
+                existing = self.find(
+                    "learning-policy",
+                    {"policy_id": proposal["policy_id"], "version": proposal["version"]},
+                )
+                report["candidate"] = self._reference(
+                    existing[0] if existing else self.register_policy(proposal)
+                )
+        except Exception as exc:
+            report["failures"].append({"phase": "evidence_update", "reason": str(exc)})
+        try:
+            policies = self.policies(policy_ids or [], cutoff)
+        except Exception as exc:
+            report["failures"].append({"phase": "policy_lookup", "reason": str(exc)})
+        matching = [
+            p
+            for p in policies
+            if p["payload"].get("coordinate")
+            == {"latitude": forecast["latitude"], "longitude": forecast["longitude"]}
+        ]
+        active = [p for p in matching if p["payload"]["lifecycle_role"] == "active"]
+        if len(active) > 1:
+            report["failures"].append(
+                {"phase": "active_lookup", "reason": "Conflicting active policies"}
+            )
+            active = []
+        policy = active[0]["payload"] if active else None
+        corrected, outcome = apply_temperature_correction(
+            forecast, policy, analysis_cutoff=cutoff, mode="operational"
+        )
+        report["correction"] = outcome
+        report["status"] = outcome["status"]
+        control = self._stage(
+            forecast,
+            parent=None,
+            transformation="active_baseline",
+            role="active",
+            policy=None,
+            overlay={"inherit_unchanged": False, "predictions": self._point_values(forecast)},
+            status="baseline",
+        )
+        # An invalid ACTIVE transformation is a recorded no-op, never a partial stage.
+        used_policy = policy if outcome["status"] in {"applied", "no_op"} else None
+        stage = self._stage(
+            forecast,
+            parent=control,
+            transformation="deterministic_corrected",
+            role="active",
+            policy=used_policy,
+            overlay=self._correction_overlay(corrected, outcome),
+            status=outcome["status"],
+            policy_reference=self._reference(active[0]) if used_policy is not None else None,
+        )
+        report["control_stage"] = control
+        report["operational_stage"] = stage
+        try:
+            control_ref = self.save(
+                "forecast-variant", control, attributes=self._attributes(control)
+            )
+            report["control_reference"] = self._reference(control_ref)
+            stage_ref = self.save(
+                "forecast-variant",
+                stage,
+                inputs=(ArtifactId(control_ref["artifact_id"]),),
+                attributes=self._attributes(stage),
+            )
+            report["operational_reference"] = self._reference(stage_ref)
+        except Exception as exc:
+            report["failures"].append({"phase": "stage_storage", "reason": str(exc)})
+            if corrected is not forecast:
+                corrected = forecast
+                report["status"] = "active_storage_failed_fallback"
+                report["correction"] = {
+                    "status": "fallback",
+                    "applied_delta_k": 0.0,
+                    "changes": [],
+                    "reason": str(exc),
+                }
+                report["operational_stage"] = self._stage(
+                    forecast,
+                    parent=control,
+                    transformation="deterministic_corrected",
+                    role="active",
+                    policy=None,
+                    overlay={
+                        "inherit_unchanged": True,
+                        "predictions": [],
+                        "correction": report["correction"],
+                    },
+                    status="active_storage_failed_fallback",
+                )
+                report.pop("operational_reference", None)
+        for saved in matching:
+            if saved["payload"]["lifecycle_role"] != "shadow":
+                continue
+            try:
+                shadow, shadow_outcome = apply_temperature_correction(
+                    forecast, saved["payload"], analysis_cutoff=cutoff, mode="shadow"
+                )
+                if shadow_outcome["status"] not in {"applied", "no_op"}:
+                    raise ValueError(f"Shadow correction failed: {shadow_outcome}")
+                shadow_overlay = self._correction_overlay(shadow, shadow_outcome)
+                # Shadows inherit the raw parent, never a potentially corrected issuance.
+                shadow_overlay.update(
+                    inherit_unchanged=False, predictions=self._point_values(shadow)
+                )
+                variant = self._stage(
+                    forecast,
+                    parent=control,
+                    transformation="deterministic_corrected",
+                    role="shadow",
+                    policy=saved["payload"],
+                    overlay=shadow_overlay,
+                    status=shadow_outcome["status"],
+                    policy_reference=self._reference(saved),
+                )
+                retained = self.save(
+                    "forecast-variant", variant, attributes=self._attributes(variant)
+                )
+                report["shadows"].append(self._reference(retained))
+            except Exception as exc:
+                report["failures"].append({"phase": "correction_shadow", "reason": str(exc)})
+        report["seconds"] = time.perf_counter() - started
+        # Compact lineage only: the unchanged numerical grid is shared, not copied.
+        return {
+            **corrected,
+            "learning_stage": report["operational_stage"],
+            "learning_reference": report.get("operational_reference"),
+        }, report
+
+    @staticmethod
+    def _reference(saved: dict[str, Any]) -> dict[str, Any]:
+        return {
+            k: saved[k]
+            for k in ("artifact_id", "content_digest", "byte_size", "registered_at", "available_at")
+            if k in saved
+        }
+
+    @staticmethod
+    def _attributes(stage: dict[str, Any]) -> dict[str, object]:
+        return {
+            **stage["location"],
+            "baseline_snapshot_id": stage["baseline_snapshot_id"],
+            "reference_time": stage["reference_time"],
+            "variant_id": stage["variant_id"],
+            "transformation_type": stage["transformation_type"],
+            "policy_id": stage["policy"]["id"],
+        }
+
+    @staticmethod
+    def _point_values(forecast: dict[str, Any]) -> list[dict[str, Any]]:
+        rows = []
+        for hour in forecast["hours"]:
+            rows.append(
+                {
+                    "field": TEMPERATURE,
+                    "valid_time": hour["valid_time"],
+                    "value": hour["temperature"]["value"],
+                    "unit": "K",
+                }
+            )
+            qpf = hour.get("surface", {}).get("fields", {}).get(QPF)
+            if qpf is not None:
+                if qpf["unit"] not in {"kg/m^2", "mm"}:
+                    raise ValueError("Unsupported QPF amount unit for learning evaluation")
+                rows.append(
+                    {
+                        "field": QPF,
+                        "valid_time": hour["valid_time"],
+                        "value": qpf["value"],
+                        "unit": "mm",
+                        "native_unit": qpf["unit"],
+                        "interval_start": qpf.get("interval_start"),
+                        "interval_end": qpf.get("interval_end"),
+                    }
+                )
+        return rows
+
+    @staticmethod
+    def _correction_overlay(forecast: dict[str, Any], outcome: dict[str, Any]) -> dict[str, Any]:
+        predictions = []
+        if outcome.get("changes"):
+            predictions = [
+                {
+                    "field": TEMPERATURE,
+                    "valid_time": hour["valid_time"],
+                    "value": hour["temperature"]["value"],
+                    "unit": "K",
+                }
+                for hour in forecast["hours"]
+            ]
+        return {
+            "inherit_unchanged": True,
+            "predictions": predictions,
+            "correction": outcome,
+            "affected_fields": [TEMPERATURE, DEW_POINT, RH] if outcome.get("changes") else [],
+        }
+
+    def bind(self, issued: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
+        if not all(key in report for key in ("control_reference", "operational_reference")):
+            raise ValueError(
+                "Cannot bind an incomplete learning stage; operational issuance is preserved"
+            )
+        control = self.read(ArtifactId(report["control_reference"]["artifact_id"]))["payload"]
+        operational = self.read(ArtifactId(report["operational_reference"]["artifact_id"]))[
+            "payload"
+        ]
+        if (
+            control["transformation_type"] != "active_baseline"
+            or operational["parent_stage_id"] != control["variant_id"]
+            or operational["lifecycle_role"] != "active"
+            or any(
+                operational[key] != control[key]
+                for key in (
+                    "baseline_snapshot_id",
+                    "prepared_snapshot_id",
+                    "location",
+                    "reference_time",
+                    "analysis_cutoff",
+                )
+            )
+        ):
+            raise ValueError("Operational correction must retain its exact raw baseline parent")
+        with self.storage.factory() as uow:
+            record = uow.issued_forecasts.get(UUID(issued["issued_forecast_id"]))
+        if (
+            record.latitude != control["location"]["latitude"]
+            or record.longitude != control["location"]["longitude"]
+            or record.target_reference_time != instant(control["reference_time"])
+        ):
+            raise ValueError(
+                "Learning binding differs from its immutable issued decision/coordinate"
+            )
+        refs = [
+            report[key] for key in ("control_reference", "operational_reference") if key in report
+        ]
+        refs.extend(report.get("shadows", []))
+        payload = {
+            "schema_version": "mesoforge.learning-issuance-binding.v1",
+            "issued_forecast_id": issued["issued_forecast_id"],
+            "variants": refs,
+        }
+        return self._reference(
+            self.save(
+                "learning-binding",
+                payload,
+                inputs=tuple(ArtifactId(ref["artifact_id"]) for ref in refs),
+                attributes={"issued_forecast_id": issued["issued_forecast_id"]},
+            )
+        )
+
+    def background(
+        self, pinned: Any, policy_ids: list[ArtifactId], *, analysis_cutoff: datetime
+    ) -> dict[str, Any]:
+        """Optional overlays are built once in the background; failures cannot publish active."""
+        from mesoforge.application.candidate_baseline import build_candidate_overlay
+        from mesoforge.forecasting.candidate_policy import CandidateBlendPolicy
+
+        report: dict[str, Any] = {"overlays": [], "failures": []}
+        for identifier in policy_ids:
+            try:
+                retained = self.policies([identifier], analysis_cutoff)[0]
+                policy = CandidateBlendPolicy.model_validate_json(
+                    canonical_json_bytes(retained["payload"])
+                )
+                policy.validate_execution(analysis_cutoff)
+                if policy.lifecycle_role != "shadow":
+                    raise ValueError("Configured execution requires explicit shadow activation")
+                key = {
+                    "baseline_snapshot_id": pinned.manifest["baseline_snapshot_id"],
+                    "policy_digest": policy.digest,
+                    "code_identity": _digest(self.identity),
+                }
+                existing = self.find("learning-overlay", key)
+                if existing:
+                    overlay = existing[0]
+                else:
+                    built = build_candidate_overlay(pinned, policy, analysis_cutoff=analysis_cutoff)
+                    overlay = self.save(
+                        "learning-overlay",
+                        built["overlay"],
+                        inputs=(ArtifactId(identifier),),
+                        attributes=key,
+                        identity_key=key,
+                    )
+                    report.setdefault("measurements", []).append(built["timings"])
+                report["overlays"].append(self._reference(overlay))
+            except Exception as exc:
+                report["failures"].append({"policy_artifact": identifier, "reason": str(exc)})
+        return report
+
+    def candidate_stages(
+        self, forecast: dict[str, Any], report: dict[str, Any], overlays: list[dict[str, Any]]
+    ) -> None:
+        """Attach background field patches; this method cannot invoke numerical blending."""
+        from mesoforge.application.candidate_baseline import candidate_point_overlay
+
+        for reference in overlays:
+            try:
+                retained = self.read(ArtifactId(reference["artifact_id"]))
+                overlay = retained["payload"]
+                if (
+                    overlay["baseline_snapshot_id"]
+                    != forecast["baseline_snapshot"]["baseline_snapshot_id"]
+                ):
+                    raise ValueError("Candidate overlay has a different parent baseline")
+                cutoff = instant(forecast["baseline_snapshot"]["forecast_analysis_cutoff"])
+                if (
+                    max(instant(retained["registered_at"]), instant(retained["available_at"]))
+                    > cutoff
+                ):
+                    raise ValueError("Candidate baseline overlay was not available at analysis")
+                if instant(overlay["analysis_cutoff"]) > cutoff:
+                    raise ValueError("Candidate baseline analysis follows location analysis cutoff")
+                point = candidate_point_overlay(
+                    overlay,
+                    latitude=forecast["latitude"],
+                    longitude=forecast["longitude"],
+                    reference_time=instant(forecast["target_reference_time"]),
+                )
+                predictions = {
+                    (p["field"], p["valid_time"]): p for p in self._point_values(forecast)
+                }
+                for hour in point:
+                    for field in (TEMPERATURE, QPF):
+                        if field not in hour["fields"]:
+                            continue
+                        value = hour["fields"][field]
+                        row = {
+                            "field": field,
+                            "valid_time": hour["valid_time"],
+                            "value": value["value"],
+                            "unit": "K" if field == TEMPERATURE else "mm",
+                        }
+                        if field == QPF:
+                            row.update(
+                                interval_start=value["interval_start"],
+                                interval_end=value["interval_end"],
+                            )
+                        predictions[(field, hour["valid_time"])] = row
+                stage = self._stage(
+                    forecast,
+                    parent=report["control_stage"],
+                    transformation="candidate_blend",
+                    role="shadow",
+                    policy=overlay["policy"],
+                    overlay={
+                        "inherit_unchanged": False,
+                        "predictions": list(predictions.values()),
+                        "background_overlay": reference,
+                        "affected_fields": overlay["affected_fields"],
+                    },
+                    status="shadow",
+                )
+                saved = self.save(
+                    "forecast-variant",
+                    stage,
+                    inputs=(ArtifactId(reference["artifact_id"]),),
+                    attributes=self._attributes(stage),
+                )
+                report["shadows"].append(self._reference(saved))
+            except Exception as exc:
+                report["failures"].append({"phase": "candidate_projection", "reason": str(exc)})
+
+    def stage_issued(
+        self, identifier: UUID, *, policy_ids: list[ArtifactId] | None = None
+    ) -> dict[str, Any]:
+        """Explicit retained-data replay; never rewrites a historical issuance."""
+        with self.storage.artifacts.acquire_identity(
+            Digest.of_bytes(canonical_json_bytes({"learning_issued_replay": str(identifier)}))
+        ):
+            return self._stage_issued(identifier, policy_ids=policy_ids)
+
+    def _stage_issued(
+        self, identifier: UUID, *, policy_ids: list[ArtifactId] | None = None
+    ) -> dict[str, Any]:
+        if policy_ids:
+            raise ValueError(
+                "Historical stage replay retains the no-op stage only; "
+                "use configured shadow execution"
+            )
+        existing = self.find("learning-binding", {"issued_forecast_id": str(identifier)})
+        if existing:
+            return {"already_existing": True, "binding": existing[0]}
+        saved = self.storage.issuer.read(identifier)
+        original = saved["forecast"]
+        if original.get("learning_stage") is not None:
+            raise ValueError(
+                "Issued stage already has learning lineage but no binding; "
+                "do not reinterpret a potentially corrected forecast as its raw baseline"
+            )
+        corrected, report = self.local_stage(original, policy_ids=policy_ids)
+        # Historical operational output stays untouched even with an explicit old active policy.
+        report["historical_issuance_unchanged"] = True
+        report["numerical_no_op"] = corrected["hours"] == original["hours"]
+        report["binding"] = self.bind(saved, report)
+        return report
+
+    def analyze(
+        self,
+        field: str,
+        latitude: float,
+        longitude: float,
+        *,
+        start: datetime,
+        end: datetime,
+        variant_ids: list[ArtifactId] | None = None,
+    ) -> dict[str, Any]:
+        """Read existing facts and compact bound variants; no new verification facts."""
+        from mesoforge.verification.variant_evaluation import evaluate_variants
+
+        started = time.perf_counter()
+        if instant(end) <= instant(start):
+            raise ValueError("Analysis end must follow start")
+        if field == TEMPERATURE:
+            control = analyze_site_verification(
+                latitude,
+                longitude,
+                unit_of_work_factory=self.storage.factory,
+                load_payload=lambda m: self.storage.artifacts.load_verified_payload(m.artifact_id)[
+                    1
+                ],
+            )
+            control = {
+                **control,
+                "samples": [
+                    row
+                    for row in control["samples"]
+                    if instant(start) <= instant(row["valid_time"]) < instant(end)
+                ],
+            }
+        elif field == QPF:
+            control = self.storage.analyze_window(
+                latitude=latitude,
+                longitude=longitude,
+                start_valid_time=start,
+                end_valid_time=end,
+                stages=("final_issued",),
+            )
+        else:
+            raise ValueError("Learning metrics currently support temperature and exact-hour QPF")
+        with self.storage.factory() as uow:
+            issued = uow.issued_forecasts.list_for_coordinate(latitude, longitude, limit=None)
+        bindings: dict[str, list[str]] = {}
+        for issuance in issued:
+            for row in self.find(
+                "learning-binding", {"issued_forecast_id": str(issuance.issued_forecast_id)}
+            ):
+                for ref in row["payload"]["variants"]:
+                    bindings.setdefault(ref["artifact_id"], []).append(
+                        str(issuance.issued_forecast_id)
+                    )
+        chosen = (
+            [str(value) for value in variant_ids] if variant_ids is not None else list(bindings)
+        )
+        variants = []
+        for identifier in chosen:
+            value = self.read(ArtifactId(identifier))["payload"]
+            validate_variant(value)
+            variants.append({**value, "control_issued_forecast_ids": bindings.get(identifier, [])})
+        result = evaluate_variants(field, control, variants)
+        return {
+            **result,
+            "analysis_seconds": time.perf_counter() - started,
+            "control_canonicalization": control["canonicalization"],
+            "canonicalization_scope": (
+                "all_retained_temperature_history; samples_filtered_to_requested_window"
+                if field == TEMPERATURE
+                else "requested_qpf_window"
+            ),
+            "writes": 0,
+        }
+
+
+def configured_learning() -> LearningService:
+    from mesoforge.application.issued_qpf_verification import configured_service
+
+    return LearningService(configured_service())
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    register = commands.add_parser("register-policy")
+    register.add_argument("--file", type=Path, required=True)
+    read = commands.add_parser("read")
+    read.add_argument("--artifact-id", type=ArtifactId, required=True)
+    stage = commands.add_parser(
+        "stage-issued", help="Explicit retained-data stage replay; no forecast rewrite"
+    )
+    stage.add_argument("--issued-forecast-id", type=UUID, required=True)
+    stage.add_argument("--learning-policies", type=Path)
+    background = commands.add_parser("build-candidate", help="Explicit background shadow build")
+    background.add_argument("--baseline-root", type=Path, required=True)
+    background.add_argument("--policy-id", type=ArtifactId, action="append", required=True)
+    analyze = commands.add_parser("analyze")
+    analyze.add_argument("--field", choices=(TEMPERATURE, QPF), required=True)
+    analyze.add_argument("--lat", type=float, required=True)
+    analyze.add_argument("--lon", type=float, required=True)
+    analyze.add_argument("--start", type=datetime.fromisoformat, required=True)
+    analyze.add_argument("--end", type=datetime.fromisoformat, required=True)
+    analyze.add_argument("--variant-id", type=ArtifactId, action="append")
+    args = parser.parse_args(argv)
+    try:
+        service = configured_learning()
+        if args.command == "read":
+            result = service.read(args.artifact_id)
+        elif args.command == "register-policy":
+            result = service.register_policy(json.loads(args.file.read_text(encoding="utf-8")))
+        elif args.command == "stage-issued":
+            result = service.stage_issued(
+                args.issued_forecast_id,
+                policy_ids=load_learning_config(args.learning_policies)["correction_policies"],
+            )
+        elif args.command == "build-candidate":
+            from mesoforge.application.baseline_snapshot import load_baseline
+
+            result = service.background(
+                load_baseline(args.baseline_root),
+                args.policy_id,
+                analysis_cutoff=_utc(),
+            )
+        else:
+            result = service.analyze(
+                args.field,
+                args.lat,
+                args.lon,
+                start=args.start,
+                end=args.end,
+                variant_ids=args.variant_id,
+            )
+        print(json.dumps(result, indent=2, default=str))
+        return 0
+    except Exception as exc:
+        print(json.dumps({"error": str(exc)}), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

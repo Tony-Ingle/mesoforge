@@ -193,6 +193,51 @@ def test_unimplemented_stages_are_explicit_and_do_not_create_adjustments(
         assert hour["verification"]["status"] == "not_yet_verified"
 
 
+def test_learning_noop_keeps_existing_report_exactly(forecast):
+    unchanged = build_hourly_report(forecast)
+    forecast["learning_stage"] = {"overlay": {"correction": {"status": "no_policy", "changes": []}}}
+    assert build_hourly_report(forecast) == unchanged
+
+
+def test_active_correction_report_preserves_exact_baseline_and_separate_final(forecast):
+    original = deepcopy(forecast)
+    points = []
+    for index, hour in enumerate(forecast["hours"]):
+        baseline = deepcopy(hour["temperature"])
+        delta = -0.75 if index < 6 else 0.0
+        hour["temperature"]["value"] += delta
+        points.append(
+            {
+                "valid_time": hour["valid_time"],
+                "baseline_temperature": baseline,
+                "temperature": deepcopy(hour["temperature"]),
+                "applied_delta_k": delta,
+            }
+        )
+    forecast["learning_stage"] = {
+        "variant_id": "corrected",
+        "parent_stage_id": "control",
+        "overlay": {
+            "correction": {
+                "status": "applied",
+                "point_values": points,
+                "policy": {"policy_id": "site-policy", "version": "1"},
+            }
+        },
+    }
+    report = build_hourly_report(forecast)
+    for index, row in enumerate(report["hours"]):
+        assert row["raw_numerical_temperature"] == original["hours"][index]["temperature"]
+        assert row["final_temperature"] == forecast["hours"][index]["temperature"]
+        assert row["bias_correction"]["applied_delta"]["value"] == (-0.75 if index < 6 else 0)
+        assert row["bias_correction"]["stage_id"] == "corrected"
+        assert row["ai_adjustment"]["action"] == "not_run"
+    assert report["hours"][6]["bias_correction"]["status"] == "no_op"
+    rendered = render_hourly_report(report)
+    assert "explicitly active" in rendered
+    assert "neither stage is implemented" not in rendered
+
+
 def test_missing_active_temperature_and_native_ifs_gaps_stay_missing(
     forecast: dict[str, Any],
 ) -> None:

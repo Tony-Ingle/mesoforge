@@ -35,9 +35,9 @@ flowchart TD
     F --> H[Current approved cross-field coherence]
     H --> B[Immutable MesoForge baseline snapshot]
     B --> L[Configured-location extraction from a pinned baseline]
-    L -. FUTURE .-> S[Deterministic site / regime correction]
+    L --> S[Local deterministic temperature correction stage / explicit no-op]
     S -. FUTURE .-> A[Bounded AI forecast desk and final validation]
-    L --> I[Immutable issuance today]
+    S --> I[Immutable issuance today]
     A -. FUTURE .-> I
     I --> V[Verification facts and canonical analysis]
     O[Observation / analysis providers] --> V
@@ -77,7 +77,7 @@ Two roles organize one codebase. They are not a collection of weather microservi
 | Acquire and normalize selected evidence | Pin one published baseline |
 | Reuse raw/prepared guidance across locations | Read its saved local domain/reference view |
 | Publish prepared contributor state | Produce deterministic reports |
-| Build fields and current coherence | Save an immutable issuance when requested |
+| Build fields and current coherence; configured candidate shadows | Apply explicit local correction/no-op and save an immutable issuance |
 | Publish a complete numerical baseline | Read back and participate in verification |
 
 The implemented application boundaries are:
@@ -145,6 +145,7 @@ flowchart TD
 | Raw/native evidence | What did the provider supply, and when was it acquired? | Original bytes, URL/object identity, checksum and timestamps |
 | Prepared contributor state | What normalized guidance was available? | Prepared files, native semantics, selection evidence and source manifests |
 | Baseline snapshot | What numerical forecast did current policies construct? | Immutable domains/views, policy/coherence identity and exact prepared lineage |
+| Learning policy / variant | What explicit transformation of its parent was evaluated? | Immutable policy/version, parent stage, compact field overlay, role, evidence cutoff and code/config identity |
 | Issued forecast | What was issued for this coordinate at this time? | Issued UUID, actual issuance, reference time, payload digest and baseline lineage |
 | Verification fact | What exact forecast/evidence comparison was evaluated? | Immutable field/stage-specific evidence and explicit status |
 | Canonical sample | Which comparisons may count analytically? | Deterministic read-only selection/deduplication of facts |
@@ -711,7 +712,7 @@ must narrow explicit historical windows or increase bounds for omitted work.
 | Opportunity | Issued version, stage, coordinate, field, exact hourly interval and verification policy |
 | Event matching | Forecast and MRMS have identical `(start,end]`, exactly one hour |
 | Eligibility | Issued no later than interval start; event and retained observation availability within cutoff |
-| Field/stage | Current baseline and final-issued cohorts separate; no generated correction/AI stage |
+| Field/stage | Current baseline and final-issued QPF cohorts separate; no QPF correction or AI execution |
 | Fact | `issued-qpf-verification.v1` under `qpf-mrms-verification.v1`, compact immutable attributes/references |
 | Persistence | Existing ArtifactService, PostgreSQL advisory idempotency and S3-compatible payloads |
 | Repeat | Same evidence/status reuses the original fact; a later retry cutoff alone does not multiply facts |
@@ -760,20 +761,121 @@ Code: [temperature facts](src/mesoforge/application/issued_temperature_verificat
 
 ## L. Learning
 
-Current learning-related infrastructure consists of retained verification facts,
-canonical analysis, contributor/recipe comparisons and site-evidence readiness.
-It does not apply learned weights, bias corrections or AI edits.
+The current Learning Core composes one shared variant model, temperature correction,
+candidate blend policies and one field-aware shadow evaluator. It does not promote
+policies, tune current production weights, diagnose regimes or execute AI.
 
-| Layer | Target responsibility | Current status |
-|---|---|---|
-| Statistical learning | Deterministic site/regime correction from comparable verified error | Analysis foundation only; correction not applied |
-| Site knowledge | Versioned inspectable local behavior/context | No assumed LLM memory or autonomous operational knowledge store |
-| AI performance learning | Compare accepted edit behavior against the corrected baseline on identical samples | Future |
+```text
+prepared contributors → active FieldBlendEngine → active baseline
+    └→ explicit shadow field policy → compact candidate baseline overlay
 
-The target order is baseline → deterministic correction → AI adjustment → final
-validation. Preserve each stage separately. Evidence sufficiency and controlled
-promotion precede operational use; a small demonstration is not a weight-selection
-or long-term skill result.
+pinned active baseline → local extraction → deterministic correction/no-op → issuance
+                                └→ configured correction shadow
+
+control + bound variants + canonical temperature/MRMS facts → identical-sample evaluation
+```
+
+### Common immutable identity and storage
+
+[`forecast_variants`](src/mesoforge/contracts/forecast_variants.py) defines the
+shared stage identity: parent, transformation, field list, lifecycle role,
+policy/version/digest, baseline/contributor IDs, coordinate, reference/analysis
+time, evidence/creation/activation times and code identity. An explicit no-op is
+still a stage. An AI-named stage can be represented for future evaluation contracts;
+no AI-generated stage or AI behavior exists now.
+
+[`learning`](src/mesoforge/application/learning.py) persists policies, overlays,
+variants and issuance bindings using the existing ArtifactService, PostgreSQL
+metadata and content-addressed S3 objects. These are compact transformations and
+references, not another full forecast-history store. Unchanged fields/native
+evidence remain owned by the parent baseline. Historical issuances are never
+rewritten when an explicit retained-data stage is later attached.
+Point-hour verification context carries a marked stage identity/status summary
+and artifact reference, not the local domain's correction overlay. The full sealed
+stage remains authoritative in its artifact and immutable issuance.
+
+### Temperature correction after local extraction
+
+[`corrections`](src/mesoforge/application/corrections.py) consumes the unchanged
+`mesoforge-bias-evidence-policy.v1`: each 1–6 / 7–18 / 19–36 bucket independently
+requires 30 canonical samples, 10 UTC decision dates, at most 25% concentration on
+one date, and a decision-date-means Student-t 95% bias interval excluding zero.
+Sample-mean error is forecast minus observation; its negative is the proposed delta.
+Other buckets remain unchanged. Sparse evidence produces no candidate.
+
+The lifecycle distinguishes no policy, insufficient evidence, candidate, shadow,
+active and retired. Only an explicitly active policy changes operational output;
+qualified evidence never promotes one. No such promoted policy ships with this
+milestone. Shadow application also requires explicit configuration/activation.
+
+The current correction recipe declares a uniform temperature offset over the
+configured local grid. It is not evidence that a station-derived bias has spatial
+skill at all surrounding cells. The policy and compact changed values retain this
+limitation. The shared baseline/native contributors remain immutable. Copy-on-write
+local fields are re-extracted at the exact center through the existing grid reader.
+
+The same coherence engine reruns only current T/Td consistency and Bolton RH when
+temperature changes. It neither reblends native guidance nor enforces future
+precipitation/fog relationships. A no-op does not rerun diagnostics. Any incomplete
+active transformation or failed stage retention falls back to the complete original
+local baseline and records the failure; a partially transformed forecast is not issued.
+
+### Candidate field policies on the background side
+
+[`CandidateBlendPolicy`](src/mesoforge/forecasting/candidate_policy.py) is versioned
+data: field, parent/control policy, contributors through existing recipe/table
+parameters, lead applicability, missing/fallback contract, proposal source, evidence
+cutoff and candidate/shadow lifecycle. It cannot select an active role.
+`FieldBlendEngine` executes an explicitly selected policy override using the same
+scalar, vector, gust and interval-QPF kernels as the active path.
+
+[`candidate_baseline`](src/mesoforge/application/candidate_baseline.py) replays
+retained contributor values for saved domains/reference views in the background,
+producing affected fields and currently required diagnostics as an immutable
+overlay. It references the active baseline and stores no cloned native evidence.
+Configured jobs only extract the saved candidate overlay; they do not calculate
+candidate blends. No real QPF candidate is generated from the small retained dataset.
+
+### One evaluator and truthful cutoffs
+
+[`variant_evaluation`](src/mesoforge/verification/variant_evaluation.py) consumes the
+existing field canonicalizers. It joins stages through immutable issuance lineage
+to one common set of configured target, reference/lead, valid event and observation
+revision identities. Temperature keeps its current station matching contract; QPF
+requires the exact hourly `(start,end]` MRMS event. Duplicates collapse, conflicting
+evidence stays ambiguous, and absent/incompatible variants exclude that event from
+the common population. Inheritance is explicit, never guessed from a missing field.
+In the evaluator, `inherit_unchanged` means the canonical **issued control** value;
+it does not traverse arbitrary parent stages. Raw-baseline, correction-shadow and
+candidate-shadow projections therefore retain explicit temperature/QPF point values,
+including unchanged events, so an active correction cannot be mistaken for raw
+guidance. A future AI adapter must likewise supply its resulting stage values or
+explicitly identify unchanged issued-control events; no AI execution exists here.
+
+Read-only results expose control/variant bias, MAE, RMSE and metric differences,
+paired counts, QPF descriptive totals, exact/provisional leads, coordinate/date
+concentration, observation identities and exclusion reasons. There is no overall
+winner score or promotion decision. Equivalent/no-op variants are valid comparisons.
+
+Learning evidence is filtered before canonicalization by both verified-input cutoff
+and fact registration. Legacy facts without availability proof cannot teach a
+historical decision. Policy evidence precedes creation, activation precedes use,
+and artifact availability must also precede forecast analysis. Actual stage
+execution may finish later; its creation time is retained rather than backdated.
+Verification completed after the pinned analysis cutoff can inform a future run,
+not silently enter the current decision.
+Temperature correction proposals also require raw-baseline/no-op stage evidence;
+already corrected final-issued errors cannot train a new raw-baseline offset.
+Compact fact attributes retain stage identity; legacy attributes without it are
+reprojected from the immutable verification payload. Ordinary final-issued analysis
+and its error definition remain unchanged. The older recipe/contributor comparison
+rejects transformed stages with an explicit route to the unified evaluator.
+
+The prospective operator builds configured candidate overlays on the background
+side and composes the permanent local learning stage. No-op is the default.
+Learning/shadow failures remain subordinate to control issuance and per-location
+isolation. Promotion/rollback governance, broader correction science, site/regime
+modeling and the bounded AI desk remain future milestones.
 
 ## M. Future bounded AI forecast desk
 
@@ -808,8 +910,10 @@ The most recent fully validated state always remains available. Timeout, failure
 exhausted budget or lack of justified changes must not leave a partially edited
 forecast. No accepted edit means the valid deterministic baseline remains usable.
 
-Forecast reports currently state bias/AI stages did not run. Zero report deltas do
-not imply a correction or AI inference was computed.
+No-op/historical forecast reports retain their existing zero-delta presentation;
+the explicit learning-stage metadata distinguishes no policy from an applied stage.
+An actually applied active temperature correction preserves raw baseline, delta,
+policy identity and final coherent values separately. AI always remains not_run.
 
 ## N. Operations and deployment
 
@@ -870,7 +974,9 @@ it is not the forecast scheduler. Hermes development orchestration remains pause
 | Temperature automatic matching/verification | Implemented | Bounded station/METAR path; no public registration required |
 | MRMS hourly contract and QPF facts/analysis | Implemented | Exact-event service, canonical stages and identical-sample comparison |
 | Automatic QPF observation accumulation | Implemented | Bounded on-demand attempts before issuance; explicit bounded backfill |
-| Site/regime correction | Future | Evidence analysis exists, no applied correction |
+| Deterministic local temperature correction | Implemented | Evidence-gated candidates, explicit active/shadow policy, no-op default; no promoted policy configured |
+| Candidate blend and unified shadow evaluation | Implemented | Background field overlays; common canonical temperature/MRMS samples; no automatic promotion |
+| Broader site/regime correction and governance | Future | No regime classifier, additional correction science or promotion/rollback controller |
 | Bounded AI editing and final validation | Future | No LLM execution or edit controller |
 | Scheduled hosted operation and delivery | Future | Scheduler chooses when; MesoForge keeps all meteorology |
 

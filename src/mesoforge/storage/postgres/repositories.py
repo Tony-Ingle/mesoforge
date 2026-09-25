@@ -522,6 +522,30 @@ class PostgresArtifactRepository:
         )
         return tuple(_artifact_row_to_manifest(row) for row in rows)
 
+    def find_learning_artifacts(
+        self, artifact_type: str, *, attributes: dict[str, object], limit: int = 1000
+    ) -> tuple[ArtifactManifest, ...]:
+        """Bounded lookup of compact learning artifacts in the existing artifact catalog."""
+        if (
+            artifact_type
+            not in {"learning-policy", "learning-overlay", "forecast-variant", "learning-binding"}
+            or not 1 <= limit <= 10000
+        ):
+            raise ValueError("Invalid learning artifact query")
+        rows = self._session.scalars(
+            sa.select(ArtifactRow)
+            .where(
+                ArtifactRow.artifact_type == artifact_type,
+                ArtifactRow.attributes.contains(attributes),
+            )
+            .order_by(ArtifactRow.registered_at, ArtifactRow.id)
+            .limit(limit + 1)
+        )
+        found = tuple(_artifact_row_to_manifest(row) for row in rows)
+        if len(found) > limit:
+            raise ValueError("Learning artifact query is truncated; narrow its scope")
+        return found
+
     def find_unindexed_issued_temperature_verifications(
         self, *, limit: int
     ) -> tuple[ArtifactManifest, ...]:

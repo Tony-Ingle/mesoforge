@@ -30,6 +30,8 @@ def operator(tmp_path, monkeypatch):
     pointer = {"baseline_snapshot_id": "baseline-a"}
     issuer = Mock()
     issuer.find_versions.return_value = []
+    learning = Mock()
+    monkeypatch.setattr(cycle, "configured_learning", lambda: learning)
 
     def refresh(path, root):
         events.append(("refresh", load_locations(path)))
@@ -70,7 +72,12 @@ def operator(tmp_path, monkeypatch):
     monkeypatch.setattr(cycle, "build_baseline", build)
     monkeypatch.setattr(cycle, "forecast_from_baseline", forecast)
     return SimpleNamespace(
-        config=config, root=tmp_path / "runtime", issuer=issuer, events=events, pointer=pointer
+        config=config,
+        root=tmp_path / "runtime",
+        issuer=issuer,
+        events=events,
+        pointer=pointer,
+        learning=learning,
     )
 
 
@@ -84,6 +91,10 @@ def test_now_clock_resampled_after_background_and_reference_can_cross_hour(opera
     assert result["request_time"] == AFTER.isoformat()
     assert result["reference_time"] == "2031-11-02T07:00:00+00:00"
     assert operator.events[-1][1]["reference_time"] is None
+    assert operator.events[-1][1]["learning_service"] is operator.learning
+    assert operator.events[-1][1]["learning_policy_ids"] == []
+    assert operator.events[-1][1]["learning_overlays"] == []
+    operator.learning.background.assert_not_called()
     assert result["status"] == "completed"
     assert len(result["results"]) == 2
     saved = json.loads((Path(result["directory"]) / "result.json").read_text())
@@ -229,5 +240,85 @@ def test_scheduler_cli_requires_no_date_or_interactive_input(monkeypatch, tmp_pa
     monkeypatch.setattr(cycle, "run_prospective_cycle", run)
     assert cycle.main(["--root", str(tmp_path)]) == 0
     assert run.call_args.args == (cycle.DEFAULT_CONFIG, tmp_path)
-    assert run.call_args.kwargs == {"replay_reference_time": None}
+    assert run.call_args.kwargs == {"replay_reference_time": None, "learning_policies": None}
     assert "Cycle result: completed" in capsys.readouterr().out
+
+
+def test_candidate_background_finishes_before_location_cutoff_and_pins_active_parent(
+    operator, monkeypatch, tmp_path
+):
+    blend_id = "art_10000000-0000-4000-8000-000000000001"
+    correction_id = "art_10000000-0000-4000-8000-000000000002"
+    policies = tmp_path / "policies.json"
+    policies.write_text(
+        json.dumps({"blend_policies": [blend_id], "correction_policies": [correction_id]})
+    )
+    pinned = object()
+
+    def pin(root, *, pointer):
+        assert pointer is operator.pointer
+        return pinned
+
+    def background(actual, identifiers, *, analysis_cutoff):
+        assert actual is pinned
+        assert identifiers == [blend_id]
+        assert analysis_cutoff == AFTER
+        operator.events.append(("shadow_background", analysis_cutoff))
+        return {"overlays": [{"artifact_id": "retained-shadow"}], "failures": []}
+
+    monkeypatch.setattr(cycle, "load_baseline", pin)
+    operator.learning.background.side_effect = background
+    finished = AFTER + timedelta(minutes=2)
+    clock = iter((START, AFTER, finished))
+    result = cycle.run_prospective_cycle(
+        operator.config,
+        operator.root,
+        clock=lambda: next(clock),
+        issuer=operator.issuer,
+        learning_policies=policies,
+        learning_service=operator.learning,
+    )
+    assert result["status"] == "completed"
+    assert [event[0] for event in operator.events] == [
+        "refresh",
+        "build",
+        "shadow_background",
+        "forecast",
+    ]
+    kwargs = operator.events[-1][1]
+    assert kwargs["baseline_pointer"] is operator.pointer
+    assert kwargs["request_time"] == finished
+    assert kwargs["learning_policy_ids"] == [correction_id]
+    assert kwargs["learning_overlays"] == [{"artifact_id": "retained-shadow"}]
+    assert result["background"]["learning"]["status"] == "ready"
+
+
+@pytest.mark.parametrize("failure", ["policy_config", "initialization", "candidate_background"])
+def test_learning_failure_never_blocks_active_location_batch(
+    operator, monkeypatch, tmp_path, failure
+):
+    policies = tmp_path / "policies.json"
+    policies.write_text(
+        json.dumps({"blend_policies": ["art_10000000-0000-4000-8000-000000000001"]})
+    )
+    if failure == "policy_config":
+        policies.write_text("not-json")
+    elif failure == "initialization":
+        monkeypatch.setattr(
+            cycle, "configured_learning", Mock(side_effect=OSError("learning offline"))
+        )
+    else:
+        monkeypatch.setattr(cycle, "load_baseline", lambda *args, **kwargs: object())
+        operator.learning.background.side_effect = OSError("candidate storage failed")
+    result = cycle.run_prospective_cycle(
+        operator.config,
+        operator.root,
+        clock=lambda: START,
+        issuer=operator.issuer,
+        learning_policies=policies,
+    )
+    assert result["status"] == "completed"
+    assert [row["issuance_outcome"] for row in result["results"]] == ["issued", "issued"]
+    assert result["background"]["learning"]["failures"][0]["phase"] == failure
+    assert operator.events[-1][1]["baseline_pointer"] is operator.pointer
+    assert operator.events[-1][1]["learning_overlays"] == []

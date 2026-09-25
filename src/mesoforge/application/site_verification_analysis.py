@@ -30,6 +30,7 @@ from mesoforge.verification.analytical_attributes import (
     analytical_block,
     build_analytical_attributes,
 )
+from mesoforge.verification.model_comparison import is_raw_temperature_control
 from mesoforge.verification.site_analysis import (
     ANALYSIS_POLICY,
     CANONICALIZATION_POLICY,
@@ -102,6 +103,8 @@ def analyze_site_verification(
     display_timezone: str | None = None,
     payload_only: bool = False,
     now: datetime | None = None,
+    as_of: datetime | None = None,
+    raw_baseline_only: bool = False,
     unit_of_work_factory: Callable[[], Any] | None = None,
     load_payload: Callable[[ArtifactManifest], bytes] | None = None,
 ) -> dict[str, Any]:
@@ -116,6 +119,11 @@ def analyze_site_verification(
     evaluated_at = now if now is not None else datetime.now(UTC)
     if evaluated_at.tzinfo is None or evaluated_at.utcoffset() is None:
         raise ValueError("The evaluation time must include a timezone")
+    if as_of is not None:
+        if as_of.tzinfo is None or as_of.utcoffset() is None:
+            raise ValueError("The evidence cutoff must include a timezone")
+        if as_of > evaluated_at:
+            raise ValueError("The evidence cutoff cannot follow the evaluation time")
     factory = unit_of_work_factory or _configured_factory
     with factory() as uow:
         issued = uow.issued_forecasts.list_for_coordinate(latitude, longitude, limit=None)
@@ -141,6 +149,8 @@ def analyze_site_verification(
             block, reason = analytical_block(manifest.attributes)
             if payload_only:
                 block, reason = None, "payload_only_requested"
+            elif raw_baseline_only and block is not None and "forecast_stage" not in block:
+                block, reason = None, "legacy_forecast_stage_identity_unavailable"
         if block is not None:
             from_attributes += 1
             attribute_bytes += len(canonical_json_bytes(block))
@@ -173,6 +183,20 @@ def analyze_site_verification(
         exclusion = _metadata_exclusion(fact, records)
         if exclusion is not None:
             fact["integrity_exclusion"] = exclusion
+        elif raw_baseline_only and not is_raw_temperature_control(fact.get("forecast_stage")):
+            fact["integrity_exclusion"] = "nonbaseline_temperature_stage"
+        elif as_of is not None:
+            # Filter facts before canonicalization: a future revision must neither
+            # teach this decision nor make previously known evidence ambiguous.
+            try:
+                cutoff = datetime.fromisoformat(str(fact.get("verification_cutoff")))
+                if cutoff.tzinfo is None or cutoff.utcoffset() is None:
+                    raise ValueError("unproven verification availability")
+            except (TypeError, ValueError):
+                fact["integrity_exclusion"] = "learning_evidence_availability_unproven"
+            else:
+                if cutoff > as_of or manifest.registered_at > as_of:
+                    fact["integrity_exclusion"] = "learning_evidence_after_cutoff"
         facts.append(fact)
 
     analysis = analyze_facts(facts, display_timezone=display_timezone)
@@ -192,7 +216,16 @@ def analyze_site_verification(
         "coordinate": {"latitude": latitude, "longitude": longitude},
         "evaluation": {
             "evaluated_at": evaluated_at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
-            "note": "Only this block depends on the clock; all other content is deterministic.",
+            "note": "Without as_of, only this block depends on the clock.",
+            **({"forecast_stage_scope": "raw_baseline_only"} if raw_baseline_only else {}),
+            **(
+                {
+                    "evidence_cutoff": as_of.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+                    "evidence_availability": "verified_input_cutoff_and_fact_registration",
+                }
+                if as_of is not None
+                else {}
+            ),
         },
         "inventory": {
             "issued_versions_for_coordinate": len(records),

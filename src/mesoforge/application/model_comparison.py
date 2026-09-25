@@ -22,7 +22,11 @@ from mesoforge.common.identifiers import ArtifactId, Digest
 from mesoforge.forecasting.recipes import DEFAULT_CONFIGURATION, ContributorConfiguration
 from mesoforge.storage.json import CanonicalJsonSerializer
 from mesoforge.verification.issued_temperature import forecast_eligibility_reasons
-from mesoforge.verification.model_comparison import compare_hour, summarize
+from mesoforge.verification.model_comparison import (
+    compare_hour,
+    require_raw_temperature_control,
+    summarize,
+)
 
 _JSON = CanonicalJsonSerializer()
 _PACKAGE = Path(__file__).resolve().parents[1]
@@ -213,6 +217,7 @@ def compare_verified(
             or match["forecast_code_identity"] != saved["code_identity"]
         ):
             raise IntegrityError("Verification does not describe the exact saved issued forecast")
+        require_raw_temperature_control(forecast.get("learning_stage"))
         resolved, contributor_evidence = resolver.resolve(saved, hour)
         configuration = _configuration(forecast)
         ineligible_models = {
@@ -298,6 +303,7 @@ def compare_issued(
     saved = read_forecast(issued_forecast_id)
     if saved["issued_forecast_id"] != str(issued_forecast_id):
         raise IntegrityError("Readback returned a different issued forecast")
+    require_raw_temperature_control(saved["forecast"].get("learning_stage"))
     identity = comparison_identity()
     resolver = RetainedContributors(guidance_roots, identity)
     configuration = _configuration(saved["forecast"])

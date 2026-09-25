@@ -8,6 +8,7 @@ Native evidence is read-only; only per-hour dependency results are cached.
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Literal
@@ -187,9 +188,37 @@ class FieldBlendEngine:
 
     contributors: ContributorConfiguration
     phase2: Phase2BlendConfiguration | None = None
+    policy_overrides: Mapping[str, Recipe | FallbackWeightTable] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Explicit background shadow execution cannot mutate the active policy set."""
+        overrides = dict(self.policy_overrides)
+        for field_id, policy in overrides.items():
+            definition = FIELD_REGISTRY[field_id]
+            if definition.policy_binding == "rh":
+                raise SurfaceBlendError("RH is diagnostic, not an independently weighted field")
+            if definition.policy_binding == "control_recipe":
+                if not isinstance(policy, Recipe) or policy.field != field_id:
+                    raise SurfaceBlendError(
+                        "Temperature override requires a matching scalar recipe"
+                    )
+                definitions = self.contributors.model_map()
+                for contributor in policy.contributors:
+                    model = definitions.get(contributor.model)
+                    if (
+                        model is None
+                        or field_id not in model.supported_fields
+                        or model.status == "retired"
+                    ):
+                        raise SurfaceBlendError("Candidate recipe uses unsupported contributor")
+            elif not isinstance(policy, FallbackWeightTable):
+                raise SurfaceBlendError("This field requires its existing fallback-table contract")
+        object.__setattr__(self, "policy_overrides", MappingProxyType(overrides))
 
     def policy_for(self, field_id: str) -> Recipe | FallbackWeightTable | str:
         definition = FIELD_REGISTRY[field_id]
+        if field_id in self.policy_overrides:
+            return self.policy_overrides[field_id]
         if definition.policy_binding == "control_recipe":
             return self.contributors.control_recipe
         if definition.policy_binding == "rh":

@@ -76,7 +76,9 @@ def test_two_locations_issue_one_baseline_lineage_read_exactly_and_preserve_hist
         saved_versions.append(saved)
 
     before = storage_tests.storage_inventory(migrated_dsn, object_store)
-    assert [len(items) for items in before] == [3, 3, 3]
+    # Three issuances plus control/stage/binding artifacts for each new location.
+    # Learning uses the same PostgreSQL/MinIO path; history still has three rows.
+    assert [len(items) for items in before] == [3, 9, 9]
     repeat = forecast_from_baseline(
         baseline_case["baseline"],
         locations,
@@ -114,6 +116,7 @@ def test_prior_verification_failure_does_not_block_baseline_issuance_or_later_lo
     baseline_case,
     migrated_dsn: str,
     object_store: S3ArtifactObjectStore,
+    configured_retrieval_storage: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Observation availability never gates the real immutable issuance transaction."""
@@ -152,7 +155,7 @@ def test_prior_verification_failure_does_not_block_baseline_issuance_or_later_lo
         len(items) for items in storage_tests.storage_inventory(migrated_dsn, object_store)
     ] == [
         2,
-        2,
-        2,
+        8,
+        8,
     ]
     forbidden.assert_not_called()

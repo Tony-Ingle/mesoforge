@@ -60,12 +60,42 @@ def _prediction(temperature: Any, reasons: Any, label: str) -> dict[str, Any]:
     return {"value": value, "unit": "K", "missing_reasons": list(dict.fromkeys(missing))}
 
 
+def is_raw_temperature_control(stage: Any) -> bool:
+    """Legacy/no-op stages retain the raw recipe; transformed temperatures do not."""
+    if stage is None:
+        return True
+    if not isinstance(stage, Mapping):
+        return False
+    if stage.get("transformation_type") == "active_baseline":
+        return True
+    overlay = stage.get("overlay", {})
+    correction = overlay.get("correction", {}) if isinstance(overlay, Mapping) else {}
+    return (
+        stage.get("transformation_type") == "deterministic_corrected"
+        and isinstance(correction, Mapping)
+        and correction.get("status")
+        in {"no_policy", "insufficient_evidence", "no_op", "not_active", "retired", "fallback"}
+        and not correction.get("changes")
+        and not overlay.get("predictions")
+    )
+
+
+def require_raw_temperature_control(stage: Any) -> None:
+    """Keep the historical contributor comparison explicit about the stage it scores."""
+    if not is_raw_temperature_control(stage):
+        raise ValueError(
+            "Adjusted temperature stage is not the raw contributor blend; "
+            "use mesoforge.application.learning analyze for stage-aware comparison."
+        )
+
+
 def compare_hour(
     hour: dict[str, Any],
     observation: dict[str, Any] | None,
     *,
     configuration: ContributorConfiguration = DEFAULT_CONFIGURATION,
     ineligible_models: Mapping[str, Sequence[str]] | None = None,
+    forecast_stage: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compare retained values against the already-selected verified temperature.
 
@@ -73,6 +103,7 @@ def compare_hour(
     this function neither selects observations nor changes eligibility. Missing
     legacy contributor values stay missing, even when the control was retained.
     """
+    require_raw_temperature_control(forecast_stage)
     bucket = _lead_bucket(hour.get("horizon_hours"))
     active = hour.get("sources")
     shadows = hour.get("shadow_sources", [])

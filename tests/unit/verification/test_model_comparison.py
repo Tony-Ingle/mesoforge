@@ -68,6 +68,17 @@ def test_independent_predictions_signed_errors_and_inputs_unchanged():
     assert (hour, observation) == original
 
 
+def test_adjusted_stage_routes_to_unified_evaluator_while_noop_is_exact():
+    stage = {
+        "transformation_type": "deterministic_corrected",
+        "overlay": {"predictions": [], "correction": {"status": "no_policy", "changes": []}},
+    }
+    assert compare_hour(_hour(), None, forecast_stage=stage) == compare_hour(_hour(), None)
+    stage["overlay"]["correction"]["status"] = "applied"
+    with pytest.raises(ValueError, match="learning analyze"):
+        compare_hour(_hour(control=282.0), None, forecast_stage=stage)
+
+
 @pytest.mark.parametrize(
     ("horizon", "bucket"),
     [(1, "1-6"), (6, "1-6"), (7, "7-18"), (18, "7-18"), (19, "19-36"), (36, "19-36")],

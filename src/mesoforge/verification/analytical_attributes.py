@@ -62,6 +62,27 @@ def _kelvin(value: Any) -> Any:
     return block.get("value") if block.get("unit") == "K" else None
 
 
+def _forecast_stage(context: Mapping[str, Any]) -> dict[str, Any] | None:
+    stage = context.get("learning_stage")
+    if stage is None:
+        return None
+    if not isinstance(stage, Mapping):
+        return {"invalid": True}
+    overlay = _mapping(stage.get("overlay"))
+    correction = _mapping(overlay.get("correction"))
+    return {
+        "variant_id": stage.get("variant_id"),
+        "transformation_type": stage.get("transformation_type"),
+        "overlay": {
+            "predictions": bool(overlay.get("predictions")),
+            "correction": {
+                "status": correction.get("status"),
+                "changes": bool(correction.get("changes")),
+            },
+        },
+    }
+
+
 def build_analytical_attributes(fact: Mapping[str, Any]) -> dict[str, Any]:
     """Project one verification fact payload onto the compact analytical block."""
     match = _mapping(fact.get("match"))
@@ -102,6 +123,7 @@ def build_analytical_attributes(fact: Mapping[str, Any]) -> dict[str, Any]:
         "valid_time": forecast.get("valid_time"),
         "horizon_hours": forecast.get("horizon_hours"),
         "forecast_temperature_k": _kelvin(forecast.get("temperature")),
+        "forecast_stage": _forecast_stage(context),
         "temperature_error_k": error.get("value") if error.get("unit") == "K" else None,
         "observation": {
             **{key: selected.get(key) for key in _OBSERVATION_KEYS},

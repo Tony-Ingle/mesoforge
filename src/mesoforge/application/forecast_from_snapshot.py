@@ -218,6 +218,9 @@ def _deliver_locations(
     run_lock: Callable[[], AbstractContextManager[None]] | None,
     lineage: dict[str, dict[str, Any]],
     build_timing_key: str,
+    stage_processor: Callable[[dict[str, Any]], tuple[dict[str, Any], dict[str, Any]]]
+    | None = None,
+    stage_binding: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Deliver pinned forecasts with one shared location-isolation/issuance boundary."""
     result: dict[str, Any] = {}
@@ -285,6 +288,13 @@ def _deliver_locations(
                 forecast = view.forecast(latitude=latitude, longitude=longitude)
                 row[build_timing_key] = time.perf_counter() - clock
                 forecast.update({key: dict(value) for key, value in lineage.items()})
+                if stage_processor is not None:
+                    try:
+                        forecast, row["learning"] = stage_processor(forecast)
+                    except Exception as exc:
+                        # The complete pinned numerical baseline survives learning failure.
+                        row["learning"] = {"status": "fallback", "reason": str(exc)}
+                        forecast = {**forecast, "learning_failure": row["learning"]}
                 clock = time.perf_counter()
                 forecast["hourly_report"] = build_hourly_report(forecast, display_timezone=zone)
                 row["hourly_report_seconds"] = time.perf_counter() - clock
@@ -328,6 +338,13 @@ def _deliver_locations(
                         )
                     else:
                         row["issued"] = issued.model_dump(mode="json")
+                        if stage_binding is not None and "learning" in row:
+                            try:
+                                row["learning"]["binding"] = stage_binding(
+                                    row["issued"], row["learning"]
+                                )
+                            except Exception as exc:
+                                row["learning"]["binding_failure"] = str(exc)
             rows.append(row)
     result.update(
         status="ok",

@@ -222,6 +222,70 @@ def analyze(storage: Storage, **kwargs: Any) -> dict[str, Any]:
     )
 
 
+def test_learning_cutoff_filters_facts_before_revision_canonicalization():
+    record = issued(VERSION_A, TARGET)
+    storage = Storage([record])
+    storage.add(payload(record, 1, forecast=296.0, observed=295.0), compact=True)
+    storage.add(
+        payload(record, 1, forecast=296.0, observed=294.0, revision="later"),
+        minutes=90,
+        compact=True,
+    )
+    as_of = NOW - timedelta(hours=1)
+    result = analyze(storage, as_of=as_of)
+    assert result["overall"]["n"] == 1
+    assert result["overall"]["bias_k"] == 1.0
+    assert result["inventory"]["excluded_by_reason"] == {"learning_evidence_after_cutoff": 1}
+    assert analyze(storage)["overall"]["n"] == 0  # later conflict remains visible now
+    assert result["evaluation"]["evidence_cutoff"] == as_of.isoformat().replace("+00:00", "Z")
+
+
+def test_learning_evidence_requires_proven_input_cutoff_not_just_early_registration():
+    record = issued(VERSION_A, TARGET)
+    storage = Storage([record])
+    for cutoff in (None, (NOW + timedelta(hours=1)).isoformat()):
+        body = payload(record, 1, forecast=296.0, observed=295.0)
+        body["verification_cutoff"] = cutoff
+        storage.add(body, compact=True)
+    result = analyze(storage, as_of=NOW)
+    assert result["overall"]["n"] == 0
+    assert result["inventory"]["excluded_by_reason"] == {
+        "learning_evidence_availability_unproven": 1,
+        "learning_evidence_after_cutoff": 1,
+    }
+    assert analyze(storage)["overall"]["n"] == 1  # historical read semantics unchanged
+    with pytest.raises(ValueError, match="timezone"):
+        analyze(storage, as_of=NOW.replace(tzinfo=None))
+    with pytest.raises(ValueError, match="cannot follow"):
+        analyze(storage, as_of=NOW + timedelta(hours=1))
+
+
+@pytest.mark.parametrize("legacy_attributes", [False, True])
+def test_raw_learning_excludes_corrected_errors_but_keeps_noop_stage(legacy_attributes):
+    record = issued(VERSION_A, TARGET)
+    storage = Storage([record])
+    for horizon, status in ((1, "applied"), (2, "no_policy")):
+        body = payload(record, horizon, forecast=296.0, observed=295.0)
+        body["match"]["forecast_context"]["learning_stage"] = {
+            "variant_id": f"stage-{horizon}",
+            "transformation_type": "deterministic_corrected",
+            "overlay": {"predictions": [], "correction": {"status": status}},
+        }
+        block = build_analytical_attributes(body)
+        if legacy_attributes:
+            block.pop("forecast_stage")
+        storage.add(body, analysis=block)
+    unchanged = analyze(storage)
+    assert unchanged["overall"]["n"] == 2
+    assert storage.loads == []
+    learning = analyze(storage, as_of=NOW, raw_baseline_only=True)
+    assert learning["overall"]["n"] == 1
+    assert learning["samples"][0]["horizon_hours"] == 2
+    assert learning["inventory"]["excluded_by_reason"] == {"nonbaseline_temperature_stage": 1}
+    assert len(storage.loads) == (2 if legacy_attributes else 0)
+    assert learning["evaluation"]["forecast_stage_scope"] == "raw_baseline_only"
+
+
 @pytest.fixture()
 def history() -> Storage:
     a, b = issued(VERSION_A, TARGET, 42), issued(VERSION_B, TARGET, 49)

@@ -318,6 +318,38 @@ def _event(
 class CoherenceEngine:
     """Execute the finite current baseline graph over one aligned cell/hour state."""
 
+    def apply_local_fields(
+        self, fields: dict[str, dict[str, Any]], *, changed_fields: tuple[str, ...]
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+        """Recheck affected existing local diagnostics without native reblending.
+
+        Temperature is the only currently supported local transformation. The
+        baseline's source eligibility and wind/gust results remain untouched.
+        Missing/inconsistent dew point and RH follow the same baseline kernels.
+        """
+        if set(changed_fields) - {TEMPERATURE}:
+            raise CoherenceError("Only temperature local transformations are supported")
+        if not changed_fields:
+            return fields, {"version": COHERENCE_VERSION, "relationships": {}}
+        working = {
+            **fields,
+            DEW_POINT: {
+                **fields[DEW_POINT],
+                "missing_reasons": list(fields[DEW_POINT]["missing_reasons"]),
+            },
+        }
+        events = {
+            "blended_dew_point_consistency": self._check_dew(working),
+            "relative_humidity": self._derive_rh(working),
+        }
+        return working, {
+            "version": COHERENCE_VERSION,
+            "phase": "local_temperature_correction",
+            "status": "passed",
+            "relationships": events,
+            "future_rules_enforced": False,
+        }
+
     def apply_baseline(
         self,
         blend_engine: FieldBlendEngine,
@@ -423,8 +455,14 @@ class CoherenceEngine:
     def _blended_dew_point_consistency(
         self, engine: FieldBlendEngine, state: BlendState
     ) -> dict[str, Any]:
-        temperature = engine._blend_raw(TEMPERATURE, state)["value"]
-        dew = engine._blend_raw(DEW_POINT, state)
+        engine._blend_raw(TEMPERATURE, state)
+        engine._blend_raw(DEW_POINT, state)
+        return self._check_dew(state.results)
+
+    @staticmethod
+    def _check_dew(fields: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        temperature = fields[TEMPERATURE]["value"]
+        dew = fields[DEW_POINT]
         before = dew["value"]
         if before is not None:
             if not _usable(temperature, 150.0, 340.0):
@@ -450,8 +488,12 @@ class CoherenceEngine:
         )
 
     def _relative_humidity(self, engine: FieldBlendEngine, state: BlendState) -> dict[str, Any]:
-        temperature = state.results[TEMPERATURE]["value"]
-        dew = state.results[DEW_POINT]["value"]
+        return self._derive_rh(state.results)
+
+    @staticmethod
+    def _derive_rh(fields: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        temperature = fields[TEMPERATURE]["value"]
+        dew = fields[DEW_POINT]["value"]
         value = None
         reasons: list[str] = []
         if _usable(temperature, 150.0, 340.0) and dew is not None:
@@ -461,7 +503,7 @@ class CoherenceEngine:
                 reasons.append(str(exc))
         else:
             reasons.append("RH requires available, consistent baseline temperature and dew point")
-        state.results[RH] = {
+        fields[RH] = {
             "value": value,
             "unit": "%",
             "missing_reasons": reasons,

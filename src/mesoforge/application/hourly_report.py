@@ -1,4 +1,4 @@
-"""Presentation of an unchanged numerical forecast and explicitly unrun stages."""
+"""Present saved numerical baselines and explicit correction/AI stage outcomes."""
 
 from __future__ import annotations
 
@@ -67,6 +67,13 @@ def build_hourly_report(
     Verification of an earlier issued version never verifies this new version.
     """
     timezone = ZoneInfo(display_timezone)
+    stage = forecast.get("learning_stage", {})
+    correction = stage.get("overlay", {}).get("correction", {})
+    corrected_points = (
+        {row["valid_time"]: row for row in correction["point_values"]}
+        if correction.get("status") == "applied"
+        else {}
+    )
     hours = []
     for index, hour in enumerate(forecast["hours"]):
         valid = datetime.fromisoformat(hour["valid_time"])
@@ -81,7 +88,10 @@ def build_hourly_report(
                     "display_temperature": _display_temperature(source["temperature"]),
                     "provenance_ref": f"#/hours/{index}/{source_list}/{source_index}",
                 }
-        raw = deepcopy(hour["temperature"])
+        corrected_point = corrected_points.get(hour["valid_time"])
+        raw = deepcopy(
+            corrected_point["baseline_temperature"] if corrected_point else hour["temperature"]
+        )
         hours.append(
             {
                 "horizon_hours": hour["horizon_hours"],
@@ -111,6 +121,21 @@ def build_hourly_report(
                 },
             }
         )
+        if corrected_point is not None:
+            hours[-1].update(
+                bias_correction={
+                    "status": "applied" if corrected_point["applied_delta_k"] else "no_op",
+                    "applied_delta": {"value": corrected_point["applied_delta_k"], "unit": "K"},
+                    "reason": (
+                        "Explicit active deterministic temperature policy; no promotion inferred"
+                    ),
+                    "policy": deepcopy(correction["policy"]),
+                    "stage_id": stage["variant_id"],
+                    "parent_stage_id": stage["parent_stage_id"],
+                },
+                final_temperature=deepcopy(hour["temperature"]),
+                final_display_temperature=_display_temperature(hour["temperature"]),
+            )
         if "surface" in hour:
             hours[-1]["surface"] = deepcopy(hour["surface"])
             hours[-1]["final_surface_fields"] = deepcopy(hour["surface"]["fields"])
@@ -141,17 +166,26 @@ def render_hourly_report(report: dict[str, Any]) -> str:
     """Render every stored hour, without calculating any bias or AI correction."""
     if any("surface" in hour for hour in report["hours"]):
         return _render_surface_report(report)
+    applied = any(hour["bias_correction"]["status"] == "applied" for hour in report["hours"])
     lines = [
         f"Forecast at {report['latitude']}, {report['longitude']}",
         "",
         report["notice"],
         f"Reference: {report['target_reference_time']}. "
         f"Local/display timezone: {report['display_timezone']}. {report['timezone_note']}.",
-        "Temperatures are displayed in °F; original unrounded Kelvin values remain in the "
-        "saved numerical baseline. Bias and AI deltas are 0 because neither stage is "
-        "implemented. AI action is not_run; reason: AI forecast-desk stage not implemented yet. "
-        "Final equals the raw numerical blend; delivery has not run. "
-        "Each newly issued hour is not_yet_verified; earlier versions' verification is separate.",
+        (
+            "Raw temperatures retain the original numerical baseline. An explicitly active "
+            "deterministic temperature policy supplies the displayed bias delta and final "
+            "temperature. AI action is not_run, nudge 0; no AI stage ran. Delivery has not run."
+            if applied
+            else "Temperatures are displayed in °F; original unrounded Kelvin values remain in the "
+            "saved numerical baseline. Bias and AI deltas are 0 because neither stage is "
+            "implemented. AI action is not_run; reason: "
+            "AI forecast-desk stage not implemented yet. "
+            "Final equals the raw numerical blend; delivery has not run. "
+            "Each newly issued hour is not_yet_verified; "
+            "earlier versions' verification is separate."
+        ),
         "",
         "| Hour | UTC valid time | Local/display valid time | Raw °F | HRRR °F | GFS °F | "
         "RAP °F | IFS °F | Bias Δ°F | AI action / Δ°F | Final °F | Verification |",
@@ -389,6 +423,7 @@ def _render_surface_report(report: dict[str, Any]) -> str:
     qpf_headers = " QPF in | Accumulation start UTC (exclusive) | End UTC (inclusive) |"
     qpf_separator = " --- | --- | --- |"
     pop_headers = " Native-period PoP % | PoP start UTC (exclusive) | PoP end UTC (inclusive) |"
+    applied = any(hour["bias_correction"]["status"] == "applied" for hour in report["hours"])
     lines = [
         f"Surface forecast at {report['latitude']}, {report['longitude']}",
         "",
@@ -399,10 +434,17 @@ def _render_surface_report(report: dict[str, Any]) -> str:
         "19–36 when both are eligible; approved single-model fallbacks are labeled. "
         "RAP/IFS are zero-weight shadows. "
         "RH is derived over liquid water from temperature/dew point.",
-        "Bias correction: not_implemented, applied delta 0. AI action: not_run, nudge 0; "
-        "AI forecast-desk stage not implemented yet. Final surface fields equal the "
-        "numerical baseline. Delivery has not run. New issued hours are not_yet_verified; "
-        "verification of previous versions is separate.",
+        (
+            "The surface table shows the coherent final fields after the explicitly active "
+            "temperature correction. The structured hourly report retains raw temperature, "
+            "policy/stage identity and each applied delta separately. AI action: not_run, "
+            "nudge 0. Delivery has not run; previous versions' verification is separate."
+            if applied
+            else "Bias correction: not_implemented, applied delta 0. AI action: not_run, nudge 0; "
+            "AI forecast-desk stage not implemented yet. Final surface fields equal the "
+            "numerical baseline. Delivery has not run. New issued hours are not_yet_verified; "
+            "verification of previous versions is separate."
+        ),
         "Active cloud cover uses the approved temporary native NBM total-cloud baseline when "
         "the saved field is eligible. Missing or invalid NBM guidance has no shadow fallback. "
         "Separate native cloud evidence is shown below when prepared. "

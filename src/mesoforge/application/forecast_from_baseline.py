@@ -22,9 +22,11 @@ from typing import Any
 from mesoforge.application.batch_forecast import _coordinates, load_locations
 from mesoforge.application.forecast_from_snapshot import _deliver_locations, _public, _write_outputs
 from mesoforge.application.issuance import ForecastIssuanceService
+from mesoforge.application.learning import LearningService, configured_learning
 from mesoforge.application.prepared_snapshot import SnapshotError, derive_reference_time
 from mesoforge.application.spatial_coverage import validate_coordinate
 from mesoforge.application.weather_transitions import validate_display_timezone
+from mesoforge.common.identifiers import ArtifactId
 
 _ROOT = Path(__file__).resolve().parents[3]
 
@@ -45,6 +47,9 @@ def forecast_from_baseline(
     verification_runner: Callable[[float, float], dict[str, Any]] | None = None,
     qpf_lookback_hours: int = 72,
     qpf_max_opportunities: int = 36,
+    learning_service: LearningService | None = None,
+    learning_policy_ids: list[ArtifactId] | None = None,
+    learning_overlays: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Pin one complete baseline once, then isolate each location's delivery."""
     from mesoforge.application.baseline_snapshot import load_baseline
@@ -154,6 +159,26 @@ def forecast_from_baseline(
                 verification[index] = {"status": "error", "retryable": True, "reason": str(exc)}
         # Observation work is outside the issuance lock and cannot gate delivery.
         # One immutable baseline stays pinned throughout all of these attempts.
+    learning_error: str | None = None
+    if learning_service is None:
+        try:
+            learning_service = configured_learning()
+        except Exception as exc:
+            learning_error = str(exc)
+
+    def local_stage(forecast: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        if learning_service is None:
+            report = {
+                "status": "fallback",
+                "reason": learning_error,
+                "applied_delta_k": 0.0,
+                "stage": "deterministic_correction",
+            }
+            return {**forecast, "learning_failure": report}, report
+        transformed, report = learning_service.local_stage(forecast, policy_ids=learning_policy_ids)
+        learning_service.candidate_stages(forecast, report, learning_overlays or [])
+        return transformed, report
+
     result.update(
         _deliver_locations(
             view,
@@ -166,6 +191,8 @@ def forecast_from_baseline(
             run_lock=run_lock,
             lineage={"baseline_snapshot": baseline_lineage, "prepared_snapshot": prepared_lineage},
             build_timing_key="baseline_extraction_seconds",
+            stage_processor=local_stage,
+            stage_binding=learning_service.bind if learning_service is not None else None,
         )
     )
     for row in result["results"]:

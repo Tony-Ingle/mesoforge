@@ -127,7 +127,11 @@ def test_prospective_cycle_pins_once_isolates_locations_and_repeat_preserves_sto
         assert forecast["hourly_report"]["display_timezone"] == "America/Chicago"
         saved_versions.append((issued_id, saved))
     before = storage_tests.storage_inventory(migrated_dsn, object_store)
-    assert [len(rows) for rows in before] == [2, 2, 2]
+    assert [len(rows) for rows in before] == [2, 8, 8]
+    for row in (first["results"][0], first["results"][2]):
+        assert row["learning"]["status"] == "no_policy"
+        assert row["learning"]["operational_reference"]["byte_size"] < 15_000
+        assert "binding" in row["learning"]
 
     # The uncovered middle domain remains an explicit failure. Successfully issued
     # locations retain their primary version rather than creating duplicate objects.

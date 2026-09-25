@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from mesoforge.application import issued_temperature_verification as application
-from mesoforge.application.issuance import ForecastIssuanceService
+from mesoforge.application.issuance import ForecastIssuanceService, issued_forecast_context
 from mesoforge.common.errors import IntegrityError, NotFound
 from mesoforge.common.identifiers import ArtifactId, Digest
 from mesoforge.contracts.artifacts import Availability
@@ -184,6 +184,63 @@ def verification_case(service_and_uow):
         identity=identity,
         register=register,
     )
+
+
+@pytest.mark.parametrize("status", ["applied", "no_policy"])
+def test_learning_context_references_stage_without_copying_domain_overlay(
+    verification_case, status
+):
+    from mesoforge.verification.model_comparison import is_raw_temperature_control
+
+    case = verification_case
+    original = copy.deepcopy(case.forecast)
+    assert issued_forecast_context(original) == {
+        key: value for key, value in original.items() if key != "hours"
+    }
+    changes = (
+        [
+            {"x_index": x, "y_index": y, "retained_fields": "x" * 5000}
+            for y in range(7)
+            for x in range(7)
+        ]
+        if status == "applied"
+        else []
+    )
+    stage = {
+        "variant_id": "stage-digest",
+        "parent_stage_id": "baseline-stage-digest",
+        "transformation_type": "deterministic_corrected",
+        "lifecycle_role": "active",
+        "policy": {"id": "temperature-site", "version": "1"},
+        "analysis_cutoff": _iso(_TARGET),
+        "evidence_cutoff": _iso(_TARGET - timedelta(days=1)),
+        "overlay": {
+            "inherit_unchanged": True,
+            "predictions": [],
+            "correction": {"status": status, "changes": changes},
+        },
+    }
+    case.forecast.update(learning_stage=stage, learning_reference={"artifact_id": "stage-artifact"})
+    context = issued_forecast_context(case.forecast)
+    summary = context["learning_stage"]
+    assert summary["representation"] == "summary_reference_not_sealed_variant"
+    assert summary["variant_id"] == stage["variant_id"]
+    assert summary["policy"] == stage["policy"]
+    assert summary["analysis_cutoff"] == stage["analysis_cutoff"]
+    assert summary["authoritative_artifact"] == context["learning_reference"]
+    assert summary["overlay"]["correction"] == {"status": status, "changes": bool(changes)}
+    assert len(_JSON.serialize(context)) < 4000
+    assert is_raw_temperature_control(summary) is (status == "no_policy")
+    issued = case.issuer.issue(case.forecast, batch_run_id=uuid4(), location_index=0)
+    case.match.update(issued_forecast_id=str(issued.issued_forecast_id), forecast_context=context)
+    verified = case.service.verify(issued.issued_forecast_id, _VALID)
+    assert verified["status"] == "verified"
+    assert verified["result"]["match"]["forecast_context"] == context
+    saved = case.issuer.read(issued.issued_forecast_id)
+    assert saved["forecast"]["learning_stage"] == stage
+    assert saved["forecast"]["learning_stage"]["overlay"]["correction"]["changes"] == changes
+    compact = build_analytical_attributes(verified["result"])
+    assert is_raw_temperature_control(compact["forecast_stage"]) is (status == "no_policy")
 
 
 def test_verify_round_trip_and_retry_preserve_exact_forecast_and_observation(verification_case):

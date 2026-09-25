@@ -168,7 +168,10 @@ EVIDENCE_POLICY: dict[str, Any] = {
         "and RMSE, not mean bias alone, on identical samples against the unchanged baseline."
     ),
     "ai_desk": "A later AI forecast desk is evaluated against the bias-corrected baseline.",
-    "not_implemented": "No candidate correction value is calculated and nothing is applied.",
+    "not_implemented": (
+        "This read-only evidence analysis calculates no candidate or applied correction; "
+        "the separate learning stage consumes its qualified evidence without promotion."
+    ),
 }
 
 # Two-sided 95% Student t multipliers for 1..30 degrees of freedom.

@@ -212,6 +212,30 @@ class _InMemoryArtifactRepository:
             in (None, product_time.astimezone(UTC).isoformat())
         )[:limit]
 
+    def find_learning_artifacts(
+        self, artifact_type: str, *, attributes: dict[str, object], limit: int = 1000
+    ) -> tuple[ArtifactManifest, ...]:
+        if (
+            artifact_type
+            not in {"learning-policy", "learning-overlay", "forecast-variant", "learning-binding"}
+            or not 1 <= limit <= 10000
+        ):
+            raise ValueError("Invalid learning artifact query")
+        matches = tuple(
+            sorted(
+                (
+                    row
+                    for row in self._store.values()
+                    if row.artifact_type == artifact_type
+                    and all(row.attributes.get(key) == value for key, value in attributes.items())
+                ),
+                key=lambda row: (row.registered_at, row.artifact_id),
+            )
+        )
+        if len(matches) > limit:
+            raise ValueError("Learning artifact query is truncated; narrow its scope")
+        return matches
+
 
 class _InMemoryConfigurationSnapshot:
     def __init__(self, configuration_snapshot_id: str, configuration_digest: str) -> None:

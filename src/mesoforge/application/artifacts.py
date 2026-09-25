@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import jcs
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -301,6 +302,10 @@ class ArtifactService:
         self._unit_of_work_factory = unit_of_work_factory
         self._object_store = object_store
         self._idempotency_lock = idempotency_lock
+
+    def acquire_identity(self, digest: Digest) -> AbstractContextManager[None]:
+        """Serialize a compound application identity using the existing persistent lock."""
+        return cast(AbstractContextManager[None], self._idempotency_lock.acquire(Digest(digest)))
 
     def _verify_configuration_consistency(
         self,

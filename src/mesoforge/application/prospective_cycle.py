@@ -28,9 +28,15 @@ from mesoforge.application.build_baseline import build_baseline
 from mesoforge.application.forecast_from_baseline import forecast_from_baseline
 from mesoforge.application.forecast_from_snapshot import _public
 from mesoforge.application.issuance import ForecastIssuanceService
+from mesoforge.application.learning import (
+    LearningService,
+    configured_learning,
+    load_learning_config,
+)
 from mesoforge.application.prepared_snapshot import derive_reference_time
 from mesoforge.application.refresh_guidance import refresh_guidance
 from mesoforge.application.spatial_coverage import validate_coordinate
+from mesoforge.common.identifiers import ArtifactId
 
 _ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG = _ROOT / "configs/locations.json"
@@ -80,6 +86,8 @@ def run_prospective_cycle(
     clock: Callable[[], datetime] | None = None,
     replay_reference_time: datetime | None = None,
     issuer: ForecastIssuanceService | None = None,
+    learning_policies: Path | None = None,
+    learning_service: LearningService | None = None,
 ) -> dict[str, Any]:
     """One noninteractive operator cycle; clock injection is for deterministic tests.
 
@@ -161,6 +169,38 @@ def run_prospective_cycle(
                 "status": "reused_for_already_issued_window",
                 "reason": "Every valid location has a version; recheck under issuance lock.",
             }
+        # Learning remains subordinate to independently published active state.
+        # Policy data never selects active meteorology at this operator boundary.
+        learning: dict[str, Any] = {"status": "ready", "overlays": [], "failures": []}
+        policies: dict[str, list[ArtifactId]] = {"correction_policies": [], "blend_policies": []}
+        try:
+            policies = load_learning_config(learning_policies)
+        except Exception as exc:
+            learning["failures"].append({"phase": "policy_config", "reason": str(exc)})
+        try:
+            learning_service = learning_service or configured_learning()
+        except Exception as exc:
+            learning["status"] = "unavailable"
+            learning["failures"].append({"phase": "initialization", "reason": str(exc)})
+        if learning_service is not None and policies["blend_policies"]:
+            try:
+                pinned = load_baseline(root / "baseline", pointer=pointer)
+                shadow_cutoff = _now(clock)
+                if shadow_cutoff < started:
+                    raise ValueError("Runtime clock moved backward before shadow construction")
+                background_learning = learning_service.background(
+                    pinned, policies["blend_policies"], analysis_cutoff=shadow_cutoff
+                )
+                learning["overlays"] = background_learning["overlays"]
+                learning["failures"].extend(background_learning["failures"])
+                learning["analysis_cutoff"] = shadow_cutoff.isoformat()
+                if "measurements" in background_learning:
+                    learning["measurements"] = background_learning["measurements"]
+            except Exception as exc:
+                learning["failures"].append({"phase": "candidate_background", "reason": str(exc)})
+        if learning["failures"] and learning["status"] != "unavailable":
+            learning["status"] = "partial"
+        result["background"]["learning"] = learning
         phase = "configured_forecast"
         requested = _now(clock)
         if requested < started:
@@ -175,6 +215,9 @@ def run_prospective_cycle(
             baseline_pointer=pointer,
             issue=True,
             issuer=issuer,
+            learning_service=learning_service,
+            learning_policy_ids=policies["correction_policies"],
+            learning_overlays=learning["overlays"],
         )
         result.update(_public(forecast))
         result["status"] = (
@@ -234,6 +277,13 @@ def render_summary(result: dict[str, Any]) -> str:
         f"Contributor snapshot: {baseline.get('prepared_snapshot_id', 'not available')}",
         f"Baseline: {baseline.get('baseline_snapshot_id', 'not available')}",
     ]
+    learning = result.get("background", {}).get("learning")
+    if learning is not None:
+        lines.append(
+            f"Learning background: {learning['status']}; "
+            f"candidate overlays: {len(learning['overlays'])}; "
+            f"failures: {len(learning['failures'])}"
+        )
     for row in result["results"]:
         location = row["location"]
         lines.append(
@@ -277,10 +327,18 @@ def main(argv: list[str] | None = None) -> int:
         type=datetime.fromisoformat,
         help="Explicit covered hour for testing/replay/debugging only; normal runs need no date",
     )
+    parser.add_argument(
+        "--learning-policies",
+        type=Path,
+        help="Optional immutable correction/blend policy artifact references; empty by default",
+    )
     args = parser.parse_args(argv)
     try:
         result = run_prospective_cycle(
-            args.config, args.root, replay_reference_time=args.replay_reference_time
+            args.config,
+            args.root,
+            replay_reference_time=args.replay_reference_time,
+            learning_policies=args.learning_policies,
         )
     except Exception as exc:
         print(f"Prospective cycle failed: {exc}", file=sys.stderr)

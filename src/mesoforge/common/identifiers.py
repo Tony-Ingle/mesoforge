@@ -190,6 +190,10 @@ class MatchingPolicyId(_KebabDotId):
     """Identifier for a forecast/observation matching policy."""
 
 
+class LearningPolicyId(_KebabDotId):
+    """Named immutable correction/candidate policy; version is retained separately."""
+
+
 class MetricSetId(_KebabDotId):
     """Identifier for a named verification metric set."""
 

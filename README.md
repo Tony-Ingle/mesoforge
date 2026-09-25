@@ -36,6 +36,7 @@ reblend fields, rerun baseline coherence or download guidance.
 | Temperature verification | Automatic coordinate-driven METAR discovery/acquisition, matching, immutable facts and analysis |
 | QPF verification | Bounded automatic MRMS accumulation before issuance, exact-hour facts, canonical samples and paired scoring |
 | Prospective operator cycle | Current-clock discovery, background preparation/build, then one pinned baseline for configured issuance |
+| Learning stages | Explicit local temperature correction/no-op, immutable candidate policy data, background shadow overlays and one temperature/QPF variant evaluator |
 
 ### Current numerical policies
 
@@ -64,8 +65,10 @@ new enforcement rules. Conditions do not promote evidence-only fields.
 ### What is not implemented
 
 There is no continuously hosted guidance/baseline worker, scheduler or VPS deployment.
-There is no applied learned site correction, AI forecast desk, delivery/email service,
-adaptive production weighting or calibrated multi-source precipitation blend.
+There is no promoted correction or candidate policy in the current configuration,
+AI forecast desk, delivery/email service, adaptive production weighting or calibrated
+multi-source precipitation blend. The correction stage is implemented; an explicit
+active temperature policy is required to change operational values.
 QPF accumulation runs on demand with configured issuance or explicit bounded
 backfill; it is not a continuous MRMS poller or archive mirror.
 
@@ -189,7 +192,9 @@ The batch pins one exact published baseline for all configured locations. It
 attempts prior temperature and QPF verification, then extracts and issues each
 forecast through the existing baseline path. Observation failures remain explicit
 and do not block issuance; a location failure does not stop later locations.
-Location jobs do not download guidance or rerun blending/coherence.
+Location jobs do not download guidance or rerun baseline blending/coherence. The
+local learning stage is a no-op without an explicit active correction; a changed
+temperature reruns only the existing affected T/Td/RH consistency/diagnostic rules.
 
 The operator command composes the separate publication boundaries below. A failed
 refresh preserves `latest_complete`; a failed build preserves `latest_baseline`
@@ -482,6 +487,76 @@ threshold or automatic readiness gate is approved. Date/time concentration is
 reported without claiming hourly samples are independent storms or ranking models
 on different sample populations.
 
+## Learning stages and shadow comparisons
+
+The normal prospective path now records a deterministic correction stage after
+local extraction. **No policy / insufficient evidence is a normal no-op.** There
+are no promoted corrections or real blend candidates in the shipped configuration;
+operational weather values and current weights remain unchanged.
+
+Temperature proposals reuse canonical site evidence independently in the 1–6,
+7–18 and 19–36 hour buckets: at least 30 samples, 10 UTC decision dates, no date
+above 25% of samples, and a decision-date-clustered 95% bias interval excluding
+zero. Qualified evidence permits a candidate, never promotion. Positive
+forecast-minus-observation bias gives a negative candidate correction. QPF has
+comparison infrastructure, **not** a new correction or weight proposal.
+Raw-baseline correction proposals exclude errors from already transformed
+temperature stages. Their final-issued verification facts remain valid for stage
+evaluation. The legacy contributor-comparison command directs adjusted issuances
+to the unified evaluator rather than treating the corrected value as raw HRRR/GFS.
+
+Policies and compact stages use the existing PostgreSQL/S3 artifact store. Inspect
+or register an explicit immutable definition, or attach read-only numerical stages
+to an existing issuance without rewriting it:
+
+```text
+uv run --locked python -m mesoforge.application.learning register-policy --file POLICY_JSON
+uv run --locked python -m mesoforge.application.learning read --artifact-id ARTIFACT_ID
+uv run --locked python -m mesoforge.application.learning stage-issued --issued-forecast-id ISSUED_ID
+```
+
+Build a configured shadow blend overlay from one retained active baseline,
+without acquiring guidance or changing its active fields:
+
+```text
+uv run --locked python -m mesoforge.application.learning build-candidate --baseline-root BASELINE_ROOT --policy-id POLICY_ARTIFACT_ID
+```
+
+Repeat `--policy-id` for separately registered shadow policies. This background
+command stores only affected fields/dependencies and parent references.
+
+`learning stage-issued` retains only no-op stages for historical replay; it cannot
+retroactively apply a correction. Optional `--learning-policies LEARNING_JSON` on
+`prospective_cycle` selects already registered correction artifacts. The
+prospective command also builds configured blend shadows on the background side.
+The configuration contains artifact IDs, not dates, geographic metadata or new
+inline science:
+
+```json
+{"correction_policies": [], "blend_policies": []}
+```
+
+An explicitly configured shadow cannot change active issuance. Candidates alone
+do not execute as shadows or become active. Policy evidence, creation, activation
+and storage availability must precede the applicable forecast analysis cutoff;
+today's newly learned policy cannot silently enter an earlier decision. Shadow
+failure is reported separately and does not block the active forecast.
+
+Compare saved stages against the same canonical observation events:
+
+```text
+uv run --locked python -m mesoforge.application.learning analyze --field air_temperature_2m --lat 44.98861 --lon -93.25553 --start START_UTC --end END_UTC
+uv run --locked python -m mesoforge.application.learning analyze --field liquid_equivalent_precipitation_amount_1h --lat 44.98861 --lon -93.25553 --start START_UTC --end END_UTC
+```
+
+Use an actual saved valid-time window, with end exclusive. Optional repeated
+`--variant-id ARTIFACT_ID` arguments bound the comparison. The evaluator reports
+shared sample count, bias/MAE/RMSE, metric differences, exact/provisional leads,
+locations/date concentration and exclusions. Temperature retains its station-proxy
+contract; QPF requires the exact same MRMS hourly interval and revision. Missing
+variants exclude that event from the common comparison population. There is no
+overall winner score, automatic promotion or AI execution.
+
 ## Repository map and development checks
 
 | Path | Job |
@@ -564,8 +639,11 @@ not matured. Temporary validation services were stopped afterward.
 
 Known broader-suite failures carried forward from the previous code checkpoint are
 one batch mock-signature failure and two identifier/code-revision inventory failures.
-All three reproduced at earlier checkpoints. The current broader offline run had
-3,529 passes and exactly those three failures. The previously corrected Windows
+All three reproduced at the Learning Core starting revision. Its broader offline
+run had 3,592 passes and those three failures; final focused reruns cover the
+subsequent Learning Core guards. The final typed-boundary inventory adds no new
+findings to the starting revision. Learning Core validation also passed 32 distinct
+relevant PostgreSQL/MinIO integration checks. The previously corrected Windows
 MRMS-cache rename regression did not recur.
 The three pre-existing failures remain unwaived and unchanged. Check current test results
 when changing code; a saved commit does not certify the whole application.

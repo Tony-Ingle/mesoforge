@@ -35,6 +35,34 @@ def issue_with_contributors(case):
     return case.service.verify(issued.issued_forecast_id, verification_tests._VALID)
 
 
+def test_corrected_final_verifies_its_own_error_and_routes_legacy_comparison(verification_case):
+    case = verification_case
+    for hour in case.forecast["hours"]:
+        hour["temperature"]["value"] -= 1.0
+    case.forecast["learning_stage"] = {
+        "variant_id": "corrected",
+        "transformation_type": "deterministic_corrected",
+        "overlay": {"predictions": [{"value": 280.25}], "correction": {"status": "applied"}},
+    }
+    from mesoforge.application.issuance import issued_forecast_context
+
+    case.match["forecast_context"] = issued_forecast_context(case.forecast)
+    verified = issue_with_contributors(case)
+    assert verified["status"] == "verified"
+    assert verified["result"]["temperature_error"]["value"] == 1.25  # final 280.25 - observed 279
+    identifier = UUID(verified["result"]["match"]["issued_forecast_id"])
+    before = verification_tests._inventory(case)
+    with pytest.raises(ValueError, match="learning analyze"):
+        application.compare_verified(
+            [ArtifactId(verified["verification_id"])],
+            read_verification=case.service.read,
+            read_forecast=case.issuer.read,
+        )
+    with pytest.raises(ValueError, match="learning analyze"):
+        application.compare_issued(identifier, read_forecast=case.issuer.read)
+    assert verification_tests._inventory(case) == before
+
+
 def test_read_compares_distinct_versions_without_writes_or_reverification(
     verification_case, monkeypatch
 ):

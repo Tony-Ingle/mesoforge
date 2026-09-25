@@ -70,6 +70,7 @@ from mesoforge.common.identifiers import (
     FallbackRowId,
     GridId,
     IssuedForecastId,
+    LearningPolicyId,
     MatchingPolicyId,
     MetricSetId,
     ModelCycleSelectionPolicyId,
@@ -91,6 +92,7 @@ _TYPED_IDENTIFIER_CLASSES = (
     VerticalDefinitionId,
     StationId,
     MatchingPolicyId,
+    LearningPolicyId,
     MetricSetId,
     # Phase 2 catalog identities; both are real validated
     # ``common.identifiers`` classes, so a boundary typed with either

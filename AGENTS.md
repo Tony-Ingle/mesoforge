@@ -66,9 +66,14 @@
   remain active until explicitly replaced. Generalized machinery does not authorize
   new scientific policies or model promotion. Prove equivalence when replacing
   scaffolding, then remove superseded execution rather than stack another path.
-- Current publication is on demand. Continuous workers, scheduling, applied site
-  correction, AI editing and delivery remain future work. Schedulers decide WHEN;
+- Current publication is on demand. Continuous workers, scheduling, automatic
+  policy promotion, AI editing and delivery remain future work. Schedulers decide WHEN;
   MesoForge owns meteorology. Do not put forecast science in workflow/GHA YAML.
+- Learning uses common immutable stage/variant lineage and the existing artifact
+  store/evaluator. Local temperature correction is explicitly no-op unless an
+  ACTIVE policy exists; candidates/shadows never promote themselves. Build candidate
+  blends in the background with FieldBlendEngine, retain compact overlays and enforce
+  evidence/creation/activation cutoffs. Reuse current coherence only for affected fields.
 
 ## Scientific and verification guardrails
 

@@ -46,9 +46,52 @@ def issued_forecast_context(forecast: dict[str, Any]) -> dict[str, Any]:
     Keep its local_grid checksum, geometry and extraction metadata here, without
     duplicating every other cell/hour in each selection or verification result.
     """
-    return {
+    context = {
         key: value for key, value in forecast.items() if key not in ("hours", "local_grid_baseline")
     }
+    stage = context.get("learning_stage")
+    if isinstance(stage, dict):
+        # Point-hour verification needs exact identity/status, not every other
+        # corrected cell. This is deliberately not a sealed variant payload;
+        # the full immutable stage remains in its artifact and issued forecast.
+        overlay = stage.get("overlay", {})
+        correction = overlay.get("correction", {})
+        context["learning_stage"] = {
+            "representation": "summary_reference_not_sealed_variant",
+            "source_schema_version": stage.get("schema_version"),
+            **{
+                key: stage.get(key)
+                for key in (
+                    "variant_id",
+                    "parent_stage_id",
+                    "transformation_type",
+                    "lifecycle_role",
+                    "fields",
+                    "policy",
+                    "baseline_snapshot_id",
+                    "prepared_snapshot_id",
+                    "parent_grid_sha256",
+                    "location",
+                    "reference_time",
+                    "analysis_cutoff",
+                    "evidence_cutoff",
+                    "evidence_status",
+                    "policy_created_at",
+                    "policy_activated_at",
+                    "created_at",
+                )
+            },
+            "authoritative_artifact": forecast.get("learning_reference"),
+            "overlay": {
+                "inherit_unchanged": overlay.get("inherit_unchanged"),
+                "predictions": bool(overlay.get("predictions")),
+                "correction": {
+                    "status": correction.get("status"),
+                    "changes": bool(correction.get("changes")),
+                },
+            },
+        }
+    return context
 
 
 def validate_hour_selection(
