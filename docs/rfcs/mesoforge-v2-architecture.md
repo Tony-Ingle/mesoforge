@@ -948,10 +948,44 @@ Raw metadata, acquisition time, candidate metadata/distances and lineage use the
 PostgreSQL/MinIO artifact path. Repeated coordinates reuse that immutable snapshot.
 Refresh/revalidation can create a new version without changing locations.json; scheduled
 refresh, a nationwide catalog mirror and full effective-dated station history remain
-future work. The existing time/QC and nearest-station rules still govern observation
+future work. The existing time/QC and nearest-station rules still govern temperature-observation
 suitability. A missing elevation remains explicit and cannot satisfy the current
 metadata-tolerance QC. Historical configuration-based snapshots remain readable.
 This increment does not implement the full worker, registration or lifecycle design.
+
+Implemented bounded QPF-reference prerequisite: `application/prepared_mrms.py` retains
+one fixed NOAA MRMS `MultiSensor_QPE_01H_Pass2` event through the existing immutable
+artifact service. Contract `mrms.multisensor-qpe-01h-pass2.v1` validates GRIB identity
+209/6/37 and native mm units. [NOAA product documentation](https://vlab.noaa.gov/web/wdtd/-/multi-sensor-qpe)
+defines indicated time T as accumulation end; this exact one-hour product maps to
+`(T-1h, T]`. Current template 4.0 does not encode statistical bounds. The external
+versioned contract supplements that absence; contradictory encoded intervals fail.
+Nominal one-hour latency is not evidence of actual availability: acquisition time and
+source response identity remain separate provenance.
+
+`mrms.nearest-native-gridpoint.wgs84.v1` extracts without interpolation from the
+validated native CONUS 0.01-degree grid, retaining configured/native coordinates,
+row/column/scanning index, grid identity and separation distance. MRMS is an analysed
+precipitation reference associated with the coordinate, not an exact point gauge or
+perfect truth. Preserve positive/zero, documented missing -1 and no-coverage -3;
+malformed data fails and no trace quantity is invented.
+
+Matching `GaugeInflIndex_01H_Pass2` (209/8/17) and
+`RadarAccumulationQualityIndex_01H` (209/8/10) remain dimensionless support evidence,
+with exact product-time/grid/cell alignment, their own semantics and raw provenance.
+No quality threshold or claim of complete analysis uncertainty is implemented. Their
+time association does not generalize the QPE accumulation contract to other products.
+The [NOAA parameter table](https://www.nssl.noaa.gov/projects/mrms/operational/tables.php)
+supplies the exact local-parameter units and sentinels. MRMS can incorporate model
+gap filling, which must remain visible when interpreting future verification.
+
+Original compressed source bytes use shared content-addressed objects; compact
+coordinate extractions reference those immutable sources through existing PostgreSQL
+manifests/activities and MinIO payloads. Changed bytes create a new source revision.
+Offline replay validates raw digests, reparses GRIB and requires identical extraction
+bytes without writes. This establishes a source contract only: QPF verification facts,
+canonical samples, metrics, quality-selection policy and precipitation optimization
+remain future work. Historical METAR precipitation interpretation is unchanged.
 
 ### 6.5 Evaluation
 

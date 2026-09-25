@@ -110,6 +110,17 @@ The QPF increment adds [real interval/conservation and offline replay evidence](
 precipitation verification remains future work. The [PoP increment](#probability-of-precipitation-on-the-local-grid)
 adds actual native probabilistic guidance without changing QPF or other surface values.
 
+Known observation-normalization defect: the retained METAR precipitation parser maps
+`P0000` to numeric zero, although [NOAA defines it as trace](https://www.weather.gov/media/asos/aum-toc.pdf).
+Its assumed report-relative hour and the legacy Phase 2 matcher's ±15-minute tolerance
+also do not establish an exact clock-hour QPF verification sample. A future versioned
+normalization correction must preserve raw evidence and historical normalized records;
+these legacy precipitation records must not be treated as validated QPF truth.
+
+The bounded [MRMS hourly QPE source contract](#prepare-one-mrms-hourly-qpe-reference)
+now retains analysed precipitation and quality evidence for future QPF verification.
+It does not yet create QPF verification facts, samples or skill scores.
+
 There is **no active snowfall/ice blend, delivered snow depth on the ground, deterministic bias correction,
 site learning, AI editing, production deployment or scheduling in the V2 path yet**. Bias/AI
 report stages are explicitly unimplemented and final values currently equal the baseline.
@@ -1750,6 +1761,76 @@ remain outside Git under `%LOCALAPPDATA%\MesoForge\baselines\20260910-station-di
 and existing artifact storage. Temporary PostgreSQL and MinIO were stopped.
 Full acceptance/coverage, scheduled refresh and provider
 reliability remain unverified; current metadata does not prove historical station validity.
+
+### Prepare one MRMS hourly QPE reference
+
+`prepared_mrms` retains one fixed hourly NOAA MRMS QPE grid and its matching
+gauge-influence/radar-quality grids, then saves a compact coordinate extraction through
+the existing PostgreSQL/MinIO artifact path. MRMS is an **analysis reference**, not
+perfect truth or an exact point gauge. The current versioned contract is
+`mrms.multisensor-qpe-01h-pass2.v1`, restricted to `MultiSensor_QPE_01H_Pass2`
+(GRIB discipline/category/parameter **209/6/37**, mm).
+
+[NOAA's Multi-Sensor QPE documentation](https://vlab.noaa.gov/web/wdtd/-/multi-sensor-qpe)
+defines the indicated time as the accumulation end. For this one-hour product,
+MesoForge maps indicated time `T` to **`(T-1h, T]`**. The current GRIB template 4.0
+does **not** encode those statistical bounds; the documented product contract supplies
+them. Contradictory encoded metadata, wrong product identity or unsupported grids fail
+validation. NOAA documents hourly updates and approximately one-hour latency; actual
+acquisition time is retained separately and is not backdated to that nominal latency.
+
+Extraction policy `mrms.nearest-native-gridpoint.wgs84.v1` selects the nearest native
+point on the CONUS 0.01-degree grid without interpolation. It retains row/column,
+scanning index, native coordinate, configured coordinate, grid identity and geodesic
+separation. It represents analysed QPE associated with the requested coordinate.
+Numeric zero, positive amount, native `-1` missing and `-3` no coverage remain distinct;
+malformed inputs fail. MRMS has no trace interpretation here. Units and sentinels come
+from the [NOAA local-parameter table](https://www.nssl.noaa.gov/projects/mrms/operational/tables.php),
+including when the decoder reports the local parameter's units as `unknown`.
+
+`GaugeInflIndex_01H_Pass2` (209/8/17) and `RadarAccumulationQualityIndex_01H`
+(209/8/10) are retained as dimensionless support evidence at the same indicated time,
+native grid and selected cell. They are not probabilities or complete uncertainty
+estimates. No quality cutoff is approved. Their hourly association is retained without
+claiming they encode the QPE accumulation bounds. MRMS may use model-based gap filling;
+it is not wholly independent of numerical guidance.
+
+With the existing PostgreSQL/MinIO environment configured, acquire **one fixed hour**
+into a new directory outside Git, then extract another coordinate from those same files:
+
+```sh
+python -m mesoforge.application.prepared_mrms --time 2026-09-24T12:00:00Z --lat 44.98859 --lon -93.25557 --raw-dir /outside-git/mrms-20260924-12
+python -m mesoforge.application.prepared_mrms --from-raw --lat 45.016 --lon -94.264 --raw-dir /outside-git/mrms-20260924-12
+python -m mesoforge.application.prepared_mrms --replay-artifact <extraction-artifact-id>
+```
+
+The fixed acquisition URL has limited operational retention, so the historical command
+is illustrative once those files expire. `--from-raw` uses the retained bundle;
+`--replay-artifact` reparses the immutable raw objects and checks exact canonical
+extraction equality without provider calls or storage writes. Original gzip bytes,
+URLs, checksums, response identity, acquisition time and parsed metadata are retained;
+PostgreSQL holds manifests/lineage, MinIO holds content-addressed payloads. Different
+source bytes create distinct revisions. The extraction references the shared raw grids
+instead of embedding millions of grid values. QPF verification/scoring remains the
+next separate milestone.
+
+Verified fixed-hour demonstration: the three retained `20260924-120000` files total
+**8,222,622 compressed bytes** (QPE 721,721; gauge influence 4,280,177; radar quality
+3,220,724). For `(11:00Z,12:00Z]`, coordinate `45.016,-94.264` selects native
+`45.015,-94.265` (row 998, column 3573; 136.249 m) with **1.4 mm** QPE,
+gauge influence **0.078** and radar quality **1**. Minneapolis `44.98859,-93.25557`
+selects `44.985,-93.255` (row 1001, column 3674; 401.487 m) with **0 mm** and both
+support values **1**. This establishes the source contract, not a forecast-verification
+sample or a skill claim. The two saved extractions are about 17.3 KB each and share
+three raw artifacts. Offline reparse took 0.84–0.86 seconds per extraction, reproduced
+canonical output exactly, and created no records/objects. The retained-input and
+artifact-replay CLI modes were exercised against isolated PostgreSQL/MinIO; the online
+CLI acquisition uses a tested transport boundary, but was not rerun over these already
+retained real files. **30 focused MRMS tests, 283 retained observation/storage/provenance
+tests and 31 storage integration tests passed**, plus Ruff, formatting, mypy, import
+contracts, lock consistency, docs and hygiene checks. Missing/no-coverage cases use
+actual GRIB fixtures. Full repository/forecast acceptance tests were not run for this
+source-only change.
 
 ### Prepare one real METAR dataset
 
