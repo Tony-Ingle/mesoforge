@@ -7,7 +7,7 @@ Native evidence is read-only; only per-hour dependency results are cached.
 
 from __future__ import annotations
 
-import math
+import time
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Literal
@@ -17,34 +17,31 @@ from mesoforge.catalog.configuration import (
     FallbackWeightTable,
     Phase2BlendConfiguration,
 )
-from mesoforge.forecasting.gust_blend import (
-    GustDisqualificationError,
-    blend_gust,
-    validate_source_gust,
+from mesoforge.forecasting.coherence import (
+    BASELINE_COHERENCE,
+    DEW_POINT,
+    GUST,
+    QPF,
+    RH,
+    TEMPERATURE,
+    WIND,
+    CoherenceError,
+    ValidatedSources,
 )
+from mesoforge.forecasting.gust_blend import blend_gust
 from mesoforge.forecasting.precipitation_blend import blend_qpf
 from mesoforge.forecasting.recipes import ContributorConfiguration, Recipe, evaluate_recipe
 from mesoforge.forecasting.scalar_blend import (
-    ConsistencyError,
     Contribution,
     blend_scalar,
-    check_dew_point_consistency,
 )
 from mesoforge.forecasting.surface import (
     RH_POLICY,
-    RH_SOURCE,
     SurfaceBlendError,
     _usable,
-    relative_humidity_percent,
 )
 from mesoforge.forecasting.vector_blend import blend_vector
 
-TEMPERATURE = "air_temperature_2m"
-DEW_POINT = "dew_point_temperature_2m"
-WIND = "wind_10m"
-GUST = "wind_gust_10m"
-QPF = "liquid_equivalent_precipitation_amount_1h"
-RH = "relative_humidity_2m"
 _U = "eastward_wind_10m"
 _V = "northward_wind_10m"
 _ACTIVE_MODELS = ("HRRR", "GFS")
@@ -82,7 +79,7 @@ FIELD_REGISTRY = MappingProxyType(
             RH,
             "derived",
             "%",
-            "_humidity",
+            "coherence.relative_humidity",
             "rh",
             "require_consistent_temperature_and_dew_point",
             (TEMPERATURE, DEW_POINT),
@@ -117,16 +114,6 @@ FIELD_REGISTRY = MappingProxyType(
 
 
 @dataclass
-class _Validated:
-    dew: dict[str, float]
-    u: dict[str, float]
-    v: dict[str, float]
-    gust: dict[str, float]
-    dew_reasons: list[str]
-    wind_reasons: list[str]
-
-
-@dataclass
 class BlendState:
     """Extracted values at one point/valid hour; never shared across hours/cells.
 
@@ -139,7 +126,11 @@ class BlendState:
     precipitation: dict[str, dict[str, Any]] = field(default_factory=dict)
     results: dict[str, dict[str, Any]] = field(default_factory=dict, init=False)
     source_validation: dict[str, Any] = field(default_factory=dict, init=False)
-    validated: _Validated | None = field(default=None, init=False)
+    validated: ValidatedSources | None = field(default=None, init=False)
+    coherence_events: dict[str, dict[str, Any]] = field(default_factory=dict, init=False)
+    coherence_seconds: dict[str, float] = field(default_factory=dict, init=False)
+    blend_seconds: float = field(default=0.0, init=False)
+    coherence_collected: bool = field(default=False, init=False)
 
 
 def _weights(row: FallbackWeightRow | None) -> dict[str, float]:
@@ -184,99 +175,14 @@ def _contributions(values: dict[str, float], row: FallbackWeightRow) -> tuple[Co
     )
 
 
-def _validate_sources(state: BlendState, configuration: Phase2BlendConfiguration) -> _Validated:
-    source_validation = state.source_validation
-    dew_values: dict[str, float] = {}
-    u_values: dict[str, float] = {}
-    v_values: dict[str, float] = {}
-    gust_values: dict[str, float] = {}
-    dew_reasons: list[str] = []
-    wind_reasons: list[str] = []
-    for model in sorted(set(state.contributors) | set(_ACTIVE_MODELS)):
-        source = state.contributors.get(model, {})
-        source_temperature = source.get(TEMPERATURE)
-        dew = source.get(DEW_POINT)
-        source_dew_reasons: list[str] = []
-        if not _usable(dew, 150.0, 340.0):
-            source_dew_reasons.append(f"{model}: dew point missing/nonfinite/outside [150, 340] K")
-        elif not _usable(source_temperature, 150.0, 340.0):
-            source_dew_reasons.append(f"{model}: temperature unavailable for dew-point consistency")
-        else:
-            assert source_temperature is not None and dew is not None
-            try:
-                check_dew_point_consistency(temperature_k=source_temperature, dew_point_k=dew)
-            except ConsistencyError as exc:
-                source_dew_reasons.append(f"{model}: {exc}")
-        if model in _ACTIVE_MODELS:
-            dew_reasons.extend(source_dew_reasons)
-            if not source_dew_reasons:
-                assert dew is not None
-                dew_values[model] = dew
-
-        u, v, gust = source.get(_U), source.get(_V), source.get(GUST)
-        source_wind_reasons = [
-            f"{model}: {variable} missing/nonfinite/outside canonical bounds"
-            for variable, value, low, high in (
-                (_U, u, -100.0, 100.0),
-                (_V, v, -100.0, 100.0),
-                (GUST, gust, 0.0, configuration.gust_policy.valid_max_m_s),
-            )
-            if not _usable(value, low, high)
-        ]
-        validated_gust: float | None = None
-        source_floor = False
-        sustained = math.hypot(u, v) if u is not None and v is not None else None
-        if not source_wind_reasons:
-            assert gust is not None and sustained is not None
-            try:
-                validation = validate_source_gust(
-                    gust_m_s=gust,
-                    sustained_speed_m_s=sustained,
-                    shortfall_floor_tolerance_m_s=(
-                        configuration.gust_policy.shortfall_floor_tolerance_m_s
-                    ),
-                )
-                validated_gust = validation.validated_gust_m_s
-                source_floor = validation.source_gust_floor_applied
-            except GustDisqualificationError as exc:
-                source_wind_reasons.append(f"{model}: {exc}")
-        if model in _ACTIVE_MODELS:
-            wind_reasons.extend(source_wind_reasons)
-            if not source_wind_reasons:
-                assert u is not None and v is not None and validated_gust is not None
-                u_values[model], v_values[model], gust_values[model] = u, v, validated_gust
-        source_validation[model] = {
-            "dew_point": {
-                "status": "rejected" if source_dew_reasons else "accepted",
-                "missing_reasons": source_dew_reasons,
-            },
-            "wind_gust": {
-                "status": "rejected" if source_wind_reasons else "accepted",
-                "missing_reasons": source_wind_reasons,
-                "rejection_scope": "coupled-wind-gust-point" if source_wind_reasons else None,
-                "source_gust_m_s": gust if _usable(gust, 0.0, 100.0) else None,
-                "source_sustained_speed_m_s": (
-                    sustained if sustained is not None and math.isfinite(sustained) else None
-                ),
-                "validated_gust_m_s": validated_gust,
-                "source_gust_floor_applied": source_floor,
-            },
-        }
-
-    state.validated = _Validated(
-        dew_values, u_values, v_values, gust_values, dew_reasons, wind_reasons
-    )
-    return state.validated
-
-
 @dataclass(frozen=True)
 class FieldBlendEngine:
     """Dispatch the active V2 fields using existing versioned policy definitions.
 
     A state belongs to this engine for one immutable set of extracted inputs.
-    Dependencies are explicit calls in the few specialized handlers, not a new
-    graph/coherence framework. Temperature-only historical prepared data needs
-    no Phase 2 configuration.
+    Current cross-field ordering is owned by the finite coherence engine; these
+    handlers retain the existing scientific blend kernels. Temperature-only
+    historical prepared data needs no Phase 2 configuration.
     """
 
     contributors: ContributorConfiguration
@@ -297,21 +203,33 @@ class FieldBlendEngine:
         )
 
     def blend_field(self, field_id: str, state: BlendState) -> dict[str, Any]:
-        """Produce one field from aligned native evidence, caching dependencies."""
-        definition = FIELD_REGISTRY[field_id]
+        """Produce one field through its current blend and coherence dependencies."""
+        FIELD_REGISTRY[field_id]
         if field_id != TEMPERATURE and (
             isinstance(state.horizon, bool) or state.horizon not in range(1, 37)
         ):
             raise SurfaceBlendError("surface forecast horizon must be an integer from 1 through 36")
-        if field_id not in state.results:
-            state.results[field_id] = getattr(self, definition.execution)(state)
+        if field_id in (TEMPERATURE, QPF):
+            return self._blend_raw(field_id, state)
+        BASELINE_COHERENCE.apply_baseline(self, state, fields=(field_id,))
         return state.results[field_id]
 
-    def _sources(self, state: BlendState) -> _Validated:
-        if self.phase2 is None:
-            raise SurfaceBlendError("Prepared Phase 2 policy configuration required")
+    def _blend_raw(self, field_id: str, state: BlendState) -> dict[str, Any]:
+        """Kernel dispatch only; source eligibility and ordering belong to coherence."""
+        if field_id not in state.results:
+            definition = FIELD_REGISTRY[field_id]
+            if definition.semantic_kind == "derived":
+                raise CoherenceError(f"{field_id}: diagnostic requires coherence execution")
+            clock = time.perf_counter()
+            try:
+                state.results[field_id] = getattr(self, definition.execution)(state)
+            finally:
+                state.blend_seconds += time.perf_counter() - clock
+        return state.results[field_id]
+
+    def _sources(self, state: BlendState) -> ValidatedSources:
         if state.validated is None:
-            return _validate_sources(state, self.phase2)
+            raise CoherenceError("Native source eligibility must precede dependent blends")
         return state.validated
 
     def _row(
@@ -342,42 +260,9 @@ class FieldBlendEngine:
         reasons = list(sources.dew_reasons)
         row = self._row(DEW_POINT, sources.dew, state)
         value = blend_scalar(_contributions(sources.dew, row)).blended_value if row else None
-        temperature = self.blend_field(TEMPERATURE, state)["value"]
-        status = None
-        if value is not None:
-            if not _usable(temperature, 150.0, 340.0):
-                value = None
-                reasons.append("active temperature unavailable for blended dew-point consistency")
-            else:
-                try:
-                    check_dew_point_consistency(temperature_k=temperature, dew_point_k=value)
-                except ConsistencyError as exc:
-                    value = None
-                    status = "inconsistent"
-                    reasons.append(str(exc))
         table = self.policy_for(DEW_POINT)
         assert isinstance(table, FallbackWeightTable)
-        return _field(value, "K", policy=table.table_id, reasons=reasons, row=row, status=status)
-
-    def _humidity(self, state: BlendState) -> dict[str, Any]:
-        temperature = self.blend_field(TEMPERATURE, state)["value"]
-        dew = self.blend_field(DEW_POINT, state)["value"]
-        value = None
-        reasons: list[str] = []
-        if _usable(temperature, 150.0, 340.0) and dew is not None:
-            try:
-                value = relative_humidity_percent(temperature_k=temperature, dew_point_k=dew)
-            except SurfaceBlendError as exc:
-                reasons.append(str(exc))
-        else:
-            reasons.append("RH requires available, consistent baseline temperature and dew point")
-        result = _field(value, "%", policy=RH_POLICY, reasons=reasons)
-        result.update(
-            derived_from=[TEMPERATURE, DEW_POINT],
-            saturation_reference="liquid_water",
-            source=RH_SOURCE,
-        )
-        return result
+        return _field(value, "K", policy=table.table_id, reasons=reasons, row=row)
 
     def _wind(self, state: BlendState) -> dict[str, Any]:
         sources = self._sources(state)
@@ -416,7 +301,7 @@ class FieldBlendEngine:
 
     def _gust(self, state: BlendState) -> dict[str, Any]:
         sources = self._sources(state)
-        wind = self.blend_field(WIND, state)
+        wind = state.results[WIND]
         row = self._row(GUST, sources.u, state)
         value = None
         final_floor = False
@@ -487,11 +372,14 @@ class FieldBlendEngine:
         actual versioned recipe recorded on the containing forecast. Neither this
         projection nor the historical cloud placeholder is a second blend path.
         """
+        if isinstance(state.horizon, bool) or state.horizon not in range(1, 37):
+            raise SurfaceBlendError("surface forecast horizon must be an integer from 1 through 36")
+        BASELINE_COHERENCE.apply_baseline(self, state)
         fields = {}
         for field_id in FIELD_REGISTRY:
             if field_id == QPF and not state.precipitation:
                 continue
-            value = self.blend_field(field_id, state)
+            value = state.results[field_id]
             if field_id == WIND:
                 fields.update(value)
             elif field_id == TEMPERATURE:

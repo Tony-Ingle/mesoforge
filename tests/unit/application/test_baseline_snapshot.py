@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing
 import shutil
@@ -23,6 +24,7 @@ from mesoforge.application.forecast_from_baseline import forecast_from_baseline
 from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.spatial_coverage import CoverageRequiredError
 from mesoforge.contracts.serialization import canonical_json_bytes
+from mesoforge.forecasting.coherence import CoherenceEngine
 from mesoforge.forecasting.field_blend import FieldBlendEngine
 from tests.support.in_memory_uow import InMemoryObjectStore, InMemoryUnitOfWorkFactory
 from tests.unit.application.test_batch_forecast import FIRST, LAST, write_config
@@ -95,6 +97,7 @@ def baseline_case(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
 def forbid_location_calculation(monkeypatch: pytest.MonkeyPatch) -> Mock:
     forbidden = Mock(side_effect=AssertionError("Location job recalculated or acquired guidance"))
     monkeypatch.setattr(FieldBlendEngine, "blend_field", forbidden)
+    monkeypatch.setattr(CoherenceEngine, "apply_baseline", forbidden)
     monkeypatch.setattr(prepared, "load_preparation", forbidden)
     monkeypatch.setattr(background, "load_preparation", forbidden)
     monkeypatch.setattr("requests.Session", forbidden)
@@ -113,6 +116,9 @@ def test_persisted_canvas_has_exact_lineage_and_replays_every_cell_without_blend
     assert manifest["prepared_snapshot"]["snapshot_id"] == source["snapshot_id"]
     assert manifest["prepared_snapshot"]["manifest_sha256"] == pointer["manifest_sha256"]
     assert manifest["field_policies"] == source["field_policies"]
+    assert manifest["coherence_and_derivation"]["status"] == "passed"
+    assert manifest["coherence_and_derivation"]["phase"] == "baseline"
+    assert all(domain["coherence"] for domain in manifest["domains"])
     assert manifest["information_cutoff"]["status"] == "proven"
     assert manifest["coverage"]["reference_times"] == [
         time.isoformat().replace("+00:00", "Z") for time in REFERENCES
@@ -306,14 +312,8 @@ def test_failed_new_state_retains_previous_baseline_then_retry_publishes_without
     assert (guidance / prepared.POINTER_FILE).read_bytes() == source_pointer
     assert prepared.resolve_latest_complete(guidance)[0] == new_source
 
-    def replay(*, latitude, longitude):
-        return deepcopy(baseline_case["expected"][(latitude, longitude)])
-
-    monkeypatch.setattr(
-        background,
-        "load_preparation",
-        lambda _: SimpleNamespace(reference_view=lambda _: SimpleNamespace(forecast=replay)),
-    )
+    # Retry executes required coherence for the new build, not a cached grid that
+    # merely looks complete. Historical read-only extraction is checked below.
     rebuilt = background.build_baseline(guidance, root, LOCATIONS, reference_times=[TARGET])
     assert rebuilt["status"] == "published"
     current = baselines.load_baseline(root)
@@ -325,6 +325,66 @@ def test_failed_new_state_retains_previous_baseline_then_retry_publishes_without
         old.reference_view(TARGET).forecast(latitude=FIRST["lat"], longitude=FIRST["lon"])
     ) == canonical_json_bytes(baseline_case["expected"][(FIRST["lat"], FIRST["lon"])])
     assert (guidance / prepared.POINTER_FILE).read_bytes() == source_pointer
+
+
+@pytest.mark.parametrize("failure", ["constraint", "bypassed"])
+def test_required_coherence_failure_cannot_publish_or_change_prepared_state(
+    baseline_case, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    root, guidance = baseline_case["baseline"], baseline_case["guidance"]
+    before = (root / baselines.POINTER_FILE).read_bytes()
+    prepared_before = (guidance / prepared.POINTER_FILE).read_bytes()
+    if failure == "constraint":
+        monkeypatch.setattr(
+            CoherenceEngine,
+            "apply_baseline",
+            Mock(side_effect=ValueError("required coherence failed")),
+        )
+    else:
+
+        def replay(*, latitude, longitude):
+            return deepcopy(baseline_case["expected"][(latitude, longitude)])
+
+        monkeypatch.setattr(
+            background,
+            "load_preparation",
+            lambda _: SimpleNamespace(reference_view=lambda _: SimpleNamespace(forecast=replay)),
+        )
+    with pytest.raises(ValueError, match="coherence|Coherence"):
+        background.build_baseline(guidance, root, [FIRST], reference_times=[TARGET])
+    assert (root / baselines.POINTER_FILE).read_bytes() == before
+    assert (guidance / prepared.POINTER_FILE).read_bytes() == prepared_before
+
+
+def test_historical_baseline_without_framework_report_remains_readable(
+    baseline_case, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "legacy"
+    shutil.copytree(baseline_case["baseline"], root)
+    pointer = baselines.read_pointer(root)
+    directory = root / pointer["baseline_directory"]
+    manifest = json.loads((directory / baselines.MANIFEST_FILE).read_bytes())
+    manifest["coherence_and_derivation"] = {
+        "scope": "current_checks_only_not_generalized_coherence"
+    }
+    for domain in manifest["domains"]:
+        domain.pop("coherence")
+    # Transform only a test copy to the previous additive schema; no production
+    # artifact is rewritten, and the payload/digests remain the original ones.
+    payload = canonical_json_bytes(manifest)
+    (directory / baselines.MANIFEST_FILE).write_bytes(payload)
+    pointer["manifest_sha256"] = hashlib.sha256(payload).hexdigest()
+    (root / baselines.POINTER_FILE).write_text(json.dumps(pointer))
+    forbidden = forbid_location_calculation(monkeypatch)
+    actual = (
+        baselines.load_baseline(root)
+        .reference_view(TARGET)
+        .forecast(latitude=FIRST["lat"], longitude=FIRST["lon"])
+    )
+    assert canonical_json_bytes(actual) == canonical_json_bytes(
+        baseline_case["expected"][(FIRST["lat"], FIRST["lon"])]
+    )
+    forbidden.assert_not_called()
 
 
 @pytest.mark.parametrize("omission", ["hour", "field"])
@@ -420,6 +480,24 @@ def _publish_worker(root, manifest, digest, attempted, read, release):
         else:
             result = {"status": "published"}
     (root / f"{manifest['baseline_snapshot_id']}.result.json").write_text(json.dumps(result))
+
+
+def test_failed_coherence_manifest_cannot_replace_published_baseline(tmp_path: Path) -> None:
+    original, digest = _publication_manifest(tmp_path, "original", 0)
+    baselines.publish_latest_baseline(tmp_path, original, digest, published_at=datetime.now(UTC))
+    before = (tmp_path / baselines.POINTER_FILE).read_bytes()
+    failed = deepcopy(original)
+    failed["baseline_snapshot_id"] = "failed"
+    failed["coherence_and_derivation"] = {
+        "framework_version": "mesoforge.baseline-coherence.v1",
+        "status": "failed",
+    }
+    directory = tmp_path / baselines.BASELINES_DIRECTORY / "failed"
+    directory.mkdir()
+    _, digest = baselines.write_manifest(directory, failed)
+    with pytest.raises(prepared.SnapshotError, match="coherence"):
+        baselines.publish_latest_baseline(tmp_path, failed, digest, published_at=datetime.now(UTC))
+    assert (tmp_path / baselines.POINTER_FILE).read_bytes() == before
 
 
 @pytest.mark.parametrize("first_minute,second_minute", [(1, 2), (2, 1)])

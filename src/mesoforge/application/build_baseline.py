@@ -40,8 +40,11 @@ from mesoforge.application.spatial_coverage import (
     UnsupportedCoordinateError,
     validate_coordinate,
 )
+from mesoforge.forecasting.coherence import (
+    collect_baseline_coherence,
+    framework_metadata,
+)
 from mesoforge.forecasting.field_blend import FIELD_REGISTRY
-from mesoforge.forecasting.surface import RH_POLICY
 
 _ROOT = Path(__file__).resolve().parents[3]
 
@@ -178,13 +181,14 @@ def build_baseline(
     directory.mkdir(parents=True, exist_ok=False)
     domains: list[dict[str, Any]] = []
     artifacts: list[dict[str, Any]] = []
-    build_seconds = persist_seconds = 0.0
+    build_seconds = persist_seconds = coherence_seconds = blend_seconds = 0.0
     for reference in references:
         view = prepared.reference_view(reference)
         for latitude, longitude in coordinates:
             clock = time.perf_counter()
             try:
-                forecast = view.forecast(latitude=latitude, longitude=longitude)
+                with collect_baseline_coherence() as coherence:
+                    forecast = view.forecast(latitude=latitude, longitude=longitude)
             except (CoverageRequiredError, UnsupportedCoordinateError) as exc:
                 failures.append(
                     {
@@ -199,6 +203,14 @@ def build_baseline(
             clock = time.perf_counter()
             grid = forecast["local_grid_baseline"]
             availability = _availability(grid, reference)
+            # Missing peripheral coverage remains ordinary missingness. Every
+            # actually calculated cell/hour must complete current required rules;
+            # cached/replayed payloads cannot masquerade as a new coherent build.
+            coherence.validate(
+                sum(len(cell["hours"]) for cell in grid["cells"] if cell["status"] == "calculated")
+            )
+            coherence_seconds += coherence.coherence_seconds
+            blend_seconds += coherence.blend_seconds
             artifact = write_artifact(
                 directory, f"domain-{len(domains):04d}.json.gz", codec.encode(grid)
             )
@@ -215,6 +227,7 @@ def build_baseline(
                     "grid_policy": grid["policy"],
                     "grid_sha256": forecast["local_grid"]["sha256"],
                     "field_availability": availability,
+                    "coherence": coherence.report(),
                     "transformation": grid["transformation"],
                     "artifact": artifact,
                 }
@@ -277,11 +290,11 @@ def build_baseline(
         "field_policies": prepared_manifest["field_policies"],
         "field_registry": {name: asdict(row) for name, row in FIELD_REGISTRY.items()},
         "coherence_and_derivation": {
-            "scope": "current_checks_only_not_generalized_coherence",
-            "relative_humidity": RH_POLICY,
-            "dew_point": "existing scalar check_dew_point_consistency",
-            "wind_gust": "existing coupled source validation and blend_gust final floor",
-            "implementation": domains[0]["transformation"],
+            **framework_metadata(),
+            "status": "passed",
+            "scope": "current_approved_rules_only",
+            "execution_reports": "domains[].coherence",
+            "field_evidence": "cells[].hours[].surface.fields/source_validation",
         },
         "producer_source_sha256": producer,
         "information_cutoff": {
@@ -301,7 +314,10 @@ def build_baseline(
     _, digest = write_manifest(directory, manifest)
     persist_seconds += time.perf_counter() - clock
     timings.update(
-        baseline_build_seconds=build_seconds, serialization_persistence_seconds=persist_seconds
+        baseline_build_seconds=build_seconds,
+        field_blend_kernel_seconds=blend_seconds,
+        coherence_seconds=coherence_seconds,
+        serialization_persistence_seconds=persist_seconds,
     )
     clock = time.perf_counter()
     published = publish_latest_baseline(

@@ -65,6 +65,7 @@ def create_issuer() -> ForecastIssuanceService:
         "application/surface_forecast.py",
         "application/local_surface_grid.py",
         "forecasting/surface.py",
+        "forecasting/coherence.py",
         "forecasting/vector_blend.py",
         "forecasting/gust_blend.py",
         "contracts/issued_forecasts.py",

@@ -293,7 +293,8 @@ registration, verification, AI, and delivery milestone.
 - **MesoForge baseline snapshot (implemented on demand):** the current numerical
   canvas calculated before location runs, linked to exact prepared state and current
   field policies/checks. Section 5.7 defines the configured-domain representation.
-  Continuous hosted maintenance and generalized coherence remain future work. A
+  Current approved coherence runs through section 5.5's framework; broader scientific
+  rules and continuous hosted maintenance remain future work. A
   location run pins the baseline throughout extraction and later stages.
 - **Issued forecast snapshot:** one immutable persisted forecast version. Refresh creates a
   new version and never edits an earlier one.
@@ -553,7 +554,7 @@ and remain in force; none of them is the final philosophy:
 |---|---|---|
 | Temperature | Named recipe `temperature_control_v1`, version `1`, HRRR/GFS 70/30, `require_all`; issuance refuses any other control recipe | `forecasting/recipes.py`, dispatched by `forecasting/field_blend.py`; `validate_current_control` in `application/batch_forecast.py` |
 | Dew point, U/V, gust, QPF | Retained Phase 2 fallback tables keyed by available-model set and lead band (70/30 h1–18, 60/40 h19–36); active HRRR/GFS set and table column order preserved | `blend_configuration` in `configs/phase2-grasston.yaml`, dispatched by `forecasting/field_blend.py` |
-| RH | `bolton-1980-relative-humidity-liquid-water.v1`, diagnostic from blended temperature/dew point | `forecasting/surface.py` kernel, dispatched by `forecasting/field_blend.py` |
+| RH | `bolton-1980-relative-humidity-liquid-water.v1`, diagnostic from coherent blended temperature/dew point | `forecasting/surface.py` kernel, orchestrated by `forecasting/coherence.py` |
 | PoP, sky, thunder | Temporary single-source NBM passthrough policies with weight 1 and no substitute | `pop_policy` in the same configuration; policy constants in `forecasting/cloud_cover.py` and `forecasting/thunder.py` |
 | Precipitation type | Temporary HRRR/GFS categorical agreement rule | `application/precipitation_type.py` |
 | Visibility, SWE, snowfall, Kuchera, ice | Evidence only; "no approved policy" placeholders with a null active value | the corresponding `application/*` and `forecasting/*` modules |
@@ -573,8 +574,8 @@ cached dependency results and source-validation evidence. Specialized handlers c
 the retained scalar, vector, gust, QPF and RH kernels. Native input dictionaries are
 not modified. Wind/gust share the same accepted U/V/gust contributor tuple; gust
 depends on blended sustained speed. Dew point retains native and blended-temperature
-checks; RH is derived, never independently weighted. Dependencies are the few
-explicit handler calls needed today, not a generalized coherence/graph engine.
+checks; RH is derived, never independently weighted. The coherence framework below
+now owns these dependencies; field handlers retain the specialized blend kernels.
 
 Temperature remains 70/30 with both inputs required at all 36 hours. Dew point,
 wind and gust reuse `phase2-scalar-vector-fallback.v1`; QPF reuses the distinct
@@ -598,10 +599,56 @@ NBM PoP/sky/thunder, p-type agreement and all evidence-only products remain on t
 existing field-specific paths, outside this migration. The separate retained Phase 2
 station assembler remains a compatible consumer of the scientific kernels and its
 three-model contracts. Comparison recipes still use the generic scalar recipe kernel.
-Continuous blended-baseline publication, generalized coherence, dynamic weights and
-corrections remain future work. Section 5.6 publishes prepared contributors;
+Continuous blended-baseline publication, broader scientific coherence, dynamic weights
+and corrections remain future work. Section 5.6 publishes prepared contributors;
 section 5.7 now runs these policies before location jobs and publishes an on-demand
 numerical baseline.
+
+**Implemented coherence orchestration.** `forecasting/coherence.py` provides one
+finite baseline execution boundary and an immutable relationship registry. Executable
+relationships have deterministic dependency order; cycles and unknown prerequisites
+are errors. Future conceptual dependencies are explicitly nonexecuting, so a conceptual
+QPF/PoP or precipitation/thermal relationship cannot create an iterative solver.
+
+The current sequence preserves the existing scientific contracts:
+
+- Native source eligibility checks T/Td and the coupled U/V/gust tuple before the
+  relevant blends. An inconsistent native Td is excluded without changing source T.
+  A source gust shortfall within the configured tolerance floors only the working
+  gust; a larger shortfall rejects that source's entire wind/gust tuple. Shadows keep
+  their validation evidence and zero active weight.
+- Blended Td is checked against blended T using the existing `1e-6 K` tolerance.
+  Failure nulls Td with its existing reason/status; it never clamps temperature or Td.
+- Bolton RH then derives from coherent T/Td, retaining its stricter rejection of any
+  Td above T, even inside the Td consistency tolerance. Missing or inconsistent
+  prerequisites produce the same unavailable RH as before.
+- The existing vector kernel blends U/V then derives speed/direction. Exactly calm
+  wind keeps undefined direction. The same validated source subset feeds the gust
+  kernel, including its configured final epsilon floor and fatal invariant check.
+
+The framework orchestrates these kernels; it does not replace their equations,
+thresholds, field-policy identities, row selection or missing-source rules. Native
+contributor diagnostics and native-corner Kuchera evidence remain at their existing
+extraction boundaries. Contributor RH/wind keep their existing `derived_from`
+provenance; Kuchera is registered as externally executed evidence. Neither is promoted
+into a new active policy. The unused retained PoP/QPF tension helper is
+not activated by this milestone.
+
+QPF/PoP, QPF/p-type, QPF/thunder, precipitation/thermal structure, snow/SWE/SLR,
+freezing-rain/ice and visibility/fog relationships are registered as future work.
+They do not change any field or block publication. In particular, zero deterministic
+QPF does not force zero PoP or thunder, surface temperature does not select p-type,
+and reduced visibility does not diagnose fog. Future post-AI validation is not run.
+
+Each new baseline manifest records the framework version, relationship definitions
+and a compact report per domain/reference view. Reports distinguish validation,
+working-value adjustment, derivation and approved unavailable outcomes, referring
+to the unchanged cell/hour field and source-validation evidence. Every calculated
+cell/hour must complete all current required operations before publication. Ordinary
+approved missingness is not a failed execution. A missing required execution or
+invariant exception fails the build and leaves `latest_baseline` unchanged. Reports
+are publication facts; location extraction reads them by baseline lineage and never
+reruns coherence. Historical manifests without framework reports remain readable.
 
 ### 5.6 Implemented guidance refresh and the latest complete prepared snapshot
 
@@ -789,7 +836,9 @@ use the section 5.5 dispatcher. Temporary NBM PoP/sky/thunder and HRRR/GFS p-typ
 their current source/policy paths. Currently attached visibility and winter/probability
 evidence retain their roles, native timing and explicit gaps. Existing T/Td consistency,
 RH derivation, source wind/gust validation and final gust handling run during the
-background build. No generalized coherence engine or field promotion is claimed.
+background build through the generalized coherence framework in section 5.5. Only
+those current rules are enforced; no new scientific constraint or field promotion
+is claimed.
 
 **Durable representation.** `mesoforge.baseline-snapshot.v1` manifests identify the
 exact prepared snapshot/digest, background analysis cutoff, build/completion times,
@@ -818,7 +867,7 @@ recorded separately; unexpected build failures do not publish an incomplete arti
 is the normal configured-location boundary. It resolves once, pins one immutable ID,
 verifies baseline/source digests and cutoff proof, chooses the saved current-UTC-hour
 reference view and reads each requested domain/center. No native model arrays are loaded
-and no basic field blend is invoked by a location job. A later pointer publication does
+and neither field blending nor baseline coherence is invoked by a location job. A later pointer publication does
 not change its pinned reader. Missing reference coverage returns `no_current_baseline`;
 an unbuilt center returns `coverage_required`, with later coordinates still processed.
 Optional `--issue` reuses the existing PostgreSQL/MinIO path and decision-window lock,
@@ -836,7 +885,7 @@ baseline publication and actual issuance remain separate facts. Historical prepa
 snapshots and issuances remain readable through their existing paths without rewrites.
 
 This is on-demand background computation, not a daemon, schedule or continuously
-maintained hosted service. Incremental affected-field recomputation, generalized
+maintained hosted service. Incremental affected-field recomputation, broader scientific
 cross-field coherence, site correction and AI editing remain future work. Registry and
 policy dependency identities are retained for those later stages. Commands and measured
 validation belong in [README](../../README.md#background-mesoforge-baseline-snapshots).
@@ -933,7 +982,8 @@ retention precede the per-location work. For each configured/registered location
    proceed with the new forecast when no suitable observation is available.
 3. Pin one immutable MesoForge baseline snapshot, then derive/extract the local fields.
    Section 5.7 implements on-demand background construction and saved-domain extraction;
-   continuous hosted maintenance and generalized baseline coherence remain future work. Save
+   current approved coherence uses section 5.5, while broader rules and continuous
+   hosted maintenance remain future work. Save
    the original numerical baseline, every contributor's values and the
    source/transform/configuration identity. No acquisition or regional grid preparation
    occurs inside a forecast HTTP request.
@@ -2021,7 +2071,7 @@ is inventoried in section 6.7. Its read-only saved-grid preview, bounded initial
 wording policy, multi-hour transition detection and period summaries are implemented,
 and background guidance refresh, numerical-baseline generation and location consumption
 are separate boundaries (sections 5.6–5.7). Further rules, field promotion,
-dynamic blending and a coherence engine require separate approval.
+dynamic blending and additional coherence science require separate approval.
 
 File/module/table/code/test/change-size estimates are non-binding planning aids per slice.
 Material overrun triggers review when it reveals changed design, not because of a line
@@ -2144,9 +2194,9 @@ features exist or an acceptance gate for future baseline-snapshot work.
 | Forecast identity | The blend is the forecast: one coherent baseline grid from field-specific blend policies; models are contributors/evidence, preserved beside the blend, never a selected final forecast |
 | Blend weights | Per-field policies with field-valid mathematics; dynamic inputs (lead, availability, freshness, verified skill, site, later regime) are conceptual; current fixed weights and single-source rules are scaffolding |
 | AI edits | Persisted as bounded, interpretable edits to the MesoForge field after deterministic correction; contributors are cited evidence, not selections |
-| Refresh versus request | Today refresh publishes prepared contributors and the consumer builds the grid; target background blending/coherence publishes an immutable MesoForge baseline pinned by each configured-location run. Scheduler controls timing, not science |
+| Refresh versus request | Refresh publishes prepared contributors; on-demand background blending/current coherence publishes an immutable MesoForge baseline. Configured-location runs pin and extract it without reblending or rerunning coherence. Continuous hosted maintenance remains future work; schedulers control timing, not science |
 | Snapshot coverage | Usability is absolute valid-time coverage of R+1..R+36 for the active deterministic contributors (`mesoforge-prepared-coverage-policy.v1`, 42-hour target window, never forced); NBM-based products report their own coverage; the request hour is the reference hour |
-| Cross-field coherence | Field-specific blends must stay mutually coherent (p-type/precipitation/thermal structure, thunder/convective support, gust/wind, RH/T/Td, later fog); snapshots keep every contributor field and its availability so a later coherence engine can evaluate them |
+| Cross-field coherence | The implemented framework enforces current T/Td/RH and wind/gust behavior; precipitation/thermal/thunder/winter/visibility dependencies remain nonexecuting until their science is approved. Snapshots retain contributor evidence for those future rules |
 | Issuance | Immutable baseline, corrected fields, proposal/recipe and final fields when implemented; mutable pointer/status only |
 | Facts | Normalized facts and on-demand evaluation; no Cartesian lattice |
 | Errors | Derive on demand; no first-release `error_facts` |

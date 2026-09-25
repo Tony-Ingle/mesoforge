@@ -130,9 +130,11 @@ publishes a complete prepared contributor snapshot (up to 42 hours), then a sepa
 [baseline build](#background-mesoforge-baseline-snapshots) materializes the current
 forecast canvas for configured locations and usable reference hours. Location jobs
 consume that saved numerical state; the compatibility forward run still prepares inline.
-Continuous refresh on
-the VPS, GitHub Actions scheduling and a cross-field coherence engine remain future
-work. The current numerical fields use one [field-policy dispatcher](src/mesoforge/forecasting/field_blend.py):
+Continuous refresh on the VPS and GitHub Actions scheduling remain future work.
+The [coherence framework](src/mesoforge/forecasting/coherence.py) now orchestrates only
+the existing approved source checks, T/Td consistency, RH and wind/gust dependencies.
+Other meteorological relationships are registered without invented enforcement rules.
+The current numerical fields use one [field-policy dispatcher](src/mesoforge/forecasting/field_blend.py):
 temperature, dew point, vector wind, gust and interval QPF, with RH derived from
 blended temperature/dew point. It reuses the existing recipe, Phase 2 tables and
 scientific kernels without changing weights, fallbacks or policy identities.
@@ -586,9 +588,10 @@ so that analysis scales without opening each multi-megabyte evidence payload, wh
 older facts stay readable without migration. Two owner-approved policies now govern
 future learning: [which issuance represents a decision window and what evidence a
 correction proposal needs](#decision-window-and-evidence-policies). On-demand background
-baseline publication now uses the field-specific dispatcher and current checks;
-generalized cross-field coherence is the next proposed architecture milestone and
-remains unimplemented. Prepared and baseline publication retain separate concurrency
+baseline publication now uses the field-specific dispatcher and generalized coherence
+framework with only current approved rules enforced. Broader precipitation, thermal,
+winter and visibility coherence still needs scientific policy decisions.
+Prepared and baseline publication retain separate concurrency
 and cutoff boundaries as described below. More independent verification evidence is still
 needed before deriving weights or corrections; visibility/fog needs separate causal
 evidence and policy.
@@ -2804,7 +2807,13 @@ configured domain. It writes `baselines/<id>/baseline.json`
 (`mesoforge.baseline-snapshot.v1`), compressed domain artifacts, shared metadata and
 cutoff evidence before publishing `latest_baseline.json`. Field policies, native
 contributors, shadows, missingness and current derivations/checks are unchanged.
-No provider call, new coherence engine or forecast-history write occurs during build.
+The generalized coherence framework runs the existing required checks/derivations
+before publication. No provider call or forecast-history write occurs during build.
+The manifest records its version, dependency registry and compact per-domain outcomes.
+Ordinary missing sources remain explicit unavailable fields; a failed required
+operation or an incomplete execution report blocks the new baseline and preserves
+the previous pointer. Future relationships such as QPF/PoP/thunder do not modify
+fields or fail the build. Location reads neither blend nor rerun baseline coherence.
 
 The spatial representation is a collection of exact configured 7×7 domains using
 today's 6 km spacing and nested masks, not a new common/continental grid. Each domain
@@ -2839,27 +2848,44 @@ a slower older publisher cannot move the pointer backward. Failures preserve pre
 immutable baselines and the existing pointer. Retrying a build produces a new artifact.
 
 Current operation is manual/on-demand. A daemon, scheduled hosted worker, incremental
-recomputation, generalized coherence, corrections and AI editing remain future work.
+recomputation, broader scientific coherence rules, corrections and AI editing remain future work.
 The implementation and current limits are detailed in
 [RFC §5.7](docs/rfcs/mesoforge-v2-architecture.md#57-implemented-background-baseline-snapshots).
 
-Validated on 2026-09-24 using the retained September 18 contributor state: two
-coordinates × seven reference views reproduced all 49×36 grids and exact points
-canonically, with matching conditions/transitions/periods and zero location-time
-blend/provider calls. The 14-view baseline occupies **227.75 MB**, referencing existing
-source metadata; extracted rich issuance payloads still occupy about **365 MB each**.
-Measured baseline load was 0.8–1.3 s and extraction 17–19 s, versus 25.5–27.6 s to
-build a grid from loaded guidance. Two real PostgreSQL/MinIO issuances took 67.35 s;
-repeat execution reused both, and both payloads read back exactly. These were explicit
-historical-reference demonstrations with actual September 24 issuance clocks.
+Coherence validation on 2026-09-24 reused the same retained September 18 contributor
+state, without provider access. Two locations × seven reference views reproduced all
+**24,696 cell-hours** and exact points at zero tolerance, including every represented
+field/evidence record, masks, missingness, policies, conditions, transitions and period
+summaries. Only three execution-source identities and dependent digests changed; the
+RH registry handler label now names coherence, and baseline manifests add versioned
+relationship/report metadata. All 14 saved-view reads ran with both blending and
+coherence disabled and still reproduced their forecasts exactly. Historical baselines
+without coherence reports remain readable.
 
-Checks run: **31 new artifact/cutoff unit cases**, **257 retained scientific/grid/rendering
-tests**, and **46 PostgreSQL/MinIO integration/storage tests** passed. The broader offline
-selection had **3,388 passed and the same three previously documented failures** below;
-four additional cutoff cases passed separately after that selection was collected.
-Ruff, formatting, mypy, import contracts, lock consistency, docs, hygiene and whitespace
-checks passed. Temporary services were stopped. Large rich-payload serialization and
-conditions integrity checks remain costs; no full storage normalization was attempted.
+The 14-view background build measured 2.53 s for contributor load, 362.22 s for grid
+construction, 151.16 s for serialization and 518.84 s overall. Previous numerical
+construction was 375.29 s and serialization 153.43 s; load times are cache-sensitive.
+The complete coherence boundary, including graph/report collection but excluding
+blend kernels, took **0.093 s** in a separate 25.87 s single-grid replay. The build's
+`coherence_seconds` counter measures relationship handlers only (0.746 s over all 14
+views), excluding graph/report bookkeeping; retained combined vector/gust kernels
+are counted in `field_blend_kernel_seconds`. Uncontended location extraction was
+16.29 s, with conditions/integrity checks about 23.4 s and transitions/periods under
+0.005 s. No serialization or extraction optimization was attempted.
+
+The complete compressed baseline occupies **227.91 MB**, only **19.25 KB** more than
+its predecessor including the compact coherence manifests/reports. The existing rich
+issued payload format remains unchanged. Peak background working memory was 2.78 GB.
+Focused coherence/scientific/artifact checks passed, and **46 PostgreSQL/MinIO tests**
+passed, including two-location immutable issuance/readback, historical compatibility,
+read-only conditions and concurrent issuance locking. Temporary services were stopped.
+The broader offline unit/contract/property selection reported **3,406 passed and the
+same three known pre-existing failures**: the explicit-cycle batch mock signature,
+typed-identifier inventory and code-revision-validator inventory. These unrelated
+failures remain unresolved. Ruff, formatting, mypy, import contracts, lock consistency,
+documentation validation, repository hygiene and `git diff --check` passed. Full
+expensive acceptance and live-provider tests were not run for this milestone; saving
+a local checkpoint does not establish whole-application verification.
 
 **Development/replay from prepared evidence** (the older path; no provider access,
 but it still performs local blending and is not the normal location command):

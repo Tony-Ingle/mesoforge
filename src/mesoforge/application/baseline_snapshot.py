@@ -124,6 +124,11 @@ def _resolve(root: Path, pointer: dict[str, Any]) -> tuple[dict[str, Any], Path]
         or manifest.get("completeness", {}).get("status") != "complete"
     ):
         raise SnapshotError("Baseline identity/schema/completeness differs")
+    coherence = manifest.get("coherence_and_derivation", {})
+    # Historical baselines predate executable coherence reports and stay readable.
+    # New reports are publication facts, never an instruction to rerun the engine.
+    if coherence.get("framework_version") and coherence.get("status") != "passed":
+        raise SnapshotError("Baseline required coherence did not pass")
     return manifest, directory
 
 

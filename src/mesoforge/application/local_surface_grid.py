@@ -167,6 +167,7 @@ def _transformation_identity() -> dict[str, Any]:
         "application/ice.py",
         "forecasting/surface.py",
         "forecasting/field_blend.py",
+        "forecasting/coherence.py",
         "forecasting/snowfall_amount.py",
         "forecasting/cloud_cover.py",
         "forecasting/visibility.py",

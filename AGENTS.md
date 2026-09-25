@@ -44,13 +44,15 @@ Forecast philosophy guardrails ([canonical VISION](VISION.md#north-star)):
    development/replay path. Keep `latest_complete`, `latest_baseline` and issued
    forecasts distinct. Preserve exact source/attachment cutoff evidence, background
    analysis cutoff and later issuance times; do not fabricate proof for historical
-   inputs. Current publication is on demand, not a continuous hosted worker or a
-   generalized coherence engine. Schedulers decide when, not weather science.
+   inputs. Current publication is on demand, not a continuous hosted worker.
+   Normal operation runs baseline coherence in background construction; location
+   jobs do not rerun it. Explicit development/replay may rebuild it for comparison.
+   Schedulers decide when, not weather science.
    See README for configured-domain coverage and publication/issuance locking.
 5. This direction is not permission to implement future stages. Current fixed weights,
    NBM-only sources, the HRRR/GFS p-type agreement rule and zero-weight shadows are
-   approved scaffolding: do not change them, add dynamic weighting, a coherence
-   engine, corrections or AI editing unless the owner's current task asks for it.
+   approved scaffolding: do not change them, add dynamic weighting, new coherence
+   science, corrections or AI editing unless the owner's current task asks for it.
    Field-specific blends must stay mutually coherent (p-type with precipitation and
    thermal structure, thunder with convective support, gust with wind, RH with T/Td);
    do not design snapshot or field formats that hide the evidence such checks need.
@@ -58,7 +60,9 @@ Forecast philosophy guardrails ([canonical VISION](VISION.md#north-star)):
    permanently stack another execution path above it. Current V2 temperature, dew
    point, wind, gust, QPF and derived RH dispatch through `forecasting/field_blend.py`
    using the existing recipe/tables/kernels; do not reintroduce parallel numerical
-   orchestration. Other field policies remain unchanged. Future AI has finite budgets
+   orchestration. `forecasting/coherence.py` owns the finite dependency order for
+   current source checks, T/Td, RH and wind/gust. Registered future relationships
+   are not approved enforcement rules. Other field policies remain unchanged. Future AI has finite budgets
    and must preserve the last fully validated forecast state.
 
 This direction does not authorize future stages during unrelated tasks or settle
