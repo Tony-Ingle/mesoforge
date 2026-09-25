@@ -468,6 +468,33 @@ class PostgresArtifactRepository:
         )
         return tuple(_artifact_row_to_manifest(row) for row in rows)
 
+    def find_issued_qpf_verifications(
+        self,
+        *,
+        latitude: float,
+        longitude: float,
+        start_valid_time: datetime,
+        end_valid_time: datetime,
+        limit: int = 5000,
+    ) -> tuple[ArtifactManifest, ...]:
+        """Bounded, field-specific analytical facts; never mix temperature records."""
+        if not 1 <= limit <= 10001:
+            raise ValueError("QPF fact query limit must be within 1..10001")
+        rows = self._session.scalars(
+            sa.select(ArtifactRow)
+            .where(
+                ArtifactRow.artifact_type == "issued-qpf-verification",
+                ArtifactRow.attributes.contains({"latitude": latitude, "longitude": longitude}),
+                sa.cast(ArtifactRow.attributes["valid_time"].astext, sa.DateTime(timezone=True))
+                >= start_valid_time,
+                sa.cast(ArtifactRow.attributes["valid_time"].astext, sa.DateTime(timezone=True))
+                < end_valid_time,
+            )
+            .order_by(ArtifactRow.registered_at, ArtifactRow.id)
+            .limit(limit)
+        )
+        return tuple(_artifact_row_to_manifest(row) for row in rows)
+
     def find_unindexed_issued_temperature_verifications(
         self, *, limit: int
     ) -> tuple[ArtifactManifest, ...]:

@@ -97,7 +97,8 @@ only required geographic inputs; names are optional display metadata.
   and [bounded verification](#automatically-prepare-observations-and-verify) use real
   observations and idempotent facts. [Comparison metrics](#compare-temperature-models-and-blends)
   retain separate issued versions and identical paired samples. Verification/scoring
-  currently covers temperature, not the new dew-point/wind fields.
+  covers temperature; the explicit [hourly QPF analysis](#verify-and-analyze-hourly-qpf)
+  now uses MRMS. Dew-point/wind verification remains future work.
 
 The surface milestone recorded **560 focused offline tests and 19 PostgreSQL/MinIO
 integration tests passing**, plus quality checks, real Minneapolis issuance, exact
@@ -107,7 +108,7 @@ integration tests**, with byte-identical replay and unchanged point values; meas
 are [recorded below](#local-surface-baseline-grid). Full acceptance,
 coverage, forecast skill and production reliability are not established by that demonstration.
 The QPF increment adds [real interval/conservation and offline replay evidence](#liquid-precipitation-on-the-local-grid);
-precipitation verification remains future work. The [PoP increment](#probability-of-precipitation-on-the-local-grid)
+hourly liquid-QPF verification is now available separately. The [PoP increment](#probability-of-precipitation-on-the-local-grid)
 adds actual native probabilistic guidance without changing QPF or other surface values.
 
 Known observation-normalization defect: the retained METAR precipitation parser maps
@@ -118,8 +119,9 @@ normalization correction must preserve raw evidence and historical normalized re
 these legacy precipitation records must not be treated as validated QPF truth.
 
 The bounded [MRMS hourly QPE source contract](#prepare-one-mrms-hourly-qpe-reference)
-now retains analysed precipitation and quality evidence for future QPF verification.
-It does not yet create QPF verification facts, samples or skill scores.
+now supports [immutable hourly QPF verification and read-only analysis](#verify-and-analyze-hourly-qpf).
+QPF forecasts and weights are unchanged; verification measures exact matching hourly
+events against a gridded analysis reference, with explicit exclusions and revisions.
 
 There is **no active snowfall/ice blend, delivered snow depth on the ground, deterministic bias correction,
 site learning, AI editing, production deployment or scheduling in the V2 path yet**. Bias/AI
@@ -1811,8 +1813,8 @@ extraction equality without provider calls or storage writes. Original gzip byte
 URLs, checksums, response identity, acquisition time and parsed metadata are retained;
 PostgreSQL holds manifests/lineage, MinIO holds content-addressed payloads. Different
 source bytes create distinct revisions. The extraction references the shared raw grids
-instead of embedding millions of grid values. QPF verification/scoring remains the
-next separate milestone.
+instead of embedding millions of grid values. The separate verification command below
+consumes those retained extractions without provider access.
 
 Verified fixed-hour demonstration: the three retained `20260924-120000` files total
 **8,222,622 compressed bytes** (QPE 721,721; gauge influence 4,280,177; radar quality
@@ -1831,6 +1833,103 @@ tests and 31 storage integration tests passed**, plus Ruff, formatting, mypy, im
 contracts, lock consistency, docs and hygiene checks. Missing/no-coverage cases use
 actual GRIB fixtures. Full repository/forecast acceptance tests were not run for this
 source-only change.
+
+### Verify and analyze hourly QPF
+
+`issued_qpf_verification` measures saved forecasts; it never generates or changes
+forecast values. Prepare/retain the needed MRMS events first. For older fixed hours,
+`prepared_mrms --archive` selects the official NOAA MRMS public archive; the default
+remains the operational endpoint. Both preserve the actual source URL and original
+bytes under the same approved product contract.
+
+```sh
+python -m mesoforge.application.prepared_mrms --archive --time 2026-09-14T12:00:00Z --lat 44.98859 --lon -93.25557 --raw-dir /outside-git/mrms-20260914-12
+python -m mesoforge.application.prepared_mrms --archive --time 2026-09-14T16:00:00Z --lat 44.98859 --lon -93.25557 --raw-dir /outside-git/mrms-20260914-16
+python -m mesoforge.application.issued_qpf_verification window --lat 44.98859 --lon -93.25557 --start-valid-time 2026-09-14T12:00:00Z --end-valid-time 2026-09-14T17:00:00Z --mrms-extraction <12Z-extraction-id> --mrms-extraction <16Z-extraction-id> --stage baseline --stage final_issued
+python -m mesoforge.application.issued_qpf_verification analyze --lat 44.98859 --lon -93.25557 --start-valid-time 2026-09-14T12:00:00Z --end-valid-time 2026-09-14T17:00:00Z --stage baseline --stage final_issued --contributor HRRR --contributor GFS
+python -m mesoforge.application.issued_qpf_verification read --verification-id <qpf-fact-artifact-id>
+```
+
+Selection includes hourly **end times in `[start,end)`**. Each measured event is
+the separate exact **`(interval_start,interval_end]`** hour. Issuance must precede or
+equal its start; the event and retained observation availability must precede the
+verification cutoff (`--as-of`, default execution time). No station tolerance,
+interval splitting or temporal interpolation is used. `kg/m²` liquid-equivalent
+forecast amounts are numerically equal to mm. Missing forecast/observation, MRMS
+no-coverage, incompatible intervals and unsupported stages remain explicitly excluded.
+Native quality indices remain descriptive evidence, without rejection thresholds.
+
+An **opportunity** identifies issued version, field, stage, coordinate, exact interval
+and verification policy. An immutable **fact** answers that opportunity for retained
+evidence. A canonical **sample** is selected only after duplicate/revision/reissue
+checks. `issued-qpf-verification.v1` artifacts use existing PostgreSQL manifests,
+activities and advisory-lock idempotency plus MinIO payloads. Compact analytical
+attributes retain values, policy, source leads/cycles, observation cell/quality,
+checksums and authoritative issuance/extraction references; no full grid is copied.
+Repeated unchanged evidence/status reuses the first fact and its original cutoff.
+
+Analysis keeps `baseline` and `final_issued` populations separate even where values
+are identical. Baseline attribution requires a saved baseline snapshot or recognized
+saved local-baseline contract; absent historical snapshot IDs remain absent. Future
+corrected/AI stages are not implemented. Identical evidence/reissues collapse;
+conflicting MRMS or quality revisions remain ambiguous. A known primary is not replaced
+by a materially different explicit reissue, which remains alternate evidence. Different
+legacy versions without adequate decision metadata remain ambiguous.
+
+Reports include fact/opportunity/sample counts, exclusions, amount bias/MAE/RMSE,
+totals, exact leads, provisional 1–6/7–18/19–36 groups, locations and UTC
+decision/issuance/valid-date concentration. Positive-versus-zero counts are literal
+numeric descriptions, not a newly chosen measurable-precipitation threshold or PoP
+skill score. Pairwise comparisons carry their own identical sample IDs and corresponding
+MesoForge metrics; requested joint comparisons use only the common intersection.
+HRRR/GFS have retained compatible hourly QPF. RAP/IFS QPF adapters currently provide
+explicit missing evidence, so they receive no invented comparison values.
+
+This is an explicit retained-evidence command. The automatic forward verifier remains
+temperature/METAR-specific; adding bounded MRMS work discovery to that orchestrator is
+separate work. Read-only analysis uses compact facts and issuance metadata, not forecast
+grids; `--payload-only` audits equivalence with the saved fact payload. QPF optimization,
+PoP calibration, precipitation coherence science and AI editing remain future work.
+
+Real retained-data check: Minneapolis issuance
+`3bd4cada-d4c3-4f1e-94d8-2d5182c61991` was issued on September 13, 2026 at
+23:22:23.898666 UTC, before both September 14 events below. Its original payload was
+restored verbatim into isolated development storage; no forecast was regenerated.
+
+| Exact UTC event on September 14 | MesoForge mm | HRRR mm | GFS mm | MRMS mm |
+| --- | ---: | ---: | ---: | ---: |
+| (11:00, 12:00] | 0 | 0 | 0 | 0 |
+| (15:00, 16:00] | 1.257377 | 1.795655 | 0.001393 | 0.4 |
+
+Both use nearest native MRMS point 44.985, −93.255, 401.49 m from the configured
+coordinate; gauge influence and radar accumulation quality were each 1. Values here
+are rounded for display only. Ten stage-specific opportunities produced ten immutable
+facts: four matched facts and six explicit `observation_missing` facts for the three
+intervening hours. Canonical analysis contains **two samples per stage**, not four
+independent weather events. Baseline/final QPF values are identical in this historical
+local-baseline issuance; it predates baseline-snapshot IDs, so those IDs remain absent.
+On the same two samples, MesoForge bias/MAE/RMSE are 0.428688/0.428688/0.606257 mm;
+HRRR 0.697828/0.697828/0.986877 mm; GFS −0.199304/0.199304/0.281858 mm.
+Both samples are at one location/date and leads 13/17 hours (7–18 group); this is a
+pipeline demonstration, not enough evidence to rank models or tune weights.
+
+Six raw QPE/support files totaled 16,070,584 bytes; the two coordinate extractions
+totaled 35,364 bytes. Ten QPF facts totaled 59,912 bytes (5,991 bytes average), plus
+the same compact analytical content in PostgreSQL attributes. Verification took
+5.04 s; repeat verification 3.30 s and reused all ten facts. Attribute-only analysis
+took 0.074 s, matched payload analysis exactly, and made no writes or forecast reads.
+Both MRMS extractions replayed offline; verification made zero provider calls and
+left the issued forecast unchanged. These are local measurements, not throughput guarantees.
+
+Validation: **73 focused QPF/MRMS tests**, **571 relevant retained tests**, and
+**44 PostgreSQL/MinIO integration tests** passed (overlapping selections, not summed).
+The broader unit/contract/property selection passed **3,479 tests** with the three
+known batch-mock, typed-identifier-inventory and code-revision-inventory failures.
+All three reproduced at starting commit `4e8f354`; the final targeted inventory
+matches its original failures after validating the new QPF identifier boundary.
+The 66 service/identifier tests and Ruff, formatting, mypy, import contracts, offline
+lock consistency, documentation, hygiene and diff checks passed. Temporary services
+were stopped. No model acquisition, forecast changes or weight optimization occurred.
 
 ### Prepare one real METAR dataset
 

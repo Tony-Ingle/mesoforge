@@ -16,6 +16,7 @@ from mesoforge.common.identifiers import (
     ConfigurationSnapshotId,
     Digest,
     GridId,
+    IssuedForecastId,
     MatchingPolicyId,
     MetricSetId,
     RunId,
@@ -23,6 +24,15 @@ from mesoforge.common.identifiers import (
     VariableId,
     VerticalDefinitionId,
 )
+
+
+def test_issued_forecast_id_preserves_existing_uuid_and_rejects_malformed_identity() -> None:
+    raw = "3bd4cada-d4c3-4f1e-94d8-2d5182c61991"
+    assert str(IssuedForecastId(raw)) == raw
+    assert uuid.UUID(IssuedForecastId(raw)) == uuid.UUID(raw)
+    for invalid in (raw.upper(), raw.replace("-", ""), f"art_{raw}", raw + "\n", "invalid", None):
+        with pytest.raises(InvalidIdentifier):
+            IssuedForecastId(invalid)
 
 
 class TestArtifactId:

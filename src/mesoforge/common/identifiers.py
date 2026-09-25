@@ -71,6 +71,15 @@ class ArtifactId(_PrefixedUuidId):
     prefix = "art_"
 
 
+class IssuedForecastId(str):
+    """Existing unprefixed issued-version UUID, validated without changing stored IDs."""
+
+    def __new__(cls, value: str) -> Self:
+        if not isinstance(value, str) or not _CANONICAL_UUID_RE.fullmatch(value):
+            raise InvalidIdentifier("IssuedForecastId must be a canonical lowercase UUID")
+        return super().__new__(cls, value)
+
+
 class ActivityId(_PrefixedUuidId):
     """Record identity for an activity manifest: ``act_<uuid4>``."""
 

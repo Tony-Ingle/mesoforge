@@ -983,9 +983,45 @@ Original compressed source bytes use shared content-addressed objects; compact
 coordinate extractions reference those immutable sources through existing PostgreSQL
 manifests/activities and MinIO payloads. Changed bytes create a new source revision.
 Offline replay validates raw digests, reparses GRIB and requires identical extraction
-bytes without writes. This establishes a source contract only: QPF verification facts,
-canonical samples, metrics, quality-selection policy and precipitation optimization
-remain future work. Historical METAR precipitation interpretation is unchanged.
+bytes without writes. Historical METAR precipitation interpretation is unchanged.
+
+Implemented hourly QPF measurement: `verification/issued_qpf.py` projects an exact
+saved issued hour and approved MRMS extraction into a compact field/stage-aware
+`issued-qpf-verification.v1` fact under `qpf-mrms-verification.v1`. The application
+`issued_qpf_verification` uses the existing artifact service, PostgreSQL idempotency
+lock and MinIO objects; no parallel history tables or forecast execution are introduced.
+An opportunity includes issued version, coordinate, field, stage, exact accumulation
+bounds and verification policy. Facts preserve issuance/content identity, baseline
+lineage where present, field policy/contributor evidence, selected MRMS native cell,
+source/extraction revisions, quality evidence and truthful receipt/cutoff times.
+Both matched and explicitly excluded opportunities are retained. Retrying unchanged
+evidence/status reuses its first immutable fact; a later cutoff does not multiply it.
+
+Matching requires identical `(start,end]` one-hour events. Issuance must be no later
+than interval start; completed events and observation availability must be within
+the verification cutoff. There is no ±15-minute precipitation tolerance or interval
+redistribution. Numeric zero, positive, missing and no coverage stay distinct. Native
+quality support remains evidence without invented thresholds. Source-contract or
+interval failures remain unscored. Forecast amounts are unmodified; liquid kg/m² is
+numerically equivalent to analysed mm.
+
+`verification/qpf_analysis.py` follows the existing fact-versus-sample philosophy with
+QPF-specific event/stage identity. It collapses identical evidence and reissues,
+reports conflicting native observation/support revisions as ambiguous, retains a
+known primary ahead of alternate explicit reissues, and excludes differing legacy
+versions when primary identity is unavailable. Baseline and final-issued cohorts
+remain separate; no corrected/AI stage is generated. The analytical identity leaves
+room for later stage comparisons without relabelling historical facts.
+
+Amount error is forecast minus analysis; MAE, RMSE and mean error reuse existing
+scalar metric calculations. Compatible contributors use identical per-comparison
+samples and an explicit common intersection, never split IFS periods. Exact lead,
+provisional lead groups, location and UTC date/shared-event concentration accompany
+metrics; numeric-positive counts are not a new detection threshold or independent
+storm count. Read-only queries use compact artifact attributes and issuance metadata,
+with payload-audit equivalence available. The current forward verifier remains
+temperature-specific; bounded automatic MRMS opportunity acquisition, QPF optimization,
+quality-selection thresholds and precipitation-family coherence are future work.
 
 ### 6.5 Evaluation
 

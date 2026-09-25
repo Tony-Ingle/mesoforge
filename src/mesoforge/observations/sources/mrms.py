@@ -10,9 +10,10 @@ from mesoforge.observations.interfaces import Clock, HttpTransport
 from mesoforge.observations.mrms import PRODUCT_CONTRACTS
 
 BASE_URL = "https://mrms.ncep.noaa.gov/2D"
+ARCHIVE_URL = "https://noaa-mrms-pds.s3.amazonaws.com/CONUS"
 
 
-def source_url(product: str, product_time: datetime) -> str:
+def source_url(product: str, product_time: datetime, *, archive: bool = False) -> str:
     if product not in PRODUCT_CONTRACTS:
         raise ValueError(f"Unsupported MRMS product: {product}")
     if product_time.tzinfo is None:
@@ -20,7 +21,10 @@ def source_url(product: str, product_time: datetime) -> str:
     instant = product_time.astimezone(UTC)
     if instant.minute or instant.second or instant.microsecond:
         raise ValueError("MRMS hourly product time must be on the UTC hour")
-    return f"{BASE_URL}/{product}/MRMS_{product}_00.00_{instant:%Y%m%d-%H%M%S}.grib2.gz"
+    filename = f"MRMS_{product}_00.00_{instant:%Y%m%d-%H%M%S}.grib2.gz"
+    if archive:
+        return f"{ARCHIVE_URL}/{product}_00.00/{instant:%Y%m%d}/{filename}"
+    return f"{BASE_URL}/{product}/{filename}"
 
 
 def fetch_product(
@@ -29,9 +33,10 @@ def fetch_product(
     *,
     transport: HttpTransport,
     clock: Clock,
+    archive: bool = False,
 ) -> tuple[bytes, dict[str, Any]]:
     """One fixed object, retaining response identity and conservative availability."""
-    url = source_url(product, product_time)
+    url = source_url(product, product_time, archive=archive)
     response = transport.get(
         url,
         headers={"User-Agent": "MesoForge bounded MRMS source-contract ingestion"},

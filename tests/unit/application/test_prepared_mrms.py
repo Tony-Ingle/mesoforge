@@ -43,7 +43,9 @@ class Transport:
 
     def get(self, url: str, **kwargs: Any) -> FakeHttpResponse:
         self.calls.append(url)
-        product = url.split("/")[-2]
+        product = next(
+            product for product in PRODUCTS if url.rsplit("/", 1)[1].startswith(f"MRMS_{product}_")
+        )
         return FakeHttpResponse(
             200,
             {
@@ -118,6 +120,44 @@ def test_fixed_hour_acquisition_retains_original_bytes_and_only_three_sources(
             directory, product_time=TIME, transport=transport, clock=FixedClock(ACQUIRED)
         )
     assert len(transport.calls) == 3
+
+
+def test_archive_acquisition_retains_exact_official_urls_and_replays_offline(
+    tmp_path: Path, infrastructure: tuple[Any, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payloads = {product: make_mrms_message(product) for product in PRODUCTS}
+    transport = Transport(payloads)
+    directory = tmp_path / "archive"
+    metadata = acquire_bundle(
+        directory,
+        product_time=TIME,
+        transport=transport,
+        clock=FixedClock(ACQUIRED),
+        archive=True,
+    )
+    expected = [
+        f"https://noaa-mrms-pds.s3.amazonaws.com/CONUS/{product}_00.00/20260924/"
+        f"MRMS_{product}_00.00_20260924-120000.grib2.gz"
+        for product in PRODUCTS
+    ]
+    assert transport.calls == expected
+    assert [metadata["sources"][product]["url"] for product in PRODUCTS] == expected
+
+    def no_network() -> Any:
+        raise AssertionError("Retained archive replay attempted provider access")
+
+    monkeypatch.setattr("mesoforge.application.prepared_mrms.default_transport", no_network)
+    assert load_bundle(directory) == (metadata, payloads)
+    first = register(directory, infrastructure)
+    replay = replay_registered(
+        ArtifactId(first["extraction_artifact_id"]), artifacts=infrastructure[0]
+    )
+    assert replay["extraction"] == first["extraction"]
+    assert replay["provider_calls"] == replay["storage_writes"] == 0
+    metadata["sources"][PRODUCTS[0]]["url"] = expected[0].replace("20260924/", "20260923/")
+    (directory / "manifest.json").write_text(json.dumps(metadata), encoding="utf-8")
+    with pytest.raises(ValueError, match="locator"):
+        load_bundle(directory)
 
 
 def test_immutable_registration_repeat_and_offline_replay_are_exact(

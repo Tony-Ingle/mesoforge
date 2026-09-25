@@ -85,11 +85,12 @@ def acquire_bundle(
     product_time: datetime,
     transport: HttpTransport | None = None,
     clock: Clock | None = None,
+    archive: bool = False,
 ) -> dict[str, Any]:
     """Retain exactly three fixed-hour sources, once; never overwrite a previous bundle."""
     clock = clock or SystemClock()
     for product in PRODUCTS:
-        source_url(product, product_time)
+        source_url(product, product_time, archive=archive)
     if product_time > clock.now():
         raise ValueError("MRMS acquisition accepts fixed past product times only")
     if raw_dir.resolve().is_relative_to(_ROOT):
@@ -98,7 +99,9 @@ def acquire_bundle(
     transport = transport or default_transport()
     sources = {}
     for product in PRODUCTS:
-        raw, acquired = fetch_product(product, product_time, transport=transport, clock=clock)
+        raw, acquired = fetch_product(
+            product, product_time, transport=transport, clock=clock, archive=archive
+        )
         # Keep original bytes even if subsequent contract validation fails.
         with (raw_dir / acquired["filename"]).open("xb") as output:
             output.write(raw)
@@ -138,8 +141,11 @@ def load_bundle(raw_dir: Path) -> tuple[dict[str, Any], dict[str, bytes]]:
     sources = {}
     for product in PRODUCTS:
         record = metadata["sources"][product]
-        url = source_url(product, instant)
-        if record["url"] != url or record["filename"] != url.rsplit("/", 1)[1]:
+        urls = {source_url(product, instant, archive=archive) for archive in (False, True)}
+        if (
+            record["url"] not in urls
+            or record["filename"] != source_url(product, instant).rsplit("/", 1)[1]
+        ):
             raise ValueError("Retained MRMS source locator differs from its fixed-hour identity")
         data = (raw_dir / record["filename"]).read_bytes()
         if (
@@ -342,6 +348,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lat", type=float)
     parser.add_argument("--lon", type=float)
     parser.add_argument(
+        "--archive", action="store_true", help="Acquire the fixed hour from NOAA's CONUS archive"
+    )
+    parser.add_argument(
         "--from-raw", action="store_true", help="Reuse raw bundle, no provider calls"
     )
     parser.add_argument(
@@ -349,18 +358,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     if args.replay_artifact:
-        if args.from_raw or any(
-            v is not None for v in (args.raw_dir, args.time, args.lat, args.lon)
+        if (
+            args.from_raw
+            or args.archive
+            or any(v is not None for v in (args.raw_dir, args.time, args.lat, args.lon))
         ):
             parser.error("Use --replay-artifact alone")
     elif args.raw_dir is None or args.lat is None or args.lon is None:
         parser.error("Supply --raw-dir, --lat and --lon")
     elif (args.from_raw and args.time is not None) or (not args.from_raw and args.time is None):
         parser.error("Supply --time for acquisition, or --from-raw for retained data")
+    elif args.from_raw and args.archive:
+        parser.error("--archive selects acquisition only; --from-raw uses retained source URLs")
     try:
         if not args.replay_artifact and not args.from_raw:
             _coordinate(args.lat, args.lon)
-            acquire_bundle(args.raw_dir, product_time=args.time)
+            acquire_bundle(args.raw_dir, product_time=args.time, archive=args.archive)
         dsn = resolve_database_dsn("MESOFORGE_DATABASE_DSN")
         factory = cast(Any, lambda: PostgresUnitOfWork(dsn))
         objects = S3ArtifactObjectStore(
