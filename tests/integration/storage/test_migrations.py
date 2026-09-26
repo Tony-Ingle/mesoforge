@@ -41,6 +41,8 @@ def test_upgrade_downgrade_upgrade_on_empty_database(clean_postgres_dsn: str) ->
         "activity_inputs",
         "activity_outputs",
         "run_selected_inputs",
+        "issued_forecasts",
+        "governance_events",
     }
     assert expected_tables.issubset(tables_after_upgrade)
 

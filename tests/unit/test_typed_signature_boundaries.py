@@ -68,6 +68,7 @@ from mesoforge.common.identifiers import (
     ConfigurationSnapshotId,
     Digest,
     FallbackRowId,
+    GovernanceEventId,
     GridId,
     IssuedForecastId,
     LearningPolicyId,
@@ -102,6 +103,8 @@ _TYPED_IDENTIFIER_CLASSES = (
     # Phase 2 bounded canonical retention: the policy under which a
     # canonical artifact was cut from its model's full native grid.
     CanonicalRetentionPolicyId,
+    # Policy-governance audit events (append-only governance_events rows).
+    GovernanceEventId,
 )
 
 # Parameter/attribute names that look like an identifier/digest but are

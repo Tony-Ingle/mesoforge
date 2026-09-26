@@ -25,6 +25,7 @@ from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.prepared_temperature import _code_identity, prepare_locations
 from mesoforge.application.spatial_coverage import CoverageRequiredError, UnsupportedCoordinateError
 from mesoforge.application.spatial_preparation import ensure_coverage
+from mesoforge.contracts.policy_governance import GovernanceBlockedError
 from mesoforge.forecasting.recipes import (
     DEFAULT_CONFIGURATION,
     ContributorConfiguration,
@@ -262,6 +263,8 @@ def run_batch(
             else:
                 try:
                     issued = issuer.issue(forecast, batch_run_id=batch_run_id, location_index=index)
+                except GovernanceBlockedError as exc:
+                    result.update(status="error", error={"code": exc.code, "message": str(exc)})
                 except Exception:
                     # Keep connection details out of the public per-location result.
                     result.update(

@@ -2,6 +2,8 @@
 
 On-demand background work only: no discovery, provider access, or issuance. Exact
 configured domains and usable reference-hour views preserve the current science.
+ACTIVE governed blend policies are resolved once at the build cutoff and execute only
+through FieldBlendEngine policy overrides; the manifest pins what was resolved.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from mesoforge.application.baseline_snapshot import (
     write_manifest,
 )
 from mesoforge.application.batch_forecast import _coordinates, load_locations
+from mesoforge.application.governance import GovernanceService
 from mesoforge.application.prepared_snapshot import (
     SnapshotError,
     check_information_cutoff,
@@ -119,12 +122,16 @@ def build_baseline(
     prepared_pointer: dict[str, Any] | None = None,
     analysis_cutoff: datetime | None = None,
     reference_times: list[datetime] | None = None,
+    governance: GovernanceService | None = None,
 ) -> dict[str, Any]:
     """Pin contributors once; materialize all requested domains before publication.
 
     Default views cover every usable prepared reference hour. This matters because
     current lead-band weights depend on that reference; slicing a single blended
     view would silently change the forecast. Explicit views are for bounded replay.
+    ``governance`` resolves ACTIVE blend policies at the cutoff; a resolution failure
+    fails the build (the previous baseline is retained). None is a development build
+    recorded as ``not_configured``, which issuance refuses.
     """
     if baseline_root.resolve().is_relative_to(_ROOT):
         raise ValueError("Baseline artifacts must remain outside the repository")
@@ -175,8 +182,25 @@ def build_baseline(
     if not coordinates:
         raise SnapshotError("No valid configured coordinates for a baseline build")
     timings = {"contributor_validation_seconds": time.perf_counter() - started}
+    blend_governance: dict[str, Any] = {"status": "not_configured"}
+    overrides: dict[str, Any] = {}
+    if governance is not None:
+        from mesoforge.application.baseline_snapshot import current_manifest
+
+        previous = None
+        try:
+            current = current_manifest(baseline_root)
+            previous = current.get("blend_governance") if current is not None else None
+        except Exception:
+            previous = None
+        resolved = governance.blend_resolution(cutoff, previous=previous)
+        overrides = resolved.pop("overrides")
+        timings["blend_governance_seconds"] = resolved.pop("seconds")
+        blend_governance = resolved
     clock = time.perf_counter()
     prepared = load_preparation(preparation)
+    if overrides:
+        prepared = prepared.with_policy_overrides(overrides)
     timings["contributor_load_seconds"] = time.perf_counter() - clock
     clock = time.perf_counter()
     codec = CompactCodec(_source_documents(information))
@@ -258,8 +282,18 @@ def build_baseline(
             "application/build_baseline.py",
             "application/baseline_snapshot.py",
             "application/baseline_codec.py",
+            "application/governance.py",
         )
     }
+    field_policies = dict(prepared_manifest["field_policies"])
+    for target, row in blend_governance.get("policies", {}).items():
+        field_policies[target] = {
+            "policy": f"{row['policy_id']}/{row['version']}",
+            "status": "governed_active",
+            "policy_artifact_id": row["policy_artifact_id"],
+            "content_digest": row["content_digest"],
+            "head_event_id": row["head_event_id"],
+        }
     manifest = {
         "schema_version": BASELINE_SCHEMA,
         "baseline_snapshot_id": identity,
@@ -292,7 +326,8 @@ def build_baseline(
             "failed_locations": failures,
         },
         "domains": domains,
-        "field_policies": prepared_manifest["field_policies"],
+        "field_policies": field_policies,
+        "blend_governance": blend_governance,
         "field_registry": {name: asdict(row) for name, row in FIELD_REGISTRY.items()},
         "coherence_and_derivation": {
             **framework_metadata(),
@@ -353,13 +388,24 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         help="Limit materialization to these exact reference hours (default: all covered hours)",
     )
+    parser.add_argument(
+        "--without-governance",
+        action="store_true",
+        help="Development build recorded as not_configured; issuance refuses it",
+    )
     args = parser.parse_args(argv)
     try:
+        governance = None
+        if not args.without_governance:
+            from mesoforge.application.governance import configured_governance
+
+            governance = configured_governance()
         result = build_baseline(
             args.guidance_root,
             args.baseline_root,
             load_locations(args.config),
             reference_times=args.reference_time,
+            governance=governance,
         )
     except Exception as exc:
         print(

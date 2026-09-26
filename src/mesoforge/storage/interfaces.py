@@ -29,11 +29,13 @@ from mesoforge.common.identifiers import (
     ArtifactId,
     ConfigurationSnapshotId,
     Digest,
+    GovernanceEventId,
     GridId,
     RunId,
 )
 from mesoforge.contracts.artifacts import ArtifactManifest
 from mesoforge.contracts.issued_forecasts import IssuedForecastRecord
+from mesoforge.contracts.policy_governance import GovernanceEvent
 from mesoforge.contracts.provenance import ActivityManifest
 from mesoforge.provenance.lineage import ActivityEdge, LineageGraph
 
@@ -191,6 +193,38 @@ class UnitOfWork(Protocol):
     def rollback(self) -> None: ...
 
 
+class GovernanceRepository(Protocol):
+    """Append-only governance events inside the caller's transaction.
+
+    ``lock`` takes the family's transaction-scoped advisory lock (exclusive for
+    writers, shared for readers) with a bounded wait; ``append`` returns the event
+    stamped by the database clock. Refusals raise ``GovernanceConflict``.
+    """
+
+    def lock(self, family: str, *, shared: bool, timeout_seconds: float) -> None: ...
+    def db_now(self) -> datetime: ...
+    def append(self, event: GovernanceEvent) -> GovernanceEvent: ...
+    def get(self, event_id: GovernanceEventId) -> GovernanceEvent: ...
+    def find_by_request_key(self, key: Digest) -> GovernanceEvent | None: ...
+    def events(
+        self, family: str, scope_keys: tuple[str, ...] | None = None
+    ) -> tuple[GovernanceEvent, ...]: ...
+    def policy_events(self, policy_artifact_id: ArtifactId) -> tuple[GovernanceEvent, ...]: ...
+
+
+class GovernanceUnitOfWork(Protocol):
+    """The repositories a governance transaction needs; nothing else is writable."""
+
+    @property
+    def governance(self) -> GovernanceRepository: ...
+    @property
+    def artifacts(self) -> ArtifactRepository: ...
+    def __enter__(self) -> GovernanceUnitOfWork: ...
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> object | None: ...
+    def commit(self) -> None: ...
+    def rollback(self) -> None: ...
+
+
 __all__ = [
     "ActivityEdge",
     "ActivityRepository",
@@ -199,6 +233,8 @@ __all__ = [
     "ConfigurationRepository",
     "ConfigurationSnapshotLike",
     "DatasetSerializer",
+    "GovernanceRepository",
+    "GovernanceUnitOfWork",
     "GridDefinitionLike",
     "GridRepository",
     "IdempotencyLock",

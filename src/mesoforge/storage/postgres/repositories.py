@@ -18,6 +18,7 @@ than silently becoming a query miss).
 from __future__ import annotations
 
 import math
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -32,6 +33,7 @@ from mesoforge.common.identifiers import (
     ArtifactId,
     ConfigurationSnapshotId,
     Digest,
+    GovernanceEventId,
     GridId,
     RunId,
     strip_prefix,
@@ -39,6 +41,11 @@ from mesoforge.common.identifiers import (
 )
 from mesoforge.contracts.artifacts import ArtifactManifest, Availability, SourceIdentity
 from mesoforge.contracts.issued_forecasts import IssuedForecastRecord
+from mesoforge.contracts.policy_governance import (
+    FAMILIES,
+    GovernanceConflict,
+    GovernanceEvent,
+)
 from mesoforge.contracts.provenance import ActivityArtifactRef, ActivityError, ActivityManifest
 from mesoforge.contracts.runs import RunManifest
 from mesoforge.storage.postgres.database import create_database_engine, create_session_factory
@@ -48,6 +55,7 @@ from mesoforge.storage.postgres.models import (
     ActivityRow,
     ArtifactRow,
     ConfigurationSnapshotRow,
+    GovernanceEventRow,
     GridRow,
     IssuedForecastRow,
     RunRow,
@@ -503,13 +511,24 @@ class PostgresArtifactRepository:
         start_valid_time: datetime,
         end_valid_time: datetime,
         limit: int = 5000,
+        available_by: datetime | None = None,
     ) -> tuple[ArtifactManifest, ...]:
-        """Bounded, field-specific analytical facts; never mix temperature records."""
+        """Bounded, field-specific analytical facts; never mix temperature records.
+
+        ``available_by`` keeps only facts registered and available by that instant, so
+        later facts can neither enter nor truncate an as-of analysis.
+        """
         if not 1 <= limit <= 10001:
             raise ValueError("QPF fact query limit must be within 1..10001")
+        visible = (
+            (sa.func.greatest(ArtifactRow.registered_at, ArtifactRow.available_at) <= available_by,)
+            if available_by is not None
+            else ()
+        )
         rows = self._session.scalars(
             sa.select(ArtifactRow)
             .where(
+                *visible,
                 ArtifactRow.artifact_type == "issued-qpf-verification",
                 ArtifactRow.attributes.contains({"latitude": latitude, "longitude": longitude}),
                 sa.cast(ArtifactRow.attributes["valid_time"].astext, sa.DateTime(timezone=True))
@@ -866,6 +885,182 @@ class PostgresIssuedForecastRepository:
         return tuple(_issued_forecast_row_to_record(row) for row in rows)
 
 
+_GOVERNANCE_CODE = re.compile(r"governance:([a-z_]+)")
+_GOVERNANCE_CONSTRAINT_CODES = {
+    "uq_governance_events_request_key": "request_key_conflict",
+    "uq_governance_events_scope_seq": "scope_seq_conflict",
+    "ix_governance_events_registered_policy": "already_registered",
+    "ix_governance_events_retired_policy": "already_retired",
+}
+
+
+def _gev(value: uuid.UUID | None) -> GovernanceEventId | None:
+    return GovernanceEventId(f"gev_{value}") if value is not None else None
+
+
+def _art(value: uuid.UUID | None) -> ArtifactId | None:
+    return ArtifactId(f"art_{value}") if value is not None else None
+
+
+def _governance_row_to_event(row: GovernanceEventRow) -> GovernanceEvent:
+    return GovernanceEvent(
+        schema_version="mesoforge.policy-governance-event.v1",
+        event_id=GovernanceEventId(f"gev_{row.id}"),
+        family=row.family,  # type: ignore[arg-type]
+        scope_key=row.scope_key,
+        scope_seq=row.scope_seq,
+        event_type=row.event_type,  # type: ignore[arg-type]
+        policy_artifact_id=_art(row.policy_artifact_id),
+        policy_content_digest=(
+            Digest(row.policy_content_digest) if row.policy_content_digest is not None else None
+        ),
+        previous_head_event_id=_gev(row.previous_head_event_id),
+        rolled_back_event_id=_gev(row.rolled_back_event_id),
+        evaluation_artifact_id=_art(row.evaluation_artifact_id),
+        decision=row.decision,  # type: ignore[arg-type]
+        information_cutoff=(
+            row.information_cutoff.astimezone(UTC) if row.information_cutoff is not None else None
+        ),
+        governance_policy_version=row.governance_policy_version,
+        governance_policy_digest=Digest(row.governance_policy_digest),
+        actor=row.actor,
+        reason=row.reason,
+        recorded_at=row.recorded_at.astimezone(UTC),
+        code_revision=row.code_revision,
+        environment_digest=Digest(row.environment_digest),
+        request_key=Digest(row.request_key),
+        request_digest=Digest(row.request_digest),
+        payload=row.payload,
+    )
+
+
+def _uuid(value: str | None, prefix: str) -> uuid.UUID | None:
+    return uuid.UUID(strip_prefix(value, prefix)) if value is not None else None
+
+
+def _governance_conflict(exc: sa.exc.DBAPIError) -> GovernanceConflict:
+    message = str(exc.orig) if exc.orig is not None else str(exc)
+    match = _GOVERNANCE_CODE.search(message)
+    if match is not None:
+        return GovernanceConflict(match.group(1), message.splitlines()[0])
+    diag = getattr(exc.orig, "diag", None)
+    constraint = getattr(diag, "constraint_name", None)
+    if isinstance(constraint, str) and constraint in _GOVERNANCE_CONSTRAINT_CODES:
+        return GovernanceConflict(_GOVERNANCE_CONSTRAINT_CODES[constraint], constraint)
+    return GovernanceConflict("governance_constraint_violation", message.splitlines()[0])
+
+
+class PostgresGovernanceRepository:
+    """Append-only governance events; the migration 0005 trigger owns the invariants.
+
+    A refused append rolls back the whole session transaction and raises
+    ``GovernanceConflict`` with a machine code, never a driver exception.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def lock(self, family: str, *, shared: bool, timeout_seconds: float) -> None:
+        if family not in FAMILIES:
+            raise ValueError(f"unknown governance family {family!r}")
+        if not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 600:
+            raise ValueError("governance lock timeout must be within (0, 600] seconds")
+        function = "pg_advisory_xact_lock_shared" if shared else "pg_advisory_xact_lock"
+        try:
+            self._session.execute(
+                sa.text(f"SET LOCAL lock_timeout = '{int(timeout_seconds * 1000)}ms'")
+            )
+            self._session.execute(
+                sa.text(f"SELECT {function}(governance_lock_key(:family))"), {"family": family}
+            )
+        except sa.exc.OperationalError as exc:
+            self._session.rollback()
+            raise GovernanceConflict("governance_busy", "governance lock wait timed out") from exc
+
+    def db_now(self) -> datetime:
+        value = self._session.execute(sa.text("SELECT clock_timestamp()")).scalar_one()
+        assert isinstance(value, datetime)
+        return value.astimezone(UTC)
+
+    def append(self, event: GovernanceEvent) -> GovernanceEvent:
+        event = GovernanceEvent.model_validate(event.model_dump())
+        row = GovernanceEventRow(
+            id=uuid.UUID(strip_prefix(event.event_id, "gev_")),
+            schema_version=event.schema_version,
+            family=event.family,
+            scope_key=event.scope_key,
+            scope_seq=event.scope_seq,
+            event_type=event.event_type,
+            policy_artifact_id=_uuid(event.policy_artifact_id, "art_"),
+            policy_content_digest=event.policy_content_digest,
+            previous_head_event_id=_uuid(event.previous_head_event_id, "gev_"),
+            rolled_back_event_id=_uuid(event.rolled_back_event_id, "gev_"),
+            evaluation_artifact_id=_uuid(event.evaluation_artifact_id, "art_"),
+            decision=event.decision,
+            information_cutoff=event.information_cutoff,
+            governance_policy_version=event.governance_policy_version,
+            governance_policy_digest=event.governance_policy_digest,
+            actor=event.actor,
+            reason=event.reason,
+            # The insert trigger replaces this with clock_timestamp() after the family lock.
+            recorded_at=datetime(1970, 1, 1, tzinfo=UTC),
+            code_revision=event.code_revision,
+            environment_digest=event.environment_digest,
+            request_key=event.request_key,
+            request_digest=event.request_digest,
+            payload=event.payload,
+        )
+        try:
+            self._session.add(row)
+            self._session.flush()
+            self._session.refresh(row)
+        except sa.exc.DBAPIError as exc:
+            self._session.rollback()
+            raise _governance_conflict(exc) from exc
+        return _governance_row_to_event(row)
+
+    def get(self, event_id: GovernanceEventId) -> GovernanceEvent:
+        event_id = GovernanceEventId(event_id)
+        row = self._session.get(GovernanceEventRow, uuid.UUID(strip_prefix(event_id, "gev_")))
+        if row is None:
+            raise NotFound(f"governance event {event_id!r} not found")
+        return _governance_row_to_event(row)
+
+    def find_by_request_key(self, key: Digest) -> GovernanceEvent | None:
+        key = Digest(key)
+        row = self._session.execute(
+            sa.select(GovernanceEventRow).where(GovernanceEventRow.request_key == str(key))
+        ).scalar_one_or_none()
+        return _governance_row_to_event(row) if row is not None else None
+
+    def events(
+        self, family: str, scope_keys: tuple[str, ...] | None = None
+    ) -> tuple[GovernanceEvent, ...]:
+        if family not in FAMILIES:
+            raise ValueError(f"unknown governance family {family!r}")
+        query = sa.select(GovernanceEventRow).where(GovernanceEventRow.family == family)
+        if scope_keys is not None:
+            if not scope_keys:
+                return ()
+            query = query.where(GovernanceEventRow.scope_key.in_(sorted(set(scope_keys))))
+        rows = self._session.scalars(
+            query.order_by(GovernanceEventRow.scope_key, GovernanceEventRow.scope_seq)
+        )
+        return tuple(_governance_row_to_event(row) for row in rows)
+
+    def policy_events(self, policy_artifact_id: ArtifactId) -> tuple[GovernanceEvent, ...]:
+        policy_artifact_id = ArtifactId(policy_artifact_id)
+        rows = self._session.scalars(
+            sa.select(GovernanceEventRow)
+            .where(
+                GovernanceEventRow.policy_artifact_id
+                == uuid.UUID(strip_prefix(policy_artifact_id, "art_"))
+            )
+            .order_by(GovernanceEventRow.recorded_at)
+        )
+        return tuple(_governance_row_to_event(row) for row in rows)
+
+
 class PostgresUnitOfWork:
     """Concrete storage.interfaces.UnitOfWork over one SQLAlchemy Session."""
 
@@ -883,6 +1078,7 @@ class PostgresUnitOfWork:
         self.activities = PostgresActivityRepository(self._session)
         self.runs = PostgresRunRepository(self._session)
         self.issued_forecasts = PostgresIssuedForecastRepository(self._session)
+        self.governance = PostgresGovernanceRepository(self._session)
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:

@@ -5,6 +5,11 @@ guidance, blend fields, discover model providers or prepare model data. Before
 issuance, independent prior-temperature/QPF verification may acquire observations.
 An uncovered reference
 or coordinate requires a new background baseline build, not on-request blending.
+
+Governed persistent policy is read once per batch at the request time from committed
+governance events. Issuance never proceeds under an unproven governed state: an
+unreadable governance store, a baseline without resolved blend governance, or a
+rollback recorded while a location was in flight issues nothing for that scope.
 """
 
 from __future__ import annotations
@@ -21,12 +26,19 @@ from typing import Any
 
 from mesoforge.application.batch_forecast import _coordinates, load_locations
 from mesoforge.application.forecast_from_snapshot import _deliver_locations, _public, _write_outputs
+from mesoforge.application.governance import GovernanceService
 from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.learning import LearningService, configured_learning
 from mesoforge.application.prepared_snapshot import SnapshotError, derive_reference_time
 from mesoforge.application.spatial_coverage import validate_coordinate
 from mesoforge.application.weather_transitions import validate_display_timezone
 from mesoforge.common.identifiers import ArtifactId
+from mesoforge.contracts.policy_governance import (
+    GovernanceBlockedError,
+    GovernanceSnapshot,
+    GovernanceUnavailableError,
+    correction_scope,
+)
 
 _ROOT = Path(__file__).resolve().parents[3]
 
@@ -48,8 +60,8 @@ def forecast_from_baseline(
     qpf_lookback_hours: int = 72,
     qpf_max_opportunities: int = 36,
     learning_service: LearningService | None = None,
-    learning_policy_ids: list[ArtifactId] | None = None,
     learning_overlays: list[dict[str, Any]] | None = None,
+    governance: GovernanceService | None = None,
 ) -> dict[str, Any]:
     """Pin one complete baseline once, then isolate each location's delivery."""
     from mesoforge.application.baseline_snapshot import load_baseline
@@ -120,6 +132,16 @@ def forecast_from_baseline(
         "reference_time": result["reference_time"],
         "reference_time_source": result["reference_time_source"],
         "field_policies": manifest["field_policies"],
+        **(
+            {
+                "blend_governance": {
+                    key: manifest["blend_governance"].get(key)
+                    for key in ("status", "decision_time", "heads")
+                }
+            }
+            if isinstance(manifest.get("blend_governance"), dict)
+            else {}
+        ),
         "information_cutoff": manifest["information_cutoff"],
         "issuance_mode": ("explicit_reissue" if reissue else "primary") if issue else None,
     }
@@ -136,6 +158,60 @@ def forecast_from_baseline(
         "issuance_mode": baseline_lineage["issuance_mode"],
     }
     result["baseline"] = baseline_lineage
+    learning_error: str | None = None
+    if learning_service is None:
+        try:
+            learning_service = configured_learning()
+        except Exception as exc:
+            learning_error = str(exc)
+    snapshot: GovernanceSnapshot | None = None
+    clock = time.perf_counter()
+    try:
+        if learning_service is None:
+            raise GovernanceUnavailableError("learning_storage_unavailable", learning_error)
+        governance = governance or GovernanceService(learning_service)
+        coordinates = []
+        for location in locations:
+            try:
+                coordinate = _coordinates(location)
+                validate_coordinate(*coordinate)
+            except ValueError:
+                continue
+            coordinates.append(coordinate)
+        snapshot = governance.correction_snapshot(coordinates, requested_at)
+        blend = manifest.get("blend_governance")
+        if issue and (not isinstance(blend, dict) or blend.get("status") != "resolved"):
+            return _not_issued(
+                result,
+                locations,
+                started,
+                "baseline_governance_unproven",
+                "The pinned baseline has no resolved blend governance; rebuild it",
+            )
+        if issue and isinstance(blend, dict) and governance.blend_revoked(blend):
+            return _not_issued(
+                result,
+                locations,
+                started,
+                "baseline_governance_revoked",
+                "A blend policy pinned by this baseline was rolled back; rebuild it",
+            )
+        result["governance"] = {
+            "status": "resolved",
+            "decision_time": result["request_time"],
+            "snapshot_read_at": snapshot.snapshot_read_at.isoformat().replace("+00:00", "Z"),
+            "scopes": len(snapshot.scopes),
+            "active_scopes": sum(scope.active is not None for scope in snapshot.scopes.values()),
+            "blend": {key: blend.get(key) for key in ("status", "decision_time", "heads")}
+            if isinstance(blend, dict)
+            else {"status": "pre_governance"},
+        }
+    except GovernanceUnavailableError as exc:
+        if issue:
+            return _not_issued(result, locations, started, "governance_unavailable", str(exc))
+        snapshot = None
+        result["governance"] = {"status": "governance_unavailable", "code": exc.code}
+    timings["governance_resolution_seconds"] = time.perf_counter() - clock
     verification: dict[int, dict[str, Any]] = {}
     if issue and verify_prior:
         from mesoforge.application.forward_verification import verify_previous_fields
@@ -159,15 +235,15 @@ def forecast_from_baseline(
                 verification[index] = {"status": "error", "retryable": True, "reason": str(exc)}
         # Observation work is outside the issuance lock and cannot gate delivery.
         # One immutable baseline stays pinned throughout all of these attempts.
-    learning_error: str | None = None
-    if learning_service is None:
-        try:
-            learning_service = configured_learning()
-        except Exception as exc:
-            learning_error = str(exc)
 
     def local_stage(forecast: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        scope = (
+            snapshot.scope(correction_scope(forecast["latitude"], forecast["longitude"]))
+            if snapshot is not None
+            else None
+        )
         if learning_service is None:
+            # Preview only: issuance returned above when governance was unavailable.
             report: dict[str, Any] = {
                 "status": "fallback",
                 "reason": learning_error,
@@ -177,15 +253,27 @@ def forecast_from_baseline(
             corrected = {**forecast, "learning_failure": report}
         else:
             try:
-                corrected, report = learning_service.local_stage(
-                    forecast, policy_ids=learning_policy_ids
-                )
-                learning_service.candidate_stages(forecast, report, learning_overlays or [])
+                corrected, report = learning_service.local_stage(forecast, governance=scope)
+            except GovernanceBlockedError:
+                raise
             except Exception as exc:
+                if scope is not None and scope.active is not None:
+                    # Issuing raw here would be an unrecorded rollback of ACTIVE policy.
+                    raise GovernanceBlockedError("governed_correction_failed", str(exc)) from exc
                 report = {"status": "fallback", "reason": str(exc), "applied_delta_k": 0.0}
                 corrected = {**forecast, "learning_failure": report}
-
-        return attempt_forecast_desk(corrected, report, learning_service), report
+            else:
+                try:
+                    learning_service.candidate_stages(forecast, report, learning_overlays or [])
+                except Exception as exc:
+                    report["failures"].append({"phase": "candidate_projection", "reason": str(exc)})
+        final = attempt_forecast_desk(corrected, report, learning_service)
+        if issue and scope is not None and governance is not None:
+            try:
+                governance.rollback_guard(scope)
+            except GovernanceUnavailableError as exc:
+                raise GovernanceBlockedError("governance_unavailable", str(exc)) from exc
+        return final, report
 
     result.update(
         _deliver_locations(
@@ -208,6 +296,23 @@ def forecast_from_baseline(
             row["previous_verification"] = verification[row["index"]]
     timings["total_seconds"] = time.perf_counter() - started
     result["timings"] = timings
+    return result
+
+
+def _not_issued(
+    result: dict[str, Any], locations: list[Any], started: float, status: str, reason: str
+) -> dict[str, Any]:
+    """Fail safe: nothing is issued, no stage is built and no desk/provider call occurs."""
+    result.update(
+        status=status,
+        reason=reason,
+        results=[
+            {"index": index, "location": location, "status": "not_run", "reason": reason}
+            for index, location in enumerate(locations)
+        ],
+        summary={"ok": 0, "issued": 0, "skipped": 0, "failed": len(locations)},
+    )
+    result["timings"] = {"total_seconds": time.perf_counter() - started}
     return result
 
 
@@ -436,6 +541,8 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps(_public(result), indent=2, default=str))
     if result["status"] == "no_current_baseline":
         return 3
+    if result["status"] != "ok":
+        return 2
     return 1 if result["summary"]["failed"] else 0
 
 

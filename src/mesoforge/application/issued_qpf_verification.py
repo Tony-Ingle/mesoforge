@@ -340,12 +340,20 @@ class IssuedQpfVerificationService:
         limit: int = 5000,
         contributors: Sequence[str] | None = None,
         payload_only: bool = False,
+        as_of: datetime | None = None,
     ) -> dict[str, Any]:
-        """Read compact fact attributes and issuance metadata; never read/rebuild forecast grids."""
+        """Read compact fact attributes and issuance metadata; never read/rebuild forecast grids.
+
+        ``as_of`` is an explicit information cutoff: facts, revisions and issuances that
+        were not registered, available and verified by then are removed before
+        canonicalization, and opportunities are counted at that cutoff, not the clock.
+        """
         started = time.perf_counter()
         window = validate_hour_selection(latitude, longitude, start_valid_time, end_valid_time)
         if not 1 <= limit <= 10000:
             raise ValueError("Analysis limit must be within 1..10000")
+        if as_of is not None and (as_of.tzinfo is None or as_of.utcoffset() is None):
+            raise ValueError("Evidence cutoff must be timezone-aware")
         with self.factory() as uow:
             records = uow.issued_forecasts.list_for_coordinate(latitude, longitude, limit=None)
             manifests = uow.artifacts.find_issued_qpf_verifications(
@@ -354,9 +362,20 @@ class IssuedQpfVerificationService:
                 start_valid_time=start_valid_time,
                 end_valid_time=end_valid_time,
                 limit=limit + 1,
+                **({"available_by": as_of} if as_of is not None else {}),
             )
         if len(manifests) > limit:
             raise ValueError("Too many QPF facts; narrow the window or raise --limit")
+        as_of_exclusions: Counter[str] = Counter()
+        if as_of is not None:
+            records = tuple(r for r in records if r.issued_at <= as_of)
+            visible = []
+            for manifest in manifests:
+                if max(manifest.registered_at, manifest.availability.available_at) > as_of:
+                    as_of_exclusions["fact_not_available_at_evidence_cutoff"] += 1
+                else:
+                    visible.append(manifest)
+            manifests = tuple(visible)
         rows, attribute_bytes, payload_bytes = [], 0, 0
         records_by_id = {str(r.issued_forecast_id): r for r in records}
         for manifest in manifests:
@@ -370,6 +389,18 @@ class IssuedQpfVerificationService:
             _validate_fact(fact)
             if fact["stage"] not in stages:
                 continue
+            if as_of is not None:
+                verified = fact.get("verification_cutoff")
+                try:
+                    verified_at = datetime.fromisoformat(str(verified))
+                except ValueError:
+                    verified_at = None
+                if verified_at is None or verified_at.tzinfo is None:
+                    as_of_exclusions["learning_evidence_availability_unproven"] += 1
+                    continue
+                if verified_at > as_of:
+                    as_of_exclusions["fact_verified_after_evidence_cutoff"] += 1
+                    continue
             record = records_by_id.get(fact["issued_forecast_id"])
             exclusion = None
             if (
@@ -392,7 +423,7 @@ class IssuedQpfVerificationService:
                 }
             )
         analysis = analyze_qpf_facts(rows, contributors=contributors)
-        cutoff = self.clock()
+        cutoff = as_of if as_of is not None else self.clock()
         potential = 0
         for record in records:
             for lead in range(1, 37):
@@ -414,6 +445,8 @@ class IssuedQpfVerificationService:
                 "stages": list(stages),
             },
             "eligible_issued_stage_opportunities": potential,
+            "evidence_cutoff": as_of.isoformat() if as_of is not None else None,
+            "evidence_cutoff_exclusions": dict(sorted(as_of_exclusions.items())),
             "opportunity_inventory_basis": (
                 "issuance metadata horizons 1..36; field/interval validity assessed by facts"
             ),

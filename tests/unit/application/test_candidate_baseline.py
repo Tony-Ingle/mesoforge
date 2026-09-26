@@ -44,12 +44,12 @@ def test_background_overlay_reuses_saved_native_state_and_is_reproducible(
     original_provenance = deepcopy(policy.provenance)
     original_engine = candidates._engine
 
-    def engine(grid, pinned_policy):
+    def engine(grid, pinned_policy, governed=None):
         # A caller retains this otherwise-frozen model; changing its nested metadata
         # after execution begins must not change the policy recorded in the overlay.
         policy.provenance["caller_mutated_during_build"] = True
         assert pinned_policy.provenance == original_provenance
-        return original_engine(grid, pinned_policy)
+        return original_engine(grid, pinned_policy, governed)
 
     monkeypatch.setattr(candidates, "_engine", engine)
     parent_manifest = deepcopy(pinned.manifest)

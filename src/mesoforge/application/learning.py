@@ -2,6 +2,8 @@
 
 Policies/overlays/stages are artifacts, not a second forecast-history system.
 Operational issuance remains the authority binding stages to an issued version.
+Which persistent policy executes is resolved by application.governance from
+append-only events at a pinned decision time; payload lifecycle roles never select.
 """
 
 from __future__ import annotations
@@ -26,11 +28,21 @@ from mesoforge.contracts.forecast_variants import (
     seal_variant,
     validate_variant,
 )
+from mesoforge.contracts.policy_governance import ResolvedPolicy, ScopeResolution
 from mesoforge.contracts.serialization import canonical_json_bytes
 from mesoforge.forecasting.coherence import DEW_POINT, QPF, RH, TEMPERATURE
 from mesoforge.storage.json import CanonicalJsonSerializer
 
 _JSON = CanonicalJsonSerializer()
+_KINDS = frozenset(
+    {
+        "forecast-variant",
+        "learning-policy",
+        "learning-overlay",
+        "learning-binding",
+        "governance-evaluation",
+    }
+)
 
 
 def _utc() -> datetime:
@@ -43,19 +55,6 @@ def _iso(value: datetime) -> str:
 
 def _digest(value: Any) -> str:
     return str(Digest.of_bytes(canonical_json_bytes(value)))
-
-
-def load_learning_config(path: Path | None) -> dict[str, list[ArtifactId]]:
-    """Only immutable artifact references; no geographic configuration or promotion flags."""
-    value = json.loads(path.read_text(encoding="utf-8")) if path else {}
-    if not isinstance(value, dict) or set(value) - {"correction_policies", "blend_policies"}:
-        raise ValueError("Learning config accepts correction_policies and blend_policies only")
-    for key in ("correction_policies", "blend_policies"):
-        entries = value.setdefault(key, [])
-        if not isinstance(entries, list):
-            raise ValueError("Learning policy references must be lists")
-        value[key] = [ArtifactId(entry) for entry in entries]
-    return value
 
 
 class LearningService:
@@ -88,18 +87,16 @@ class LearningService:
                     "application/forecast_desk_provider.py",
                     "contracts/forecast_desk.py",
                     "forecasting/field_edit.py",
+                    "application/governance.py",
+                    "contracts/policy_governance.py",
+                    "verification/governance_eligibility.py",
                 )
             },
         }
 
     def read(self, identifier: ArtifactId) -> dict[str, Any]:
         manifest, raw = self.storage.artifacts.load_verified_payload(identifier)
-        if manifest.artifact_type not in {
-            "forecast-variant",
-            "learning-policy",
-            "learning-overlay",
-            "learning-binding",
-        }:
+        if manifest.artifact_type not in _KINDS:
             raise ValueError("Not a learning artifact")
         payload = json.loads(raw)
         if manifest.artifact_type == "forecast-variant":
@@ -128,12 +125,7 @@ class LearningService:
         identity_key: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Existing advisory-lock/content-addressed transaction supplies immutability."""
-        if kind not in {
-            "forecast-variant",
-            "learning-policy",
-            "learning-overlay",
-            "learning-binding",
-        }:
+        if kind not in _KINDS:
             raise ValueError("Unsupported learning artifact type")
         if kind == "forecast-variant":
             validate_variant(payload)
@@ -182,6 +174,10 @@ class LearningService:
             validate_temperature_policy(payload)
             if payload["lifecycle_role"] == "insufficient_evidence":
                 raise ValueError("An insufficient-evidence report is not a candidate policy")
+        elif payload.get("schema_version") == "mesoforge.forecast-desk-version.v1":
+            from mesoforge.application.governance import validate_desk_version
+
+            validate_desk_version(payload)
         else:
             CandidateBlendPolicy.model_validate_json(canonical_json_bytes(payload))
         # Version is a scientific identity, not an overwrite slot. Also inspect older
@@ -213,15 +209,6 @@ class LearningService:
                 )
             return saved
 
-    def policies(self, identifiers: list[ArtifactId], cutoff: datetime) -> list[dict[str, Any]]:
-        rows = []
-        for identifier in identifiers:
-            saved = self.read(ArtifactId(identifier))
-            if max(instant(saved["registered_at"]), instant(saved["available_at"])) > cutoff:
-                raise ValueError("Policy artifact was not available before analysis cutoff")
-            rows.append(saved)
-        return rows
-
     def evidence(self, latitude: float, longitude: float, cutoff: datetime) -> dict[str, Any]:
         return analyze_site_verification(
             latitude,
@@ -246,10 +233,18 @@ class LearningService:
         overlay: dict[str, Any],
         status: str,
         policy_reference: dict[str, Any] | None = None,
+        activated_at: datetime | None = None,
+        governance_resolution: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         lineage = forecast["baseline_snapshot"]
+        governed = (
+            {"governance_resolution": governance_resolution}
+            if governance_resolution is not None
+            else {}
+        )
         return seal_variant(
             {
+                **governed,
                 "parent_stage_id": parent["variant_id"] if parent else None,
                 "transformation_type": transformation,
                 "lifecycle_role": role,
@@ -275,7 +270,13 @@ class LearningService:
                 "evidence_required": policy is not None,
                 "evidence_status": status,
                 "policy_created_at": policy.get("created_at") if policy else None,
-                "policy_activated_at": policy.get("activated_at") if policy else None,
+                "policy_activated_at": (
+                    _iso(activated_at)
+                    if policy and activated_at is not None
+                    else policy.get("activated_at")
+                    if policy
+                    else None
+                ),
                 "created_at": _iso(self.clock()),
                 "code_identity": self.identity,
                 "field_policies": lineage["field_policies"],
@@ -284,18 +285,38 @@ class LearningService:
         )
 
     def local_stage(
-        self, forecast: dict[str, Any], *, policy_ids: list[ArtifactId] | None = None
+        self, forecast: dict[str, Any], *, governance: ScopeResolution | None = None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """An explicit stage always exists; optional learning/storage failures are isolated."""
+        """An explicit stage always exists; optional learning/storage failures are isolated.
+
+        ``governance`` is the committed state of this coordinate's correction scope at
+        the batch decision time. None means no policy may execute (no active policy and
+        no shadows). A resolved ACTIVE policy executes under its operational grant;
+        registered candidates execute only as shadows under their registration grant.
+        """
         from mesoforge.application.corrections import (
             apply_temperature_correction,
             propose_temperature_policy,
         )
+        from mesoforge.contracts.policy_governance import GovernanceBlockedError
 
         started = time.perf_counter()
         cutoff = instant(forecast["baseline_snapshot"]["forecast_analysis_cutoff"])
-        report: dict[str, Any] = {"status": "no_policy", "shadows": [], "failures": []}
-        policies: list[dict[str, Any]] = []
+        report: dict[str, Any] = {
+            "status": "no_policy",
+            "shadows": [],
+            "shadow_attempts": [],
+            "failures": [],
+        }
+        if governance is not None:
+            if governance.error is not None:
+                raise GovernanceBlockedError("governance_unavailable", governance.error)
+            if instant(governance.decision_time) != cutoff:
+                raise GovernanceBlockedError(
+                    "governance_decision_time_mismatch",
+                    "Governance was resolved for a different decision time",
+                )
+            report["governance"] = governance.summary()
         try:
             analysis = self.evidence(forecast["latitude"], forecast["longitude"], cutoff)
             report["evidence"] = analysis["correction_readiness"]
@@ -314,6 +335,7 @@ class LearningService:
             )
             report["candidate_status"] = proposal["lifecycle_role"]
             if proposal["lifecycle_role"] == "candidate":
+                # PROPOSED only: an automatic proposal never shadows or activates itself.
                 existing = self.find(
                     "learning-policy",
                     {"policy_id": proposal["policy_id"], "version": proposal["version"]},
@@ -323,26 +345,30 @@ class LearningService:
                 )
         except Exception as exc:
             report["failures"].append({"phase": "evidence_update", "reason": str(exc)})
-        try:
-            policies = self.policies(policy_ids or [], cutoff)
-        except Exception as exc:
-            report["failures"].append({"phase": "policy_lookup", "reason": str(exc)})
-        matching = [
-            p
-            for p in policies
-            if p["payload"].get("coordinate")
-            == {"latitude": forecast["latitude"], "longitude": forecast["longitude"]}
-        ]
-        active = [p for p in matching if p["payload"]["lifecycle_role"] == "active"]
-        if len(active) > 1:
-            report["failures"].append(
-                {"phase": "active_lookup", "reason": "Conflicting active policies"}
-            )
-            active = []
-        policy = active[0]["payload"] if active else None
-        corrected, outcome = apply_temperature_correction(
-            forecast, policy, analysis_cutoff=cutoff, mode="operational"
+        active = governance.active if governance is not None else None
+        resolution = (
+            governance.record("resolved_active" if active else "resolved_none", active)
+            if governance is not None
+            else None
         )
+        corrected, outcome = apply_temperature_correction(
+            forecast,
+            active.payload if active is not None else None,
+            analysis_cutoff=cutoff,
+            mode="operational",
+            grant=active.grant("operational") if active is not None else None,
+        )
+        if outcome["status"] not in {"applied", "no_op", "no_policy", "fallback"}:
+            # A resolved ACTIVE policy that cannot execute is a recorded no-op, never
+            # a silent substitution or a partially applied stage.
+            corrected = forecast
+            outcome = {
+                **outcome,
+                "status": "fallback",
+                "reason": f"governed_policy_not_executable:{outcome['status']}",
+                "changes": [],
+                "applied_delta_k": 0.0,
+            }
         report["correction"] = outcome
         report["status"] = outcome["status"]
         control = self._stage(
@@ -355,7 +381,11 @@ class LearningService:
             status="baseline",
         )
         # An invalid ACTIVE transformation is a recorded no-op, never a partial stage.
-        used_policy = policy if outcome["status"] in {"applied", "no_op"} else None
+        used_policy = (
+            active.payload
+            if active is not None and outcome["status"] in {"applied", "no_op"}
+            else None
+        )
         stage = self._stage(
             forecast,
             parent=control,
@@ -364,7 +394,9 @@ class LearningService:
             policy=used_policy,
             overlay=self._correction_overlay(corrected, outcome),
             status=outcome["status"],
-            policy_reference=self._reference(active[0]) if used_policy is not None else None,
+            policy_reference=active.reference if active is not None else None,
+            activated_at=active.event.recorded_at if active is not None else None,
+            governance_resolution=resolution,
         )
         report["control_stage"] = control
         report["operational_stage"] = stage
@@ -403,38 +435,15 @@ class LearningService:
                         "correction": report["correction"],
                     },
                     status="active_storage_failed_fallback",
+                    policy_reference=active.reference if active is not None else None,
+                    governance_resolution=resolution,
                 )
                 report.pop("operational_reference", None)
-        for saved in matching:
-            if saved["payload"]["lifecycle_role"] != "shadow":
-                continue
-            try:
-                shadow, shadow_outcome = apply_temperature_correction(
-                    forecast, saved["payload"], analysis_cutoff=cutoff, mode="shadow"
-                )
-                if shadow_outcome["status"] not in {"applied", "no_op"}:
-                    raise ValueError(f"Shadow correction failed: {shadow_outcome}")
-                shadow_overlay = self._correction_overlay(shadow, shadow_outcome)
-                # Shadows inherit the raw parent, never a potentially corrected issuance.
-                shadow_overlay.update(
-                    inherit_unchanged=False, predictions=self._point_values(shadow)
-                )
-                variant = self._stage(
-                    forecast,
-                    parent=control,
-                    transformation="deterministic_corrected",
-                    role="shadow",
-                    policy=saved["payload"],
-                    overlay=shadow_overlay,
-                    status=shadow_outcome["status"],
-                    policy_reference=self._reference(saved),
-                )
-                retained = self.save(
-                    "forecast-variant", variant, attributes=self._attributes(variant)
-                )
-                report["shadows"].append(self._reference(retained))
-            except Exception as exc:
-                report["failures"].append({"phase": "correction_shadow", "reason": str(exc)})
+        if governance is not None:
+            report["shadow_attempts"].extend(dict(row) for row in governance.shadow_failures)
+            for candidate in governance.shadows:
+                attempt = self._shadow(forecast, candidate, control, governance, cutoff, report)
+                report["shadow_attempts"].append(attempt)
         report["seconds"] = time.perf_counter() - started
         # Compact lineage only: the unchanged numerical grid is shared, not copied.
         return {
@@ -442,6 +451,58 @@ class LearningService:
             "learning_stage": report["operational_stage"],
             "learning_reference": report.get("operational_reference"),
         }, report
+
+    def _shadow(
+        self,
+        forecast: dict[str, Any],
+        candidate: ResolvedPolicy,
+        control: dict[str, Any],
+        governance: ScopeResolution,
+        cutoff: datetime,
+        report: dict[str, Any],
+    ) -> dict[str, Any]:
+        """One registered candidate on the raw parent; its outcome is always recorded."""
+        from mesoforge.application.corrections import apply_temperature_correction
+
+        attempt: dict[str, Any] = {
+            "policy_artifact_id": str(candidate.policy_artifact_id),
+            "registration_event_id": str(candidate.registration.event_id),
+        }
+        try:
+            shadow, outcome = apply_temperature_correction(
+                forecast,
+                candidate.payload,
+                analysis_cutoff=cutoff,
+                mode="shadow",
+                grant=candidate.grant("shadow"),
+            )
+            if outcome["status"] not in {"applied", "no_op"}:
+                raise ValueError(f"Shadow correction failed: {outcome.get('reason', outcome)}")
+            overlay = self._correction_overlay(shadow, outcome)
+            # Shadows inherit the raw parent, never a potentially corrected issuance.
+            overlay.update(inherit_unchanged=False, predictions=self._point_values(shadow))
+            variant = self._stage(
+                forecast,
+                parent=control,
+                transformation="deterministic_corrected",
+                role="shadow",
+                policy=candidate.payload,
+                overlay=overlay,
+                status=outcome["status"],
+                policy_reference=candidate.reference,
+                activated_at=candidate.event.recorded_at,
+                governance_resolution=governance.record("candidate_shadow", candidate),
+            )
+        except Exception as exc:
+            report["failures"].append({"phase": "correction_shadow", "reason": str(exc)})
+            return {**attempt, "status": "candidate_failed", "reason": str(exc)}
+        try:
+            retained = self.save("forecast-variant", variant, attributes=self._attributes(variant))
+        except Exception as exc:
+            report["failures"].append({"phase": "correction_shadow_storage", "reason": str(exc)})
+            return {**attempt, "status": "storage_failed", "reason": str(exc)}
+        report["shadows"].append(self._reference(retained))
+        return {**attempt, "status": "stored", "variant_id": variant["variant_id"]}
 
     @staticmethod
     def _reference(saved: dict[str, Any]) -> dict[str, Any]:
@@ -739,10 +800,13 @@ class LearningService:
             if key in report
         ]
         refs.extend(report.get("shadows", []))
+        # v2 adds every governed shadow attempt, so a candidate is never judged only
+        # where it succeeded. Readers accept v1 (no attempts recorded) and v2.
         payload = {
-            "schema_version": "mesoforge.learning-issuance-binding.v1",
+            "schema_version": "mesoforge.learning-issuance-binding.v2",
             "issued_forecast_id": issued["issued_forecast_id"],
             "variants": refs,
+            "shadow_attempts": report.get("shadow_attempts", []),
         }
         return self._reference(
             self.save(
@@ -754,25 +818,51 @@ class LearningService:
         )
 
     def background(
-        self, pinned: Any, policy_ids: list[ArtifactId], *, analysis_cutoff: datetime
+        self,
+        pinned: Any,
+        candidates: list[ResolvedPolicy],
+        *,
+        analysis_cutoff: datetime,
     ) -> dict[str, Any]:
-        """Optional overlays are built once in the background; failures cannot publish active."""
+        """Governed blend candidates build overlays once; failures cannot publish active.
+
+        ``candidates`` are registered, non-retired, non-active blend candidates resolved
+        from committed governance at ``analysis_cutoff``. Payload roles never select.
+        """
         from mesoforge.application.candidate_baseline import build_candidate_overlay
         from mesoforge.forecasting.candidate_policy import CandidateBlendPolicy
 
         report: dict[str, Any] = {"overlays": [], "failures": []}
-        for identifier in policy_ids:
+        for candidate in candidates:
+            identifier = candidate.policy_artifact_id
             try:
-                retained = self.policies([identifier], analysis_cutoff)[0]
+                if (
+                    candidate.event.event_type != "REGISTERED"
+                    or candidate.event.recorded_at is None
+                    or candidate.event.recorded_at > analysis_cutoff
+                ):
+                    raise ValueError("Background execution requires a committed registration")
+                saved = self.read(ArtifactId(identifier))
+                if max(
+                    instant(saved["registered_at"]), instant(saved["available_at"])
+                ) > analysis_cutoff or saved["content_digest"] != str(candidate.content_digest):
+                    raise ValueError("Policy artifact was not available before analysis cutoff")
                 policy = CandidateBlendPolicy.model_validate_json(
-                    canonical_json_bytes(retained["payload"])
+                    canonical_json_bytes(saved["payload"])
                 )
                 policy.validate_execution(analysis_cutoff)
-                if policy.lifecycle_role != "shadow":
-                    raise ValueError("Configured execution requires explicit shadow activation")
+                if policy.lifecycle_role != "candidate":
+                    raise ValueError("Only governed candidate payloads execute as shadows")
+                governance = {
+                    "policy_artifact_id": str(identifier),
+                    "content_digest": str(candidate.content_digest),
+                    "registration_event_id": str(candidate.registration.event_id),
+                    "registered_at": _iso(candidate.event.recorded_at),
+                }
                 key = {
                     "baseline_snapshot_id": pinned.manifest["baseline_snapshot_id"],
                     "policy_digest": policy.digest,
+                    "registration_event_id": governance["registration_event_id"],
                     "code_identity": _digest(self.identity),
                 }
                 existing = self.find("learning-overlay", key)
@@ -782,7 +872,7 @@ class LearningService:
                     built = build_candidate_overlay(pinned, policy, analysis_cutoff=analysis_cutoff)
                     overlay = self.save(
                         "learning-overlay",
-                        built["overlay"],
+                        {**built["overlay"], "governance": governance},
                         inputs=(ArtifactId(identifier),),
                         attributes=key,
                         identity_key=key,
@@ -790,7 +880,7 @@ class LearningService:
                     report.setdefault("measurements", []).append(built["timings"])
                 report["overlays"].append(self._reference(overlay))
             except Exception as exc:
-                report["failures"].append({"policy_artifact": identifier, "reason": str(exc)})
+                report["failures"].append({"policy_artifact": str(identifier), "reason": str(exc)})
         return report
 
     def candidate_stages(
@@ -798,11 +888,28 @@ class LearningService:
     ) -> None:
         """Attach background field patches; this method cannot invoke numerical blending."""
         from mesoforge.application.candidate_baseline import candidate_point_overlay
+        from mesoforge.contracts.policy_governance import BLEND_POLICY, blend_scope
 
         for reference in overlays:
+            attempt: dict[str, Any] = {
+                "family": BLEND_POLICY,
+                "overlay_artifact_id": reference.get("artifact_id"),
+            }
+            report.setdefault("shadow_attempts", []).append(attempt)
             try:
                 retained = self.read(ArtifactId(reference["artifact_id"]))
+            except Exception as exc:
+                attempt.update(status="storage_failed", reason=str(exc))
+                report["failures"].append({"phase": "candidate_projection", "reason": str(exc)})
+                continue
+            try:
                 overlay = retained["payload"]
+                governed = overlay.get("governance")
+                if isinstance(governed, dict):
+                    attempt.update(
+                        policy_artifact_id=governed.get("policy_artifact_id"),
+                        registration_event_id=governed.get("registration_event_id"),
+                    )
                 if (
                     overlay["baseline_snapshot_id"]
                     != forecast["baseline_snapshot"]["baseline_snapshot_id"]
@@ -816,6 +923,12 @@ class LearningService:
                     raise ValueError("Candidate baseline overlay was not available at analysis")
                 if instant(overlay["analysis_cutoff"]) > cutoff:
                     raise ValueError("Candidate baseline analysis follows location analysis cutoff")
+                governance = overlay.get("governance")
+                if (
+                    not isinstance(governance, dict)
+                    or instant(governance["registered_at"]) > cutoff
+                ):
+                    raise ValueError("Candidate overlay lacks a committed governance registration")
                 point = candidate_point_overlay(
                     overlay,
                     latitude=forecast["latitude"],
@@ -855,34 +968,55 @@ class LearningService:
                         "affected_fields": overlay["affected_fields"],
                     },
                     status="shadow",
+                    activated_at=instant(governance["registered_at"]),
+                    governance_resolution={
+                        "schema_version": "mesoforge.governance-resolution.v1",
+                        "family": BLEND_POLICY,
+                        "scope_key": blend_scope(overlay["policy"]["field"]),
+                        "status": "candidate_shadow",
+                        "decision_time": overlay["analysis_cutoff"],
+                        **{
+                            key: governance[key]
+                            for key in (
+                                "registration_event_id",
+                                "policy_artifact_id",
+                                "registered_at",
+                            )
+                        },
+                        "policy_content_digest": governance["content_digest"],
+                    },
                 )
+            except Exception as exc:
+                attempt.update(status="candidate_failed", reason=str(exc))
+                report["failures"].append({"phase": "candidate_projection", "reason": str(exc)})
+                continue
+            try:
                 saved = self.save(
                     "forecast-variant",
                     stage,
                     inputs=(ArtifactId(reference["artifact_id"]),),
                     attributes=self._attributes(stage),
                 )
-                report["shadows"].append(self._reference(saved))
             except Exception as exc:
-                report["failures"].append({"phase": "candidate_projection", "reason": str(exc)})
+                attempt.update(status="storage_failed", reason=str(exc))
+                report["failures"].append({"phase": "candidate_storage", "reason": str(exc)})
+                continue
+            attempt.update(status="stored", variant_id=stage["variant_id"])
+            report["shadows"].append(self._reference(saved))
 
-    def stage_issued(
-        self, identifier: UUID, *, policy_ids: list[ArtifactId] | None = None
-    ) -> dict[str, Any]:
-        """Explicit retained-data replay; never rewrites a historical issuance."""
+    def stage_issued(self, identifier: UUID) -> dict[str, Any]:
+        """Explicit retained-data replay; never rewrites a historical issuance.
+
+        Replay never consults governance: a policy that is active today, or was active
+        at the historical decision, must not be bound retroactively to an issuance that
+        went out without it. Only the unchanged no-op stage may be retained.
+        """
         with self.storage.artifacts.acquire_identity(
             Digest.of_bytes(canonical_json_bytes({"learning_issued_replay": str(identifier)}))
         ):
-            return self._stage_issued(identifier, policy_ids=policy_ids)
+            return self._stage_issued(identifier)
 
-    def _stage_issued(
-        self, identifier: UUID, *, policy_ids: list[ArtifactId] | None = None
-    ) -> dict[str, Any]:
-        if policy_ids:
-            raise ValueError(
-                "Historical stage replay retains the no-op stage only; "
-                "use configured shadow execution"
-            )
+    def _stage_issued(self, identifier: UUID) -> dict[str, Any]:
         existing = self.find("learning-binding", {"issued_forecast_id": str(identifier)})
         if existing:
             return {"already_existing": True, "binding": existing[0]}
@@ -893,10 +1027,11 @@ class LearningService:
                 "Issued stage already has learning lineage but no binding; "
                 "do not reinterpret a potentially corrected forecast as its raw baseline"
             )
-        corrected, report = self.local_stage(original, policy_ids=policy_ids)
-        # Historical operational output stays untouched even with an explicit old active policy.
+        corrected, report = self.local_stage(original, governance=None)
+        if corrected["hours"] != original["hours"]:
+            raise ValueError("Historical replay would bind a changed forecast; nothing was bound")
         report["historical_issuance_unchanged"] = True
-        report["numerical_no_op"] = corrected["hours"] == original["hours"]
+        report["numerical_no_op"] = True
         report["binding"] = self.bind(saved, report)
         return report
 
@@ -999,8 +1134,9 @@ def main(argv: list[str] | None = None) -> int:
         "stage-issued", help="Explicit retained-data stage replay; no forecast rewrite"
     )
     stage.add_argument("--issued-forecast-id", type=UUID, required=True)
-    stage.add_argument("--learning-policies", type=Path)
-    background = commands.add_parser("build-candidate", help="Explicit background shadow build")
+    background = commands.add_parser(
+        "build-candidate", help="Explicit background build of registered blend candidates"
+    )
     background.add_argument("--baseline-root", type=Path, required=True)
     background.add_argument("--policy-id", type=ArtifactId, action="append", required=True)
     analyze = commands.add_parser("analyze")
@@ -1018,17 +1154,23 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "register-policy":
             result = service.register_policy(json.loads(args.file.read_text(encoding="utf-8")))
         elif args.command == "stage-issued":
-            result = service.stage_issued(
-                args.issued_forecast_id,
-                policy_ids=load_learning_config(args.learning_policies)["correction_policies"],
-            )
+            result = service.stage_issued(args.issued_forecast_id)
         elif args.command == "build-candidate":
             from mesoforge.application.baseline_snapshot import load_baseline
+            from mesoforge.application.governance import GovernanceService
 
+            cutoff = _utc()
+            governed = {
+                str(row.policy_artifact_id): row
+                for row in GovernanceService(service).blend_candidates(cutoff)
+            }
+            unknown = sorted(set(map(str, args.policy_id)) - set(governed))
+            if unknown:
+                raise ValueError(f"Not registered blend candidates at the cutoff: {unknown}")
             result = service.background(
                 load_baseline(args.baseline_root),
-                args.policy_id,
-                analysis_cutoff=_utc(),
+                [governed[str(identifier)] for identifier in args.policy_id],
+                analysis_cutoff=cutoff,
             )
         else:
             result = service.analyze(

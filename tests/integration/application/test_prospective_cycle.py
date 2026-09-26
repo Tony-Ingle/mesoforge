@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock
 from uuid import UUID
@@ -29,8 +30,26 @@ object_store = storage_tests.object_store
 configured_retrieval_storage = storage_tests.configured_retrieval_storage
 
 
+@pytest.fixture
+def governed_build(baseline_case, configured_retrieval_storage: None, tmp_path: Path) -> dict:
+    """The fixture guidance built with blend governance resolved from the test store."""
+    from mesoforge.application import build_baseline as background
+    from mesoforge.application.governance import configured_governance
+
+    root = tmp_path / "governed-baseline"
+    built = background.build_baseline(
+        baseline_case["guidance"],
+        root,
+        [FIRST, LAST],
+        reference_times=[TARGET],
+        governance=configured_governance(),
+    )
+    return {**built, "root": root}
+
+
 def test_prospective_cycle_pins_once_isolates_locations_and_repeat_preserves_storage(
     baseline_case,
+    governed_build: dict,
     migrated_dsn: str,
     object_store: S3ArtifactObjectStore,
     configured_retrieval_storage: None,
@@ -38,8 +57,11 @@ def test_prospective_cycle_pins_once_isolates_locations_and_repeat_preserves_sto
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Mock only acquisition/build boundaries; exercise real extraction/locking/storage."""
-    pointer = baseline_case["result"]["pointer"]
+    pointer = governed_build["pointer"]
     now = datetime.fromisoformat(pointer["published_at"]) + timedelta(seconds=1)
+    # Governance never clamps a decision time ahead of the database clock; let real
+    # time pass this fixture's synthetic "now" before the cycle resolves at it.
+    time.sleep(max(0.0, (now - datetime.now(UTC)).total_seconds()) + 0.2)
     service = ForecastIssuanceService(
         object_store,
         lambda: PostgresUnitOfWork(migrated_dsn),
@@ -61,20 +83,20 @@ def test_prospective_cycle_pins_once_isolates_locations_and_repeat_preserves_sto
             "downloaded_bytes": 0,
         }
     )
-    built = Mock(return_value=baseline_case["result"])
+    built = Mock(return_value=governed_build)
     monkeypatch.setattr(prospective_cycle, "refresh_guidance", refreshed)
     monkeypatch.setattr(prospective_cycle, "build_baseline", built)
     original_load = baseline_snapshot.load_baseline
 
     def load(_root, **kwargs):
-        return original_load(baseline_case["baseline"], **kwargs)
+        return original_load(governed_build["root"], **kwargs)
 
     monkeypatch.setattr(prospective_cycle, "load_baseline", load)
     pinned_calls = []
 
     def deliver(_root, configured, **kwargs):
         pinned_calls.append(kwargs["baseline_pointer"])
-        return forecast_from_baseline(baseline_case["baseline"], configured, **kwargs)
+        return forecast_from_baseline(governed_build["root"], configured, **kwargs)
 
     monkeypatch.setattr(prospective_cycle, "forecast_from_baseline", deliver)
     verification_calls = []

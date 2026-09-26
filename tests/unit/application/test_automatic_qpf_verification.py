@@ -15,6 +15,7 @@ from mesoforge.application import automatic_qpf_verification as automatic
 from mesoforge.application import forward_verification
 from mesoforge.application.artifacts import SourceRegistrationRequest
 from mesoforge.application.forecast_from_baseline import forecast_from_baseline
+from mesoforge.application.learning import LearningService
 from mesoforge.application.prepared_mrms import MRMSUnavailableError
 from mesoforge.common.identifiers import Digest
 from mesoforge.storage.json import CanonicalJsonSerializer
@@ -251,6 +252,7 @@ def test_pinned_baseline_issues_after_verification_failure_and_continues(
         "baseline_snapshot_id": "baseline",
         "schema_version": "mesoforge.baseline-snapshot.v1",
         "field_policies": {},
+        "blend_governance": {"status": "resolved", "heads": {}, "policies": {}},
     }
 
     def extract(*, latitude, longitude):
@@ -280,8 +282,9 @@ def test_pinned_baseline_issues_after_verification_failure_and_continues(
         issuer=service,
         run_lock=nullcontext,
         verification_runner=attempts,
+        learning_service=LearningService(case.service),
     )
-    assert result["summary"]["issued"] == 2
+    assert result["summary"]["issued"] == 2, result
     assert result["results"][0]["previous_verification"]["status"] == "error"
     assert result["results"][1]["previous_verification"]["qpf"]["status"] == "completed"
     assert service.issue.call_count == 2

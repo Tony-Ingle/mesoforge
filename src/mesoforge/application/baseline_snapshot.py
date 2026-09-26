@@ -159,6 +159,12 @@ def publish_latest_baseline(
         current = read_pointer(root)
         if current:
             previous, _ = _resolve(root, current)
+            if (previous.get("blend_governance") or {}).get("status") == "resolved" and (
+                manifest.get("blend_governance") or {}
+            ).get("status") != "resolved":
+                raise SnapshotError(
+                    "A baseline without resolved blend governance cannot replace a governed one"
+                )
             if _order(manifest) < _order(previous):
                 raise SnapshotError("Older baseline cannot replace the current baseline")
             if _order(manifest) == _order(previous):
@@ -252,3 +258,12 @@ def load_baseline(root: Path, *, pointer: dict[str, Any] | None = None) -> Pinne
         raise SnapshotError("Baseline source information has unresolved cutoff limitations")
     tables = read_artifact(directory, manifest["metadata_file"])
     return PinnedBaseline(pointer, manifest, directory, CompactCodec.from_tables(tables))
+
+
+def current_manifest(root: Path) -> dict[str, Any] | None:
+    """The verified manifest the latest pointer names, or None before any publication."""
+    pointer = read_pointer(root)
+    if pointer is None:
+        return None
+    manifest, _ = _resolve(root, pointer)
+    return manifest

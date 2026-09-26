@@ -28,8 +28,31 @@ object_store = storage_tests.object_store
 configured_retrieval_storage = storage_tests.configured_retrieval_storage
 
 
+@pytest.fixture
+def governed_baseline(baseline_case, configured_retrieval_storage: None, tmp_path: Path) -> Path:
+    """The same pinned guidance rebuilt with blend governance resolved from the test store.
+
+    Issuance refuses a baseline without resolved governance; with nothing ACTIVE the
+    rebuilt fields equal the module baseline exactly.
+    """
+    from mesoforge.application import build_baseline as background
+    from mesoforge.application.governance import configured_governance
+
+    root = tmp_path / "governed-baseline"
+    built = background.build_baseline(
+        baseline_case["guidance"],
+        root,
+        [FIRST, LAST],
+        reference_times=[TARGET],
+        governance=configured_governance(),
+    )
+    assert built["manifest"]["blend_governance"]["status"] == "resolved"
+    return root
+
+
 def test_two_locations_issue_one_baseline_lineage_read_exactly_and_preserve_history(
     baseline_case,
+    governed_baseline: Path,
     migrated_dsn: str,
     object_store: S3ArtifactObjectStore,
     configured_retrieval_storage: None,
@@ -52,7 +75,7 @@ def test_two_locations_issue_one_baseline_lineage_read_exactly_and_preserve_hist
     locations = [FIRST, failed, LAST]
     # Explicit reissue is needed only because the historical FIRST version exists.
     result = forecast_from_baseline(
-        baseline_case["baseline"],
+        governed_baseline,
         locations,
         reference_time=TARGET,
         request_time=datetime.now(UTC),
@@ -81,7 +104,7 @@ def test_two_locations_issue_one_baseline_lineage_read_exactly_and_preserve_hist
     # stage is retained. Learning uses the same PostgreSQL/MinIO path.
     assert [len(items) for items in before] == [3, 9, 9]
     repeat = forecast_from_baseline(
-        baseline_case["baseline"],
+        governed_baseline,
         locations,
         reference_time=TARGET,
         issue=True,
@@ -115,6 +138,7 @@ def test_two_locations_issue_one_baseline_lineage_read_exactly_and_preserve_hist
 
 def test_prior_verification_failure_does_not_block_baseline_issuance_or_later_locations(
     baseline_case,
+    governed_baseline: Path,
     migrated_dsn: str,
     object_store: S3ArtifactObjectStore,
     configured_retrieval_storage: None,
@@ -168,7 +192,7 @@ def test_prior_verification_failure_does_not_block_baseline_issuance_or_later_lo
 
     forbidden = baseline_tests.forbid_location_calculation(monkeypatch)
     result = forecast_from_baseline(
-        baseline_case["baseline"],
+        governed_baseline,
         [FIRST, {"lat": 999, "lon": 0}, LAST],
         reference_time=TARGET,
         issue=True,

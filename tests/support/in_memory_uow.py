@@ -7,13 +7,22 @@ from __future__ import annotations
 
 import hashlib
 import threading
+import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from mesoforge.common.errors import Conflict, IntegrityError, NotFound
 from mesoforge.contracts.artifacts import ArtifactManifest
 from mesoforge.contracts.issued_forecasts import IssuedForecastRecord
+from mesoforge.contracts.policy_governance import (
+    FAMILIES,
+    GovernanceConflict,
+    GovernanceEvent,
+    validate_append,
+)
 from mesoforge.contracts.provenance import ActivityManifest
 
 
@@ -346,6 +355,85 @@ class _InMemoryIssuedForecastRepository:
         return tuple(sorted(records, key=lambda row: row.issued_at, reverse=True)[:limit])
 
 
+class _InMemoryGovernanceRepository:
+    """Python mirror of migration 0005: buffered per unit of work, applied on commit.
+
+    Race, visibility, trigger and lock behavior is proven only against PostgreSQL.
+    This double enforces the same append rules (``validate_append``), stamps
+    ``recorded_at`` from the factory's injectable monotonic database clock and
+    discards writes of a unit of work that never commits.
+    """
+
+    def __init__(self, factory: InMemoryUnitOfWorkFactory) -> None:
+        self._factory = factory
+        self.pending: list[GovernanceEvent] = []
+
+    def _visible(self) -> list[GovernanceEvent]:
+        return [*self._factory.governance_events, *self.pending]
+
+    def lock(self, family: str, *, shared: bool, timeout_seconds: float) -> None:
+        if family not in FAMILIES:
+            raise ValueError(f"unknown governance family {family!r}")
+        if self._factory.governance_unavailable:
+            raise GovernanceConflict("governance_busy", "simulated governance outage")
+
+    def db_now(self) -> datetime:
+        return self._factory.governance_now()
+
+    def append(self, event: GovernanceEvent) -> GovernanceEvent:
+        existing = self._visible()
+        if any(row.request_key == event.request_key for row in existing):
+            raise GovernanceConflict("request_key_conflict")
+        if any(
+            row.event_type == "RETIRED" == event.event_type
+            and row.policy_artifact_id == event.policy_artifact_id
+            for row in existing
+        ):
+            raise GovernanceConflict("already_retired")
+        artifacts = self._factory.artifacts
+        for identifier in (event.policy_artifact_id, event.evaluation_artifact_id):
+            if identifier is None:
+                continue
+            manifest = artifacts.get(identifier)
+            stamped = self._factory.governance_stamp(dry_run=True)
+            if manifest is None or (
+                max(manifest.registered_at, manifest.availability.available_at) > stamped
+            ):
+                raise GovernanceConflict("artifact_not_available")
+            if (
+                identifier == event.policy_artifact_id
+                and manifest.content_digest != event.policy_content_digest
+            ):
+                raise GovernanceConflict("policy_digest_mismatch")
+        stamped_event = event.model_copy(update={"recorded_at": self._factory.governance_stamp()})
+        validate_append(existing, stamped_event)
+        self.pending.append(stamped_event)
+        return stamped_event
+
+    def get(self, event_id: str) -> GovernanceEvent:
+        for row in self._visible():
+            if row.event_id == event_id:
+                return row
+        raise NotFound(f"governance event {event_id!r} not found")
+
+    def find_by_request_key(self, key: str) -> GovernanceEvent | None:
+        return next((row for row in self._visible() if row.request_key == key), None)
+
+    def events(
+        self, family: str, scope_keys: tuple[str, ...] | None = None
+    ) -> tuple[GovernanceEvent, ...]:
+        rows = [
+            row
+            for row in self._visible()
+            if row.family == family and (scope_keys is None or row.scope_key in scope_keys)
+        ]
+        return tuple(sorted(rows, key=lambda row: (row.scope_key, row.scope_seq)))
+
+    def policy_events(self, policy_artifact_id: str) -> tuple[GovernanceEvent, ...]:
+        rows = [row for row in self._visible() if row.policy_artifact_id == policy_artifact_id]
+        return tuple(sorted(rows, key=lambda row: row.recorded_at or datetime.min))
+
+
 class InMemoryUnitOfWork:
     def __init__(self, factory: InMemoryUnitOfWorkFactory) -> None:
         self._factory = factory
@@ -356,18 +444,25 @@ class InMemoryUnitOfWork:
         self.configurations = _InMemoryConfigurationRepository(factory.configurations)
         self.runs = _InMemoryRunRepository(factory.runs)
         self.issued_forecasts = _InMemoryIssuedForecastRepository(factory.issued_forecasts)
+        self.governance = _InMemoryGovernanceRepository(factory)
 
     def __enter__(self) -> InMemoryUnitOfWork:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        pass
+        self.governance.pending.clear()
 
     def commit(self) -> None:
-        pass
+        pending, self.governance.pending = self.governance.pending, []
+        with self._factory._guard:
+            committed = list(self._factory.governance_events)
+            for event in pending:
+                validate_append(committed, event)
+                committed.append(event)
+            self._factory.governance_events[:] = committed
 
     def rollback(self) -> None:
-        pass
+        self.governance.pending.clear()
 
 
 class InMemoryUnitOfWorkFactory:
@@ -382,7 +477,35 @@ class InMemoryUnitOfWorkFactory:
         self.configurations: dict[str, _InMemoryConfigurationSnapshot] = {}
         self.runs: dict[str, object] = {}
         self.issued_forecasts: dict[UUID, IssuedForecastRecord] = {}
+        self.governance_events: list[GovernanceEvent] = []
+        self.governance_unavailable = False
+        # Injectable database clock; stamps strictly increase like clock_timestamp().
+        self._real_clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+        self.governance_clock: Callable[[], datetime] = self._real_clock
+        self._governance_last: datetime | None = None
         self._guard = threading.Lock()
+
+    def governance_now(self) -> datetime:
+        now = self.governance_clock()
+        if self._governance_last is not None and now < self._governance_last:
+            return self._governance_last
+        return now
+
+    def governance_stamp(self, *, dry_run: bool = False) -> datetime:
+        now = self.governance_now()
+        if self._governance_last is not None and now <= self._governance_last:
+            if self.governance_clock is self._real_clock and not dry_run:
+                # A coarse wall clock: wait for it to advance instead of inventing a
+                # stamp in the caller's future (PostgreSQL's clock is monotonic).
+                deadline = time.monotonic() + 1
+                while now <= self._governance_last and time.monotonic() < deadline:
+                    time.sleep(0.0005)
+                    now = self.governance_clock()
+            if now <= self._governance_last:
+                now = self._governance_last + timedelta(microseconds=1)
+        if not dry_run:
+            self._governance_last = now
+        return now
 
     def __call__(self) -> InMemoryUnitOfWork:
         return InMemoryUnitOfWork(self)

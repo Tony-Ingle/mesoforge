@@ -74,6 +74,21 @@
   ACTIVE policy exists; candidates/shadows never promote themselves. Build candidate
   blends in the background with FieldBlendEngine, retain compact overlays and enforce
   evidence/creation/activation cutoffs. Reuse current coherence only for affected fields.
+- Persistent policy changes only through explicit append-only governance events
+  (`python -m mesoforge.application.governance`). Forecast jobs, learning code, the
+  AI desk and providers only read committed governance; none may register, evaluate
+  with `--record`, activate, roll back or retire. Payload lifecycle roles never grant
+  execution. Eligibility is recorded evidence, not activation. Reuse the approved
+  evidence policy unchanged. Families without an approved rule stay `not_eligible`.
+  Never add a threshold, margin or fallback that issues under an unproven governed
+  state.
+- The AI cannot promote itself: `ai_desk_policy` versions are register/retire only,
+  and desk modules must not import governance or gain a governance tool. Changing
+  final-review behavior requires a desk-policy version bump and a new explicit
+  registration.
+- Tests and demonstrations never activate a real policy: they use the in-memory
+  store or dedicated test databases. Governance state changes against an operator
+  store are deliberate owner acts, never test or agent side effects.
 - Configured jobs always attempt the bounded AI desk after correction; no execution
   modes. Pin evidence/cutoffs, expose only bounded structured meteorological tools,
   and issue the latest fully validated checkpoint on failure. Field registry edit

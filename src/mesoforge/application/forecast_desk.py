@@ -25,6 +25,7 @@ from mesoforge.application.forecast_desk_context import (
     inspect_evidence,
     task_queue,
 )
+from mesoforge.application.forecast_desk_provider import REASONING_EFFORTS
 from mesoforge.application.local_surface_grid import extract_grid_point
 from mesoforge.contracts.forecast_desk import (
     DESK_POLICY,
@@ -362,10 +363,12 @@ def run_forecast_desk(
             budgets=asdict(config),
         )
         effort = getattr(provider, "reasoning_effort", None)
+        # Every supported explicit effort, including none/minimal, is recorded; only an
+        # unset effort is the provider default. The marker distinguishes this recording
+        # from earlier stages, where none/minimal were pooled into provider-default.
         report["inference_settings"] = {
-            "reasoning_effort": effort
-            if effort in ("low", "medium", "high", "xhigh", "max")
-            else None
+            "reasoning_effort": effort if effort in REASONING_EFFORTS else None,
+            "effort_recording": "explicit.v1",
         }
         # Initial validation is required, even when provider configuration is absent.
         before = monotonic()

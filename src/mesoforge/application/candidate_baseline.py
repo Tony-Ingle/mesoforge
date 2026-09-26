@@ -51,7 +51,22 @@ def _instant(value: str) -> datetime:
     return result.astimezone(UTC)
 
 
-def _engine(grid: dict[str, Any], policy: CandidateBlendPolicy) -> FieldBlendEngine:
+def governed_overrides(manifest: dict[str, Any]) -> dict[str, CandidateBlendPolicy]:
+    """ACTIVE governed blend policies pinned by the parent baseline manifest."""
+    policies = (manifest.get("blend_governance") or {}).get("policies", {})
+    return {
+        field: CandidateBlendPolicy.model_validate_json(canonical_json_bytes(row["policy"]))
+        for field, row in policies.items()
+    }
+
+
+def _engine(
+    grid: dict[str, Any],
+    policy: CandidateBlendPolicy,
+    governed: dict[str, CandidateBlendPolicy] | None = None,
+) -> FieldBlendEngine:
+    """The parent's exact engine (including its governed overrides) plus one candidate."""
+    parents = {field: row.parameters for field, row in (governed or {}).items()}
     context = grid["forecast_context"]
     contributors = ContributorConfiguration.model_validate_json(
         json.dumps(context["contributor_configuration"])
@@ -61,7 +76,9 @@ def _engine(grid: dict[str, Any], policy: CandidateBlendPolicy) -> FieldBlendEng
             context["current_model_set"]["selection"]["source_configuration"]["blend_configuration"]
         )
     )
-    active = FieldBlendEngine(contributors=contributors, phase2=configuration)
+    active = FieldBlendEngine(
+        contributors=contributors, phase2=configuration, policy_overrides=parents
+    )
     control = active.policy_for(policy.field)
     identity = (
         f"{control.name}/{control.version}"
@@ -75,7 +92,7 @@ def _engine(grid: dict[str, Any], policy: CandidateBlendPolicy) -> FieldBlendEng
     return FieldBlendEngine(
         contributors=contributors,
         phase2=configuration,
-        policy_overrides={policy.field: policy.parameters},
+        policy_overrides={**parents, policy.field: policy.parameters},
     )
 
 
@@ -119,6 +136,7 @@ def build_candidate_overlay(
     policy = CandidateBlendPolicy.model_validate_json(policy.model_dump_json())
     policy.validate_execution(analysis_cutoff)
     manifest = pinned_baseline.manifest
+    governed = governed_overrides(manifest)
     for value in (manifest["analysis_cutoff"], pinned_baseline.pointer["published_at"]):
         if _instant(value) > analysis_cutoff:
             raise ValueError("Candidate cannot consume a baseline from after its analysis cutoff")
@@ -134,7 +152,7 @@ def build_candidate_overlay(
             or grid["geometry"] != domain["geometry"]
         ):
             raise SnapshotError("Candidate parent grid differs from its immutable identity")
-        engine = _engine(grid, policy)
+        engine = _engine(grid, policy, governed)
         cells = []
         for cell in grid["cells"]:
             if cell["status"] != "calculated":

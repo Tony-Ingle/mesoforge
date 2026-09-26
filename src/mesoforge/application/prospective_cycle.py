@@ -2,6 +2,8 @@
 
 Composition only: guidance and numerical baseline publish independently, then the
 existing issuance boundary pins one baseline, verifies prior hours and delivers.
+Governed persistent policy comes only from committed governance events; the cycle
+never selects, registers or activates a policy.
 """
 
 from __future__ import annotations
@@ -27,16 +29,12 @@ from mesoforge.application.batch_forecast import (
 from mesoforge.application.build_baseline import build_baseline
 from mesoforge.application.forecast_from_baseline import forecast_from_baseline
 from mesoforge.application.forecast_from_snapshot import _public
+from mesoforge.application.governance import GovernanceService
 from mesoforge.application.issuance import ForecastIssuanceService
-from mesoforge.application.learning import (
-    LearningService,
-    configured_learning,
-    load_learning_config,
-)
+from mesoforge.application.learning import LearningService, configured_learning
 from mesoforge.application.prepared_snapshot import derive_reference_time
 from mesoforge.application.refresh_guidance import refresh_guidance
 from mesoforge.application.spatial_coverage import validate_coordinate
-from mesoforge.common.identifiers import ArtifactId
 
 _ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG = _ROOT / "configs/locations.json"
@@ -86,8 +84,8 @@ def run_prospective_cycle(
     clock: Callable[[], datetime] | None = None,
     replay_reference_time: datetime | None = None,
     issuer: ForecastIssuanceService | None = None,
-    learning_policies: Path | None = None,
     learning_service: LearningService | None = None,
+    governance: GovernanceService | None = None,
 ) -> dict[str, Any]:
     """One noninteractive operator cycle; clock injection is for deterministic tests.
 
@@ -144,6 +142,12 @@ def run_prospective_cycle(
         if not valid:
             raise ValueError("No valid configured locations")
         issuer = issuer or create_issuer()
+        # Governed state must be readable before any background build or issuance.
+        phase = "governance_resolution"
+        learning_service = learning_service or configured_learning()
+        governance = governance or GovernanceService(learning_service)
+        governance.status()
+        phase = "storage_preflight"
         pointer = _repeat_pointer(root / "baseline", valid, reference, issuer)
         if pointer is None:
             # Refresh's collection validation is intentionally strict. Isolate bad
@@ -161,6 +165,7 @@ def run_prospective_cycle(
                 root / "baseline",
                 valid,
                 prepared_pointer=refresh["latest_complete"],
+                governance=governance,
             )
             result["background"]["build"] = {k: v for k, v in build.items() if k != "manifest"}
             pointer = build["pointer"]
@@ -170,35 +175,27 @@ def run_prospective_cycle(
                 "reason": "Every valid location has a version; recheck under issuance lock.",
             }
         # Learning remains subordinate to independently published active state.
-        # Policy data never selects active meteorology at this operator boundary.
+        # Registered blend candidates shadow in the background; none can become active.
         learning: dict[str, Any] = {"status": "ready", "overlays": [], "failures": []}
-        policies: dict[str, list[ArtifactId]] = {"correction_policies": [], "blend_policies": []}
         try:
-            policies = load_learning_config(learning_policies)
-        except Exception as exc:
-            learning["failures"].append({"phase": "policy_config", "reason": str(exc)})
-        try:
-            learning_service = learning_service or configured_learning()
-        except Exception as exc:
-            learning["status"] = "unavailable"
-            learning["failures"].append({"phase": "initialization", "reason": str(exc)})
-        if learning_service is not None and policies["blend_policies"]:
-            try:
+            shadow_cutoff = _now(clock)
+            if shadow_cutoff < started:
+                raise ValueError("Runtime clock moved backward before shadow construction")
+            candidates = governance.blend_candidates(shadow_cutoff)
+            if candidates:
                 pinned = load_baseline(root / "baseline", pointer=pointer)
-                shadow_cutoff = _now(clock)
-                if shadow_cutoff < started:
-                    raise ValueError("Runtime clock moved backward before shadow construction")
                 background_learning = learning_service.background(
-                    pinned, policies["blend_policies"], analysis_cutoff=shadow_cutoff
+                    pinned, candidates, analysis_cutoff=shadow_cutoff
                 )
                 learning["overlays"] = background_learning["overlays"]
                 learning["failures"].extend(background_learning["failures"])
-                learning["analysis_cutoff"] = shadow_cutoff.isoformat()
                 if "measurements" in background_learning:
                     learning["measurements"] = background_learning["measurements"]
-            except Exception as exc:
-                learning["failures"].append({"phase": "candidate_background", "reason": str(exc)})
-        if learning["failures"] and learning["status"] != "unavailable":
+            learning["analysis_cutoff"] = shadow_cutoff.isoformat()
+            learning["registered_blend_candidates"] = len(candidates)
+        except Exception as exc:
+            learning["failures"].append({"phase": "candidate_background", "reason": str(exc)})
+        if learning["failures"]:
             learning["status"] = "partial"
         result["background"]["learning"] = learning
         phase = "configured_forecast"
@@ -216,8 +213,8 @@ def run_prospective_cycle(
             issue=True,
             issuer=issuer,
             learning_service=learning_service,
-            learning_policy_ids=policies["correction_policies"],
             learning_overlays=learning["overlays"],
+            governance=governance,
         )
         result.update(_public(forecast))
         result["status"] = (
@@ -339,18 +336,12 @@ def main(argv: list[str] | None = None) -> int:
         type=datetime.fromisoformat,
         help="Explicit covered hour for testing/replay/debugging only; normal runs need no date",
     )
-    parser.add_argument(
-        "--learning-policies",
-        type=Path,
-        help="Optional immutable correction/blend policy artifact references; empty by default",
-    )
     args = parser.parse_args(argv)
     try:
         result = run_prospective_cycle(
             args.config,
             args.root,
             replay_reference_time=args.replay_reference_time,
-            learning_policies=args.learning_policies,
         )
     except Exception as exc:
         print(f"Prospective cycle failed: {exc}", file=sys.stderr)

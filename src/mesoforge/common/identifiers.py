@@ -92,6 +92,12 @@ class RunId(_PrefixedUuidId):
     prefix = "run_"
 
 
+class GovernanceEventId(_PrefixedUuidId):
+    """Immutable policy-governance audit event: ``gev_<uuid4>``."""
+
+    prefix = "gev_"
+
+
 class Digest(str):
     """A content digest, exactly ``sha256:<64 lowercase hex>``."""
 

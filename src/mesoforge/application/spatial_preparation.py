@@ -81,6 +81,11 @@ class PreparedRegions:
             self, regions=[region.reference_view(reference_time) for region in self.regions]
         )
 
+    def with_policy_overrides(self, overrides: dict[str, Any]) -> PreparedRegions:
+        return replace(
+            self, regions=[region.with_policy_overrides(overrides) for region in self.regions]
+        )
+
     def _region_for(self, latitude: float, longitude: float) -> PreparedPointForecast:
         validate_coordinate(latitude, longitude)
         if (latitude, longitude) in self.failures:

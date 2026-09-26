@@ -168,6 +168,88 @@ def version_may_overlap(record: IssuedForecastRecord, window: IntervalDefinition
     return first < window.end and last >= window.start
 
 
+def refuse_ungoverned_issuance(uow: Any, latitude: float, longitude: float) -> None:
+    """Development/replay issuance carries no governed stage; never issue past ACTIVE policy.
+
+    Configured issuance pins governance through the baseline path. Any other path is
+    refused for a coordinate with an ACTIVE correction, or while any blend policy is
+    ACTIVE, and fails closed when the governed state cannot be read. With nothing
+    active (the default), behavior is unchanged.
+    """
+    from mesoforge.contracts.policy_governance import (
+        BLEND_POLICY,
+        GOVERNANCE_LOCK_TIMEOUT_SECONDS,
+        TEMPERATURE_CORRECTION,
+        GovernanceBlockedError,
+        correction_scope,
+        head_at,
+    )
+
+    governance = getattr(uow, "governance", None)
+    try:
+        if governance is None:
+            raise RuntimeError("issuance storage has no governance repository")
+        for family, keys in (
+            (TEMPERATURE_CORRECTION, (correction_scope(latitude, longitude),)),
+            (BLEND_POLICY, None),
+        ):
+            governance.lock(family, shared=True, timeout_seconds=GOVERNANCE_LOCK_TIMEOUT_SECONDS)
+            events = governance.events(family, keys)
+            for key in {row.scope_key for row in events}:
+                head = head_at([row for row in events if row.scope_key == key])
+                if head is not None and head.policy_artifact_id is not None:
+                    raise GovernanceBlockedError(
+                        "governed_policy_active_use_baseline_path",
+                        "A governed policy is ACTIVE; issue through forecast_from_baseline",
+                    )
+    except GovernanceBlockedError:
+        raise
+    except Exception as exc:
+        raise GovernanceBlockedError(
+            "governance_unavailable", "Governed state could not be read; nothing was issued"
+        ) from exc
+
+
+def refuse_revoked_issuance(uow: Any, forecast: dict[str, Any]) -> None:
+    """Refuse a configured forecast whose pinned governed state was rolled back since.
+
+    Runs inside the issuance metadata transaction under the shared governance family
+    locks, which stay held until commit. A rollback committed before this check blocks
+    the issuance; a rollback recorded afterwards follows the issuance. Nothing is read
+    when the forecast pinned no chain head (the default, nothing active).
+    """
+    from mesoforge.contracts.policy_governance import (
+        GOVERNANCE_LOCK_TIMEOUT_SECONDS,
+        GovernanceBlockedError,
+        pinned_scopes,
+        rolled_back_after,
+    )
+
+    pinned = pinned_scopes(forecast)
+    if not pinned:
+        return
+    governance = getattr(uow, "governance", None)
+    try:
+        if governance is None:
+            raise RuntimeError("issuance storage has no governance repository")
+        for family in sorted({row[0] for row in pinned}):
+            governance.lock(family, shared=True, timeout_seconds=GOVERNANCE_LOCK_TIMEOUT_SECONDS)
+            scopes = tuple(sorted({row[1] for row in pinned if row[0] == family}))
+            events = governance.events(family, scopes)
+            for pinned_family, scope_key, scope_seq in pinned:
+                if pinned_family == family and rolled_back_after(events, scope_key, scope_seq):
+                    raise GovernanceBlockedError(
+                        "policy_rolled_back_before_issuance",
+                        "A governed policy this forecast pinned was rolled back before issuance",
+                    )
+    except GovernanceBlockedError:
+        raise
+    except Exception as exc:
+        raise GovernanceBlockedError(
+            "governance_unavailable", "Governed state could not be read; nothing was issued"
+        ) from exc
+
+
 class ForecastIssuanceService:
     """Store verified forecast bytes first, then publish one metadata transaction."""
 
@@ -236,6 +318,10 @@ class ForecastIssuanceService:
         if self._objects.get_verified(stored.storage_uri, digest) != payload:
             raise IntegrityError("Stored issued forecast differs from the serialized forecast")
         with self._uow_factory() as uow:
+            if "baseline_snapshot" not in forecast:
+                refuse_ungoverned_issuance(uow, forecast["latitude"], forecast["longitude"])
+            else:
+                refuse_revoked_issuance(uow, forecast)
             uow.stored_objects.add_if_absent(stored)
             uow.issued_forecasts.add(record)
             uow.commit()

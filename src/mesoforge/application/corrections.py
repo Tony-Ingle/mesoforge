@@ -1,7 +1,9 @@
 """Compact temperature-correction policies and local transformations, never promotion.
 
-Site evidence determines candidate eligibility only. A configured immutable policy
-must explicitly be shadow or active before execution. Native contributors and the
+Site evidence determines candidate eligibility only. An immutable candidate payload
+executes only under an explicit governance grant derived from a committed governance
+event (operational for the ACTIVE policy, shadow for a registered candidate); the
+payload's own lifecycle role never grants execution. Native contributors and the
 shared baseline stay unchanged; only affected local fields are copied.
 """
 
@@ -13,6 +15,7 @@ from typing import Any, Literal
 
 from mesoforge.application.local_surface_grid import extract_grid_point
 from mesoforge.common.identifiers import LearningPolicyId
+from mesoforge.contracts.policy_governance import GovernanceGrant
 from mesoforge.contracts.serialization import canonical_json_digest
 from mesoforge.forecasting.coherence import BASELINE_COHERENCE, DEW_POINT, RH, TEMPERATURE
 from mesoforge.verification.model_comparison import LEAD_BUCKETS, lead_bucket
@@ -180,8 +183,6 @@ def _validate(policy: dict[str, Any], forecast: dict[str, Any], cutoff: datetime
         raise ValueError("Correction policy belongs to another configured coordinate")
     if _time(policy["created_at"]) > cutoff:
         raise ValueError("Correction policy was created after analysis")
-    if policy["lifecycle_role"] in ("shadow", "active") and _time(policy["activated_at"]) > cutoff:
-        raise ValueError("Correction activation is after the forecast cutoff")
 
 
 def apply_temperature_correction(
@@ -190,12 +191,15 @@ def apply_temperature_correction(
     *,
     analysis_cutoff: datetime,
     mode: Literal["operational", "shadow"] = "operational",
+    grant: GovernanceGrant | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Apply one explicit policy atomically, or retain the exact uncorrected input.
 
-    The returned compact overlay owns only affected fields and references its
-    policy/parent. The caller persists common variant identity and renders the
-    returned forecast if changed. Failed transformations never escape partially.
+    Execution requires a candidate payload and a governance grant for this mode whose
+    effective time lies between the policy's creation and the analysis cutoff. Legacy
+    payloads carrying shadow/active/retired roles remain readable history and never
+    execute. The returned compact overlay owns only affected fields and references its
+    policy/parent. Failed transformations never escape partially.
     """
     if mode not in ("operational", "shadow"):
         raise ValueError("Correction execution requires operational or shadow mode")
@@ -212,7 +216,9 @@ def apply_temperature_correction(
     if policy is None:
         return forecast, outcome
     outcome["policy"] = {
-        key: policy.get(key) for key in ("policy_id", "version", "digest", "lifecycle_role")
+        **{key: policy.get(key) for key in ("policy_id", "version", "digest", "lifecycle_role")},
+        "governed_role": grant.role if grant is not None else None,
+        "grant_event_id": str(grant.event_id) if grant is not None else None,
     }
     try:
         _validate(policy, forecast, cutoff)
@@ -221,7 +227,12 @@ def apply_temperature_correction(
             key: {"status": row["status"], "delta_k": row["delta_k"]}
             for key, row in policy["lead_buckets"].items()
         }
-        permitted = role == ("active" if mode == "operational" else "shadow")
+        permitted = (
+            role == "candidate"
+            and grant is not None
+            and grant.role == mode
+            and _time(policy["created_at"]) <= _time(grant.effective_from) <= cutoff
+        )
         if not permitted:
             outcome["status"] = (
                 role if role in ("insufficient_evidence", "retired") else "not_active"

@@ -301,22 +301,10 @@ def _comparison(rows: Sequence[Mapping[str, Any]], key: str) -> dict[str, Any]:
     }
 
 
-def evaluate_variants(
-    field: str,
-    control_analysis: Mapping[str, Any],
-    variants: Sequence[Mapping[str, Any]],
-    *,
-    ancestor_stages: Sequence[Mapping[str, Any]] = (),
-) -> dict[str, Any]:
-    """Compare policy series on one common cohort of canonical control observations.
-
-    A policy series may contain immutable stages for multiple decisions/locations.
-    Values are inherited only with an explicit sparse-overlay declaration. Callers
-    must resolve control issuance IDs from authoritative immutable lineage. No
-    forecast or observation is recalculated here, including when a stage is AI-named.
-    """
-    if field not in (TEMPERATURE, QPF):
-        raise ValueError("Only temperature and exact hourly QPF have metric contracts")
+def _controls(
+    field: str, control_analysis: Mapping[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Canonical control events; ambiguous or invalid evidence is excluded explicitly."""
     raw_samples = (
         control_analysis.get("samples", [])
         if field == TEMPERATURE
@@ -337,6 +325,26 @@ def evaluate_variants(
             exclusions.append({"event_id": event, "reason": "ambiguous_control_evidence"})
         else:
             controls.append(rows[0])
+    return controls, exclusions
+
+
+def evaluate_variants(
+    field: str,
+    control_analysis: Mapping[str, Any],
+    variants: Sequence[Mapping[str, Any]],
+    *,
+    ancestor_stages: Sequence[Mapping[str, Any]] = (),
+) -> dict[str, Any]:
+    """Compare policy series on one common cohort of canonical control observations.
+
+    A policy series may contain immutable stages for multiple decisions/locations.
+    Values are inherited only with an explicit sparse-overlay declaration. Callers
+    must resolve control issuance IDs from authoritative immutable lineage. No
+    forecast or observation is recalculated here, including when a stage is AI-named.
+    """
+    if field not in (TEMPERATURE, QPF):
+        raise ValueError("Only temperature and exact hourly QPF have metric contracts")
+    controls, exclusions = _controls(field, control_analysis)
     series: dict[str, dict[str, Any]] = {}
     identities: dict[str, set[str]] = defaultdict(set)
     policy_identities: dict[tuple[str, str], set[str]] = defaultdict(set)
@@ -478,3 +486,251 @@ def _location(row: Mapping[str, Any]) -> str:
     return canonical_json_bytes({key: row[key] for key in ("latitude", "longitude")}).decode(
         "utf-8"
     )
+
+
+PAIR_SCHEMA = "mesoforge.pairwise-cohort.v1"
+
+
+def _stage_value(
+    stages: Sequence[Mapping[str, Any]],
+    row: Mapping[str, Any],
+    parents: Mapping[str, Mapping[str, Any]],
+    missing: str,
+) -> tuple[float | None, str | None]:
+    if not stages:
+        return None, missing
+    predictions = [_prediction(stage, row, parents) for stage in stages]
+    reasons = sorted({reason for _, reason in predictions if reason})
+    values = {value for value, reason in predictions if reason is None}
+    if reasons:
+        return None, ";".join(reasons)
+    if len(values) != 1:
+        return None, "conflicting_variant_stages"
+    return next(iter(values)), None
+
+
+def _pair_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    candidate = _metrics([{**r, "value": r["candidate_value"]} for r in rows], "value")
+    reference = _metrics([{**r, "value": r["reference_value"]} for r in rows], "value")
+    return {
+        "sample_count": len(rows),
+        "candidate": candidate,
+        "reference": reference,
+        "deltas_candidate_minus_reference": {
+            metric: candidate[metric] - reference[metric] if rows else None
+            for metric in ("bias", "mae", "rmse")
+        },
+    }
+
+
+def paired_date_intervals(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Date-clustered 95% intervals of paired |e| and e^2 differences; reporting only."""
+    from mesoforge.verification.site_analysis import _mean_bias_uncertainty
+
+    absolute: dict[str, list[float]] = defaultdict(list)
+    squared: dict[str, list[float]] = defaultdict(list)
+    for row in rows:
+        date = row["reference_time"][:10]
+        candidate = row["candidate_value"] - row["observed_value"]
+        reference = row["reference_value"] - row["observed_value"]
+        absolute[date].append(abs(candidate) - abs(reference))
+        squared[date].append(candidate * candidate - reference * reference)
+    return {
+        "status": "reported_only_not_a_gate",
+        "method": "decision_date_means_student_t_95 (same method as the bias evidence policy)",
+        "absolute_error_difference": _mean_bias_uncertainty(absolute),
+        "squared_error_difference": _mean_bias_uncertainty(squared),
+    }
+
+
+def evaluate_pair(
+    field: str,
+    control_analysis: Mapping[str, Any],
+    candidate_stages: Sequence[Mapping[str, Any]],
+    reference_stages: Sequence[Mapping[str, Any]] | None,
+    *,
+    ancestors: Sequence[Mapping[str, Any]] = (),
+    decision_window: tuple[datetime, datetime] | None = None,
+    in_sample_until: datetime | None = None,
+    excluded_decision_intervals: Sequence[tuple[datetime, datetime | None, str]] = (),
+    lead_range: tuple[int, int] | None = None,
+) -> dict[str, Any]:
+    """Exactly two series on their own identical-sample cohort.
+
+    ``reference_stages`` is the comparison series (for example the raw CONTROL stages);
+    ``None`` compares each candidate stage with its own exact parent stage (the AI desk
+    against its deterministic corrected parent). Other bound stages are ancestors only,
+    so a sparse unrelated series never shrinks this cohort. Metrics are candidate minus
+    reference on the same rows, never relative to the issued value. Decision times come
+    from the retained stages. Rows outside the decision window or the candidate's lead
+    scope are reported separately and are not exclusions.
+    """
+    if field not in (TEMPERATURE, QPF):
+        raise ValueError("Only temperature and exact hourly QPF have metric contracts")
+    controls, control_exclusions = _controls(field, control_analysis)
+    parents = {str(stage.get("variant_id")): stage for stage in ancestors}
+    for stage in (*candidate_stages, *(reference_stages or ())):
+        parents[str(stage.get("variant_id"))] = stage
+    window = (
+        (_time(decision_window[0]), _time(decision_window[1]))
+        if decision_window is not None
+        else None
+    )
+    in_sample = _time(in_sample_until) if in_sample_until is not None else None
+    intervals = [
+        (_time(start), _time(end) if end is not None else None, reason)
+        for start, end, reason in excluded_decision_intervals
+    ]
+    common: list[dict[str, Any]] = []
+    excluded: dict[str, list[str]] = defaultdict(list)
+    outside: list[str] = []
+    not_applicable: list[str] = []
+    for row in controls:
+        sample = row["sample_id"]
+        if lead_range is not None and not lead_range[0] <= row["lead_hours"] <= lead_range[1]:
+            not_applicable.append(sample)
+            continue
+        candidates = [stage for stage in candidate_stages if _matches(stage, row)]
+        if reference_stages is None:
+            references = [
+                parents[str(stage.get("parent_stage_id"))]
+                for stage in candidates
+                if str(stage.get("parent_stage_id")) in parents
+            ]
+            timed = candidates
+        else:
+            references = [stage for stage in reference_stages if _matches(stage, row)]
+            timed = references
+        try:
+            decisions = {_time(stage["analysis_cutoff"]) for stage in timed}
+        except (KeyError, TypeError, ValueError):
+            decisions = set()
+        if len(decisions) != 1:
+            side = "candidate" if reference_stages is None else "reference"
+            excluded[
+                f"{side}_not_bound_to_control_event" if not decisions else "ambiguous_decision_time"
+            ].append(sample)
+            continue
+        decision = next(iter(decisions))
+        if window is not None and not window[0] <= decision <= window[1]:
+            outside.append(sample)
+            continue
+        interval_reason = next(
+            (
+                reason
+                for start, end, reason in intervals
+                if start <= decision and (end is None or decision < end)
+            ),
+            None,
+        )
+        if interval_reason is not None:
+            excluded[interval_reason].append(sample)
+            continue
+        if in_sample is not None and _time(row["valid_time"]) <= in_sample:
+            excluded["in_sample_valid_time"].append(sample)
+            continue
+        candidate, reason = _stage_value(
+            candidates, row, parents, "candidate_not_bound_to_control_event"
+        )
+        if reason:
+            excluded[f"candidate:{reason}"].append(sample)
+            continue
+        reference, reason = _stage_value(
+            references, row, parents, "reference_not_bound_to_control_event"
+        )
+        if reason:
+            excluded[f"reference:{reason}"].append(sample)
+            continue
+        common.append(
+            {
+                **{
+                    k: v
+                    for k, v in row.items()
+                    if k not in ("quality_support", "baseline_snapshot")
+                },
+                "decision_time": _iso(decision),
+                "candidate_value": candidate,
+                "reference_value": reference,
+                "candidate_stage_ids": sorted({str(s["variant_id"]) for s in candidates}),
+                "reference_stage_ids": sorted({str(s["variant_id"]) for s in references}),
+            }
+        )
+    common.sort(key=lambda r: r["sample_id"])
+    exclusions = {reason: sorted(ids) for reason, ids in sorted(excluded.items())}
+    identity = {
+        "field": field,
+        "rows": [
+            [
+                r["sample_id"],
+                r["candidate_value"],
+                r["reference_value"],
+                r["candidate_stage_ids"],
+                r["reference_stage_ids"],
+            ]
+            for r in common
+        ],
+        "exclusions": exclusions,
+        "control_exclusions": sorted(
+            str(e.get("event_id", e["reason"])) for e in control_exclusions
+        ),
+    }
+    total = len(common) + sum(len(ids) for ids in exclusions.values())
+    if field == QPF:
+        wet: dict[str, Any] = {
+            "status": "observed_amount_composition",
+            "threshold": "none: exact amount greater than zero versus exactly zero",
+            "observed_positive_gt_0mm": sum(r["observed_value"] > 0 for r in common),
+            "observed_zero": sum(r["observed_value"] == 0 for r in common),
+            "candidate_forecast_positive_gt_0mm": sum(r["candidate_value"] > 0 for r in common),
+            "reference_forecast_positive_gt_0mm": sum(r["reference_value"] > 0 for r in common),
+        }
+    else:
+        wet = {
+            "status": "not_available",
+            "reason": "no_approved_observed_precipitation_join_for_temperature_samples",
+        }
+    decision_dates = sorted({r["reference_time"][:10] for r in common})
+    return {
+        "schema_version": PAIR_SCHEMA,
+        "field": field,
+        "unit": "K" if field == TEMPERATURE else "mm",
+        "reference_series": "exact_parent_stage" if reference_stages is None else "series",
+        "cohort_digest": _digest(identity),
+        "total_samples": total,
+        "common_samples": len(common),
+        "excluded_samples": total - len(common),
+        "exclusions_by_reason": {reason: len(ids) for reason, ids in exclusions.items()},
+        "excluded_sample_ids": exclusions,
+        "control_exclusions": len(control_exclusions),
+        "outside_decision_eligibility_window": len(outside),
+        "not_applicable_outside_candidate_scope": len(not_applicable),
+        "common_sample_ids": [r["sample_id"] for r in common],
+        "composition": {
+            "distinct_utc_decision_dates": len(decision_dates),
+            "independence_claim": False,
+            "decision_dates_utc": decision_dates,
+            "valid_dates_utc": dict(sorted(Counter(r["valid_time"][:10] for r in common).items())),
+            "lead_buckets": {
+                bucket: sum(r["lead_bucket"] == bucket for r in common) for bucket in LEAD_BUCKETS
+            },
+            "locations": dict(sorted(Counter(_location(r) for r in common).items())),
+            "observation_sources": dict(
+                sorted(Counter(r["observation_source"] for r in common).items())
+            ),
+            "verification_policies": dict(
+                sorted(Counter(r["verification_policy_id"] for r in common).items())
+            ),
+            "wet_non_wet": wet,
+        },
+        "by_lead_bucket": {
+            bucket: _pair_metrics([r for r in common if r["lead_bucket"] == bucket])
+            for bucket in LEAD_BUCKETS
+        },
+        "overall": {
+            **_pair_metrics(common),
+            "status": "descriptive_only",
+            "note": "identical-sample aggregate differences across lead buckets",
+        },
+        "rows": common,
+        "writes": 0,
+    }

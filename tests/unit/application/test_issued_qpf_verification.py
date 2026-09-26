@@ -79,11 +79,17 @@ def case(monkeypatch):
         raw,
     )
 
-    def find(self, *, latitude, longitude, start_valid_time, end_valid_time, limit):
+    def find(
+        self, *, latitude, longitude, start_valid_time, end_valid_time, limit, available_by=None
+    ):
         return tuple(
             m
             for m in factory.artifacts.values()
             if m.artifact_type == "issued-qpf-verification"
+            and (
+                available_by is None
+                or max(m.registered_at, m.availability.available_at) <= available_by
+            )
             and m.attributes["latitude"] == latitude
             and m.attributes["longitude"] == longitude
             and start_valid_time
@@ -213,3 +219,36 @@ def test_future_cutoff_rejected_before_persistence(case):
     assert not any(
         m.artifact_type == "issued-qpf-verification" for m in case.factory.artifacts.values()
     )
+
+
+def test_as_of_filters_facts_before_canonicalization_and_counts_at_the_cutoff(case):
+    from datetime import UTC, datetime
+
+    kwargs = dict(
+        latitude=LAT,
+        longitude=LON,
+        start_valid_time=VALID,
+        end_valid_time=VALID + timedelta(hours=2),
+        stages=("baseline", "final_issued"),
+    )
+    case.service.verify_window(**kwargs, extraction_ids=[case.extraction.artifact_id] * 2)
+    unfiltered = case.service.analyze_window(**kwargs)
+    # Facts were registered after CUTOFF: an evaluation as of CUTOFF cannot see them,
+    # and they are filtered in the query itself, so they can never truncate it either.
+    early = case.service.analyze_window(**kwargs, as_of=CUTOFF, limit=1)
+    assert early["evidence_cutoff"] == CUTOFF.isoformat()
+    assert early["canonicalization"]["samples"] == []
+    with pytest.raises(ValueError, match="Too many"):
+        case.service.analyze_window(**kwargs, limit=1)
+    later = datetime.now(UTC)
+    replay = case.service.analyze_window(**kwargs, as_of=later)
+    assert replay["evidence_cutoff_exclusions"] == {}
+    assert replay["canonicalization"] == unfiltered["canonicalization"]
+    # Opportunities are counted at the explicit cutoff, not the service clock.
+    case.service.clock = Mock(side_effect=AssertionError("as_of analysis read the clock"))
+    assert (
+        case.service.analyze_window(**kwargs, as_of=later)["eligible_issued_stage_opportunities"]
+        == (replay["eligible_issued_stage_opportunities"])
+    )
+    with pytest.raises(ValueError, match="timezone"):
+        case.service.analyze_window(**kwargs, as_of=later.replace(tzinfo=None))

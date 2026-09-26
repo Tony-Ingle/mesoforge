@@ -17,6 +17,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     SmallInteger,
+    Text,
     UniqueConstraint,
     func,
 )
@@ -266,3 +267,126 @@ class RunSelectedInputRow(Base):
     )
 
     run: Mapped[RunRow] = relationship(back_populates="selected_input_rows")
+
+
+_GOVERNANCE_CHAIN = "('ACTIVATED', 'ROLLED_BACK', 'EMERGENCY_ROLLED_BACK')"
+
+
+class GovernanceEventRow(Base):
+    """Append-only policy-governance event; migration 0005 owns the insert trigger."""
+
+    __tablename__ = "governance_events"
+    __table_args__ = (
+        CheckConstraint(
+            "schema_version = 'mesoforge.policy-governance-event.v1'",
+            name="ck_governance_events_schema_version",
+        ),
+        CheckConstraint(
+            "family IN ('temperature_correction', 'blend_policy', 'ai_desk_policy')",
+            name="ck_governance_events_family",
+        ),
+        CheckConstraint(
+            "event_type IN ('REGISTERED', 'ELIGIBILITY_EVALUATED', 'ACTIVATED', "
+            "'ROLLED_BACK', 'EMERGENCY_ROLLED_BACK', 'RETIRED')",
+            name="ck_governance_events_event_type",
+        ),
+        CheckConstraint("scope_seq >= 1", name="ck_governance_events_scope_seq"),
+        CheckConstraint(
+            "char_length(scope_key) BETWEEN 2 AND 512", name="ck_governance_events_scope_key"
+        ),
+        CheckConstraint(
+            "(policy_artifact_id IS NULL) = (policy_content_digest IS NULL)",
+            name="ck_governance_events_policy_identity",
+        ),
+        CheckConstraint(
+            "policy_artifact_id IS NOT NULL OR event_type IN ('ROLLED_BACK', "
+            "'EMERGENCY_ROLLED_BACK')",
+            name="ck_governance_events_policy_required",
+        ),
+        CheckConstraint(
+            f"previous_head_event_id IS NULL OR event_type IN {_GOVERNANCE_CHAIN}",
+            name="ck_governance_events_previous_head",
+        ),
+        CheckConstraint(
+            "(rolled_back_event_id IS NOT NULL) = "
+            "(event_type IN ('ROLLED_BACK', 'EMERGENCY_ROLLED_BACK'))",
+            name="ck_governance_events_rolled_back",
+        ),
+        CheckConstraint(
+            "decision IS NULL OR decision IN ('eligible', 'not_eligible')",
+            name="ck_governance_events_decision",
+        ),
+        CheckConstraint(
+            "(event_type = 'ELIGIBILITY_EVALUATED') = (decision IS NOT NULL) AND "
+            "(event_type <> 'ELIGIBILITY_EVALUATED' OR (evaluation_artifact_id IS NOT NULL "
+            "AND information_cutoff IS NOT NULL)) AND "
+            "(evaluation_artifact_id IS NULL OR event_type IN "
+            "('ELIGIBILITY_EVALUATED', 'ACTIVATED')) AND "
+            "(event_type <> 'ACTIVATED' OR evaluation_artifact_id IS NOT NULL)",
+            name="ck_governance_events_evaluation",
+        ),
+        CheckConstraint(
+            "family <> 'ai_desk_policy' OR event_type IN ('REGISTERED', 'RETIRED')",
+            name="ck_governance_events_ai_desk",
+        ),
+        CheckConstraint("char_length(actor) BETWEEN 1 AND 200", name="ck_governance_events_actor"),
+        CheckConstraint(
+            "char_length(reason) BETWEEN 1 AND 2000", name="ck_governance_events_reason"
+        ),
+        CheckConstraint(
+            "char_length(code_revision) = 40", name="ck_governance_events_code_revision"
+        ),
+        CheckConstraint(
+            "payload IS NULL OR octet_length(payload::text) <= 32768",
+            name="ck_governance_events_payload_size",
+        ),
+        UniqueConstraint("family", "scope_key", "scope_seq", name="uq_governance_events_scope_seq"),
+        UniqueConstraint("request_key", name="uq_governance_events_request_key"),
+        Index(
+            "ix_governance_events_registered_policy",
+            "policy_artifact_id",
+            unique=True,
+            postgresql_where="event_type = 'REGISTERED'",
+        ),
+        Index(
+            "ix_governance_events_retired_policy",
+            "policy_artifact_id",
+            unique=True,
+            postgresql_where="event_type = 'RETIRED'",
+        ),
+        Index("ix_governance_events_scope_recorded", "family", "scope_key", "recorded_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    schema_version: Mapped[str] = mapped_column(nullable=False)
+    family: Mapped[str] = mapped_column(nullable=False)
+    scope_key: Mapped[str] = mapped_column(Text, nullable=False)
+    scope_seq: Mapped[int] = mapped_column(nullable=False)
+    event_type: Mapped[str] = mapped_column(nullable=False)
+    policy_artifact_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("artifacts.id"), nullable=True
+    )
+    policy_content_digest: Mapped[str | None] = mapped_column(nullable=True)
+    previous_head_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("governance_events.id"), nullable=True
+    )
+    rolled_back_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("governance_events.id"), nullable=True
+    )
+    evaluation_artifact_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("artifacts.id"), nullable=True
+    )
+    decision: Mapped[str | None] = mapped_column(nullable=True)
+    information_cutoff: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    governance_policy_version: Mapped[str] = mapped_column(nullable=False)
+    governance_policy_digest: Mapped[str] = mapped_column(nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    code_revision: Mapped[str] = mapped_column(nullable=False)
+    environment_digest: Mapped[str] = mapped_column(nullable=False)
+    request_key: Mapped[str] = mapped_column(nullable=False)
+    request_digest: Mapped[str] = mapped_column(nullable=False)
+    payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)

@@ -51,6 +51,7 @@ from mesoforge.application.spatial_coverage import (
     validate_coordinate,
 )
 from mesoforge.application.weather_transitions import validate_display_timezone
+from mesoforge.contracts.policy_governance import GovernanceBlockedError
 
 _ROOT = Path(__file__).resolve().parents[3]
 PROVENANCE_RULE = (
@@ -302,6 +303,9 @@ def _deliver_locations(
             if stage_processor is not None:
                 try:
                     forecast, row["learning"] = stage_processor(forecast)
+                except GovernanceBlockedError:
+                    # Governed state failed or was revoked: nothing issues for this row.
+                    raise
                 except Exception as exc:
                     # The complete pinned numerical baseline survives learning failure.
                     row["learning"] = {"status": "fallback", "reason": str(exc)}
@@ -309,6 +313,9 @@ def _deliver_locations(
             clock = time.perf_counter()
             forecast["hourly_report"] = build_hourly_report(forecast, display_timezone=zone)
             row["hourly_report_seconds"] = time.perf_counter() - clock
+        except GovernanceBlockedError as exc:
+            row.pop("learning", None)
+            row.update(status="error", error={"code": exc.code, "message": str(exc)})
         except UnsupportedCoordinateError as exc:
             row.update(
                 status="error", error={"code": "unsupported_coordinate", "message": str(exc)}
@@ -351,6 +358,8 @@ def _deliver_locations(
                                 forecast, batch_run_id=batch_run_id, location_index=index
                             )
                             row["issuance_seconds"] = time.perf_counter() - clock
+                except GovernanceBlockedError as exc:
+                    row.update(status="error", error={"code": exc.code, "message": str(exc)})
                 except Exception:
                     row.update(
                         status="error",

@@ -357,6 +357,13 @@ class PreparedPointForecast:
     # Set only on a reference view: the window the guidance was prepared for.
     _prepared_reference_time: np.datetime64 | None = None
     _prepared_horizons: tuple[int, ...] | None = None
+    # Governed ACTIVE blend policies resolved by the background baseline builder.
+    # Empty means the current Phase 2 defaults; never set by a location job.
+    _policy_overrides: dict[str, Any] = field(default_factory=dict)
+
+    def with_policy_overrides(self, overrides: dict[str, Any]) -> PreparedPointForecast:
+        """The same prepared guidance blended under explicit governed field policies."""
+        return replace(self, _policy_overrides=dict(overrides))
 
     @property
     def target_reference_time(self) -> np.datetime64:
@@ -700,7 +707,9 @@ class PreparedPointForecast:
             None,
         )
         engine = FieldBlendEngine(
-            contributors=self._configuration, phase2=self._surface_configuration
+            contributors=self._configuration,
+            phase2=self._surface_configuration,
+            policy_overrides=self._policy_overrides,
         )
         hours: list[dict[str, Any]] = []
         for horizon in self._horizons:

@@ -31,14 +31,18 @@ def operator(tmp_path, monkeypatch):
     issuer = Mock()
     issuer.find_versions.return_value = []
     learning = Mock()
+    governance = Mock()
+    governance.blend_candidates.return_value = []
     monkeypatch.setattr(cycle, "configured_learning", lambda: learning)
+    monkeypatch.setattr(cycle, "GovernanceService", lambda service: governance)
 
     def refresh(path, root):
         events.append(("refresh", load_locations(path)))
         return {"status": "published", "latest_complete": prepared}
 
-    def build(guidance, root, locations, *, prepared_pointer):
+    def build(guidance, root, locations, *, prepared_pointer, governance=None):
         assert prepared_pointer is prepared
+        assert governance is not None, "Configured builds always resolve blend governance"
         events.append(("build", locations))
         return {"status": "published", "pointer": pointer}
 
@@ -78,11 +82,12 @@ def operator(tmp_path, monkeypatch):
         events=events,
         pointer=pointer,
         learning=learning,
+        governance=governance,
     )
 
 
 def test_now_clock_resampled_after_background_and_reference_can_cross_hour(operator):
-    times = iter([START, AFTER])
+    times = iter([START, AFTER, AFTER])  # start, shadow cutoff, location request
     result = cycle.run_prospective_cycle(
         operator.config, operator.root, clock=lambda: next(times), issuer=operator.issuer
     )
@@ -92,7 +97,8 @@ def test_now_clock_resampled_after_background_and_reference_can_cross_hour(opera
     assert result["reference_time"] == "2031-11-02T07:00:00+00:00"
     assert operator.events[-1][1]["reference_time"] is None
     assert operator.events[-1][1]["learning_service"] is operator.learning
-    assert operator.events[-1][1]["learning_policy_ids"] == []
+    assert operator.events[-1][1]["governance"] is operator.governance
+    assert "learning_policy_ids" not in operator.events[-1][1]
     assert operator.events[-1][1]["learning_overlays"] == []
     operator.learning.background.assert_not_called()
     assert result["status"] == "completed"
@@ -240,28 +246,24 @@ def test_scheduler_cli_requires_no_date_or_interactive_input(monkeypatch, tmp_pa
     monkeypatch.setattr(cycle, "run_prospective_cycle", run)
     assert cycle.main(["--root", str(tmp_path)]) == 0
     assert run.call_args.args == (cycle.DEFAULT_CONFIG, tmp_path)
-    assert run.call_args.kwargs == {"replay_reference_time": None, "learning_policies": None}
+    assert run.call_args.kwargs == {"replay_reference_time": None}
     assert "Cycle result: completed" in capsys.readouterr().out
 
 
 def test_candidate_background_finishes_before_location_cutoff_and_pins_active_parent(
-    operator, monkeypatch, tmp_path
+    operator, monkeypatch
 ):
-    blend_id = "art_10000000-0000-4000-8000-000000000001"
-    correction_id = "art_10000000-0000-4000-8000-000000000002"
-    policies = tmp_path / "policies.json"
-    policies.write_text(
-        json.dumps({"blend_policies": [blend_id], "correction_policies": [correction_id]})
-    )
+    candidate = SimpleNamespace(policy_artifact_id="art_10000000-0000-4000-8000-000000000001")
+    operator.governance.blend_candidates.return_value = [candidate]
     pinned = object()
 
     def pin(root, *, pointer):
         assert pointer is operator.pointer
         return pinned
 
-    def background(actual, identifiers, *, analysis_cutoff):
+    def background(actual, candidates, *, analysis_cutoff):
         assert actual is pinned
-        assert identifiers == [blend_id]
+        assert candidates == [candidate]
         assert analysis_cutoff == AFTER
         operator.events.append(("shadow_background", analysis_cutoff))
         return {"overlays": [{"artifact_id": "retained-shadow"}], "failures": []}
@@ -275,7 +277,6 @@ def test_candidate_background_finishes_before_location_cutoff_and_pins_active_pa
         operator.root,
         clock=lambda: next(clock),
         issuer=operator.issuer,
-        learning_policies=policies,
         learning_service=operator.learning,
     )
     assert result["status"] == "completed"
@@ -285,41 +286,43 @@ def test_candidate_background_finishes_before_location_cutoff_and_pins_active_pa
         "shadow_background",
         "forecast",
     ]
+    operator.governance.blend_candidates.assert_called_once_with(AFTER)
     kwargs = operator.events[-1][1]
     assert kwargs["baseline_pointer"] is operator.pointer
     assert kwargs["request_time"] == finished
-    assert kwargs["learning_policy_ids"] == [correction_id]
     assert kwargs["learning_overlays"] == [{"artifact_id": "retained-shadow"}]
     assert result["background"]["learning"]["status"] == "ready"
 
 
-@pytest.mark.parametrize("failure", ["policy_config", "initialization", "candidate_background"])
-def test_learning_failure_never_blocks_active_location_batch(
-    operator, monkeypatch, tmp_path, failure
+@pytest.mark.parametrize("failure", ["initialization", "governance_unavailable"])
+def test_unprovable_governance_stops_the_cycle_before_background_or_issuance(
+    operator, monkeypatch, failure
 ):
-    policies = tmp_path / "policies.json"
-    policies.write_text(
-        json.dumps({"blend_policies": ["art_10000000-0000-4000-8000-000000000001"]})
-    )
-    if failure == "policy_config":
-        policies.write_text("not-json")
-    elif failure == "initialization":
+    if failure == "initialization":
         monkeypatch.setattr(
             cycle, "configured_learning", Mock(side_effect=OSError("learning offline"))
         )
     else:
-        monkeypatch.setattr(cycle, "load_baseline", lambda *args, **kwargs: object())
-        operator.learning.background.side_effect = OSError("candidate storage failed")
+        operator.governance.status.side_effect = RuntimeError("governance store unreachable")
     result = cycle.run_prospective_cycle(
-        operator.config,
-        operator.root,
-        clock=lambda: START,
-        issuer=operator.issuer,
-        learning_policies=policies,
+        operator.config, operator.root, clock=lambda: START, issuer=operator.issuer
+    )
+    assert result["status"] == "failed"
+    assert result["failed_phase"] == "governance_resolution"
+    assert operator.events == []
+    assert all(row["issuance_outcome"] == "not_issued" for row in result["results"])
+
+
+def test_candidate_background_failure_never_blocks_active_location_batch(operator, monkeypatch):
+    operator.governance.blend_candidates.return_value = [SimpleNamespace()]
+    monkeypatch.setattr(cycle, "load_baseline", lambda *args, **kwargs: object())
+    operator.learning.background.side_effect = OSError("candidate storage failed")
+    result = cycle.run_prospective_cycle(
+        operator.config, operator.root, clock=lambda: START, issuer=operator.issuer
     )
     assert result["status"] == "completed"
     assert [row["issuance_outcome"] for row in result["results"]] == ["issued", "issued"]
-    assert result["background"]["learning"]["failures"][0]["phase"] == failure
+    assert result["background"]["learning"]["failures"][0]["phase"] == "candidate_background"
     assert operator.events[-1][1]["baseline_pointer"] is operator.pointer
     assert operator.events[-1][1]["learning_overlays"] == []
 

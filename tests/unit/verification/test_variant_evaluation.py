@@ -10,7 +10,12 @@ import pytest
 
 from mesoforge.verification.qpf_analysis import analyze_qpf_facts
 from mesoforge.verification.site_analysis import analyze_facts
-from mesoforge.verification.variant_evaluation import QPF, TEMPERATURE, evaluate_variants
+from mesoforge.verification.variant_evaluation import (
+    QPF,
+    TEMPERATURE,
+    evaluate_pair,
+    evaluate_variants,
+)
 from tests.unit.verification.test_qpf_analysis import fact as qpf_fact
 from tests.unit.verification.test_site_analysis import fact as temperature_fact
 
@@ -382,3 +387,116 @@ def test_fallback_status_qpf_stage_rows_stay_in_the_shared_cohort() -> None:
     assert evaluate_variants(QPF, analysis, [variant])["exclusion_counts"] == {
         "variant_prediction_unavailable": 1
     }
+
+
+def _series(
+    samples: list[dict[str, Any]], values: list[float], field: str, name: str, **overrides: Any
+) -> dict[str, Any]:
+    """One stage per issuance carrying every valid time, as real stages do."""
+    return stage(
+        samples[0],
+        field,
+        variant_id=name,
+        **{
+            "overlay": {
+                "inherit_unchanged": False,
+                "predictions": [
+                    prediction(s, value, field) for s, value in zip(samples, values, strict=True)
+                ],
+            },
+            **overrides,
+        },
+    )
+
+
+def _raw(samples: list[dict[str, Any]], values: list[float], field: str, name: str):
+    return _series(
+        samples,
+        values,
+        field,
+        name,
+        transformation_type="active_baseline",
+        parent_stage_id=None,
+        evidence_required=False,
+        evidence_status="baseline",
+        policy={"id": "active-field-policies", "version": "1"},
+    )
+
+
+def test_pair_cohort_reports_qpf_wet_composition_and_candidate_lead_scope() -> None:
+    analysis = analyze_qpf_facts(
+        [
+            qpf_fact(artifact="a", horizon=1, forecast=2.0, observation=1.0),
+            qpf_fact(artifact="b", horizon=20, forecast=0.5, observation=0.0),
+        ]
+    )
+    samples = sorted(analysis["canonicalization"]["samples"], key=lambda s: s["lead_hours"])
+    reference = _raw(samples, [s["forecast"]["amount_mm"] for s in samples], QPF, "raw")
+    candidate = _series(
+        samples,
+        [1.0, 1.0],
+        QPF,
+        "candidate",
+        parent_stage_id="raw",
+        transformation_type="candidate_blend",
+    )
+    result = evaluate_pair(QPF, analysis, [candidate], [reference], lead_range=(1, 18))
+    assert result["not_applicable_outside_candidate_scope"] == 1
+    assert result["total_samples"] == result["common_samples"] == 1
+    wet = result["composition"]["wet_non_wet"]
+    assert wet["observed_positive_gt_0mm"] == 1 and wet["observed_zero"] == 0
+    assert wet["threshold"].startswith("none")
+    assert "0.254" not in str(result)
+    bucket = result["by_lead_bucket"]["1-6"]
+    assert bucket["candidate"]["mae"] == 0.0 and bucket["reference"]["mae"] == 1.0
+    assert bucket["deltas_candidate_minus_reference"]["mae"] == -1.0
+
+
+def test_pair_parent_mode_ignores_sparse_series_and_reports_exclusions_explicitly() -> None:
+    analysis = analyze_facts(
+        [
+            temperature_fact(artifact="one", forecast=297, observed=295),
+            temperature_fact(artifact="two", forecast=297, observed=295, horizon=2),
+        ]
+    )
+    samples = sorted(analysis["samples"], key=lambda s: s["horizon_hours"])
+    parent = _raw(samples, [296.0, 296.0], TEMPERATURE, "parent")
+    ai = _series(
+        samples,
+        [295.0, 295.0],
+        TEMPERATURE,
+        "ai",
+        parent_stage_id="parent",
+        transformation_type="ai_adjusted",
+    )
+    sparse = stage(samples[0], variant_id="sparse", parent_stage_id="parent")
+    plain = evaluate_pair(TEMPERATURE, analysis, [ai], None, ancestors=[parent])
+    with_sparse = evaluate_pair(TEMPERATURE, analysis, [ai], None, ancestors=[parent, sparse])
+    assert plain["reference_series"] == "exact_parent_stage"
+    assert plain["common_samples"] == with_sparse["common_samples"] == 2
+    assert plain["cohort_digest"] == with_sparse["cohort_digest"]
+    assert plain["overall"]["deltas_candidate_minus_reference"]["mae"] == -1.0
+    missing = evaluate_pair(TEMPERATURE, analysis, [], None, ancestors=[parent])
+    assert missing["total_samples"] == 2 and missing["common_samples"] == 0
+    assert missing["exclusions_by_reason"] == {"candidate_not_bound_to_control_event": 2}
+    decided = datetime.fromisoformat(samples[0]["target_reference_time"])
+    windowed = evaluate_pair(
+        TEMPERATURE,
+        analysis,
+        [ai],
+        None,
+        ancestors=[parent],
+        decision_window=(decided + timedelta(hours=1), decided + timedelta(hours=2)),
+    )
+    assert windowed["outside_decision_eligibility_window"] == 2
+    assert windowed["total_samples"] == 0
+    operational = evaluate_pair(
+        TEMPERATURE,
+        analysis,
+        [ai],
+        None,
+        ancestors=[parent],
+        excluded_decision_intervals=[(decided, None, "candidate_was_operational")],
+        in_sample_until=decided - timedelta(days=1),
+    )
+    assert operational["exclusions_by_reason"] == {"candidate_was_operational": 2}

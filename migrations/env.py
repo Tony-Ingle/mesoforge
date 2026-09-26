@@ -20,6 +20,7 @@ from mesoforge.storage.postgres.models import (  # noqa: F401 - registers tables
     ActivityRow,
     ArtifactRow,
     ConfigurationSnapshotRow,
+    GovernanceEventRow,
     GridRow,
     IssuedForecastRow,
     RunRow,

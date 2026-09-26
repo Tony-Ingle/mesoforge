@@ -37,6 +37,7 @@ reblend fields, rerun baseline coherence or download guidance.
 | QPF verification | Bounded automatic MRMS accumulation before issuance, exact-hour facts, canonical samples and paired scoring |
 | Prospective operator cycle | Current-clock discovery, background preparation/build, then one pinned baseline for configured issuance |
 | Learning stages | Explicit local temperature correction/no-op, immutable candidate policy data, background shadow overlays and one temperature/QPF variant evaluator |
+| Policy governance | Append-only lifecycle events; explicit register/evaluate/activate/rollback/retire; deterministic identical-sample eligibility; nothing is active by default |
 | AI forecast desk | Always attempted after correction; bounded structured provider actions, deterministic field edits, validated checkpoints and automatic fallback |
 
 ### Current numerical policies
@@ -66,11 +67,13 @@ new enforcement rules. Conditions do not promote evidence-only fields.
 ### What is not implemented
 
 There is no continuously hosted guidance/baseline worker, scheduler or VPS deployment.
-There is no promoted correction or candidate policy in the current configuration,
-delivery/email service, adaptive production weighting or calibrated multi-source
-precipitation blend. An explicit active temperature correction policy is required
-for the correction stage to change values. The operational AI desk may make bounded
-edits to this forecast; it cannot promote policies or change persistent blend science.
+No correction or blend policy has been activated, and there is no delivery/email
+service, adaptive production weighting or calibrated multi-source precipitation
+blend. Only an explicitly activated governed temperature correction changes values
+in the correction stage. No approved promotion rule exists for blend, QPF or AI
+policies, so those families are never eligible. The operational AI desk may make
+bounded edits to this forecast; it cannot promote policies or change persistent
+blend science.
 QPF accumulation runs on demand with configured issuance or explicit bounded
 backfill; it is not a continuous MRMS poller or archive mirror.
 
@@ -195,8 +198,11 @@ attempts prior temperature and QPF verification, then extracts and issues each
 forecast through the existing baseline path. Observation failures remain explicit
 and do not block issuance; a location failure does not stop later locations.
 Location jobs do not download guidance or rerun baseline blending/coherence. The
-local learning stage is a no-op without an explicit active correction; a changed
+local learning stage is a no-op without an ACTIVE governed correction; a changed
 temperature reruns only the existing affected T/Td/RH consistency/diagnostic rules.
+The governed state is read before any background work and once per batch at the
+request time; if it cannot be read, the cycle fails with
+`failed_phase: governance_resolution` and issues nothing.
 Every new configured forecast then attempts the bounded AI desk. Its latest fully
 validated state drives conditions, transitions, periods and immutable issuance.
 No justified edit, missing provider configuration, timeout or provider failure
@@ -266,6 +272,14 @@ coherence/derivations and temporary field policies, then saves complete configur
 domains/reference views and publishes `latest_baseline`. The default builds every
 covered reference hour; repeat `--reference-time ISO_UTC_HOUR` to select exact views.
 
+The build resolves ACTIVE governed blend policies once at its analysis cutoff and
+executes them only through `FieldBlendEngine` overrides; the manifest pins the
+resolved heads and full policy JSON in `blend_governance`. With none active (today)
+the fields and `field_policies` are unchanged. A governance read failure fails the
+build and retains the previous baseline. `--without-governance` is a development
+build recorded as `not_configured`: it cannot replace a governed `latest_baseline`,
+and configured issuance refuses it.
+
 A new contributor snapshot may publish even if its baseline build fails. In that
 case `latest_complete` advances while `latest_baseline` retains its previous good
 forecast. Retry the background build; do not treat the two pointers as interchangeable.
@@ -296,7 +310,17 @@ not stop later configured locations.
 
 With issuance enabled, a PostgreSQL advisory lock protects lookup/publication.
 A coordinate/reference hour already issued is skipped. `--reissue` explicitly saves
-another immutable version; it never overwrites the previous one. Baseline identity,
+another immutable version; it never overwrites the previous one.
+Issuance never proceeds under an unproven governed state. The batch status is
+`governance_unavailable` when governance cannot be read,
+`baseline_governance_unproven` when the pinned baseline lacks resolved blend
+governance (including baselines built before governance existed), and
+`baseline_governance_revoked` when a blend it pinned was rolled back. Each of these
+issues nothing, calls no provider and exits 2. Each location's issuance transaction
+re-checks, under the shared governance locks held until commit, that no correction or
+blend it pinned was rolled back since resolution; otherwise that location is refused
+with `policy_rolled_back_before_issuance` and the next cycle issues it under the
+restored state. Baseline identity,
 contributor-state lineage, source cycles and actual cutoffs travel with the forecast.
 
 Before taking the issuance lock, the pinned-baseline command independently attempts
@@ -523,32 +547,28 @@ uv run --locked python -m mesoforge.application.learning read --artifact-id ARTI
 uv run --locked python -m mesoforge.application.learning stage-issued --issued-forecast-id ISSUED_ID
 ```
 
-Build a configured shadow blend overlay from one retained active baseline,
-without acquiring guidance or changing its active fields:
+Storing a policy does not make it execute. An automatic proposal stays PROPOSED.
+Only a governance `register` event (below) makes a candidate shadow, and only an
+explicit `activate` event makes it operational. `learning stage-issued` never
+consults governance and binds only an unchanged no-op stage, so no policy is
+applied retroactively. The former `--learning-policies` JSON selector has been
+removed; payload lifecycle roles never select execution.
+
+Registered blend candidates build their overlays in the background of each
+prospective cycle. The explicit command accepts only candidates registered at the
+cutoff, without acquiring guidance or changing active fields:
 
 ```text
 uv run --locked python -m mesoforge.application.learning build-candidate --baseline-root BASELINE_ROOT --policy-id POLICY_ARTIFACT_ID
 ```
 
-Repeat `--policy-id` for separately registered shadow policies. This background
-command stores only affected fields/dependencies and parent references.
-
-`learning stage-issued` retains only no-op stages for historical replay; it cannot
-retroactively apply a correction. Optional `--learning-policies LEARNING_JSON` on
-`prospective_cycle` selects already registered correction artifacts. The
-prospective command also builds configured blend shadows on the background side.
-The configuration contains artifact IDs, not dates, geographic metadata or new
-inline science:
-
-```json
-{"correction_policies": [], "blend_policies": []}
-```
-
-An explicitly configured shadow cannot change active issuance. Candidates alone
-do not execute as shadows or become active. Policy evidence, creation, activation
-and storage availability must precede the applicable forecast analysis cutoff;
-today's newly learned policy cannot silently enter an earlier decision. Shadow
-failure is reported separately and does not block the active forecast.
+A shadow cannot change active issuance. Every governed correction shadow and blend
+projection attempt is recorded with the issuance binding (`stored`,
+`candidate_failed` or `storage_failed`), so a candidate is not judged only where it
+succeeded. Background overlay build failures are reported in the cycle result. Policy evidence, creation,
+registration/activation and storage availability must precede the applicable
+forecast analysis cutoff. A policy learned today cannot silently enter an earlier
+decision, and a shadow failure does not block the active forecast.
 
 Compare saved stages against the same canonical observation events:
 
@@ -565,6 +585,102 @@ contract; QPF requires the exact same MRMS hourly interval and revision. Missing
 variants exclude that event from the common comparison population. There is no
 overall winner score or automatic promotion. Operational AI stages use this same
 evaluator; no separate AI observation population or evaluation system exists.
+
+## Policy governance
+
+Persistent scientific behavior changes only through explicit, append-only
+governance events in PostgreSQL (`governance_events`). MesoForge learns, evaluates
+and determines eligibility automatically, but no forecast job, AI desk or provider
+can register, activate, roll back or retire a policy. Three families are governed:
+
+| Family | Scope | Lifecycle |
+| --- | --- | --- |
+| `temperature_correction` | Exact configured coordinate | register → evaluate → activate → rollback/emergency rollback → retire |
+| `blend_policy` | Field | Mechanism only: no approved blend/QPF promotion rule, so never eligible; temperature recipes never activate |
+| `ai_desk_policy` | Global | Explicitly recorded code-versioned desk versions; register/retire only, never eligible or activated |
+
+Commands are read-only by default and print JSON. Errors, including invalid
+arguments, print `{"error": {"code", "message"}}` to stderr and exit 2:
+
+```text
+uv run --locked python -m mesoforge.application.governance status [--family FAMILY]
+uv run --locked python -m mesoforge.application.governance candidates
+uv run --locked python -m mesoforge.application.governance history --policy-artifact-id POLICY_ID
+uv run --locked python -m mesoforge.application.governance resolve --family temperature_correction --lat LAT --lon LON --at ISO_UTC
+uv run --locked python -m mesoforge.application.governance evaluate --policy-artifact-id POLICY_ID --information-cutoff ISO_UTC
+uv run --locked python -m mesoforge.application.governance show-evaluation --evaluation-id EVALUATION_ID
+```
+
+State changes need exact IDs, an actor and a reason:
+
+```text
+uv run --locked python -m mesoforge.application.governance register --policy-artifact-id POLICY_ID --actor NAME --reason TEXT
+uv run --locked python -m mesoforge.application.governance evaluate --policy-artifact-id POLICY_ID --information-cutoff ISO_UTC --record --actor NAME --reason TEXT
+uv run --locked python -m mesoforge.application.governance activate --policy-artifact-id POLICY_ID --evaluation-id EVALUATION_ID --expected-head gev_...|genesis --actor NAME --reason TEXT
+uv run --locked python -m mesoforge.application.governance rollback --expected-head gev_... --target art_...|none --actor NAME --reason TEXT
+uv run --locked python -m mesoforge.application.governance emergency-rollback --expected-head gev_... --actor NAME --reason TEXT
+uv run --locked python -m mesoforge.application.governance retire --policy-artifact-id POLICY_ID --actor NAME --reason TEXT
+uv run --locked python -m mesoforge.application.governance register-desk-version --actor NAME --reason TEXT
+```
+
+Semantics:
+
+- **Time.** The database clock stamps every event after a transaction-scoped
+  per-family lock. Effective intervals are derived and half-open: a chain event
+  (activation or rollback) is in force from its `recorded_at` until the next one.
+  Readers take the shared lock and require the decision time to be no later than the
+  database clock, so a job at time T and a later `resolve --at T` agree exactly.
+  Every governed stage seals its `governance_resolution` (head event, sequence and
+  decision time), and issued history is never re-resolved.
+- **Evaluation.** `evaluate` requires an explicit information cutoff. It compares the
+  candidate's prospective shadow stages with the raw CONTROL stages on their own
+  identical canonical samples, decided after registration and at or before the
+  cutoff. It reports total, common and excluded samples (with reasons and IDs),
+  decision and valid dates, lead buckets, and wet/non-wet composition. For
+  temperature, wet/non-wet is reported as not available: no approved precipitation
+  join exists. Unrelated sparse series never shrink the cohort.
+- **Eligibility** (`mesoforge-governance-eligibility.v1`). For temperature corrections
+  every rule must hold:
+  - the candidate digest reproduces from its own evidence;
+  - every applied lead bucket meets the unchanged `mesoforge-bias-evidence-policy.v1`
+    (all criteria) on the prospective raw errors;
+  - MAE and RMSE are both strictly lower than CONTROL in every applied bucket;
+  - unapplied buckets are unchanged;
+  - no candidate-caused shadow failure occurred;
+  - no correction was ACTIVE at the cutoff.
+
+  The improvement is labelled descriptive, not a significance claim, and the paired
+  interval is reported only. A candidate cannot replace an active policy without an
+  audited rollback first. Every other family is `not_eligible` with
+  machine-readable reasons. The evaluation artifact is deterministic and clock-free.
+- **Activation** names the exact candidate and recorded eligible evaluation and the
+  expected current head event (`genesis` when nothing was ever active). The command
+  re-runs the evaluation at the same cutoff and refuses on:
+  - changed evidence;
+  - a stale rule, evidence policy or code identity;
+  - a changed head (compare-and-set on event IDs, safe against ABA);
+  - a retired or unregistered candidate.
+- **Rollback** is a new event: to `none` or to a previously active, non-retired policy.
+  **Emergency rollback** restores the policy the current activation superseded and
+  is refused when the head is itself a rollback. **Retirement** is refused for the
+  active policy, and a retired policy never shadows or activates again.
+- **Idempotency.** A request key excludes actor/reason; a retried identical request
+  returns the existing event, and a reused key with another actor/reason is refused.
+  PostgreSQL constraints and a trigger enforce contiguous per-scope sequences,
+  predecessor heads, registration/retirement rules and artifact availability even
+  for a writer that skips the service. No row is ever updated or deleted.
+- **Failure.** Configured issuance is refused when the governed state cannot be
+  proven (above). Development/replay issuance (`forecast_from_snapshot`,
+  `forward_run`, batch issuance) is refused for a coordinate with an ACTIVE
+  correction, or while any blend is ACTIVE, with
+  `governed_policy_active_use_baseline_path`.
+- **AI.** AI performance is compared against each AI stage's exact deterministic
+  corrected parent, per runtime series, labelled conditional on the retained AI
+  stage, over `[desk registration or --window-start, cutoff]`, with earlier issuances
+  counted. Promotion state never gates desk attempts; only an unprovable governed state
+  stops a configured job before any stage. The negative final review stays a
+  versioned desk behavior; changing it requires a desk-policy version bump and a new
+  explicit registration. Registered historical desk versions remain evaluable.
 
 ## Bounded operational AI forecast desk
 
@@ -679,8 +795,9 @@ evaluation. A following batch without a credential skipped the issued Minneapoli
 hour and issued Surley and Grasston through the explicit provider-unavailable
 fallback. This demonstrates runtime and lineage, not forecast skill.
 
-Governance, promotion and rollback remain future work. AI cannot alter its own
-rules, tool permissions, blend weights or correction policies.
+AI cannot alter its own rules, tool permissions, blend weights or correction
+policies, and has no governance tool. Its desk versions are only recorded explicitly
+and can never be activated or made eligible.
 
 ## Repository map and development checks
 
@@ -700,6 +817,8 @@ retained Phase 2 runners are development/replay/reference paths. `forward_run` s
 combines verification with inline acquisition/blending; it is not the normal
 baseline-consuming command. Historical paths remain readable but do not define the
 current configured-location architecture. Inspect `--help` before using these tools.
+They issue nothing while a governed policy is ACTIVE for the coordinate (or any blend
+is ACTIVE), and nothing when governance cannot be read.
 
 ### Offline checks
 
