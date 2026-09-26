@@ -26,6 +26,7 @@ from mesoforge.verification.model_comparison import (
     compare_hour,
     require_raw_temperature_control,
     summarize,
+    temperature_control_stage,
 )
 
 _JSON = CanonicalJsonSerializer()
@@ -217,7 +218,7 @@ def compare_verified(
             or match["forecast_code_identity"] != saved["code_identity"]
         ):
             raise IntegrityError("Verification does not describe the exact saved issued forecast")
-        require_raw_temperature_control(forecast.get("learning_stage"))
+        require_raw_temperature_control(temperature_control_stage(forecast))
         resolved, contributor_evidence = resolver.resolve(saved, hour)
         configuration = _configuration(forecast)
         ineligible_models = {
@@ -303,7 +304,7 @@ def compare_issued(
     saved = read_forecast(issued_forecast_id)
     if saved["issued_forecast_id"] != str(issued_forecast_id):
         raise IntegrityError("Readback returned a different issued forecast")
-    require_raw_temperature_control(saved["forecast"].get("learning_stage"))
+    require_raw_temperature_control(temperature_control_stage(saved["forecast"]))
     identity = comparison_identity()
     resolver = RetainedContributors(guidance_roots, identity)
     configuration = _configuration(saved["forecast"])

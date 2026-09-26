@@ -83,6 +83,11 @@ class LearningService:
                     "verification/site_analysis.py",
                     "verification/analytical_attributes.py",
                     "verification/model_comparison.py",
+                    "application/forecast_desk.py",
+                    "application/forecast_desk_context.py",
+                    "application/forecast_desk_provider.py",
+                    "contracts/forecast_desk.py",
+                    "forecasting/field_edit.py",
                 )
             },
         }
@@ -294,6 +299,10 @@ class LearningService:
         try:
             analysis = self.evidence(forecast["latitude"], forecast["longitude"], cutoff)
             report["evidence"] = analysis["correction_readiness"]
+            report["desk_evidence"] = {
+                key: analysis[key]
+                for key in ("coordinate", "evaluation", "evidence_policy", "correction_readiness")
+            }
             proposal = propose_temperature_policy(
                 analysis,
                 policy_id=LearningPolicyId("temperature-site-bias"),
@@ -478,6 +487,11 @@ class LearningService:
                         "native_unit": qpf["unit"],
                         "interval_start": qpf.get("interval_start"),
                         "interval_end": qpf.get("interval_end"),
+                        "interval_closure": qpf.get("interval_closure"),
+                        "temporal_semantics": qpf.get("temporal_semantics"),
+                        "policy": qpf.get("policy"),
+                        "missing_reasons": qpf.get("missing_reasons", []),
+                        "status": qpf.get("status"),
                     }
                 )
         return rows
@@ -497,9 +511,177 @@ class LearningService:
             ]
         return {
             "inherit_unchanged": True,
+            "inheritance_basis": "parent_stage",
             "predictions": predictions,
             "correction": outcome,
             "affected_fields": [TEMPERATURE, DEW_POINT, RH] if outcome.get("changes") else [],
+        }
+
+    def ai_stage(
+        self,
+        corrected: dict[str, Any],
+        final: dict[str, Any],
+        desk: dict[str, Any],
+        report: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Retain runtime AI through the shared stage store, before operational issuance.
+
+        No promotion or new policy registration occurs. A failed retention raises to
+        the caller, which must retain the complete corrected forecast instead.
+        """
+        parent = report["operational_stage"]
+        if parent["transformation_type"] != "deterministic_corrected":
+            raise ValueError("AI desk requires the deterministic corrected stage as parent")
+        parent_reference = report["operational_reference"]
+        lineage = corrected["baseline_snapshot"]
+        from mesoforge.forecasting.field_edit import (
+            grid_values_digest,
+            validate_edit_scope,
+            validate_grid,
+        )
+
+        pin = desk.get("pinned_evidence", {})
+        if not desk.get("usage", {}).get("validated_actions"):
+            raise ValueError("An AI stage requires at least one validated provider action")
+        if (
+            desk.get("validation", {}).get("status") != "valid"
+            or any(
+                pin.get(key) != lineage[key]
+                for key in ("baseline_snapshot_id", "prepared_snapshot_id")
+            )
+            or instant(pin.get("analysis_cutoff")) != instant(parent["analysis_cutoff"])
+            or pin.get("corrected_stage_id") != parent["variant_id"]
+            or pin.get("parent_grid_sha256") != corrected["local_grid"]["sha256"]
+            or any(
+                final[key] != corrected[key]
+                for key in ("latitude", "longitude", "target_reference_time", "baseline_snapshot")
+            )
+            or [h["valid_time"] for h in final["hours"]]
+            != [h["valid_time"] for h in corrected["hours"]]
+        ):
+            raise ValueError("AI stage evidence differs from its pinned corrected parent")
+        validate_grid(final["local_grid_baseline"])
+        grid = final["local_grid_baseline"]
+        if grid["geometry"] != corrected["local_grid_baseline"]["geometry"]:
+            raise ValueError("AI final grid cannot change the pinned geometry")
+        target = grid["geometry"]["point_target"]
+        center = [
+            cell
+            for cell in grid["cells"]
+            if (cell["x_index"], cell["y_index"]) == (target["x_index"], target["y_index"])
+        ]
+        if len(center) != 1 or final["hours"] != center[0]["hours"]:
+            raise ValueError("AI issued point must equal its saved grid center")
+        # Replayable lineage: checkpoint 0 is the corrected parent, each ordered recipe
+        # consumes the previous validated values, and the last output is the issued grid.
+        # The full-grid content digest was computed by the bounded final extraction of
+        # this same object; only its unchanged/changed relationship is rechecked here.
+        recipes = desk.get("accepted_recipes")
+        checkpoints = desk.get("checkpoints")
+        if not isinstance(recipes, list) or not isinstance(checkpoints, list):
+            raise ValueError("AI stage requires ordered recipes and validated checkpoints")
+        chain = [grid_values_digest(corrected["local_grid_baseline"])]
+        for recipe in recipes:
+            if recipe.get("input_values_sha256") != chain[-1]:
+                raise ValueError("AI recipes do not consume the previous validated checkpoint")
+            chain.append(recipe.get("output_values_sha256"))
+        if [checkpoint.get("values_digest") for checkpoint in checkpoints] != chain or chain[
+            -1
+        ] != grid_values_digest(grid):
+            raise ValueError("AI final grid differs from the latest validated checkpoint")
+        # Only recipe-selected editable cell-hours and their coherence dependents differ.
+        validate_edit_scope(corrected["local_grid_baseline"], grid, recipes)
+        unchanged = grid is corrected["local_grid_baseline"]
+        if unchanged != (not recipes) or (
+            (final["local_grid"]["sha256"] == corrected["local_grid"]["sha256"]) != unchanged
+        ):
+            raise ValueError("AI grid content differs from its retained content identity")
+        desk = {
+            **desk,
+            "point_values": [
+                {
+                    "valid_time": before["valid_time"],
+                    "corrected_temperature": before["temperature"],
+                    "final_temperature": after["temperature"],
+                    "applied_delta_k": (
+                        after["temperature"]["value"] - before["temperature"]["value"]
+                        if before["temperature"]["value"] is not None
+                        and after["temperature"]["value"] is not None
+                        else None
+                    ),
+                }
+                for before, after in zip(corrected["hours"], final["hours"], strict=True)
+            ],
+        }
+        from mesoforge.application.forecast_desk import desk_policy_identity, desk_summary
+
+        policy = desk_policy_identity(
+            provider=desk["provider"],
+            model=desk["model"],
+            reasoning_effort=desk.get("inference_settings", {}).get("reasoning_effort"),
+        )
+        stage = seal_variant(
+            {
+                "parent_stage_id": parent["variant_id"],
+                "transformation_type": "ai_adjusted",
+                "lifecycle_role": "active",
+                "fields": sorted({TEMPERATURE, QPF, *desk.get("affected_fields", [])}),
+                "affected_fields": desk.get("affected_fields", []),
+                "policy": policy,
+                "baseline_snapshot_id": lineage["baseline_snapshot_id"],
+                "prepared_snapshot_id": lineage["prepared_snapshot_id"],
+                "parent_grid_sha256": corrected["local_grid"]["sha256"],
+                "location": parent["location"],
+                "reference_time": parent["reference_time"],
+                "analysis_cutoff": parent["analysis_cutoff"],
+                "evidence_cutoff": parent["analysis_cutoff"],
+                "evidence_required": True,
+                "evidence_basis": "pinned_forecast_evidence",
+                "evidence_status": "pinned",
+                "policy_created_at": None,
+                "policy_activated_at": None,
+                "created_at": _iso(self.clock()),
+                "code_identity": self.identity,
+                "field_policies": lineage["field_policies"],
+                "context_digest": desk["context_digest"],
+                "pinned_evidence": {
+                    "baseline_snapshot_id": lineage["baseline_snapshot_id"],
+                    "prepared_snapshot_id": lineage["prepared_snapshot_id"],
+                    "analysis_cutoff": parent["analysis_cutoff"],
+                    "corrected_stage_id": parent["variant_id"],
+                },
+                "validation": desk["validation"],
+                "overlay": {
+                    "inherit_unchanged": False,
+                    "predictions": self._point_values(final),
+                    "desk": desk,
+                    "result_grid_sha256": final["local_grid"]["sha256"],
+                },
+            }
+        )
+        retained = self.save(
+            "forecast-variant",
+            stage,
+            inputs=(ArtifactId(parent_reference["artifact_id"]),),
+            attributes=self._attributes(stage),
+        )
+        # The shared variant seal normalizes tuples/datetimes to canonical JSON.
+        # Issuance and immediate readback must expose that exact same representation.
+        desk = stage["overlay"]["desk"]
+        report["corrected_stage"] = parent
+        report["corrected_reference"] = parent_reference
+        report["operational_stage"] = stage
+        report["operational_reference"] = self._reference(retained)
+        report["ai"] = desk
+        return {
+            **final,
+            "baseline_stage": report["control_stage"],
+            "baseline_stage_reference": report["control_reference"],
+            "deterministic_stage": parent,
+            "deterministic_reference": parent_reference,
+            "learning_stage": stage,
+            "learning_reference": report["operational_reference"],
+            "ai_desk": desk_summary(desk),
         }
 
     def bind(self, issued: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
@@ -511,12 +693,26 @@ class LearningService:
         operational = self.read(ArtifactId(report["operational_reference"]["artifact_id"]))[
             "payload"
         ]
+        corrected = (
+            self.read(ArtifactId(report["corrected_reference"]["artifact_id"]))["payload"]
+            if "corrected_reference" in report
+            else operational
+        )
         if (
             control["transformation_type"] != "active_baseline"
-            or operational["parent_stage_id"] != control["variant_id"]
+            or corrected["transformation_type"] != "deterministic_corrected"
+            or corrected["parent_stage_id"] != control["variant_id"]
+            or (
+                operational is not corrected
+                and (
+                    operational["transformation_type"] != "ai_adjusted"
+                    or operational["parent_stage_id"] != corrected["variant_id"]
+                )
+            )
             or operational["lifecycle_role"] != "active"
             or any(
-                operational[key] != control[key]
+                stage[key] != control[key]
+                for stage in (corrected, operational)
                 for key in (
                     "baseline_snapshot_id",
                     "prepared_snapshot_id",
@@ -538,7 +734,9 @@ class LearningService:
                 "Learning binding differs from its immutable issued decision/coordinate"
             )
         refs = [
-            report[key] for key in ("control_reference", "operational_reference") if key in report
+            report[key]
+            for key in ("control_reference", "corrected_reference", "operational_reference")
+            if key in report
         ]
         refs.extend(report.get("shadows", []))
         payload = {
@@ -764,7 +962,13 @@ class LearningService:
             value = self.read(ArtifactId(identifier))["payload"]
             validate_variant(value)
             variants.append({**value, "control_issued_forecast_ids": bindings.get(identifier, [])})
-        result = evaluate_variants(field, control, variants)
+        ancestors = []
+        if variant_ids is not None:
+            for identifier in sorted(set(bindings) - set(chosen)):
+                value = self.read(ArtifactId(identifier))["payload"]
+                validate_variant(value)
+                ancestors.append({**value, "control_issued_forecast_ids": bindings[identifier]})
+        result = evaluate_variants(field, control, variants, ancestor_stages=ancestors)
         return {
             **result,
             "analysis_seconds": time.perf_counter() - started,

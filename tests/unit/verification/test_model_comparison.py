@@ -402,3 +402,32 @@ def test_native_ifs_hour_and_missing_intermediate_hour_use_identical_pairs_for_e
             "unit": "K",
         }
     assert (native, intermediate) == original
+
+
+def test_ai_stage_without_temperature_edit_resolves_to_its_deterministic_parent() -> None:
+    from mesoforge.verification.model_comparison import (
+        is_raw_temperature_control,
+        temperature_control_stage,
+    )
+
+    corrected = {
+        "variant_id": "corrected",
+        "transformation_type": "deterministic_corrected",
+        "overlay": {"correction": {"status": "no_policy", "changes": []}, "predictions": []},
+    }
+    ai = {
+        "variant_id": "ai",
+        "parent_stage_id": "corrected",
+        "transformation_type": "ai_adjusted",
+        "affected_fields": ["liquid_equivalent_precipitation_amount_1h"],
+    }
+    forecast = {"learning_stage": ai, "deterministic_stage": corrected}
+    assert temperature_control_stage(forecast) is corrected
+    assert is_raw_temperature_control(temperature_control_stage(forecast))
+    edited = {**ai, "affected_fields": ["air_temperature_2m"]}
+    assert temperature_control_stage({**forecast, "learning_stage": edited}) is edited
+    assert not is_raw_temperature_control(edited)
+    # A missing or foreign parent never turns an AI stage into raw control.
+    assert temperature_control_stage({"learning_stage": ai}) is ai
+    other = {**corrected, "variant_id": "other"}
+    assert temperature_control_stage({**forecast, "deterministic_stage": other}) is ai

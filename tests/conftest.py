@@ -30,6 +30,36 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def no_paid_forecast_desk_in_tests(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """Ordinary suites never spend runtime-provider credentials inherited from an operator.
+
+    Operator desk settings (provider, model, pacing, budgets) and the provider
+    credential are removed so offline results never depend on the invoking shell.
+    The controller converts transport exceptions into a safe fallback, so an attempt
+    is also recorded and fails the test at teardown instead of passing silently.
+    """
+    if request.node.get_closest_marker("live") is not None:
+        yield
+        return
+    from mesoforge.application import forecast_desk_provider
+
+    for name in list(os.environ):
+        if name.startswith("MESOFORGE_AI_") or name == "OPENAI_API_KEY":
+            monkeypatch.delenv(name)
+    attempts: list[None] = []
+
+    def forbidden(*args: object, **kwargs: object) -> bytes:
+        attempts.append(None)
+        raise AssertionError("Live forecast-desk provider transport is disabled in offline tests")
+
+    monkeypatch.setattr(forecast_desk_provider, "_post", forbidden)
+    yield
+    assert not attempts, "An offline test reached the live forecast-desk provider transport"
+
+
 @pytest.fixture(scope="session")
 def postgres_dsn() -> Iterator[str]:
     """Yield a psycopg3 DSN for a real PostgreSQL instance.

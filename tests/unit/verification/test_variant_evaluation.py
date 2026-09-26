@@ -88,6 +88,78 @@ def test_noop_reuses_control_and_cannot_inflate_canonical_samples() -> None:
     assert evaluate_variants(TEMPERATURE, analysis, [variant, deepcopy(variant)]) == result
 
 
+@pytest.mark.parametrize("field", [TEMPERATURE, QPF])
+def test_ai_final_and_corrected_parent_compare_same_event_without_control_aliasing(field):
+    analysis = (
+        analyze_facts([temperature_fact(forecast=297, observed=295)])
+        if field == TEMPERATURE
+        else analyze_qpf_facts([qpf_fact()])
+    )
+    sample = (
+        analysis["samples"][0]
+        if field == TEMPERATURE
+        else analysis["canonicalization"]["samples"][0]
+    )
+    raw_value = 294.0 if field == TEMPERATURE else 1.0
+    final_value = (
+        sample["forecast_temperature_k"]
+        if field == TEMPERATURE
+        else sample["forecast"]["amount_mm"]
+    )
+    raw = stage(
+        sample,
+        field,
+        variant_id="raw",
+        transformation_type="active_baseline",
+        parent_stage_id=None,
+        evidence_required=False,
+        evidence_status="baseline",
+        policy={"id": "raw", "version": "1"},
+        overlay={"inherit_unchanged": False, "predictions": [prediction(sample, raw_value, field)]},
+    )
+    corrected = stage(
+        sample,
+        field,
+        variant_id="corrected",
+        parent_stage_id="raw",
+        transformation_type="deterministic_corrected",
+        evidence_required=False,
+        evidence_status="no_policy",
+        policy={"id": "no-policy", "version": "1"},
+        overlay={"inherit_unchanged": True, "inheritance_basis": "parent_stage", "predictions": []},
+    )
+    ai = stage(
+        sample,
+        field,
+        variant_id="ai",
+        parent_stage_id="corrected",
+        transformation_type="ai_adjusted",
+        lifecycle_role="active",
+        policy={"id": "desk", "version": "1"},
+        evidence_basis="pinned_forecast_evidence",
+        evidence_cutoff=raw["analysis_cutoff"],
+        policy_created_at=None,
+        policy_activated_at=None,
+        validation={"status": "valid"},
+        overlay={
+            "inherit_unchanged": False,
+            "predictions": [prediction(sample, final_value, field)],
+        },
+    )
+    ai["pinned_evidence"] = {
+        k: ai[k] for k in ("baseline_snapshot_id", "prepared_snapshot_id", "analysis_cutoff")
+    }
+    ai["pinned_evidence"]["corrected_stage_id"] = "corrected"
+    result = evaluate_variants(field, analysis, [raw, corrected, ai])
+    assert result["shared_sample_count"] == 1 and result["exclusions"] == []
+    metrics = {r["policy_id"]: r for r in result["comparisons"].values()}
+    assert metrics["raw"]["variant"] == metrics["no-policy"]["variant"]
+    assert metrics["desk"]["variant"] == metrics["desk"]["control"]
+    selected = evaluate_variants(field, analysis, [corrected], ancestor_stages=[raw])
+    assert selected["shared_sample_count"] == 1 and len(selected["comparisons"]) == 1
+    assert next(iter(selected["comparisons"].values()))["variant"] == metrics["raw"]["variant"]
+
+
 def test_policy_series_spans_locations_dates_and_leads_without_new_canonicalizer() -> None:
     first = analyze_facts([temperature_fact(forecast=297, observed=295)])
     other = analyze_facts(
@@ -286,3 +358,27 @@ def test_saved_raw_baseline_stays_distinct_from_active_corrected_issuance() -> N
     result = evaluate_variants(TEMPERATURE, analysis, [raw])
     assert result["shared_sample_count"] == 0
     assert result["exclusion_counts"] == {"saved_baseline_prediction_unavailable": 1}
+
+
+def test_fallback_status_qpf_stage_rows_stay_in_the_shared_cohort() -> None:
+    """A saved blend 'fallback' amount is a value with notes, as issued QPF treats it."""
+    analysis = analyze_qpf_facts([qpf_fact(forecast=3, observation=1)])
+    sample = analysis["canonicalization"]["samples"][0]
+    row = {
+        **prediction(sample, 2, QPF),
+        "status": "fallback",
+        "missing_reasons": ["HRRR: hour unavailable; approved single-model fallback"],
+    }
+    variant = stage(sample, QPF, overlay={"inherit_unchanged": False, "predictions": [row]})
+    result = evaluate_variants(QPF, analysis, [variant])
+    assert result["shared_sample_count"] == 1
+    assert comparison(result)["variant"]["mae"] == 1
+    for status in ("unavailable", "policy_unavailable"):
+        variant["overlay"]["predictions"][0]["status"] = status
+        excluded = evaluate_variants(QPF, analysis, [variant])
+        assert excluded["exclusion_counts"] == {"variant_prediction_unavailable": 1}
+    # Rows without status keep the historical missing-reason rule.
+    variant["overlay"]["predictions"][0] = {**prediction(sample, 2, QPF), "missing_reasons": ["x"]}
+    assert evaluate_variants(QPF, analysis, [variant])["exclusion_counts"] == {
+        "variant_prediction_unavailable": 1
+    }

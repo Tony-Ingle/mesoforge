@@ -80,6 +80,26 @@ def is_raw_temperature_control(stage: Any) -> bool:
     )
 
 
+def temperature_control_stage(forecast: Mapping[str, Any]) -> Any:
+    """The stage whose temperature an issued forecast carries.
+
+    An AI stage that accepted no temperature edit carries its deterministic parent's
+    temperature unchanged, so that parent decides raw-control eligibility. A missing
+    parent keeps the AI stage itself, which is never treated as raw control.
+    """
+    stage = forecast.get("learning_stage")
+    if (
+        isinstance(stage, Mapping)
+        and stage.get("transformation_type") == "ai_adjusted"
+        and isinstance(stage.get("affected_fields"), list)
+        and "air_temperature_2m" not in stage["affected_fields"]
+    ):
+        parent = forecast.get("deterministic_stage")
+        if isinstance(parent, Mapping) and parent.get("variant_id") == stage.get("parent_stage_id"):
+            return parent
+    return stage
+
+
 def require_raw_temperature_control(stage: Any) -> None:
     """Keep the historical contributor comparison explicit about the stage it scores."""
     if not is_raw_temperature_control(stage):

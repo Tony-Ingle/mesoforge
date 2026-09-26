@@ -154,7 +154,23 @@ def _stage_reason(stage: Mapping[str, Any], field: str) -> str | None:
             and stage.get("overlay", {}).get("inherit_unchanged") is True
             and not stage.get("overlay", {}).get("predictions")
         )
-        if not no_evidence and not baseline_root:
+        runtime_ai = (
+            stage.get("transformation_type") == "ai_adjusted"
+            and stage.get("evidence_basis") == "pinned_forecast_evidence"
+        )
+        if runtime_ai:
+            pinned = stage.get("pinned_evidence", {})
+            if (
+                _time(stage["evidence_cutoff"]) != cutoff
+                or pinned.get("corrected_stage_id") != stage["parent_stage_id"]
+                or any(
+                    pinned.get(k) != stage[k]
+                    for k in ("baseline_snapshot_id", "prepared_snapshot_id", "analysis_cutoff")
+                )
+                or stage.get("validation", {}).get("status") != "valid"
+            ):
+                return "variant_pinned_evidence_unproven"
+        if not no_evidence and not baseline_root and not runtime_ai:
             for key in ("policy_created_at", "policy_activated_at"):
                 if _time(stage[key]) > cutoff:
                     return f"variant_{key}_after_analysis_cutoff"
@@ -183,8 +199,15 @@ def _matches(stage: Mapping[str, Any], row: Mapping[str, Any]) -> bool:
 
 
 def _prediction(
-    stage: Mapping[str, Any], row: Mapping[str, Any]
+    stage: Mapping[str, Any],
+    row: Mapping[str, Any],
+    parents: Mapping[str, Mapping[str, Any]] | None = None,
+    visited: frozenset[str] = frozenset(),
 ) -> tuple[float | None, str | None]:
+    identifier = str(stage.get("variant_id"))
+    if identifier in visited:
+        return None, "variant_parent_cycle"
+    visited = visited | {identifier}
     reason = _stage_reason(stage, str(row["field"]))
     if reason:
         return None, reason
@@ -211,6 +234,11 @@ def _prediction(
         if stage.get("transformation_type") == "active_baseline":
             return None, "saved_baseline_prediction_unavailable"
         if overlay.get("inherit_unchanged") is True:
+            if overlay.get("inheritance_basis") == "parent_stage":
+                parent = (parents or {}).get(stage.get("parent_stage_id", ""))
+                if parent is None or not _matches(parent, row):
+                    return None, "variant_parent_prediction_unavailable"
+                return _prediction(parent, row, parents, visited)
             return float(row["control_value"]), None
         return None, "variant_prediction_unavailable"
     if len({_digest(value) for value in candidates}) != 1:
@@ -231,11 +259,15 @@ def _prediction(
     if prediction.get("unit") != row["unit"]:
         return None, "incompatible_variant_units"
     value = prediction.get("value")
-    if (
-        not _finite(value)
-        or prediction.get("missing_reasons")
-        or (row["field"] == QPF and value < 0)
-    ):
+    status = prediction.get("status")
+    # Status-bearing rows follow the issued-field contract: "fallback" is a complete
+    # value with explanatory notes. Rows without status keep the missing-reason rule.
+    unusable = (
+        status not in ("available", "fallback")
+        if status is not None
+        else bool(prediction.get("missing_reasons"))
+    )
+    if not _finite(value) or unusable or (row["field"] == QPF and value < 0):
         return None, "variant_prediction_unavailable"
     return float(value), None
 
@@ -270,7 +302,11 @@ def _comparison(rows: Sequence[Mapping[str, Any]], key: str) -> dict[str, Any]:
 
 
 def evaluate_variants(
-    field: str, control_analysis: Mapping[str, Any], variants: Sequence[Mapping[str, Any]]
+    field: str,
+    control_analysis: Mapping[str, Any],
+    variants: Sequence[Mapping[str, Any]],
+    *,
+    ancestor_stages: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Compare policy series on one common cohort of canonical control observations.
 
@@ -344,6 +380,11 @@ def evaluate_variants(
             }
             for stage in definition["stages"]
         ]
+    parents = {str(stage.get("variant_id")): stage for stage in ancestor_stages} | {
+        str(stage.get("variant_id")): stage
+        for definition in series.values()
+        for stage in definition["stages"]
+    }
     paired = []
     for row in controls:
         candidate = dict(row)
@@ -351,7 +392,7 @@ def evaluate_variants(
         complete = bool(series)
         for identifier, definition in sorted(series.items()):
             stages = [stage for stage in definition["stages"] if _matches(stage, row)]
-            predictions = [_prediction(stage, row) for stage in stages]
+            predictions = [_prediction(stage, row, parents) for stage in stages]
             reasons = sorted({reason for _, reason in predictions if reason})
             values = {value for value, reason in predictions if reason is None}
             reason = (

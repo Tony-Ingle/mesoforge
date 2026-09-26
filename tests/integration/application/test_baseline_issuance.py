@@ -76,8 +76,9 @@ def test_two_locations_issue_one_baseline_lineage_read_exactly_and_preserve_hist
         saved_versions.append(saved)
 
     before = storage_tests.storage_inventory(migrated_dsn, object_store)
-    # Three issuances plus control/stage/binding artifacts for each new location.
-    # Learning uses the same PostgreSQL/MinIO path; history still has three rows.
+    # Three issuances plus raw/corrected/binding artifacts per new location. No
+    # provider is configured in offline tests, so no model action occurred and no AI
+    # stage is retained. Learning uses the same PostgreSQL/MinIO path.
     assert [len(items) for items in before] == [3, 9, 9]
     repeat = forecast_from_baseline(
         baseline_case["baseline"],
@@ -126,6 +127,38 @@ def test_prior_verification_failure_does_not_block_baseline_issuance_or_later_lo
         code_identity={"test": "verification-isolated-baseline-integration"},
     )
     calls = []
+    from mesoforge.contracts.forecast_desk import DeskConfig, DeskProviderUnavailableError
+    from tests.unit.application.test_forecast_desk import (
+        ASSESS,
+        COMPLETE,
+        PRIORITY,
+        REVIEW,
+        Provider,
+        edit,
+    )
+
+    providers = iter(
+        [
+            Provider([DeskProviderUnavailableError("fixture provider unavailable")]),
+            Provider(
+                [
+                    ASSESS,
+                    PRIORITY,
+                    lambda p: edit(p, operation="add", amount=0.25),
+                    COMPLETE,
+                    REVIEW,
+                ]
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        "mesoforge.application.forecast_desk_provider.provider_from_environment",
+        lambda: next(providers),
+    )
+    monkeypatch.setattr(
+        "mesoforge.application.forecast_desk_provider.config_from_environment",
+        lambda: DeskConfig(max_total_tokens=300000),
+    )
 
     def verify(latitude, longitude):
         calls.append((latitude, longitude))
@@ -146,16 +179,55 @@ def test_prior_verification_failure_does_not_block_baseline_issuance_or_later_lo
     assert calls == [(FIRST["lat"], FIRST["lon"]), (LAST["lat"], LAST["lon"])]
     assert result["results"][0]["previous_verification"]["status"] == "error"
     assert result["results"][2]["previous_verification"]["qpf"]["status"] == "retryable"
+    first, last = result["results"][0], result["results"][2]
+    assert first["learning"]["ai"]["completion_reason"] == "provider_unavailable"
+    assert (
+        first["forecast"]["hours"]
+        == baseline_case["expected"][(FIRST["lat"], FIRST["lon"])]["hours"]
+    )
+    assert last["learning"]["ai"]["usage"]["accepted_edits"] == 1, last["learning"]["ai"]
+    qpf = "liquid_equivalent_precipitation_amount_1h"
+    old = baseline_case["expected"][(LAST["lat"], LAST["lon"])]["hours"][0]["surface"]["fields"][
+        qpf
+    ]
+    new = last["forecast"]["hours"][0]["surface"]["fields"][qpf]
+    assert new["value"] == old["value"] + 0.25
+    assert new["interval_start"] == old["interval_start"]
+    # An unavailable provider produced no model action: the corrected stage is issued.
+    assert first["forecast"]["learning_stage"]["transformation_type"] == "deterministic_corrected"
+    assert first["forecast"]["ai_desk"]["issued_checkpoint"] == "deterministic_corrected"
+    assert last["forecast"]["learning_stage"]["transformation_type"] == "ai_adjusted"
+    assert (
+        last["forecast"]["deterministic_stage"]["variant_id"]
+        == (last["forecast"]["learning_stage"]["parent_stage_id"])
+    )
     for row in (result["results"][0], result["results"][2]):
         saved = service.read(UUID(row["issued"]["issued_forecast_id"]))
         assert saved["forecast"] == row["forecast"]
         coords = (saved["latitude"], saved["longitude"])
-        assert saved["forecast"]["hours"] == baseline_case["expected"][coords]["hours"]
+        original_hours = baseline_case["expected"][coords]["hours"]
+        assert saved["forecast"]["hours"][1:] == original_hours[1:]
+        assert [hour["temperature"] for hour in saved["forecast"]["hours"]] == [
+            hour["temperature"] for hour in original_hours
+        ]
+        assert (
+            saved["forecast"]["hours"][0]["surface"]["contributors"]
+            == original_hours[0]["surface"]["contributors"]
+        )
+    # Presentation is derived from the AI-final grid and passes its content checks.
+    edited = service.read(UUID(last["issued"]["issued_forecast_id"]))
+    preview = build_conditions_preview(edited, scope="grid")
+    assert preview["center_point"]
+    control = Path(baseline_case["prepared"][1]["prepared_run"]["control_directory"])
+    with TestClient(api.create_app(control)) as client:
+        address = f"/issued-forecasts/{edited['issued_forecast_id']}/conditions"
+        for suffix in ("", "/transitions", "/periods"):
+            assert client.get(address + suffix).status_code == 200, suffix
     assert [
         len(items) for items in storage_tests.storage_inventory(migrated_dsn, object_store)
     ] == [
         2,
-        8,
-        8,
+        10,
+        10,
     ]
     forbidden.assert_not_called()

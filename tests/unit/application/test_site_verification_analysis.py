@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -284,6 +285,160 @@ def test_raw_learning_excludes_corrected_errors_but_keeps_noop_stage(legacy_attr
     assert learning["inventory"]["excluded_by_reason"] == {"nonbaseline_temperature_stage": 1}
     assert len(storage.loads) == (2 if legacy_attributes else 0)
     assert learning["evaluation"]["forecast_stage_scope"] == "raw_baseline_only"
+
+
+def ai_payload(record, *, raw=299.0, final=296.0):
+    """A compact immutable verification context, not reconstructed model data."""
+    body = payload(record, 1, forecast=final, observed=295.0)
+    context = body["match"]["forecast_context"]
+    cutoff = record.target_reference_time + timedelta(minutes=20)
+    reference = {
+        "artifact_id": "art_00000000-0000-0000-0000-000000000001",
+        "content_digest": str(Digest.of_bytes(b"retained-raw-stage")),
+        "registered_at": (cutoff + timedelta(minutes=2)).isoformat(),
+    }
+    context.update(
+        baseline_snapshot={
+            "baseline_snapshot_id": "baseline-1",
+            "prepared_snapshot_id": "prepared-1",
+            "forecast_analysis_cutoff": cutoff.isoformat(),
+        },
+        baseline_stage_reference=reference,
+        baseline_stage={
+            "representation": "summary_reference_not_sealed_variant",
+            "source_schema_version": "mesoforge.forecast-variant.v1",
+            "variant_id": str(Digest.of_bytes(b"raw-stage")),
+            "parent_stage_id": None,
+            "transformation_type": "active_baseline",
+            "lifecycle_role": "active",
+            "evidence_status": "baseline",
+            "fields": ["air_temperature_2m"],
+            "baseline_snapshot_id": "baseline-1",
+            "prepared_snapshot_id": "prepared-1",
+            "location": {"latitude": LAT, "longitude": LON},
+            "reference_time": record.target_reference_time.isoformat(),
+            "analysis_cutoff": cutoff.isoformat(),
+            "created_at": (cutoff + timedelta(minutes=1)).isoformat(),
+            "authoritative_artifact": reference,
+            "baseline_temperature_predictions": [
+                {
+                    "field": "air_temperature_2m",
+                    "valid_time": body["match"]["forecast"]["valid_time"],
+                    "value": raw,
+                    "unit": "K",
+                }
+            ],
+        },
+        learning_stage={
+            "variant_id": str(Digest.of_bytes(b"ai-stage")),
+            "transformation_type": "ai_adjusted",
+            "overlay": {"predictions": True},
+        },
+    )
+    return body
+
+
+@pytest.mark.parametrize("legacy_attributes", [False, True])
+def test_raw_learning_after_ai_uses_saved_parent_without_new_facts(legacy_attributes):
+    record = issued(VERSION_A, TARGET)
+    storage = Storage([record])
+    body = ai_payload(record)
+    block = build_analytical_attributes(body)
+    if legacy_attributes:
+        block.pop("raw_baseline_temperature")
+    storage.add(body, analysis=block)
+    before = deepcopy(storage.payloads)
+    ordinary = analyze(storage)
+    assert ordinary["overall"]["bias_k"] == 1.0
+    assert storage.loads == []
+    raw = analyze(storage, as_of=NOW, raw_baseline_only=True)
+    assert raw["overall"]["n"] == 1
+    assert raw["overall"]["bias_k"] == 4.0
+    assert raw["inventory"]["stored_facts_for_coordinate"] == 1
+    assert raw["reads"]["writes"] == raw["reads"]["provider_calls"] == 0
+    projection = raw["samples"][0]["provenance"]["raw_baseline_projections"][0]
+    assert projection["issued_temperature_k"] == 296.0
+    assert projection["value"] == 299.0
+    assert projection["transformation_type"] == "active_baseline"
+    assert projection["authoritative_artifact"]["artifact_id"].startswith("art_")
+    assert storage.payloads == before
+    assert len(storage.loads) == int(legacy_attributes)
+    payload_path = analyze(storage, as_of=NOW, raw_baseline_only=True, payload_only=True)
+    assert payload_path["samples"] == raw["samples"]
+
+
+def test_ai_raw_projection_keeps_existing_reissue_revision_and_cutoff_rules():
+    a, b = issued(VERSION_A, TARGET), issued(VERSION_B, TARGET, minutes=50)
+    storage = Storage([a, b])
+    storage.add(ai_payload(a), compact=True)
+    storage.add(ai_payload(b, final=297.0), compact=True)
+    assert analyze(storage)["overall"]["n"] == 0  # different final issuances remain ambiguous
+    raw = analyze(storage, as_of=NOW, raw_baseline_only=True)
+    assert raw["overall"]["n"] == 1
+    assert raw["samples"][0]["version_classification"] == "identical_reissued_versions"
+    assert len(raw["samples"][0]["provenance"]["raw_baseline_projections"]) == 2
+    future = ai_payload(a)
+    future["verification_cutoff"] = (NOW + timedelta(hours=1)).isoformat()
+    future["match"]["selected"]["temperature"]["value"] = 294.0
+    future["temperature_error"]["value"] = 2.0
+    future["match"]["selected"]["provenance"]["revision_digest"] = "sha256:new-revision"
+    storage.add(future, compact=True)
+    filtered = analyze(storage, as_of=NOW, raw_baseline_only=True)
+    assert filtered["overall"]["n"] == 1
+    assert filtered["inventory"]["excluded_by_reason"] == {"learning_evidence_after_cutoff": 1}
+    assert analyze(storage, raw_baseline_only=True)["overall"]["n"] == 0
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "unit",
+        "duplicate",
+        "missing",
+        "location",
+        "baseline",
+        "reference",
+        "future_stage",
+        "reference_identity",
+        "wrong_transformation",
+        "invalid_issued_error",
+    ],
+)
+def test_raw_ai_learning_rejects_unproven_stage_or_invalid_issued_fact(defect):
+    record = issued(VERSION_A, TARGET)
+    storage = Storage([record])
+    body = ai_payload(record)
+    stage = body["match"]["forecast_context"]["baseline_stage"]
+    rows = stage["baseline_temperature_predictions"]
+    if defect == "unit":
+        rows[0]["unit"] = "degC"
+    elif defect == "duplicate":
+        rows.append(dict(rows[0]))
+    elif defect == "missing":
+        rows[0]["value"] = None
+    elif defect == "location":
+        stage["location"]["latitude"] += 1
+    elif defect == "baseline":
+        stage["baseline_snapshot_id"] = "another-baseline"
+    elif defect == "reference":
+        stage["reference_time"] = (TARGET - timedelta(hours=1)).isoformat()
+    elif defect == "future_stage":
+        stage["created_at"] = NOW.isoformat()
+    elif defect == "reference_identity":
+        stage["authoritative_artifact"] = {"artifact_id": "missing"}
+    elif defect == "wrong_transformation":
+        stage["transformation_type"] = "ai_adjusted"
+    elif defect == "invalid_issued_error":
+        body["temperature_error"]["value"] = 100.0
+    storage.add(body, compact=True)
+    result = analyze(storage, as_of=NOW, raw_baseline_only=True)
+    assert result["overall"]["n"] == 0
+    reason = (
+        "saved_error_disagrees_with_values"
+        if defect == "invalid_issued_error"
+        else "raw_baseline_temperature_identity_unproven"
+    )
+    assert result["inventory"]["excluded_by_reason"] == {reason: 1}
 
 
 @pytest.fixture()

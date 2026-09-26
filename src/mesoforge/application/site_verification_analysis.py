@@ -38,6 +38,7 @@ from mesoforge.verification.site_analysis import (
     EVIDENCE_POLICY,
     SCHEMA_VERSION,
     analyze_facts,
+    fact_exclusion_reason,
 )
 
 LEGACY_SCAN_LIMIT = 200
@@ -151,6 +152,17 @@ def analyze_site_verification(
                 block, reason = None, "payload_only_requested"
             elif raw_baseline_only and block is not None and "forecast_stage" not in block:
                 block, reason = None, "legacy_forecast_stage_identity_unavailable"
+            elif (
+                raw_baseline_only
+                and block is not None
+                and isinstance(block.get("forecast_stage"), dict)
+                and block["forecast_stage"].get("transformation_type") == "ai_adjusted"
+                and "raw_baseline_temperature" not in block
+            ):
+                # Only AI-stage facts can carry a saved raw projection in the payload.
+                # Historical corrected facts are excluded from the compact attributes
+                # below without reading multi-megabyte payloads.
+                block, reason = None, "legacy_raw_baseline_projection_unavailable"
         if block is not None:
             from_attributes += 1
             attribute_bytes += len(canonical_json_bytes(block))
@@ -183,8 +195,6 @@ def analyze_site_verification(
         exclusion = _metadata_exclusion(fact, records)
         if exclusion is not None:
             fact["integrity_exclusion"] = exclusion
-        elif raw_baseline_only and not is_raw_temperature_control(fact.get("forecast_stage")):
-            fact["integrity_exclusion"] = "nonbaseline_temperature_stage"
         elif as_of is not None:
             # Filter facts before canonicalization: a future revision must neither
             # teach this decision nor make previously known evidence ambiguous.
@@ -197,9 +207,51 @@ def analyze_site_verification(
             else:
                 if cutoff > as_of or manifest.registered_at > as_of:
                     fact["integrity_exclusion"] = "learning_evidence_after_cutoff"
+        if raw_baseline_only and not is_raw_temperature_control(fact.get("forecast_stage")):
+            # Validate the immutable issued-stage fact before projecting another
+            # saved stage. This cannot hide an invalid issued error or bypass the
+            # availability filter above. Observations/canonicalization stay shared.
+            prior_exclusion = fact_exclusion_reason(fact)
+            raw_stage = fact.get("raw_baseline_temperature")
+            if prior_exclusion is not None:
+                fact["integrity_exclusion"] = prior_exclusion
+            elif not isinstance(raw_stage, dict) or raw_stage.get("status") != "available":
+                fact["integrity_exclusion"] = (
+                    raw_stage.get("reason", "nonbaseline_temperature_stage")
+                    if isinstance(raw_stage, dict)
+                    else "nonbaseline_temperature_stage"
+                )
+            else:
+                fact["stage_projection"] = {
+                    **raw_stage,
+                    "issued_stage": fact.get("forecast_stage"),
+                    "issued_temperature_k": fact["forecast_temperature_k"],
+                    "issued_error_k": fact["temperature_error_k"],
+                }
+                fact["forecast_temperature_k"] = raw_stage["value"]
+                fact["temperature_error_k"] = (
+                    raw_stage["value"] - fact["observation"]["temperature_k"]
+                )
+                fact["forecast_stage"] = {
+                    "variant_id": raw_stage["variant_id"],
+                    "transformation_type": "active_baseline",
+                }
         facts.append(fact)
 
     analysis = analyze_facts(facts, display_timezone=display_timezone)
+    if raw_baseline_only:
+        projections = {
+            str(fact["artifact_id"]): fact["stage_projection"]
+            for fact in facts
+            if "stage_projection" in fact
+        }
+        for sample in analysis["samples"]:
+            sample["provenance"]["raw_baseline_projections"] = [
+                {"fact_id": identity, **projections[identity]}
+                for version in sample["provenance"]["versions"]
+                for identity in version["fact_ids"]
+                if identity in projections
+            ]
     canonical = analysis["canonicalization"]
     canonical["excluded_facts"] = sorted(
         [*canonical["excluded_facts"], *unreadable], key=lambda row: row["artifact_id"]

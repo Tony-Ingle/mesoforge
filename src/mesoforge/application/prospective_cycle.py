@@ -297,6 +297,18 @@ def render_summary(result: dict[str, Any]) -> str:
             "existing_issued_forecast_ids", ""
         )
         lines.append(f"  extraction: {row['extraction_outcome']}")
+        desk = row.get("learning", {}).get("ai")
+        if desk is not None:
+            completion = desk.get("completion_reason", "unavailable")
+            edits = len(desk.get("accepted_recipes", []))
+            # Derived from what was issued, not from the completion label: a budget,
+            # timeout or negative review can still issue accepted validated edits.
+            issued = f"AI checkpoint {edits}" if edits else "corrected forecast (no AI edit issued)"
+            discarded = len(desk.get("discarded_recipes", []))
+            lines.append(
+                f"  AI desk: {completion}; accepted edits: {edits}; issued: {issued}"
+                + (f"; discarded edits: {discarded}" if discarded else "")
+            )
         lines.append(f"  issuance: {row['issuance_outcome']} {ids}")
         if row.get("error") or row.get("reason"):
             lines.append(f"  reason: {row.get('error', row.get('reason'))}")

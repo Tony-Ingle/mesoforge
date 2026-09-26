@@ -197,5 +197,63 @@ def test_future_ai_identity_can_be_retained_in_shadow_without_execution_or_promo
     synthetic = body(transformation_type="ai_adjusted")
     validate_variant(seal_variant(synthetic))
     synthetic["lifecycle_role"] = "active"
-    with pytest.raises(ValueError, match="does not activate"):
+    with pytest.raises(ValueError, match="Cannot activate"):
         seal_variant(synthetic)
+
+
+def test_runtime_ai_uses_pinned_evidence_not_fabricated_training_times() -> None:
+    value = body(
+        transformation_type="ai_adjusted",
+        lifecycle_role="active",
+        evidence_basis="pinned_forecast_evidence",
+        evidence_status="pinned",
+        evidence_cutoff="2026-09-25T17:10:00Z",
+        policy_created_at=None,
+        policy_activated_at=None,
+        context_digest=str(Digest.of_bytes(b"bounded-context")),
+        validation={"status": "valid"},
+    )
+    value["pinned_evidence"] = {
+        k: value[k] for k in ("baseline_snapshot_id", "prepared_snapshot_id", "analysis_cutoff")
+    }
+    value["pinned_evidence"]["corrected_stage_id"] = value["parent_stage_id"]
+    value["policy"] = {
+        **value["policy"],
+        "provider": "openai",
+        "model": "explicit-model",
+        "tool_policy_version": "mesoforge.field-edit.v1",
+    }
+    value["overlay"] = {
+        **value["overlay"],
+        "inherit_unchanged": False,
+        "desk": {"accepted_recipes": [], "completion_reason": "no_edit"},
+        "result_grid_sha256": str(Digest.of_bytes(b"result-grid")),
+    }
+    validate_variant(seal_variant(value))
+    for key, bad in (
+        ("prepared_snapshot_id", "new-arriving-guidance"),
+        ("analysis_cutoff", "2026-09-25T18:00:00Z"),
+    ):
+        changed = deepcopy(value)
+        changed["pinned_evidence"][key] = bad
+        with pytest.raises(ValueError, match="pinned evidence"):
+            seal_variant(changed)
+    # Runtime identity, explicit predictions, recipes and result digest are required,
+    # and malformed nested records are contract errors, never AttributeErrors.
+    for mutate in (
+        lambda v: v["policy"].pop("model"),
+        lambda v: v["policy"].update(provider=" "),
+        lambda v: v["overlay"].update(inherit_unchanged=True),
+        lambda v: v["overlay"].update(predictions=[]),
+        lambda v: v["overlay"]["desk"].pop("accepted_recipes"),
+        lambda v: v["overlay"].update(result_grid_sha256="not-a-digest"),
+        lambda v: v.update(validation=None),
+        lambda v: v.update(pinned_evidence="pinned"),
+    ):
+        changed = deepcopy(value)
+        mutate(changed)
+        with pytest.raises(ValueError):
+            seal_variant(changed)
+    value["policy_created_at"] = "2026-09-25T17:10:00Z"
+    with pytest.raises(ValueError, match="fabricate"):
+        seal_variant(value)

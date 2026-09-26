@@ -168,16 +168,24 @@ def forecast_from_baseline(
 
     def local_stage(forecast: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         if learning_service is None:
-            report = {
+            report: dict[str, Any] = {
                 "status": "fallback",
                 "reason": learning_error,
                 "applied_delta_k": 0.0,
                 "stage": "deterministic_correction",
             }
-            return {**forecast, "learning_failure": report}, report
-        transformed, report = learning_service.local_stage(forecast, policy_ids=learning_policy_ids)
-        learning_service.candidate_stages(forecast, report, learning_overlays or [])
-        return transformed, report
+            corrected = {**forecast, "learning_failure": report}
+        else:
+            try:
+                corrected, report = learning_service.local_stage(
+                    forecast, policy_ids=learning_policy_ids
+                )
+                learning_service.candidate_stages(forecast, report, learning_overlays or [])
+            except Exception as exc:
+                report = {"status": "fallback", "reason": str(exc), "applied_delta_k": 0.0}
+                corrected = {**forecast, "learning_failure": report}
+
+        return attempt_forecast_desk(corrected, report, learning_service), report
 
     result.update(
         _deliver_locations(
@@ -201,6 +209,162 @@ def forecast_from_baseline(
     timings["total_seconds"] = time.perf_counter() - started
     result["timings"] = timings
     return result
+
+
+def attempt_forecast_desk(
+    corrected: dict[str, Any],
+    report: dict[str, Any],
+    learning_service: LearningService | None,
+) -> dict[str, Any]:
+    """Always attempt the bounded desk after correction; return the forecast to issue.
+
+    The result is either a retained AI stage (latest validated checkpoint) or the
+    complete corrected forecast with an explicit non-AI desk outcome. A partial,
+    unvalidated or unretained AI state is never returned.
+    """
+    from mesoforge.application.forecast_desk import run_forecast_desk
+
+    # Every configured job attempts the desk. Provider failures are handled by
+    # its finite controller; missing durable stage lineage cannot authorize edits.
+    checkpoint_parent = report.get("operational_stage")
+    checkpoint_reference = report.get("operational_reference")
+    lineage_ready = (
+        learning_service is not None
+        and isinstance(checkpoint_parent, dict)
+        and checkpoint_parent.get("transformation_type") == "deterministic_corrected"
+        and checkpoint_reference is not None
+        and report.get("control_reference") is not None
+    )
+
+    def retain_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any]:
+        if (
+            not lineage_ready
+            or learning_service is None
+            or checkpoint_parent is None
+            or checkpoint_reference is None
+        ):
+            raise ValueError("Durable corrected-stage lineage is unavailable")
+        parent = checkpoint_parent
+        saved = learning_service.save(
+            "learning-overlay",
+            {
+                **checkpoint,
+                "schema_version": "mesoforge.forecast-desk-checkpoint.v1",
+                "parent_stage_id": parent["variant_id"],
+                "baseline_snapshot_id": parent["baseline_snapshot_id"],
+                "prepared_snapshot_id": parent["prepared_snapshot_id"],
+                "analysis_cutoff": parent["analysis_cutoff"],
+            },
+            inputs=(ArtifactId(checkpoint_reference["artifact_id"]),),
+            attributes={"parent_stage_id": parent["variant_id"]},
+        )
+        return learning_service._reference(saved)
+
+    desk: dict[str, Any]
+    if not lineage_ready:
+        # Attempted, but no accepted edit could become durable lineage: spend no
+        # provider calls on a run whose result must be discarded.
+        desk = {
+            "schema_version": "mesoforge.forecast-desk-run.v1",
+            "completion_reason": "lineage_unavailable",
+            "usage": {"provider_calls": 0, "accepted_edits": 0},
+            "accepted_recipes": [],
+            "checkpoints": [],
+        }
+        return _corrected_fallback(corrected, report, desk)
+    try:
+        final, desk = run_forecast_desk(
+            corrected,
+            checkpoint_sink=retain_checkpoint,
+            evidence=report.get("desk_evidence"),
+        )
+    except Exception as exc:  # The controller should not raise; isolate if it does.
+        desk = {
+            "schema_version": "mesoforge.forecast-desk-run.v1",
+            "completion_reason": "desk_failure",
+            "failure_type": type(exc).__name__,
+            "accepted_recipes": [],
+            "checkpoints": [],
+        }
+        return _corrected_fallback(corrected, report, desk)
+    report["ai"] = desk
+    if (
+        not desk.get("checkpoints")
+        or desk.get("validation", {}).get("status") != "valid"
+        or not desk.get("usage", {}).get("validated_actions")
+    ):
+        # No pinned validated parent, or no provider action at all (unconfigured,
+        # unavailable, quota/timeout on the first request). The corrected forecast
+        # is issued as the operational stage; no AI stage claims a model decision.
+        return _corrected_fallback(corrected, report, desk)
+    assert learning_service is not None  # lineage_ready proves the durable store.
+    try:
+        final = learning_service.ai_stage(corrected, final, desk, report)
+    except Exception as exc:
+        report["ai_storage_failure"] = type(exc).__name__
+        desk = {
+            **desk,
+            "attempt_completion_reason": desk.get("completion_reason"),
+            "completion_reason": "stage_persistence_failed_fallback",
+        }
+        return _corrected_fallback(corrected, report, desk)
+    return final
+
+
+def _corrected_fallback(
+    corrected: dict[str, Any], report: dict[str, Any], desk: dict[str, Any]
+) -> dict[str, Any]:
+    """Issue the complete corrected forecast with an explicit, non-AI desk outcome.
+
+    No AI stage exists for this issuance. Accepted-but-unretained recipes and their
+    checkpoints are kept only as discarded audit; raw/corrected lineage stays intact.
+    """
+    accepted = desk.get("accepted_recipes", [])
+    checkpoints = desk.get("checkpoints", [])
+    outcome = {
+        **desk,
+        "issued_checkpoint": "deterministic_corrected",
+        "ai_stage": None,
+        "accepted_recipes": [],
+        "affected_fields": [],
+        "checkpoints": checkpoints[:1],
+        **(
+            {"discarded_recipes": [*desk.get("discarded_recipes", []), *accepted]}
+            if accepted or desk.get("discarded_recipes")
+            else {}
+        ),
+        **(
+            {"discarded_checkpoints": [*desk.get("discarded_checkpoints", []), *checkpoints[1:]]}
+            if checkpoints[1:] or desk.get("discarded_checkpoints")
+            else {}
+        ),
+        "point_values": [
+            {
+                "valid_time": hour["valid_time"],
+                "corrected_temperature": hour["temperature"],
+                "final_temperature": hour["temperature"],
+                "applied_delta_k": 0.0,
+            }
+            for hour in corrected["hours"]
+        ],
+    }
+    if desk.get("validation", {}).get("status") == "valid":
+        outcome["validation"] = {**desk["validation"], "basis": "validated_corrected_parent"}
+    report["ai"] = outcome
+    lineage: dict[str, Any] = {}
+    if report.get("control_reference") is not None:
+        lineage.update(
+            baseline_stage=report["control_stage"],
+            baseline_stage_reference=report["control_reference"],
+        )
+    if report.get("operational_reference") is not None:
+        lineage.update(
+            deterministic_stage=report["operational_stage"],
+            deterministic_reference=report["operational_reference"],
+        )
+    from mesoforge.application.forecast_desk import desk_summary
+
+    return {**corrected, **lineage, "ai_desk": desk_summary(outcome)}
 
 
 def main(argv: list[str] | None = None) -> int:

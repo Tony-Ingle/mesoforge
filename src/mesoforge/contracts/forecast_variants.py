@@ -173,15 +173,70 @@ def validate_variant(value: dict[str, Any]) -> None:
             "Evidence exemption is only valid for an explicit unchanged correction stage"
         )
     evidence = value.get("evidence_cutoff")
+    runtime_ai = (
+        value["transformation_type"] == "ai_adjusted"
+        and value.get("evidence_basis") == "pinned_forecast_evidence"
+    )
+    if runtime_ai:
+        pinned = value.get("pinned_evidence")
+        overlay = value.get("overlay")
+        desk = overlay.get("desk") if isinstance(overlay, dict) else None
+        policy_record = value.get("policy")
+        if (
+            not isinstance(pinned, dict)
+            or not isinstance(value.get("validation"), dict)
+            or not isinstance(overlay, dict)
+            or not isinstance(desk, dict)
+            or not isinstance(policy_record, dict)
+            or overlay.get("inherit_unchanged") is not False
+            or not isinstance(overlay.get("predictions"), list)
+            or not overlay["predictions"]
+            or not isinstance(desk.get("accepted_recipes"), list)
+            or any(
+                not isinstance(policy_record.get(key), str) or not policy_record[key].strip()
+                for key in ("provider", "model", "tool_policy_version")
+            )
+        ):
+            raise ValueError(
+                "AI stage requires provider/model identity, explicit predictions and recipes"
+            )
+        result_grid = overlay.get("result_grid_sha256")
+        if not isinstance(result_grid, str):
+            raise ValueError("AI stage requires the issued result grid content digest")
+        Digest(result_grid)
+        if (
+            not value["evidence_required"]
+            or evidence is None
+            or instant(evidence) != cutoff
+            or any(
+                pinned.get(key) != value[key]
+                for key in ("baseline_snapshot_id", "prepared_snapshot_id", "analysis_cutoff")
+            )
+            or pinned.get("corrected_stage_id") != value["parent_stage_id"]
+            or value.get("validation", {}).get("status") != "valid"
+        ):
+            raise ValueError("AI stage must retain validated pinned evidence and corrected parent")
+        context_digest = value.get("context_digest")
+        if not isinstance(context_digest, str):
+            raise ValueError("AI stage requires immutable context identity")
+        Digest(context_digest)
+        # Runtime meteorological evidence is not learned-policy training data.
+        # A versioned desk/code contract is retained without fabricating its release time.
+        if (
+            value.get("policy_created_at") is not None
+            or value.get("policy_activated_at") is not None
+        ):
+            raise ValueError("Runtime desk policy must not fabricate training/activation times")
     if evidence is not None and instant(evidence) > cutoff:
         raise ValueError("Variant training evidence follows analysis cutoff")
     if value["evidence_required"] and evidence is None:
         raise ValueError("Learning evidence cutoff is unproven")
     created, activated = value.get("policy_created_at"), value.get("policy_activated_at")
-    if value["evidence_required"] and created is None:
+    if value["evidence_required"] and not runtime_ai and created is None:
         raise ValueError("Learning policy creation time is unproven")
     if (
         value["evidence_required"]
+        and not runtime_ai
         and value["lifecycle_role"] in {"active", "shadow"}
         and activated is None
     ):
@@ -196,10 +251,13 @@ def validate_variant(value: dict[str, Any]) -> None:
     ):
         raise ValueError("Policy activation must follow creation and precede analysis")
     if (
-        value["transformation_type"] in {"candidate_blend", "ai_adjusted"}
-        and value["lifecycle_role"] == "active"
-    ):
-        raise ValueError("This milestone does not activate candidate or AI variants")
+        value["transformation_type"] == "candidate_blend"
+        or value["transformation_type"] == "ai_adjusted"
+        and not runtime_ai
+    ) and value["lifecycle_role"] == "active":
+        raise ValueError(
+            "Cannot activate a candidate or an AI variant without pinned runtime proof"
+        )
     if not isinstance(value.get("code_identity"), dict) or not value["code_identity"]:
         raise ValueError("Variant requires code/config identity and explicit overlay semantics")
 

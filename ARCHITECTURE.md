@@ -36,9 +36,8 @@ flowchart TD
     H --> B[Immutable MesoForge baseline snapshot]
     B --> L[Configured-location extraction from a pinned baseline]
     L --> S[Local deterministic temperature correction stage / explicit no-op]
-    S -. FUTURE .-> A[Bounded AI forecast desk and final validation]
-    S --> I[Immutable issuance today]
-    A -. FUTURE .-> I
+    S --> A[Bounded AI forecast desk and current final validation]
+    A --> I[Immutable issuance from latest valid checkpoint]
     I --> V[Verification facts and canonical analysis]
     O[Observation / analysis providers] --> V
 ```
@@ -77,7 +76,7 @@ Two roles organize one codebase. They are not a collection of weather microservi
 | Acquire and normalize selected evidence | Pin one published baseline |
 | Reuse raw/prepared guidance across locations | Read its saved local domain/reference view |
 | Publish prepared contributor state | Produce deterministic reports |
-| Build fields and current coherence; configured candidate shadows | Apply explicit local correction/no-op and save an immutable issuance |
+| Build fields and current coherence; configured candidate shadows | Apply local correction/no-op, bounded AI desk and immutable issuance |
 | Publish a complete numerical baseline | Read back and participate in verification |
 
 The implemented application boundaries are:
@@ -455,8 +454,10 @@ background construction. The manifest records framework identity, enforced polic
 identities, execution results and unresolved relationships once at useful scope.
 It does not replicate a large provenance report in every cell.
 
-Post-AI final coherence is future work. Normal location extraction does not rerun
-baseline coherence, and historical manifests do not acquire retroactive reports.
+Post-edit validation currently reruns only approved affected-field relationships;
+broader meteorological final coherence remains future science. Normal location
+extraction does not rerun baseline coherence, and historical manifests do not
+acquire retroactive reports.
 
 ## I. Background baseline snapshots
 
@@ -712,7 +713,7 @@ must narrow explicit historical windows or increase bounds for omitted work.
 | Opportunity | Issued version, stage, coordinate, field, exact hourly interval and verification policy |
 | Event matching | Forecast and MRMS have identical `(start,end]`, exactly one hour |
 | Eligibility | Issued no later than interval start; event and retained observation availability within cutoff |
-| Field/stage | Current baseline and final-issued QPF cohorts separate; no QPF correction or AI execution |
+| Field/stage | Raw baseline, deterministic corrected and AI-final QPF identities stay separate; same exact MRMS event; no QPF correction policy |
 | Fact | `issued-qpf-verification.v1` under `qpf-mrms-verification.v1`, compact immutable attributes/references |
 | Persistence | Existing ArtifactService, PostgreSQL advisory idempotency and S3-compatible payloads |
 | Repeat | Same evidence/status reuses the original fact; a later retry cutoff alone does not multiply facts |
@@ -763,13 +764,14 @@ Code: [temperature facts](src/mesoforge/application/issued_temperature_verificat
 
 The current Learning Core composes one shared variant model, temperature correction,
 candidate blend policies and one field-aware shadow evaluator. It does not promote
-policies, tune current production weights, diagnose regimes or execute AI.
+policies, tune current production weights or diagnose regimes. The operational AI
+desk below uses this same stage/evaluation architecture.
 
 ```text
 prepared contributors → active FieldBlendEngine → active baseline
     └→ explicit shadow field policy → compact candidate baseline overlay
 
-pinned active baseline → local extraction → deterministic correction/no-op → issuance
+pinned active baseline → local extraction → deterministic correction/no-op → bounded AI → issuance
                                 └→ configured correction shadow
 
 control + bound variants + canonical temperature/MRMS facts → identical-sample evaluation
@@ -781,8 +783,10 @@ control + bound variants + canonical temperature/MRMS facts → identical-sample
 shared stage identity: parent, transformation, field list, lifecycle role,
 policy/version/digest, baseline/contributor IDs, coordinate, reference/analysis
 time, evidence/creation/activation times and code identity. An explicit no-op is
-still a stage. An AI-named stage can be represented for future evaluation contracts;
-no AI-generated stage or AI behavior exists now.
+still a stage. Runtime AI stages retain pinned meteorological evidence rather than
+pretending it is learned-policy training data. Active runtime AI identity requires
+its corrected parent, exact baseline/contributor/cutoff proof, context digest and
+successful deterministic validation. Historical shadow-stage readers remain valid.
 
 [`learning`](src/mesoforge/application/learning.py) persists policies, overlays,
 variants and issuance bindings using the existing ArtifactService, PostgreSQL
@@ -845,12 +849,11 @@ revision identities. Temperature keeps its current station matching contract; QP
 requires the exact hourly `(start,end]` MRMS event. Duplicates collapse, conflicting
 evidence stays ambiguous, and absent/incompatible variants exclude that event from
 the common population. Inheritance is explicit, never guessed from a missing field.
-In the evaluator, `inherit_unchanged` means the canonical **issued control** value;
-it does not traverse arbitrary parent stages. Raw-baseline, correction-shadow and
-candidate-shadow projections therefore retain explicit temperature/QPF point values,
-including unchanged events, so an active correction cannot be mistaken for raw
-guidance. A future AI adapter must likewise supply its resulting stage values or
-explicitly identify unchanged issued-control events; no AI execution exists here.
+New sparse correction stages explicitly inherit their saved **parent stage**,
+with finite ancestry and cycle rejection. Legacy issued-control inheritance remains
+readable. Raw-baseline, candidate-shadow and AI-final projections retain explicit
+temperature/QPF point values. Thus no-op correction cannot accidentally inherit a
+later AI-adjusted issuance and be mislabeled as the deterministic control.
 
 Read-only results expose control/variant bias, MAE, RMSE and metric differences,
 paired counts, QPF descriptive totals, exact/provisional leads, coordinate/date
@@ -874,19 +877,22 @@ rejects transformed stages with an explicit route to the unified evaluator.
 The prospective operator builds configured candidate overlays on the background
 side and composes the permanent local learning stage. No-op is the default.
 Learning/shadow failures remain subordinate to control issuance and per-location
-isolation. Promotion/rollback governance, broader correction science, site/regime
-modeling and the bounded AI desk remain future milestones.
+isolation. Promotion/rollback governance, broader correction science and site/regime
+modeling remain future milestones.
 
-## M. Future bounded AI forecast desk
+## M. Bounded operational AI forecast desk
 
-This section is target design from VISION, **not implemented functionality**.
-The future desk receives one pinned coherent baseline, can inspect native
-contributors, observations, prior verification and surrounding context, and edits
-MesoForge fields through deterministic versioned tools.
+**CURRENT:** every new configured-location job attempts the desk after deterministic
+correction. There is no off, shadow or active mode switch. An unavailable provider
+or no material justified edit produces an explicit outcome and retains the complete
+validated corrected state. Accepted edits affect only this operational forecast;
+they cannot change persistent policies or promote candidates.
 
-It does not select a model as the final forecast or modify native model evidence.
-The controller ranks relevant forecast problems. QPF has highest default priority
-when precipitation matters, without forcing equal effort on irrelevant fields.
+[`forecast_desk`](src/mesoforge/application/forecast_desk.py) owns the finite
+controller; [`forecast_desk_context`](src/mesoforge/application/forecast_desk_context.py)
+projects bounded meteorological context; [`field_edit`](src/mesoforge/forecasting/field_edit.py)
+owns deterministic scientific field editing. Provider code never owns termination,
+validation, forecast persistence or the editable mask.
 
 ```text
 pinned baseline + deterministic correction
@@ -898,22 +904,193 @@ pinned baseline + deterministic correction
     → final validation and issuance
 ```
 
-Generic operations may adjust, scale, smooth, shift, retime, taper or edit supported
-probability/category fields. Field semantics and dependency validation constrain
-them; a separate agent or bespoke engine for every field is not the design.
+### Protocol and provider boundary
 
-Initial operational direction is approximately a 10-minute target with a 15-minute
-hard ceiling, finite passes/edits and reserved final-validation time. These are
-planning targets, not implemented timeouts or scientific constants.
+[`contracts/forecast_desk`](src/mesoforge/contracts/forecast_desk.py) defines the
+provider-neutral request/response protocol, strict bounded actions and versioned
+`mesoforge.forecast-desk` policy v1. Accepted action kinds are assessment,
+task priority, evidence request, edit proposal, no edit, final review and complete.
+Unknown actions/properties, malformed arguments and unrequested capabilities fail.
+Free-form rationale accompanies an action but is never executed. No hidden
+chain-of-thought is required or stored.
 
-The most recent fully validated state always remains available. Timeout, failure,
-exhausted budget or lack of justified changes must not leave a partially edited
-forecast. No accepted edit means the valid deterministic baseline remains usable.
+[`forecast_desk_provider`](src/mesoforge/application/forecast_desk_provider.py)
+implements OpenAI Responses over fixed HTTPS, strict JSON-schema output, no hosted
+tools, redirects, proxy inheritance or retries. Provider/model configuration is
+explicit and independent of the coding agent. The credential is read only at the
+HTTP boundary and excluded from prompts, state and errors. Provider failures expose
+sanitized status/type information rather than request headers or response bodies.
+Optional explicitly configured reasoning effort is retained as provider metadata;
+output-token budgets include reasoning consumption. Rejected/incomplete output
+retains validated token/cost metadata when available. Transport failures without
+usage evidence remain unknown; an HTTP status/allowlisted error code is not a
+statement that no API cost was incurred.
+The scientific layers import no vendor SDK. Ordinary tests block inference network
+calls; deterministic providers are explicit development fixtures.
 
-No-op/historical forecast reports retain their existing zero-delta presentation;
-the explicit learning-stage metadata distinguishes no policy from an applied stage.
-An actually applied active temperature correction preserves raw baseline, delta,
-policy identity and final coherent values separately. AI always remains not_run.
+### Pinned context, finite tasks and bounded tools
+
+A job pins baseline/contributor IDs, corrected-stage ID, reference time and analysis
+cutoff. New guidance never enters an ongoing desk run. Initial context projects
+location/geometry, per-cell taper edge distances, field availability, ranges, point
+extremes and first/last values, exact event semantics, per-contributor point QPF
+onset/peak/total on the active hourly event, compatible contributor disagreement, a
+compact dependency index and cutoff-proven site verification facts. Contributors are
+compared only within groups sharing unit, interval and event definition; fewer than
+two comparable values report `no_comparable_pairs`, never a zero spread. Wind
+direction uses the minimum containing arc. Verification evidence that is unproven,
+later than the cutoff or for another coordinate is excluded, not fatal. Source paths,
+nested acquisition provenance, URLs in free text and storage handles are omitted.
+A context over its byte budget ends as `context_budget_exceeded`. Tool responses
+retain digest references for accepted edit rationale.
+
+QPF has highest default priority when any saved QPF or PoP is positive, without
+inventing intensity or skill thresholds. Remaining finite tasks use editability,
+availability and stable field order; the model may propose priorities within the
+same bounded inventory. Disagreement is compared only for compatible units/events;
+compass direction uses circular separation. An unavailable field stays unavailable.
+
+Six inspection tools exist. `summarize_field` gives per-valid-time counts and
+min/max/mean (arc for direction) over the selection; `inspect_baseline` returns saved
+MesoForge cell-hour records; `inspect_contributors` adds every retained contributor
+row; `inspect_disagreement` returns comparable contributor groups with member values
+and spread; `inspect_verification_history` returns the pinned temperature station-
+proxy summary (QPF verification is not yet desk evidence); `inspect_dependencies`
+returns registered relationships. Every request names one known field, pinned valid
+times (equivalent UTC spellings map to the saved strings), a point/editable/context
+region, optional cell ids and a row limit of at most 144 under the byte cap. A
+malformed request is a counted rejection, not a desk failure. These tools cannot
+execute code, fetch a URL, browse files or issue database queries. Retained context
+is readable; only editable cells can change. No observation acquisition is exposed.
+
+Each provider request carries at most four recent distinct inspection results and
+a compact index of earlier requests. Evidence identifies the checkpoint inspected;
+the current checkpoint is explicit, so older results cannot masquerade as current
+edited state. Tool byte/row truncation includes counts, reasons and a narrowing
+hint. Remaining time, call, tool, edit, token and configured cost budgets are visible
+to the provider while the controller retains sole enforcement authority.
+
+### Field editing and current coherence
+
+The existing field registry owns edit contracts. Current operations are:
+
+| Field | Operations | Deterministic validation |
+|---|---|---|
+| Temperature | Additive K adjustment, optional edge taper | Finite current field bounds; T/Td consistency and Bolton RH through existing coherence |
+| Hourly liquid QPF | Add, scale, one spatial smoothing pass, optional edge taper | Finite non-negative amount; unchanged exact `(start,end]` hour; explicit zero/missing |
+| All other fields | Inspect only | No implicit source promotion or unsupported scientific editing |
+
+Tool policy `mesoforge.field-edit.v1` has per-proposal intervention limits: temperature
+addition ±5 K, QPF addition ±10 kg/m², QPF scale 0–2 and smoothing strength 0–1.
+These bound permissions; they are not verified meteorological correction thresholds.
+Smoothing exchanges values only among selected compatible editable nodes, without
+temporal redistribution or an area-integrated conservation claim. Taper weight is
+smoothstep(distance to the editable boundary / width), zero on the editable edge; on
+the current 3×3 editable domain only the centre node can change under a taper, and
+smoothing with a taper is an explicit no-op rejection. No edit can enlarge the domain
+or mutate native contributors; missing cell-hours remain missing and context-only
+values remain byte-equivalent. Each immutable recipe identifies cells, times,
+operation, parameters, evidence references and tool/coherence identities.
+`validate_grid` rechecks timing, QPF events, T bounds, Td ≤ T and RH against the
+existing Bolton kernel on every present triple; `validate_edit_scope` proves that
+only recipe-selected editable cell-hours and their coherence dependents differ from
+the corrected parent before an AI stage is retained.
+
+Temperature changes invoke the current finite affected-field coherence boundary.
+An edit that would make an available dew point or RH missing (cooling below the
+saved Td) is rejected rather than clamped or silently nulled; dew point itself is
+inspect-only. QPF relationships with PoP, thunder, p-type and winter fields are
+reported as unimplemented dependencies, not enforced by invented rules. Wind remains
+inspect-only: the local coherence boundary has no wind branch, and rotation or
+magnitude edits would need a vector edit path plus gust coupling that has not been
+adopted. Probability/category, visibility and winter/ice editing remain unsupported.
+
+### Budgets, checkpoints and fallback
+
+The versioned defaults target 600 seconds with a 900-second hard desk budget and
+60-second finalization reserve. Each provider call has at most 60 seconds and is
+supervised so a stalled adapter cannot keep the location job waiting indefinitely.
+A bounded call loop permits at most 20 provider requests, 20 tool calls, 12 proposals,
+6 accepted edits, 3 edits per field and 12 tasks. Assessment/final review have one
+pass each. Defaults cap context at 64 KiB, evidence responses at 8 KiB, individual
+output at 2,048 tokens and total usage at 300,000 tokens. The byte-based preflight
+counts one byte as one token, so `DeskConfig` requires two worst-case requests
+(context, four retained inspections, envelope and response) to fit the total budget.
+Optional cost caps require explicit configured pricing; unknown pricing cannot
+authorize a cost-capped request. README documents overrides. Optional request-start
+pacing also consumes the finite analysis budget. Reaching the target, or the last
+permitted provider call, moves the desk to its single final review within the hard
+work window instead of skipping it. Rate-limit errors fall back without retries.
+Offline tests remove operator `MESOFORGE_AI_*` settings and the credential, and fail
+if the real transport is reached.
+Provider waits, copy-on-write field edits, checkpoint storage and final point
+extraction are supervised by the controller deadline. A late result cannot replace
+the last validated state. A storage timeout may leave an immutable unselected
+checkpoint artifact; it cannot authorize that edit. Downstream final-stage storage,
+presentation and operational issuance retain their existing synchronous I/O contracts,
+so the desk budget is not a hard wall-clock bound on the entire issuance transaction.
+
+Start from a validated parent. Apply each proposal copy-on-write, run affected
+current coherence, validate and retain a compact checkpoint before accepting it.
+Selections are canonical (sorted cells and times). An exact no-op, repeated recipe,
+net return to an earlier state on the same selection (including A, B, A⁻¹) or
+out-of-bounds edit is rejected; a proposal rejected only for its task or evidence
+references can be resubmitted. Wrong-phase actions, malformed known actions and
+per-field or inspection budget exhaustion are counted rejections; exhausting the
+global proposal or accepted-edit budget moves to final review. An unknown action,
+provider failure, deadline or token/cost budget ends analysis at the last valid
+checkpoint. No edit is success. A final review with `accepted=false` discards every
+accepted edit and issues the corrected parent; final review cannot change fields or
+override deterministic checks. Finalization makes no further provider calls and
+derives point/presentation values from the accepted grid. The configured job holds
+the PostgreSQL issuance lock only for the decision-window lookup and for the locked
+recheck-and-publish step, not while the desk runs.
+
+### Immutable operational lineage and evaluation
+
+Checkpoint payloads use existing `learning-overlay` artifacts: the corrected parent
+reference, only the newly accepted recipe, the previous checkpoint reference and both
+grid-value digests. They never clone the local grid and grow linearly with edits.
+`LearningService.ai_stage` stores the final `ai_adjusted` variant through the common
+variant contract and PostgreSQL/S3 path only when the model returned at least one
+validated action; it verifies the digest chain from the corrected parent through
+every recipe to the issued grid and the edit scope. The operational lineage is raw
+baseline → deterministic corrected stage → AI-final stage → issuance. When no
+provider action was obtained (unconfigured, unavailable, quota or first-call
+timeout), lineage is unavailable, or the AI stage cannot be retained, the complete
+corrected stage is issued with an explicit desk outcome and any unretained recipes
+as discarded audit. The issued forecast carries a compact desk summary; the full
+report lives once in the AI stage. Native source evidence remains behind the pinned
+baseline.
+Conditions/transitions/periods are generated from the final accepted numerical state.
+No-op reports retain zero numerical delta while reporting the actual desk outcome.
+Historical issuances without AI metadata remain readable and are never rewritten.
+
+The same evaluator scores raw, corrected, candidate and AI-final temperature/QPF
+stages against identical canonical observations. Stage count does not inflate sample
+count; future observations verify the immutable issuance and resolve saved stage
+values. AI runtime evidence cutoff is not fabricated learned-policy creation time.
+The AI series identity is `mesoforge.forecast-desk:<provider>:<model>:<effort>`
+version 1 with a digest over the instructions, field-edit tool version and registry
+edit permissions, so different runtimes are separate evaluator series and a changed
+policy requires a new version. Status-bearing stage rows follow the issued-field
+contract (a `fallback` QPF amount is a value). Contributor comparison resolves raw
+control through the deterministic parent when the AI edited no temperature.
+Provider/model identity, actual returned model where available, context, bounded
+evidence, accepted/rejected recipes, checkpoint references and usage are immutable
+audit data. Neither evaluation nor the AI desk performs promotion or rollback.
+
+**FUTURE:** governance/promotion/rollback, broader scientifically approved edit
+contracts (dew point, vector wind with gust coupling), QPF verification as desk
+evidence and meteorological skill assessment. Deterministic fixtures cover edit,
+rollback, replay and failure behavior. On 2026-09-25 a real `gpt-6-sol` run replayed
+the Minneapolis 2026-09-18 00 UTC reference from a baseline built offline from
+retained prepared guidance: assessment, QPF-first priority, one point disagreement
+inspection, no justified edit and an accepted final review, then issuance through
+the raw → corrected → AI stage lineage with all three stages bound. A no-credential
+batch then issued Surley and Grasston through the explicit fallback. These
+demonstrate runtime behavior, not meteorological skill or a new current-guidance
+forecast. Hosted deployment and scheduling are still unimplemented.
 
 ## N. Operations and deployment
 
@@ -977,7 +1154,7 @@ it is not the forecast scheduler. Hermes development orchestration remains pause
 | Deterministic local temperature correction | Implemented | Evidence-gated candidates, explicit active/shadow policy, no-op default; no promoted policy configured |
 | Candidate blend and unified shadow evaluation | Implemented | Background field overlays; common canonical temperature/MRMS samples; no automatic promotion |
 | Broader site/regime correction and governance | Future | No regime classifier, additional correction science or promotion/rollback controller |
-| Bounded AI editing and final validation | Future | No LLM execution or edit controller |
+| Bounded operational AI desk and current final validation | Implemented | Structured provider boundary, finite tasks/budgets, temperature/QPF tools, checkpoint fallback and common stage evaluation |
 | Scheduled hosted operation and delivery | Future | Scheduler chooses when; MesoForge keeps all meteorology |
 
 ## P. Architectural debt and retained boundaries

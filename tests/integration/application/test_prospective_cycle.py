@@ -127,10 +127,15 @@ def test_prospective_cycle_pins_once_isolates_locations_and_repeat_preserves_sto
         assert forecast["hourly_report"]["display_timezone"] == "America/Chicago"
         saved_versions.append((issued_id, saved))
     before = storage_tests.storage_inventory(migrated_dsn, object_store)
+    # No provider is configured offline: no model action, so no AI stage is retained.
     assert [len(rows) for rows in before] == [2, 8, 8]
     for row in (first["results"][0], first["results"][2]):
         assert row["learning"]["status"] == "no_policy"
-        assert row["learning"]["operational_reference"]["byte_size"] < 15_000
+        assert row["learning"]["ai"]["completion_reason"] == "provider_unavailable"
+        assert (
+            row["learning"]["operational_stage"]["transformation_type"] == "deterministic_corrected"
+        )
+        assert row["learning"]["operational_reference"]["byte_size"] < 150_000
         assert "binding" in row["learning"]
 
     # The uncovered middle domain remains an explicit failure. Successfully issued

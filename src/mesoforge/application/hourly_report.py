@@ -67,7 +67,15 @@ def build_hourly_report(
     Verification of an earlier issued version never verifies this new version.
     """
     timezone = ZoneInfo(display_timezone)
-    stage = forecast.get("learning_stage", {})
+    stage = forecast.get("deterministic_stage", forecast.get("learning_stage", {}))
+    desk = forecast.get("ai_desk", {})
+    ai_points = {row["valid_time"]: row for row in desk.get("point_values", [])}
+    edited: dict[str, set[str]] = {}
+    for recipe in desk.get("accepted_recipes", []):
+        # Issued summaries carry proposal keys at top level; full reports nest them.
+        proposal = recipe.get("proposal", recipe)
+        for valid_time in proposal.get("valid_times") or []:
+            edited.setdefault(valid_time, set()).add(str(proposal.get("field")))
     correction = stage.get("overlay", {}).get("correction", {})
     corrected_points = (
         {row["valid_time"]: row for row in correction["point_values"]}
@@ -89,8 +97,13 @@ def build_hourly_report(
                     "provenance_ref": f"#/hours/{index}/{source_list}/{source_index}",
                 }
         corrected_point = corrected_points.get(hour["valid_time"])
+        ai_point = ai_points.get(hour["valid_time"])
         raw = deepcopy(
-            corrected_point["baseline_temperature"] if corrected_point else hour["temperature"]
+            corrected_point["baseline_temperature"]
+            if corrected_point
+            else ai_point["corrected_temperature"]
+            if ai_point
+            else hour["temperature"]
         )
         hours.append(
             {
@@ -136,6 +149,39 @@ def build_hourly_report(
                 final_temperature=deepcopy(hour["temperature"]),
                 final_display_temperature=_display_temperature(hour["temperature"]),
             )
+        elif stage.get("transformation_type") == "deterministic_corrected":
+            hours[-1]["bias_correction"].update(
+                status=correction.get("status", "no_policy"),
+                reason="No active deterministic correction changed this hour",
+                stage_id=stage["variant_id"],
+            )
+        if desk:
+            delta = ai_point.get("applied_delta_k") if ai_point else 0.0
+            fields_edited = sorted(edited.get(hour["valid_time"], set()))
+            hours[-1].update(
+                ai_adjustment={
+                    "action": "adjust_temperature"
+                    if delta
+                    else "adjust_other_fields"
+                    if fields_edited
+                    else "no_temperature_edit",
+                    "applied_delta": {"value": delta, "unit": "K"},
+                    # Edit target selection; a tapered edit can leave the point unchanged.
+                    "edited_fields": fields_edited,
+                    "reason": desk.get("completion_reason", "unavailable"),
+                    "stage_id": forecast.get("learning_stage", {}).get("variant_id")
+                    if forecast.get("learning_stage", {}).get("transformation_type")
+                    == "ai_adjusted"
+                    else None,
+                    "issued_checkpoint": desk.get(
+                        "issued_checkpoint", "latest_valid_ai_checkpoint"
+                    ),
+                    "policy": deepcopy(desk.get("policy")),
+                    "accepted_recipes": len(desk.get("accepted_recipes", [])),
+                },
+                final_temperature=deepcopy(hour["temperature"]),
+                final_display_temperature=_display_temperature(hour["temperature"]),
+            )
         if "surface" in hour:
             hours[-1]["surface"] = deepcopy(hour["surface"])
             hours[-1]["final_surface_fields"] = deepcopy(hour["surface"]["fields"])
@@ -153,6 +199,16 @@ def build_hourly_report(
         "timezone_note": "Presentation timezone; not inferred from forecast coordinates",
         "baseline_ref": "#/hours",
         "provenance_ref": "#",
+        **(
+            {
+                "ai_desk": {
+                    key: desk.get(key)
+                    for key in ("policy", "completion_reason", "provider", "model")
+                }
+            }
+            if desk
+            else {}
+        ),
         "hours": hours,
     }
 
@@ -429,13 +485,19 @@ def _render_surface_report(report: dict[str, Any]) -> str:
         "",
         f"Reference: {report['target_reference_time']}. "
         f"Display zone: {report['display_timezone']}.",
-        "Temperature remains HRRR/GFS 70/30. Dew point and coupled vector wind/gust "
+        "Raw temperature baseline remains HRRR/GFS 70/30. Dew point and coupled vector wind/gust "
         "use the retained Phase 2 rows: HRRR/GFS 70/30 at hours 1–18 and 60/40 at "
         "19–36 when both are eligible; approved single-model fallbacks are labeled. "
         "RAP/IFS are zero-weight shadows. "
         "RH is derived over liquid water from temperature/dew point.",
         (
-            "The surface table shows the coherent final fields after the explicitly active "
+            "The surface table shows the latest fully validated forecast after the bounded "
+            "AI desk. Raw baseline, deterministic correction and AI edit recipes remain "
+            "separate immutable stages. Desk completion: "
+            + str(report["ai_desk"].get("completion_reason"))
+            + "."
+            if report.get("ai_desk")
+            else "The surface table shows the coherent final fields after the explicitly active "
             "temperature correction. The structured hourly report retains raw temperature, "
             "policy/stage identity and each applied delta separately. AI action: not_run, "
             "nudge 0. Delivery has not run; previous versions' verification is separate."

@@ -49,14 +49,20 @@ def issued_forecast_context(forecast: dict[str, Any]) -> dict[str, Any]:
     context = {
         key: value for key, value in forecast.items() if key not in ("hours", "local_grid_baseline")
     }
-    stage = context.get("learning_stage")
-    if isinstance(stage, dict):
+    for stage_key, reference_key in (
+        ("learning_stage", "learning_reference"),
+        ("deterministic_stage", "deterministic_reference"),
+        ("baseline_stage", "baseline_stage_reference"),
+    ):
+        stage = context.get(stage_key)
+        if not isinstance(stage, dict):
+            continue
         # Point-hour verification needs exact identity/status, not every other
         # corrected cell. This is deliberately not a sealed variant payload;
         # the full immutable stage remains in its artifact and issued forecast.
         overlay = stage.get("overlay", {})
         correction = overlay.get("correction", {})
-        context["learning_stage"] = {
+        context[stage_key] = {
             "representation": "summary_reference_not_sealed_variant",
             "source_schema_version": stage.get("schema_version"),
             **{
@@ -81,7 +87,7 @@ def issued_forecast_context(forecast: dict[str, Any]) -> dict[str, Any]:
                     "created_at",
                 )
             },
-            "authoritative_artifact": forecast.get("learning_reference"),
+            "authoritative_artifact": forecast.get(reference_key),
             "overlay": {
                 "inherit_unchanged": overlay.get("inherit_unchanged"),
                 "predictions": bool(overlay.get("predictions")),
@@ -90,6 +96,35 @@ def issued_forecast_context(forecast: dict[str, Any]) -> dict[str, Any]:
                     "changes": bool(correction.get("changes")),
                 },
             },
+        }
+        if stage_key == "baseline_stage":
+            context[stage_key]["baseline_temperature_predictions"] = [
+                {key: row.get(key) for key in ("field", "value", "unit", "valid_time")}
+                for row in overlay.get("predictions", [])
+                if row.get("field") == "air_temperature_2m"
+            ]
+    if isinstance(context.get("ai_desk"), dict):
+        desk = context["ai_desk"]
+        ai_stage = forecast.get("learning_stage", {}).get("transformation_type") == "ai_adjusted"
+        context["ai_desk"] = {
+            "representation": "summary_reference_not_full_audit",
+            # Only a retained AI stage is authoritative; a corrected fallback has none.
+            "authoritative_artifact": forecast.get("learning_reference") if ai_stage else None,
+            "issued_checkpoint": desk.get(
+                "issued_checkpoint", "latest_valid_ai_checkpoint" if ai_stage else None
+            ),
+            **{
+                key: desk.get(key)
+                for key in (
+                    "policy",
+                    "provider",
+                    "model",
+                    "context_digest",
+                    "completion_reason",
+                    "validation",
+                )
+            },
+            "accepted_edit_count": len(desk.get("accepted_recipes", [])),
         }
     return context
 

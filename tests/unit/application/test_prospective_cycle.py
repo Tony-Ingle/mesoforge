@@ -322,3 +322,38 @@ def test_learning_failure_never_blocks_active_location_batch(
     assert result["background"]["learning"]["failures"][0]["phase"] == failure
     assert operator.events[-1][1]["baseline_pointer"] is operator.pointer
     assert operator.events[-1][1]["learning_overlays"] == []
+
+
+def test_operator_summary_separates_ai_completion_edits_and_fallback(operator):
+    result = cycle.run_prospective_cycle(
+        operator.config,
+        operator.root,
+        clock=lambda: START,
+        issuer=operator.issuer,
+        learning_service=operator.learning,
+    )
+    result["results"][0]["learning"] = {
+        "ai": {"completion_reason": "provider_unavailable", "accepted_recipes": []}
+    }
+    result["results"][1]["learning"] = {
+        "ai": {"completion_reason": "review_not_accepted", "accepted_recipes": [{}, {}]}
+    }
+    text = cycle.render_summary(result)
+    assert (
+        "AI desk: provider_unavailable; accepted edits: 0; "
+        "issued: corrected forecast (no AI edit issued)"
+    ) in text
+    # A negative final review still issues the latest validated AI checkpoint.
+    assert "AI desk: review_not_accepted; accepted edits: 2; issued: AI checkpoint 2" in text
+    result["results"][1]["learning"] = {
+        "ai": {
+            "completion_reason": "stage_persistence_failed_fallback",
+            "accepted_recipes": [],
+            "discarded_recipes": [{}],
+        }
+    }
+    text = cycle.render_summary(result)
+    assert (
+        "AI desk: stage_persistence_failed_fallback; accepted edits: 0; "
+        "issued: corrected forecast (no AI edit issued); discarded edits: 1"
+    ) in text

@@ -37,6 +37,7 @@ reblend fields, rerun baseline coherence or download guidance.
 | QPF verification | Bounded automatic MRMS accumulation before issuance, exact-hour facts, canonical samples and paired scoring |
 | Prospective operator cycle | Current-clock discovery, background preparation/build, then one pinned baseline for configured issuance |
 | Learning stages | Explicit local temperature correction/no-op, immutable candidate policy data, background shadow overlays and one temperature/QPF variant evaluator |
+| AI forecast desk | Always attempted after correction; bounded structured provider actions, deterministic field edits, validated checkpoints and automatic fallback |
 
 ### Current numerical policies
 
@@ -66,9 +67,10 @@ new enforcement rules. Conditions do not promote evidence-only fields.
 
 There is no continuously hosted guidance/baseline worker, scheduler or VPS deployment.
 There is no promoted correction or candidate policy in the current configuration,
-AI forecast desk, delivery/email service, adaptive production weighting or calibrated
-multi-source precipitation blend. The correction stage is implemented; an explicit
-active temperature policy is required to change operational values.
+delivery/email service, adaptive production weighting or calibrated multi-source
+precipitation blend. An explicit active temperature correction policy is required
+for the correction stage to change values. The operational AI desk may make bounded
+edits to this forecast; it cannot promote policies or change persistent blend science.
 QPF accumulation runs on demand with configured issuance or explicit bounded
 backfill; it is not a continuous MRMS poller or archive mirror.
 
@@ -195,6 +197,11 @@ and do not block issuance; a location failure does not stop later locations.
 Location jobs do not download guidance or rerun baseline blending/coherence. The
 local learning stage is a no-op without an explicit active correction; a changed
 temperature reruns only the existing affected T/Td/RH consistency/diagnostic rules.
+Every new configured forecast then attempts the bounded AI desk. Its latest fully
+validated state drives conditions, transitions, periods and immutable issuance.
+No justified edit, missing provider configuration, timeout or provider failure
+retains the last valid state; an AI stage is recorded only when the model acted. The raw baseline and corrected stage remain separate
+immutable controls for later identical-observation evaluation.
 
 The operator command composes the separate publication boundaries below. A failed
 refresh preserves `latest_complete`; a failed build preserves `latest_baseline`
@@ -492,7 +499,8 @@ on different sample populations.
 The normal prospective path now records a deterministic correction stage after
 local extraction. **No policy / insufficient evidence is a normal no-op.** There
 are no promoted corrections or real blend candidates in the shipped configuration;
-operational weather values and current weights remain unchanged.
+the deterministic stage and current weights remain unchanged without an active
+correction. The subsequent AI desk is a separately traceable per-forecast stage.
 
 Temperature proposals reuse canonical site evidence independently in the 1–6,
 7–18 and 19–36 hour buckets: at least 30 samples, 10 UTC decision dates, no date
@@ -555,7 +563,124 @@ shared sample count, bias/MAE/RMSE, metric differences, exact/provisional leads,
 locations/date concentration and exclusions. Temperature retains its station-proxy
 contract; QPF requires the exact same MRMS hourly interval and revision. Missing
 variants exclude that event from the common comparison population. There is no
-overall winner score, automatic promotion or AI execution.
+overall winner score or automatic promotion. Operational AI stages use this same
+evaluator; no separate AI observation population or evaluation system exists.
+
+## Bounded operational AI forecast desk
+
+Normal `prospective_cycle` and configured `forecast_from_baseline` jobs always
+attempt the desk after deterministic correction. There is no off/shadow/active
+mode switch. Missing credentials, an unavailable provider or a failed first request
+produce an explicit desk outcome and issue the complete corrected forecast; no AI
+stage claims a model decision that did not happen. Lower-level tests use
+deterministic providers, remove any operator `MESOFORGE_AI_*` settings and
+credential, and fail if the real transport is reached.
+
+The current concrete adapter uses OpenAI Responses with strict structured output.
+Configure an explicit model supporting structured outputs; the coding agent's
+model or login is never selected as the runtime weather provider:
+
+```text
+MESOFORGE_AI_PROVIDER=openai
+MESOFORGE_AI_MODEL=gpt-6-sol
+OPENAI_API_KEY=<set through the runtime environment or secret manager>
+```
+
+The current operator-selected meteorologist is `gpt-6-sol`; model selection remains
+runtime configuration rather than a dependency of the forecast/domain code.
+After changing Windows User environment variables, start a new terminal/runtime
+process so it inherits them. Credentials are never read from locations JSON.
+
+Optionally set `MESOFORGE_AI_REASONING_EFFORT` to `none`, `minimal`, `low`,
+`medium`, `high`, `xhigh` or `max` (case-insensitive); a value the chosen model does
+not accept fails that request with a sanitized HTTP code and the job falls back.
+The adapter otherwise omits the setting. The output-token ceiling includes any
+reasoning tokens; an incomplete response is a failed attempt, not an edit.
+An invalid runtime setting (unknown provider, unparsable price or budget, unknown
+effort) ends the attempt as `configuration_invalid`, naming the variable but never
+its value.
+
+Do not put credentials in locations JSON, forecast artifacts or Git. No weather
+model download is needed to exercise the desk on an already retained baseline.
+The adapter permits only inference at its fixed endpoint, with no hosted tools,
+redirects, retries, arbitrary URLs or runtime shell/filesystem/database access.
+See the [official structured-output contract](https://developers.openai.com/api/docs/guides/structured-outputs).
+
+The default desk target is 600 seconds, hard analysis ceiling 900 seconds,
+finalization reserve 60 seconds and individual provider timeout 60 seconds. Caps
+are 20 provider calls, 20 inspection calls, 12 proposals, 6 accepted edits and
+3 edits per field; assessment and final review each run at most once. Context
+is bounded to 64 KiB, each inspection to 8 KiB, each response to 2,048 output
+tokens and total usage to 300,000 tokens. The preflight counts one request byte as
+one token, and a configuration must fit two worst-case requests. These are versioned
+execution controls, not forecast science or a requirement to use the allowance.
+Reaching the target or the last permitted call moves the desk to its final review
+inside the hard window. The configured job holds the issuance lock only for the
+decision-window lookup and the locked recheck-and-publish, not during the desk.
+`MESOFORGE_AI_MIN_PROVIDER_INTERVAL_SECONDS` paces request starts for an account's
+rate limit (default 0). The current development account uses 65 seconds, a 4 KiB
+inspection cap (`MESOFORGE_AI_MAX_TOOL_OUTPUT_BYTES=4096`) and 300,000 total tokens;
+these are account-specific operator settings. Waiting consumes the same analysis
+budget; it never retries a rejected request or extends the deadline.
+
+Budget overrides use `MESOFORGE_AI_` plus the upper-case `DeskConfig` field,
+for example `MESOFORGE_AI_TARGET_SECONDS`, `MESOFORGE_AI_MAX_PROVIDER_CALLS`
+or `MESOFORGE_AI_MAX_TOTAL_TOKENS`. The policy version is `1`.
+An optional `MESOFORGE_AI_MAX_COST_USD` cap requires explicit
+`MESOFORGE_AI_INPUT_USD_PER_MILLION` and `MESOFORGE_AI_OUTPUT_USD_PER_MILLION`
+prices. Unknown pricing cannot satisfy a cost cap and prevents a paid request.
+Usage and configured-price estimates are reported separately from billed invoices.
+Validated usage is retained even when a response is incomplete or rejected.
+Unavailable usage after transport failure/timeout is explicitly unknown, not a
+claim of zero billable consumption. HTTP failures, including 429 quota or rate
+limits, end the attempt as `provider_failure` and retain only the status and an
+allowlisted error code, never response bodies or credentials.
+
+Currently editable fields are temperature (bounded additive K adjustment) and
+hourly liquid QPF (add, scale, conservative spatial smoothing, optional edge taper).
+Tool policy v1 caps per-proposal temperature additions to ±5 K, QPF additions to
+±10 kg/m², scaling to 0–2 and smoothing strength to 0–1. These are intervention
+permission limits, not claimed scientific improvement. A temperature edit that
+would make an available dew point or RH missing is rejected, not clamped. Taper
+weight falls to zero at the editable-domain edge, so on the current 3×3 editable
+domain only the centre node changes under a taper. Wind, dew point, probability,
+cloud, thunder, p-type, visibility and winter/ice fields remain inspect-only; there
+is no temporal QPF retiming or new precipitation-family coherence rule.
+
+The context gives each field's availability, range, point extremes, compatible
+contributor spread (or `no_comparable_pairs`), per-contributor point QPF timing,
+taper edge distances and cutoff-proven verification facts. Six inspection tools
+(`summarize_field`, `inspect_baseline`, `inspect_contributors`,
+`inspect_disagreement`, `inspect_verification_history`, `inspect_dependencies`)
+accept a field, pinned valid times, a region and optional cell ids. A wrong-phase or
+malformed action, an exhausted inspection or per-field budget, or a repeated,
+inverse or out-of-scope edit is a counted rejection rather than the end of the
+analysis. A final review with `accepted=false` discards all accepted edits.
+
+The report retains compact context identity, finite task priorities, inspection
+evidence, proposals, rejection reasons, ordered accepted recipes, checkpoint
+references, completion state and time/token/call usage. Recipes replay without
+another model call, and the AI stage verifies the digest chain from the corrected
+parent to the issued grid plus the edit scope before retention. No hidden
+chain-of-thought is requested or retained. Checkpoints store only their new recipe
+and a link to the previous checkpoint, never a grid copy; the issued forecast
+carries a compact desk summary while the full report lives in the AI stage.
+
+On 2026-09-25 a real `gpt-6-sol` run (reasoning effort `low`, 65-second pacing,
+10-call cap) replayed the Minneapolis 2026-09-18 00 UTC reference from a baseline
+built offline from already retained prepared guidance; no guidance was downloaded.
+The desk assessed a 17.7 mm point QPF event, prioritized QPF, inspected contributor
+disagreement at the forecast point for three hours, judged it peak-timing
+disagreement rather than a supported correction, and made no edit; its final review
+accepted the unchanged forecast. It used 5 provider calls, 1 inspection, 59,071
+input and 519 output tokens and 264 desk seconds, 245 of them pacing. The job
+retained raw, corrected and AI stages, issued the forecast and bound all three for
+evaluation. A following batch without a credential skipped the issued Minneapolis
+hour and issued Surley and Grasston through the explicit provider-unavailable
+fallback. This demonstrates runtime and lineage, not forecast skill.
+
+Governance, promotion and rollback remain future work. AI cannot alter its own
+rules, tool permissions, blend weights or correction policies.
 
 ## Repository map and development checks
 

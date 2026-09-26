@@ -67,13 +67,22 @@
   new scientific policies or model promotion. Prove equivalence when replacing
   scaffolding, then remove superseded execution rather than stack another path.
 - Current publication is on demand. Continuous workers, scheduling, automatic
-  policy promotion, AI editing and delivery remain future work. Schedulers decide WHEN;
+  policy promotion and delivery remain future work. Schedulers decide WHEN;
   MesoForge owns meteorology. Do not put forecast science in workflow/GHA YAML.
 - Learning uses common immutable stage/variant lineage and the existing artifact
   store/evaluator. Local temperature correction is explicitly no-op unless an
   ACTIVE policy exists; candidates/shadows never promote themselves. Build candidate
   blends in the background with FieldBlendEngine, retain compact overlays and enforce
   evidence/creation/activation cutoffs. Reuse current coherence only for affected fields.
+- Configured jobs always attempt the bounded AI desk after correction; no execution
+  modes. Pin evidence/cutoffs, expose only bounded structured meteorological tools,
+  and issue the latest fully validated checkpoint on failure. Field registry edit
+  contracts own permissions; providers cannot edit native contributors, policies,
+  credentials or arbitrary grids. Reuse Learning Core stage storage and evaluation.
+  Retain an AI stage only for a real model action with a verified recipe chain and
+  edit scope; otherwise issue the corrected stage with an explicit desk outcome.
+  Offline tests must not inherit operator `MESOFORGE_AI_*` settings or credentials
+  or reach the paid transport; a real provider run is a deliberate, bounded operator act.
 
 ## Scientific and verification guardrails
 
@@ -97,8 +106,8 @@
 - Opportunity, immutable fact and canonical analytical sample are different.
   Deduplicate evidence, respect reissues/revisions and compare stages/contributors
   on identical eligible samples. Sparse evidence does not justify skill claims.
-- Deterministic site/regime learning precedes future AI. Keep numerical baseline,
-  corrections, proposals and final fields separately traceable. Future AI edits
+- Deterministic correction precedes the operational AI desk. Keep numerical baseline,
+  corrections, proposals and final fields separately traceable. AI edits
   MesoForge fields through bounded deterministic tools, never native contributors.
   Use finite budgets/checkpoints and preserve the last validated forecast state;
   final validation and measured improvement cannot be replaced by LLM confidence.

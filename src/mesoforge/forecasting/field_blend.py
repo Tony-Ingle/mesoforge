@@ -50,6 +50,22 @@ _TABLE_MODEL_ORDER = ("HRRR", "NBM", "GFS")
 
 
 @dataclass(frozen=True)
+class FieldEditContract:
+    """Local editor capabilities; absence of a contract means inspection only.
+
+    Bounds describe the existing field contract, not model skill or a materiality
+    threshold. Native contributor records are never editing targets.
+    """
+
+    inspectable: bool = True
+    operations: tuple[str, ...] = ()
+    minimum: float | None = None
+    maximum: float | None = None
+    validation: tuple[str, ...] = ()
+    intervention_limits: tuple[tuple[str, float, float], ...] = ()
+
+
+@dataclass(frozen=True)
 class FieldDefinition:
     """Only metadata required by today's field-specific execution."""
 
@@ -60,12 +76,25 @@ class FieldDefinition:
     policy_binding: Literal["control_recipe", "scalar_vector_table", "qpf_table", "rh"]
     missing_behavior: str
     dependencies: tuple[str, ...] = ()
+    editing: FieldEditContract = FieldEditContract()
 
 
 FIELD_REGISTRY = MappingProxyType(
     {
         TEMPERATURE: FieldDefinition(
-            TEMPERATURE, "scalar", "K", "_temperature", "control_recipe", "require_all"
+            TEMPERATURE,
+            "scalar",
+            "K",
+            "_temperature",
+            "control_recipe",
+            "require_all",
+            editing=FieldEditContract(
+                operations=("add",),
+                minimum=150.0,
+                maximum=340.0,
+                validation=("blended_dew_point_consistency", "relative_humidity"),
+                intervention_limits=(("add.delta", -5.0, 5.0),),
+            ),
         ),
         DEW_POINT: FieldDefinition(
             DEW_POINT,
@@ -109,9 +138,25 @@ FIELD_REGISTRY = MappingProxyType(
             "_qpf",
             "qpf_table",
             "approved_subset_row_for_exact_hourly_intervals",
+            editing=FieldEditContract(
+                operations=("add", "scale", "smooth"),
+                minimum=0.0,
+                validation=("finite_nonnegative", "exact_hourly_interval"),
+                intervention_limits=(
+                    ("add.delta", -10.0, 10.0),
+                    ("scale.factor", 0.0, 2.0),
+                    ("smooth.strength", 0.0, 1.0),
+                ),
+            ),
         ),
     }
 )
+
+
+def field_edit_contract(field_id: str) -> FieldEditContract:
+    """Temporary/evidence fields remain inspect-only without a new blend path."""
+    definition = FIELD_REGISTRY.get(field_id)
+    return definition.editing if definition else FieldEditContract()
 
 
 @dataclass

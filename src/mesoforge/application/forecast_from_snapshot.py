@@ -14,7 +14,7 @@ import argparse
 import json
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from datetime import UTC, datetime
 from functools import partial
@@ -228,124 +228,153 @@ def _deliver_locations(
         issuer = create_issuer()
     batch_run_id = uuid4()
     rows: list[dict[str, Any]] = []
-    # Hold the existing forward-run storage lock through lookup, build and publish.
-    # A following process rechecks committed metadata before creating any new object.
-    lock = (run_lock or partial(acquire_issuance_run_lock, wait=True))() if issue else nullcontext()
+    # The storage lock serializes the decision-window lookup and, separately, the
+    # recheck-and-publish step. The bounded learning/AI stage (minutes per location)
+    # runs between them without holding a database session lock. A concurrent
+    # process that published meanwhile is detected by the locked recheck.
+    lock_factory = (run_lock or partial(acquire_issuance_run_lock, wait=True)) if issue else None
+
+    def locked() -> AbstractContextManager[None]:
+        return lock_factory() if lock_factory is not None else nullcontext()
+
     if issue:
         result["issuance_guard"] = {
             "mechanism": "postgresql_session_advisory_lock",
             "lock_key": str(FORWARD_RUN_LOCK),
-            "behavior": "wait_then_recheck_coordinate_reference_versions",
+            "behavior": "locked_lookup_unlocked_build_locked_recheck_and_publish",
             "explicit_reissue": reissue,
         }
-    with lock:
-        for index, location in enumerate(locations):
-            row: dict[str, Any] = {"index": index, "location": location}
+
+    def skipped_row(row: dict[str, Any], existing: Sequence[Any]) -> None:
+        row.pop("forecast", None)
+        row.update(
+            status="skipped_already_issued",
+            skipped={
+                "reason": "A version exists for this coordinate and reference hour; "
+                "pass --reissue to add one",
+                "existing_issued_forecast_ids": [
+                    str(record.issued_forecast_id) for record in existing
+                ],
+            },
+        )
+
+    for index, location in enumerate(locations):
+        row: dict[str, Any] = {"index": index, "location": location}
+        try:
+            latitude, longitude = _coordinates(location)
+            validate_coordinate(latitude, longitude)
+            zone = location_display_timezone(location) or display_timezone
+        except ValueError as exc:
+            row.update(status="error", error={"code": "invalid_location", "message": str(exc)})
+            rows.append(row)
+            continue
+        row["display_timezone"] = zone
+        if issue:
+            # The decision-window guard runs before the expensive grid build.
+            assert issuer is not None
             try:
-                latitude, longitude = _coordinates(location)
-                validate_coordinate(latitude, longitude)
-                zone = location_display_timezone(location) or display_timezone
-            except ValueError as exc:
-                row.update(status="error", error={"code": "invalid_location", "message": str(exc)})
-                rows.append(row)
-                continue
-            row["display_timezone"] = zone
-            if issue:
-                # The decision-window guard runs before the expensive grid build.
-                assert issuer is not None
-                try:
+                with locked():
                     existing = issuer.find_versions(
                         latitude=latitude,
                         longitude=longitude,
                         target_reference_time=reference_time,
                     )
+            except Exception:
+                row.update(
+                    status="error",
+                    error={
+                        "code": "issuance_lookup_failed",
+                        "message": "Could not check existing issuances for this location; "
+                        "nothing was issued.",
+                    },
+                )
+                rows.append(row)
+                continue
+            if existing and not reissue:
+                skipped_row(row, existing)
+                rows.append(row)
+                continue
+        try:
+            clock = time.perf_counter()
+            forecast = view.forecast(latitude=latitude, longitude=longitude)
+            row[build_timing_key] = time.perf_counter() - clock
+            forecast.update({key: dict(value) for key, value in lineage.items()})
+            if stage_processor is not None:
+                try:
+                    forecast, row["learning"] = stage_processor(forecast)
+                except Exception as exc:
+                    # The complete pinned numerical baseline survives learning failure.
+                    row["learning"] = {"status": "fallback", "reason": str(exc)}
+                    forecast = {**forecast, "learning_failure": row["learning"]}
+            clock = time.perf_counter()
+            forecast["hourly_report"] = build_hourly_report(forecast, display_timezone=zone)
+            row["hourly_report_seconds"] = time.perf_counter() - clock
+        except UnsupportedCoordinateError as exc:
+            row.update(
+                status="error", error={"code": "unsupported_coordinate", "message": str(exc)}
+            )
+        except CoverageRequiredError as exc:
+            row.update(
+                status="error",
+                error={
+                    "code": "coverage_required",
+                    "message": (
+                        f"{exc}; the snapshot covers only the refreshed collection's footprint"
+                    ),
+                },
+            )
+        except Exception as exc:
+            row.update(
+                status="error",
+                error={"code": "forecast_failed", "message": f"{type(exc).__name__}: {exc}"},
+            )
+        else:
+            row["forecast"] = forecast
+            row["status"] = "ok"
+            if issue:
+                assert issuer is not None
+                issued = None
+                try:
+                    with locked():
+                        recheck = (
+                            []
+                            if reissue
+                            else issuer.find_versions(
+                                latitude=latitude,
+                                longitude=longitude,
+                                target_reference_time=reference_time,
+                            )
+                        )
+                        if not recheck:
+                            clock = time.perf_counter()
+                            issued = issuer.issue(
+                                forecast, batch_run_id=batch_run_id, location_index=index
+                            )
+                            row["issuance_seconds"] = time.perf_counter() - clock
                 except Exception:
                     row.update(
                         status="error",
                         error={
-                            "code": "issuance_lookup_failed",
-                            "message": "Could not check existing issuances for this location; "
-                            "nothing was issued.",
+                            "code": "issuance_failed",
+                            "message": "Could not persist this forecast; nothing was issued.",
                         },
                     )
-                    rows.append(row)
-                    continue
-                if existing and not reissue:
-                    row.update(
-                        status="skipped_already_issued",
-                        skipped={
-                            "reason": "A version exists for this coordinate and reference hour; "
-                            "pass --reissue to add one",
-                            "existing_issued_forecast_ids": [
-                                str(record.issued_forecast_id) for record in existing
-                            ],
-                        },
-                    )
-                    rows.append(row)
-                    continue
-            try:
-                clock = time.perf_counter()
-                forecast = view.forecast(latitude=latitude, longitude=longitude)
-                row[build_timing_key] = time.perf_counter() - clock
-                forecast.update({key: dict(value) for key, value in lineage.items()})
-                if stage_processor is not None:
-                    try:
-                        forecast, row["learning"] = stage_processor(forecast)
-                    except Exception as exc:
-                        # The complete pinned numerical baseline survives learning failure.
-                        row["learning"] = {"status": "fallback", "reason": str(exc)}
-                        forecast = {**forecast, "learning_failure": row["learning"]}
-                clock = time.perf_counter()
-                forecast["hourly_report"] = build_hourly_report(forecast, display_timezone=zone)
-                row["hourly_report_seconds"] = time.perf_counter() - clock
-            except UnsupportedCoordinateError as exc:
-                row.update(
-                    status="error", error={"code": "unsupported_coordinate", "message": str(exc)}
-                )
-            except CoverageRequiredError as exc:
-                row.update(
-                    status="error",
-                    error={
-                        "code": "coverage_required",
-                        "message": (
-                            f"{exc}; the snapshot covers only the refreshed collection's footprint"
-                        ),
-                    },
-                )
-            except Exception as exc:
-                row.update(
-                    status="error",
-                    error={"code": "forecast_failed", "message": f"{type(exc).__name__}: {exc}"},
-                )
-            else:
-                row["forecast"] = forecast
-                row["status"] = "ok"
-                if issue:
-                    assert issuer is not None
-                    try:
-                        clock = time.perf_counter()
-                        issued = issuer.issue(
-                            forecast, batch_run_id=batch_run_id, location_index=index
-                        )
-                        row["issuance_seconds"] = time.perf_counter() - clock
-                    except Exception:
-                        row.update(
-                            status="error",
-                            error={
-                                "code": "issuance_failed",
-                                "message": "Could not persist this forecast; nothing was issued.",
-                            },
-                        )
-                    else:
-                        row["issued"] = issued.model_dump(mode="json")
-                        if stage_binding is not None and "learning" in row:
-                            try:
-                                row["learning"]["binding"] = stage_binding(
-                                    row["issued"], row["learning"]
-                                )
-                            except Exception as exc:
-                                row["learning"]["binding_failure"] = str(exc)
-            rows.append(row)
+                else:
+                    if issued is None:
+                        # Another process published this decision window while this
+                        # one built; its immutable version stands.
+                        skipped_row(row, recheck)
+                        rows.append(row)
+                        continue
+                    row["issued"] = issued.model_dump(mode="json")
+                    if stage_binding is not None and "learning" in row:
+                        try:
+                            row["learning"]["binding"] = stage_binding(
+                                row["issued"], row["learning"]
+                            )
+                        except Exception as exc:
+                            row["learning"]["binding_failure"] = str(exc)
+        rows.append(row)
     result.update(
         status="ok",
         batch_run_id=str(batch_run_id) if issue else None,

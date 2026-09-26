@@ -15,6 +15,7 @@ from typing import Any
 from uuid import UUID
 
 from mesoforge.common.identifiers import ArtifactId, Digest
+from mesoforge.contracts.forecast_variants import validate_variant
 from mesoforge.contracts.serialization import canonical_json_bytes
 from mesoforge.observations.mrms import (
     EXTRACTION_POLICY,
@@ -303,6 +304,40 @@ def evaluate_qpf_verification(
         reasons.append("forecast_hour_unavailable_or_ambiguous")
     surface = _map(hour.get("surface"))
     field = _map(_map(surface.get("fields")).get(FIELD))
+    ai_stage = _map(forecast.get("learning_stage")).get("transformation_type") == "ai_adjusted"
+    if stage == "baseline" and ai_stage:
+        raw_stage = _map(forecast.get("baseline_stage"))
+        try:
+            validate_variant(dict(raw_stage))
+            predictions = [
+                p
+                for p in raw_stage["overlay"]["predictions"]
+                if p["field"] == FIELD and _time(p["valid_time"]) == valid
+            ]
+            if (
+                len(predictions) != 1
+                or raw_stage["transformation_type"] != "active_baseline"
+                or raw_stage["location"] != coordinate
+                or _time(raw_stage["reference_time"]) != _time(saved.get("target_reference_time"))
+                or raw_stage["baseline_snapshot_id"]
+                != _baseline_reference(forecast)["baseline_snapshot_id"]
+            ):
+                raise ValueError("Raw QPF lineage unavailable")
+            prediction = predictions[0]
+            # The raw stage record alone defines the baseline event; no AI-final key
+            # carries over. Older stage rows predate saved semantics and used the
+            # only supported hourly accumulation contract.
+            field = {
+                # Contributor weights are identity metadata that AI never edits; they
+                # keep the source-cycle cutoff check below on the raw-stage fact.
+                "weights": field.get("weights"),
+                **prediction,
+                "temporal_semantics": prediction.get("temporal_semantics") or "accumulation",
+                "interval_closure": prediction.get("interval_closure") or "left_open_right_closed",
+            }
+        except (ValueError, TypeError, KeyError):
+            reasons.append("baseline_stage_unavailable")
+            field = {}
     interval = _interval(field)
     amount = _amount(field)
     if amount is None or field.get("status") not in ("available", "fallback"):
@@ -383,6 +418,10 @@ def evaluate_qpf_verification(
         "stage_evidence": (
             "unsupported_stage"
             if stage not in ("baseline", "final_issued")
+            else "saved_raw_baseline_stage"
+            if ai_stage and stage == "baseline"
+            else "saved_ai_adjusted_final_stage"
+            if ai_stage and stage == "final_issued"
             else "saved_numerical_baseline_no_qpf_adjustment_stage_implemented"
             if has_baseline
             else "saved_final_issued_hour_baseline_lineage_unavailable"

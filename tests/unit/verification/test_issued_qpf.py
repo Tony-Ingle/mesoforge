@@ -9,9 +9,11 @@ from typing import Any
 import pytest
 
 from mesoforge.common.identifiers import Digest
+from mesoforge.contracts.forecast_variants import seal_variant
 from mesoforge.contracts.serialization import canonical_json_bytes
 from mesoforge.observations.mrms import PRODUCT_CONTRACTS, extract_mrms
 from mesoforge.verification.issued_qpf import FIELD, evaluate_qpf_verification
+from tests.unit.contracts.test_forecast_variants import body
 from tests.unit.observations.test_mrms import make_mrms_message
 
 VALID = datetime(2026, 9, 24, 12, tzinfo=UTC)
@@ -317,3 +319,44 @@ def test_known_active_source_cycle_cannot_follow_issuance_but_shadow_does_not_ga
     assert "forecast_source_cycle_after_issuance" in result["reasons"]
     assert result["status"] == "excluded"
     assert result["qpf_error_mm"] is None
+
+
+def test_ai_qpf_final_and_retained_raw_baseline_are_not_aliased() -> None:
+    saved = saved_forecast(4.0)
+    forecast = saved["forecast"]
+    prediction = {
+        "field": FIELD,
+        "valid_time": VALID.isoformat(),
+        "value": 2.5,
+        "unit": "mm",
+        "interval_start": "2026-09-24T11:00:00Z",
+        "interval_end": VALID.isoformat(),
+        "policy": "phase2-qpf",
+        "status": "available",
+        "missing_reasons": [],
+    }
+    forecast["baseline_stage"] = seal_variant(
+        body(
+            parent_stage_id=None,
+            transformation_type="active_baseline",
+            lifecycle_role="active",
+            baseline_snapshot_id=forecast["baseline_snapshot"]["baseline_snapshot_id"],
+            location={"latitude": LAT, "longitude": LON},
+            reference_time=saved["target_reference_time"],
+            evidence_required=False,
+            evidence_status="baseline",
+            evidence_cutoff=None,
+            policy_created_at=None,
+            policy_activated_at=None,
+            overlay={"inherit_unchanged": False, "predictions": [prediction]},
+        )
+    )
+    forecast["learning_stage"] = {"transformation_type": "ai_adjusted"}
+    raw, final = evaluate(saved, stage="baseline"), evaluate(saved)
+    assert raw["status"] == final["status"] == "verified"
+    assert raw["forecast"]["amount_mm"] == 2.5
+    assert final["forecast"]["amount_mm"] == 4.0
+    assert raw["stage_evidence"] == "saved_raw_baseline_stage"
+    assert final["stage_evidence"] == "saved_ai_adjusted_final_stage"
+    forecast.pop("baseline_stage")
+    assert "baseline_stage_unavailable" in evaluate(saved, stage="baseline")["reasons"]

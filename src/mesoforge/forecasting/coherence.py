@@ -323,14 +323,27 @@ class CoherenceEngine:
     ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
         """Recheck affected existing local diagnostics without native reblending.
 
-        Temperature is the only currently supported local transformation. The
+        Temperature executes its existing diagnostics. QPF has registered future
+        dependencies only: report them, without inventing enforcement. The
         baseline's source eligibility and wind/gust results remain untouched.
         Missing/inconsistent dew point and RH follow the same baseline kernels.
         """
-        if set(changed_fields) - {TEMPERATURE}:
-            raise CoherenceError("Only temperature local transformations are supported")
+        if set(changed_fields) - {TEMPERATURE, QPF}:
+            raise CoherenceError("Only temperature and QPF local transformations are supported")
         if not changed_fields:
             return fields, {"version": COHERENCE_VERSION, "relationships": {}}
+        if TEMPERATURE not in changed_fields:
+            return fields, {
+                "version": COHERENCE_VERSION,
+                "phase": "local_field_edit",
+                "status": "passed",
+                "relationships": {
+                    name: {"status": "unimplemented", "enforced": False}
+                    for name, relationship in RELATIONSHIP_REGISTRY.items()
+                    if QPF in relationship.inputs and relationship.status == "dependency_only"
+                },
+                "future_rules_enforced": False,
+            }
         working = {
             **fields,
             DEW_POINT: {

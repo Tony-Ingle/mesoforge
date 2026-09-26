@@ -69,6 +69,7 @@ def learning(case, monkeypatch):
                 "interval_start": (end - timedelta(hours=1)).isoformat(),
                 "interval_end": end.isoformat(),
                 "interval_closure": "left_open_right_closed",
+                "temporal_semantics": "accumulation",
             }
     forecast = extract_grid_point(grid, latitude=LAT, longitude=LON, copy_grid=False)
     forecast["baseline_snapshot"] = {
@@ -304,3 +305,80 @@ def test_background_candidate_requires_shadow_and_reuses_existing_overlay(learni
     assert repeated["failures"] == [] and repeated["overlays"] == result["overlays"]
     built.assert_called_once()
     assert state == (learning.case.factory.artifacts, learning.case.objects.objects)
+
+
+def desk_report(corrected):
+    from mesoforge.forecasting.field_edit import grid_values_digest
+
+    parent = corrected["learning_stage"]
+    return {
+        "policy": {"id": "forecast-desk-fixture", "version": "1"},
+        "context_digest": str(canonical_json_digest({"fixture": "pinned"})),
+        "provider": "deterministic-fixture",
+        "model": "no-op",
+        "completion_reason": "no_edit",
+        "usage": {"provider_calls": 1, "validated_actions": 1},
+        "accepted_recipes": [],
+        "checkpoints": [{"values_digest": grid_values_digest(corrected["local_grid_baseline"])}],
+        "pinned_evidence": {
+            **{
+                k: parent[k]
+                for k in ("baseline_snapshot_id", "prepared_snapshot_id", "analysis_cutoff")
+            },
+            "corrected_stage_id": parent["variant_id"],
+            "parent_grid_sha256": corrected["local_grid"]["sha256"],
+        },
+        "validation": {"status": "valid"},
+    }
+
+
+def test_ai_noedit_stage_retains_three_distinct_stages_and_exact_issuance(learning):
+    service, original, case = learning.service, learning.forecast, learning.case
+    corrected, report = service.local_stage(original)
+    final = service.ai_stage(corrected, corrected, desk_report(corrected), report)
+    assert final["hours"] == original["hours"]
+    assert final["local_grid_baseline"] is original["local_grid_baseline"]
+    ai = final["learning_stage"]
+    assert ai["transformation_type"] == "ai_adjusted" and ai["lifecycle_role"] == "active"
+    assert ai["parent_stage_id"] == final["deterministic_stage"]["variant_id"]
+    assert final["deterministic_stage"]["parent_stage_id"] == final["baseline_stage"]["variant_id"]
+    assert ai["evidence_cutoff"] == ai["analysis_cutoff"]
+    assert ai["policy_created_at"] is None
+    record = case.service.issuer.issue(final, batch_run_id=uuid4(), location_index=0)
+    binding = service.bind(record.model_dump(mode="json"), report)
+    retained = service.read(ArtifactId(binding["artifact_id"]))["payload"]
+    assert len(retained["variants"]) == 3
+    assert case.service.issuer.read(record.issued_forecast_id)["forecast"] == final
+    saved = service.read(ArtifactId(report["operational_reference"]["artifact_id"]))
+    assert saved["payload"] == ai and saved["byte_size"] < 60000
+    assert service.stage_issued(record.issued_forecast_id)["already_existing"]
+
+
+def test_ai_storage_failure_cannot_update_report_or_overwrite_corrected_parent(learning):
+    service, forecast, case = learning.service, learning.forecast, learning.case
+    corrected, report = service.local_stage(forecast)
+    before = deepcopy(report)
+    case.objects.fail_next_put = True
+    with pytest.raises(RuntimeError, match="simulated upload failure"):
+        service.ai_stage(corrected, corrected, desk_report(corrected), report)
+    assert report == before
+    assert corrected["hours"] == forecast["hours"]
+
+
+@pytest.mark.parametrize("defect", ["pin", "checkpoint", "validation", "parent"])
+def test_ai_stage_rejects_unproven_or_substituted_controller_evidence(learning, defect):
+    service, forecast = learning.service, learning.forecast
+    corrected, report = service.local_stage(forecast)
+    desk = desk_report(corrected)
+    final = corrected
+    if defect == "pin":
+        desk["pinned_evidence"]["prepared_snapshot_id"] = "later-provider-arrival"
+    elif defect == "checkpoint":
+        desk["checkpoints"][-1]["values_digest"] = str(canonical_json_digest({"wrong": True}))
+    elif defect == "validation":
+        desk["validation"]["status"] = "invalid"
+    else:
+        final = {**corrected, "latitude": 30.0}
+    with pytest.raises(ValueError, match="pinned|checkpoint"):
+        service.ai_stage(corrected, final, desk, report)
+    assert report["operational_stage"]["transformation_type"] == "deterministic_corrected"

@@ -9,14 +9,18 @@ read time, which keeps both paths identical. It is not a model, weight or correc
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
+from datetime import timedelta
 from typing import Any
 
-from mesoforge.common.identifiers import Digest
+from mesoforge.common.identifiers import ArtifactId, Digest
+from mesoforge.contracts.forecast_variants import VARIANT_SCHEMA, instant, validate_variant
 from mesoforge.contracts.serialization import canonical_json_bytes
 
 ANALYTICAL_SCHEMA_VERSION = "mesoforge.verification-analytical-attributes.v1"
 ATTRIBUTE_KEY = "analysis"
+RAW_BASELINE_PROJECTION = "mesoforge.raw-baseline-temperature-projection.v1"
 
 # Saved point fields of the verified issued hour that are worth keeping for later
 # descriptive regime analysis. Values and units only; never provenance or policy prose.
@@ -83,6 +87,109 @@ def _forecast_stage(context: Mapping[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _raw_baseline_temperature(
+    context: Mapping[str, Any], forecast: Mapping[str, Any], issued_at: Any
+) -> dict[str, Any] | None:
+    """Recover the exact saved raw point, never reconstruct it from native models.
+
+    The compact context is a projection of the sealed stage retained in the
+    immutable issuance; its authoritative artifact reference remains explicit.
+    Invalid/missing legacy lineage is excluded, never inferred from an AI result.
+    """
+    stage = context.get("baseline_stage")
+    if stage is None:
+        return None
+    try:
+        if not isinstance(stage, dict):
+            raise ValueError("raw_stage_malformed")
+        reference = _mapping(context.get("baseline_stage_reference"))
+        ArtifactId(reference["artifact_id"])
+        Digest(reference["content_digest"])
+        Digest(stage["variant_id"])
+        if stage.get("schema_version") == VARIANT_SCHEMA:
+            validate_variant(stage)
+            predictions = stage["overlay"]["predictions"]
+        else:
+            if (
+                stage.get("representation") != "summary_reference_not_sealed_variant"
+                or stage.get("source_schema_version") != VARIANT_SCHEMA
+                or stage.get("authoritative_artifact") != reference
+            ):
+                raise ValueError("raw_stage_summary_identity_unproven")
+            predictions = stage["baseline_temperature_predictions"]
+        if (
+            stage.get("transformation_type") != "active_baseline"
+            or stage.get("parent_stage_id") is not None
+            or stage.get("lifecycle_role") != "active"
+            or "air_temperature_2m" not in stage["fields"]
+            or stage.get("evidence_status") != "baseline"
+            or stage.get("location")
+            != {"latitude": forecast.get("latitude"), "longitude": forecast.get("longitude")}
+        ):
+            raise ValueError("raw_stage_identity_disagrees")
+        lineage = _mapping(context.get("baseline_snapshot"))
+        for key in ("baseline_snapshot_id", "prepared_snapshot_id"):
+            if not stage.get(key) or stage[key] != lineage.get(key):
+                raise ValueError("raw_stage_baseline_lineage_disagrees")
+        target, valid = instant(context["target_reference_time"]), instant(forecast["valid_time"])
+        lead = forecast["horizon_hours"]
+        if (
+            type(lead) is not int
+            or not 1 <= lead <= 36
+            or valid - target != timedelta(hours=lead)
+            or instant(stage["reference_time"]) != target
+        ):
+            raise ValueError("raw_stage_valid_hour_disagrees")
+        cutoff, created, issued = (
+            instant(stage["analysis_cutoff"]),
+            instant(stage["created_at"]),
+            instant(issued_at),
+        )
+        if (
+            not target <= cutoff <= created <= issued
+            or cutoff != instant(lineage["forecast_analysis_cutoff"])
+            or instant(reference["registered_at"]) > issued
+        ):
+            raise ValueError("raw_stage_time_identity_disagrees")
+        if not isinstance(predictions, list):
+            raise ValueError("raw_stage_predictions_missing")
+        selected = [
+            row
+            for row in predictions
+            if isinstance(row, dict)
+            and row.get("field") == "air_temperature_2m"
+            and instant(row["valid_time"]) == valid
+        ]
+        if len(selected) != 1:
+            raise ValueError("raw_stage_hour_missing_or_ambiguous")
+        row = selected[0]
+        value = row.get("value")
+        if (
+            row.get("unit") != "K"
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or row.get("interval_start") is not None
+            or row.get("interval_end") is not None
+        ):
+            raise ValueError("raw_stage_temperature_unavailable_or_incompatible")
+        return {
+            "status": "available",
+            "projection_policy": RAW_BASELINE_PROJECTION,
+            "variant_id": stage["variant_id"],
+            "transformation_type": "active_baseline",
+            "authoritative_artifact": dict(reference),
+            "baseline_snapshot_id": stage["baseline_snapshot_id"],
+            "prepared_snapshot_id": stage["prepared_snapshot_id"],
+            "valid_time": forecast["valid_time"],
+            "value": value,
+            "unit": "K",
+            "analysis_cutoff": stage["analysis_cutoff"],
+        }
+    except (ValueError, TypeError, KeyError):
+        return {"status": "unavailable", "reason": "raw_baseline_temperature_identity_unproven"}
+
+
 def build_analytical_attributes(fact: Mapping[str, Any]) -> dict[str, Any]:
     """Project one verification fact payload onto the compact analytical block."""
     match = _mapping(fact.get("match"))
@@ -124,6 +231,9 @@ def build_analytical_attributes(fact: Mapping[str, Any]) -> dict[str, Any]:
         "horizon_hours": forecast.get("horizon_hours"),
         "forecast_temperature_k": _kelvin(forecast.get("temperature")),
         "forecast_stage": _forecast_stage(context),
+        "raw_baseline_temperature": _raw_baseline_temperature(
+            context, forecast, match.get("issued_at")
+        ),
         "temperature_error_k": error.get("value") if error.get("unit") == "K" else None,
         "observation": {
             **{key: selected.get(key) for key in _OBSERVATION_KEYS},
