@@ -1,0 +1,6 @@
+# Shell scripts, SQL for psql and systemd units run on Linux hosts and containers.
+*.sh text eol=lf
+*.psql text eol=lf
+*.service text eol=lf
+*.timer text eol=lf
+Dockerfile text eol=lf

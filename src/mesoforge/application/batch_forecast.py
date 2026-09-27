@@ -38,8 +38,12 @@ from mesoforge.storage.postgres.repositories import PostgresUnitOfWork
 from mesoforge.storage.s3 import S3ArtifactObjectStore
 
 
-def create_issuer() -> ForecastIssuanceService:
-    """Use the established PostgreSQL/S3 environment settings, with no local-file fallback."""
+def create_issuer(*, ensure_bucket: bool = True) -> ForecastIssuanceService:
+    """Use the established PostgreSQL/S3 environment settings, with no local-file fallback.
+
+    Hosted workers pass ``ensure_bucket=False``: a missing or mistyped bucket must fail
+    instead of silently creating an empty one; bucket creation is an operator step.
+    """
     dsn = resolve_database_dsn("MESOFORGE_DATABASE_DSN")
     names = (
         "MESOFORGE_S3_BUCKET",
@@ -85,6 +89,7 @@ def create_issuer() -> ForecastIssuanceService:
             endpoint_url=os.environ["MESOFORGE_S3_ENDPOINT"],
             access_key=os.environ["MESOFORGE_S3_ACCESS_KEY"],
             secret_key=os.environ["MESOFORGE_S3_SECRET_KEY"],
+            ensure_bucket=ensure_bucket,
         )
     except Exception as exc:
         raise RuntimeError("Could not connect to configured issuance object storage") from exc

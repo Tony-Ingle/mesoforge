@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import platform
-import subprocess
 import sys
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -21,6 +20,7 @@ from mesoforge.application.artifacts import (
     TransformationInputRef,
     TransformationRequest,
 )
+from mesoforge.application.code_revision import current_code_revision
 from mesoforge.application.issuance import (
     issued_forecast_context,
     read_issued_forecast,
@@ -301,12 +301,7 @@ def configured_service() -> IssuedTemperatureVerificationService:
     identity["dependency_versions"].update(
         {name: version(name) for name in ("pydantic", "sqlalchemy", "psycopg", "boto3", "jcs")}
     )
-    revision = subprocess.run(  # noqa: S603
-        ["git", "-C", str(package.parents[1]), "rev-parse", "HEAD"],  # noqa: S607
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    revision = current_code_revision(package.parents[1])
     identity["git_commit"] = revision
     environment = {
         "python": platform.python_version(),

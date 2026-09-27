@@ -529,6 +529,51 @@ def test_background_builds_only_registered_candidates_and_reuses_overlays(learni
     assert early["overlays"] == [] and "registration" in early["failures"][0]["reason"]
 
 
+def test_overlays_for_finds_background_overlays_without_building(learning, monkeypatch):
+    """Hosted issuance looks up exactly what the guidance worker's background retained."""
+    service, factory = learning.service, learning.case.factory
+    proposed = temperature_policy()
+    other = temperature_policy(
+        version="3", parameters=proposed.parameters.model_copy(update={"version": "3"})
+    )
+    first = service.register_policy(proposed.model_dump(mode="json"))
+    second = service.register_policy(other.model_dump(mode="json"))
+    factory.governance_clock = lambda: WRITE_CLOCK
+    governance = GovernanceService(service)
+    for saved in (first, second):
+        governance.register(ArtifactId(saved["artifact_id"]), actor="t", reason="r")
+    factory.governance_clock = lambda: READ_CLOCK
+    candidates = GovernanceService(service).blend_candidates(DECISION)
+    by_id = {str(row.policy_artifact_id): row for row in candidates}
+    pinned = SimpleNamespace(manifest={"baseline_snapshot_id": "fixture-baseline"})
+    built = Mock(
+        return_value={
+            "overlay": {
+                "schema_version": "mesoforge.candidate-baseline-overlay.v1",
+                "baseline_snapshot_id": "fixture-baseline",
+                "policy": proposed.model_dump(mode="json"),
+                "domains": [],
+            },
+            "timings": {"total_seconds": 0.01},
+        }
+    )
+    monkeypatch.setattr("mesoforge.application.candidate_baseline.build_candidate_overlay", built)
+    retained = service.background(pinned, [by_id[first["artifact_id"]]], analysis_cutoff=DECISION)
+    assert built.call_count == 1
+    state = deepcopy((learning.case.factory.artifacts, learning.case.objects.objects))
+    later = DECISION + timedelta(hours=1)
+    found = service.overlays_for(pinned, candidates, analysis_cutoff=later)
+    assert found["overlays"] == retained["overlays"]
+    assert found["missing"] == [
+        {"policy_artifact": second["artifact_id"], "reason": "overlay_missing"}
+    ]
+    assert found["failures"] == []
+    assert built.call_count == 1  # lookup never builds
+    assert state == (learning.case.factory.artifacts, learning.case.objects.objects)
+    other_baseline = SimpleNamespace(manifest={"baseline_snapshot_id": "another-baseline"})
+    assert service.overlays_for(other_baseline, candidates, analysis_cutoff=later)["overlays"] == []
+
+
 def desk_report(corrected):
     from mesoforge.forecasting.field_edit import grid_values_digest
 

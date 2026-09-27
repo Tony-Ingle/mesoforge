@@ -6,7 +6,6 @@ import argparse
 import hashlib
 import json
 import os
-import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -20,6 +19,7 @@ from mesoforge.application.artifacts import (
     TransformationRequest,
 )
 from mesoforge.application.batch_forecast import _coordinates, load_locations
+from mesoforge.application.code_revision import current_code_revision
 from mesoforge.application.configuration import ConfigurationService
 from mesoforge.application.prepared_temperature import _code_identity
 from mesoforge.application.spatial_coverage import validate_coordinate
@@ -58,12 +58,7 @@ def _identity() -> dict[str, Any]:
         result["source_sha256"][name] = hashlib.sha256(
             (_ROOT / "src/mesoforge" / name).read_bytes()
         ).hexdigest()
-    result["git_commit"] = subprocess.run(  # noqa: S603
-        ["git", "-C", str(_ROOT), "rev-parse", "HEAD"],  # noqa: S607
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    result["git_commit"] = current_code_revision(_ROOT)
     return result
 
 

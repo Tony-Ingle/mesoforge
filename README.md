@@ -36,6 +36,7 @@ reblend fields, rerun baseline coherence or download guidance.
 | Temperature verification | Automatic coordinate-driven METAR discovery/acquisition, matching, immutable facts and analysis |
 | QPF verification | Bounded automatic MRMS accumulation before issuance, exact-hour facts, canonical samples and paired scoring |
 | Prospective operator cycle | Current-clock discovery, background preparation/build, then one pinned baseline for configured issuance |
+| Hosted operation | One image; a polling guidance/baseline worker and a scheduled forecast/issuance worker over PostgreSQL and S3-compatible storage |
 | Learning stages | Explicit local temperature correction/no-op, immutable candidate policy data, background shadow overlays and one temperature/QPF variant evaluator |
 | Policy governance | Append-only lifecycle events; explicit register/evaluate/activate/rollback/retire; deterministic identical-sample eligibility; nothing is active by default |
 | AI forecast desk | Always attempted after correction; bounded structured provider actions, deterministic field edits, validated checkpoints and automatic fallback |
@@ -66,7 +67,8 @@ new enforcement rules. Conditions do not promote evidence-only fields.
 
 ### What is not implemented
 
-There is no continuously hosted guidance/baseline worker, scheduler or VPS deployment.
+The hosted worker roles, image, Compose stack and scheduler units exist (see
+[Hosted deployment](#hosted-deployment)); no VPS deployment has been performed.
 No correction or blend policy has been activated, and there is no delivery/email
 service, adaptive production weighting or calibrated multi-source precipitation
 blend. Only an explicitly activated governed temperature correction changes values
@@ -122,15 +124,9 @@ docker compose -f deploy/local/compose.yaml up -d --wait
 `.env` and edit local values if using Compose. Application Python reads process
 environment variables; it does **not** automatically import `.env`.
 
-Set these in the process that runs application commands:
-
-| Variable | Purpose |
-| --- | --- |
-| `MESOFORGE_DATABASE_DSN` | SQLAlchemy `postgresql+psycopg://...` connection |
-| `MESOFORGE_S3_ENDPOINT` | S3/MinIO endpoint, e.g. `http://127.0.0.1:59000` |
-| `MESOFORGE_S3_BUCKET` | Application artifact bucket |
-| `MESOFORGE_S3_ACCESS_KEY` | Object-store access key |
-| `MESOFORGE_S3_SECRET_KEY` | Object-store secret key |
+Set `MESOFORGE_DATABASE_DSN` and the four `MESOFORGE_S3_*` settings in the process
+that runs application commands; every variable is listed once under
+[Environment variables](#environment-variables).
 
 The application `MESOFORGE_S3_*` variables are distinct from the
 `MESOFORGE_TEST_S3_*` settings in `.env.example`. Configure both deliberately when
@@ -227,10 +223,11 @@ for a configuration/background/batch failure.
 `--replay-reference-time ISO_UTC_HOUR` is an explicit replay/debug override, never
 needed for normal operation.
 
-The command is noninteractive and suitable for a future external scheduler invoking
-the same command at **08:00 and 20:00 `America/Chicago`**, including daylight-saving
-changes. Those times are an initial evidence-collection strategy, not forecast
-science. No schedule, GitHub Actions workflow or hosted worker is installed.
+The command remains a one-shot composition for development and recovery. Hosted
+operation splits it into the two worker roles under [Hosted deployment](#hosted-deployment),
+whose forecast role is scheduled at **08:00 and 20:00 `America/Chicago`**, including
+daylight-saving changes. Those times are an initial evidence-collection strategy, not
+forecast science.
 
 ## Prepare guidance, build the baseline, issue forecasts
 
@@ -799,6 +796,244 @@ AI cannot alter its own rules, tool permissions, blend weights or correction
 policies, and has no governance tool. Its desk versions are only recorded explicitly
 and can never be activated or made eligible.
 
+## Hosted deployment
+
+One repository, one codebase and one image run two process roles against shared
+PostgreSQL and S3-compatible storage. An external scheduler decides only **when**
+the forecast role runs; all meteorology stays in MesoForge. The artifacts are the
+[Dockerfile](Dockerfile), [deploy/hosted/compose.yaml](deploy/hosted/compose.yaml)
+and the scripts and units beside it. There is no web UI, public API, Kubernetes or
+per-forecast approval.
+
+| Role | Command (`python -m ...`) | Lifecycle |
+| --- | --- | --- |
+| Guidance/baseline worker | `mesoforge.application.guidance_worker run` | Long-running, restarts automatically |
+| Forecast/issuance worker | `mesoforge.application.forecast_worker run --scheduled` | One run per scheduler trigger |
+| Operator commands | `mesoforge.application.operations <command>` | One-shot `admin` container |
+
+### Guidance/baseline worker
+
+Every `--interval-seconds` (default 300) one poll composes the existing workflows:
+
+1. Compare the database revision with the repository head. A mismatch
+   (`schema_not_at_head`) stops the poll; the worker never migrates. An unreachable
+   database still permits guidance refresh but defers builds.
+2. **Refresh** (existing `refresh_guidance`) when there is no prepared state, when the
+   current UTC reference hour or the next two hours (`--coverage-margin-hours`) are no
+   longer usable, when a configured coordinate lies outside the prepared footprint, in
+   the UTC hour before a scheduled slot (fresh NBM/HRRR/GFS for issuance), or when the
+   hourly discovery probe (existing `select_model_set`, metadata only) finds a newer
+   HRRR/GFS cycle. That refresh reuses the probe's selection instead of rediscovering.
+   Otherwise nothing is downloaded (`no_material_change`). Missing RAP/IFS shadows or
+   NBM PoP are tolerated exactly as the refresh workflow already tolerates them.
+3. **Build** (existing `build_baseline` with governed blend resolution) when the latest
+   baseline is missing, pins an older prepared snapshot, lacks resolved blend
+   governance, was rolled back (`blend_revoked`), pins different governed blend heads,
+   or lacks a configured coordinate the prepared snapshot covers. Each build-input
+   fingerprint (prepared snapshot and digest, coordinates, code revision, governed
+   heads) is attempted once, so a deterministic failure cannot loop; a transient
+   failure backs off and retries, and a build killed mid-way (watchdog, memory limit,
+   forced stop) is retried at most twice.
+4. Build overlays for registered blend candidates on the current baseline (existing
+   Learning Core background; already retained overlays are reused).
+5. Record readiness, guidance and next-slot coverage in `status/guidance-worker.json`.
+
+Refreshes are bounded: at most two attempts and one success per UTC hour, none
+starting after minute 40 (`--latest-start-minute`; discovery and preparation must
+finish inside their hour), a free-space floor (`--min-free-gb`, default 6, category
+`disk_low`), and backoff `min(cap, max(interval, base * 2^(n-1)))` from 5 minutes to
+1 hour. Counters, fingerprints and the in-flight phase persist across restarts; an
+interrupted phase counts as a failure at the next start. A failed refresh or build
+never replaces `latest_complete` or `latest_baseline`. SIGTERM/SIGINT end the poll at
+the next phase boundary (Compose allows 20 minutes for a running refresh or build); a
+second signal exits at once and the abandoned phase is recorded. A watchdog exits a
+phase or poll that exceeds its bound so the restart policy recovers the process. Only
+an unexpected internal error slows the poll cadence; a database outage or an
+unmigrated schema keeps polling at the normal interval so recovery is noticed
+promptly. One process may own a runtime root (`worker_busy` otherwise).
+
+`--refresh off` builds from the retained `latest_complete` only (recovery; no
+downloads). `--no-hourly-probe` refreshes only for coverage, footprint and pre-slot
+reasons: fewer downloads, less current intermediate guidance. `once` runs one poll; `status` prints the state file; `health` exits 0/1;
+`discover` runs a read-only availability probe and deletes its evidence (`--keep`
+retains it under `discovery/manual-*`; the worker clears only its own
+`discovery/worker/` scratch).
+
+### Forecast/issuance worker
+
+`run` loads the configured locations, applies the `--scheduled` gate (outside a slot
+window it prints `not_due` and exits 0), takes a PostgreSQL run lock (a scheduled
+trigger waits for it inside its window and exits 2 with
+`run_lock_busy_until_window_closed` if another run held it throughout; a manual
+overlapping run exits 0 as `already_running`), checks the schema head, the bucket
+(never created here) and governance, then reads the latest baseline pointer **once** and
+checks readiness with the same rules issuance applies. The pinned pointer, one clock
+sample and lookup-only candidate overlays go to `forecast_from_baseline`, which
+performs prior verification, extraction, correction, the always-attempted AI desk,
+validation, presentation and issuance per location. One location's failure never
+stops the next; the existing locked lookup turns a repeated trigger into
+`skipped_already_issued`, never a second issuance. It never refreshes guidance.
+
+With `--scheduled`, readiness is rechecked every minute until the slot window closes
+(the window is clipped to the slot's UTC hour, so the reference hour cannot change).
+Without a ready baseline the run exits 3 (`baseline_not_ready`) with the reasons.
+Exit codes: 0 completed, already issued, not due or already running; 1 some location
+failed; 2 infrastructure, configuration or governance failure; 3 no ready baseline.
+Each run writes structured JSON events to stderr, `runs/forecast-<time>-<id>/result.json`
+and `status/forecast-worker.json`, including each location's AI desk outcome and a
+network-free desk configuration check. `readiness` and `next-run` are read-only;
+`--reference-time` (explicit replay) and `--skip-verification` are recovery options.
+
+### Readiness, health and status
+
+Health is process health only: the guidance worker's heartbeat is fresh and no phase
+exceeds its bound. Readiness is separate and never an age threshold: the pinned
+publication verifies (`load_baseline`), timestamps precede the request, blend
+governance is resolved and not revoked, the request's reference hour is covered and
+at least one configured coordinate has a domain (others fail per location). Both
+report the baseline and contributor-state IDs, publication and build times,
+information cutoff, reference views, contributor cycles, age and reasons.
+
+`operations status` (human text, `--json` for machines) answers: is the worker
+healthy; is guidance current and which cycles it holds; which baseline is pinned and
+when it was built; which governed policies are active; the last forecast run and each
+location's AI desk outcome; recent refresh/build failures; the latest issuance per
+location; and the next scheduled run. Other commands: `migration-status`,
+`migrate --expect-database NAME`, `apply-grants --expect-database NAME`,
+`init-storage`, `baseline`, `issuances`, `export-objects --destination DIR`,
+`import-objects --source DIR`. Governance stays an explicit CLI, run through the admin
+service (`docker compose run --rm admin mesoforge.application.governance ...`); the
+worker database role cannot append governance events, and nothing is served over HTTP.
+
+### Scheduling at 08:00 and 20:00 America/Chicago
+
+Install [the systemd timer](deploy/hosted/systemd/mesoforge-forecast.timer) and
+[service](deploy/hosted/systemd/mesoforge-forecast.service) (edit
+`WorkingDirectory`); `OnCalendar=*-*-* 08,20:00:00 America/Chicago` follows daylight
+saving. Alternatives that stay DST-safe through the worker's own gate:
+
+```text
+5 * * * * cd /path/to/checkout/deploy/hosted && docker compose run --rm forecast-worker
+```
+
+(any cron, hourly in UTC), or a GitHub Actions workflow with `cron: "5 * * * *"` on a
+**self-hosted runner on the deployment host** running the same command (hosted
+runners cannot reach the internal network or the runtime volume). Keep
+`MESOFORGE_FORECAST_TIMEZONE`/`MESOFORGE_FORECAST_TIMES` equal to the timer.
+
+### Deploying the stack
+
+Prerequisites: one Linux host with Docker Engine and Compose v2.24 or newer, a Git
+checkout, outbound HTTPS, and enough disk on a filesystem dedicated to Docker volumes.
+No inbound port needs to be opened.
+
+```text
+cp deploy/hosted/.env.example deploy/hosted/.env      # fill in generated secrets
+cp deploy/hosted/ai.env.example deploy/hosted/ai.env  # optional: OpenAI key/budgets
+sh deploy/hosted/build-image.sh                       # set MESOFORGE_IMAGE to the tag
+make hosted-migrate DB=mesoforge                      # explicit: migrate, then create bucket
+make hosted-up                                        # verifies head, starts the worker
+make hosted-status
+```
+
+`hosted-migrate` starts only PostgreSQL and MinIO, runs `operations migrate` through
+the owner credentials, verifies the head and applies the worker grants (after any
+other migration path, run `operations apply-grants`); `hosted-up` refuses to start the
+worker
+unless `migration-status` reports the head. Workers never migrate, so two processes
+can never race a migration. To upgrade: build the new commit, back up, stop the
+guidance worker, migrate, then start it; run both roles from one image tag (overlay
+identities include the code identity).
+
+### Storage, backups and retention
+
+| Volume | Contents |
+| --- | --- |
+| `postgres-data` | Issuance metadata, verification facts, artifacts, governance events |
+| `minio-data` | Content-addressed issuance, stage and verification payloads |
+| `runtime` (`/var/lib/mesoforge/runtime`) | `guidance/` snapshots and `latest_complete`, `baseline/` baselines and `latest_baseline`, `runs/`, `status/`, `observations/` |
+
+Both workers mount `runtime` at the same absolute path (baselines record absolute
+prepared paths; publication locks are local), so the stack runs on one host. Nothing
+is deleted automatically: baselines, issuances, governance history and verification
+evidence are permanent. A prepared snapshot is 1.1–1.8 GB and a failed refresh
+leaves about 1 GB; expect several refreshes per day. The worker reports free space
+and stops refreshing below its floor. Removing old guidance is an explicit operator
+decision: a snapshot directory is safe to delete only if `latest_complete` does not
+name it and no retained baseline manifest references it.
+
+[backup.sh](deploy/hosted/backup.sh) (`sh deploy/hosted/backup.sh DEST`) dumps
+PostgreSQL (`pg_dump -Fc`, verified by `pg_restore --list`), then exports every
+referenced object with digest verification, then archives the runtime volume with the
+guidance worker paused (snapshot manifests only unless `--with-guidance`) and restarts
+it if it was running, also after an interruption. The destination must be outside the
+repository; avoid the 08:00/20:00 slot windows. [restore.sh](deploy/hosted/restore.sh)
+restores into a new stack with empty volumes under the same bucket name the rows
+reference, checking the empty database, the bucket name and the readability of the
+export before writing anything.
+
+### Security
+
+No service publishes a host port. PostgreSQL and MinIO sit on an internal network;
+only the workers also reach the internet. Workers log in as a member of the
+[`mesoforge_runtime` group role](deploy/hosted/postgres-init/worker-role.psql), whose
+table grants `operations migrate` applies: SELECT and INSERT, UPDATE of activity status
+only, read-only governance events, and no DDL, DELETE, TRUNCATE or trigger changes.
+Only the `admin` service holds the owner credentials; for an external S3 endpoint it
+also needs the egress network. The OpenAI key reaches only the forecast
+worker (`ai.env`). Containers run as uid 10001 with all capabilities dropped; the
+image contains no credentials and records its commit. Logs and status files redact
+credential values, DSN passwords and API tokens. For a bucket-scoped object-store
+credential, create a MinIO user with get/put/list on the bucket only (no delete) and
+use it as `MESOFORGE_S3_ACCESS_KEY`/`MESOFORGE_S3_SECRET_KEY`. The development HTTP
+interface (`mesoforge.api`) is not part of the hosted stack.
+
+A real VPS deployment needs operator-supplied inputs that this repository does not
+assume: the provider and host, its Linux distribution, SSH access, disk capacity, the
+generated secrets and optionally an OpenAI key. DNS names and public ports are not
+needed.
+
+### Environment variables
+
+Application commands read the process environment; they never import `.env` files.
+
+| Variable | Used by | Purpose |
+| --- | --- | --- |
+| `MESOFORGE_DATABASE_DSN` | All persistence | SQLAlchemy `postgresql+psycopg://...`; the worker role in the hosted stack |
+| `MESOFORGE_ALEMBIC_DSN` | Migrations only | Owner DSN; falls back to `MESOFORGE_DATABASE_DSN` |
+| `MESOFORGE_S3_ENDPOINT` | Object storage | S3-compatible endpoint (`http://minio:9000` in the hosted stack) |
+| `MESOFORGE_S3_BUCKET` | Object storage | Application bucket; workers never create it |
+| `MESOFORGE_S3_ACCESS_KEY` | Object storage | Access key identifier |
+| `MESOFORGE_S3_SECRET_KEY` | Object storage | Secret key |
+| `AWS_DEFAULT_REGION` | Object storage | boto3 region (`us-east-1` for MinIO) |
+| `MESOFORGE_PROSPECTIVE_ROOT` | Workers, cycle, operations | Runtime root (`guidance/`, `baseline/`, `runs/`, `status/`) |
+| `MESOFORGE_OBSERVATIONS_DIR` | Temperature verification | Retained METAR/station evidence root |
+| `MESOFORGE_MRMS_DIR` | QPF verification | Retained MRMS evidence root |
+| `MESOFORGE_OBSERVATIONS_ARTIFACT_ID` | Observation preview | Set internally during verification; optional explicit preview input |
+| `MESOFORGE_CODE_REVISION` | Code identity | Commit baked into the image; otherwise `git rev-parse HEAD` |
+| `MESOFORGE_FORECAST_TIMEZONE` | Both workers | Slot time zone (default `America/Chicago`) |
+| `MESOFORGE_FORECAST_TIMES` | Both workers | Comma-separated local `HH:MM` slots (default `08:00,20:00`) |
+| `MESOFORGE_AI_PROVIDER` | AI desk | `openai` |
+| `MESOFORGE_AI_MODEL` | AI desk | Model, currently `gpt-6-sol` |
+| `OPENAI_API_KEY` | AI desk | Provider credential (forecast worker only) |
+| `MESOFORGE_AI_REASONING_EFFORT` | AI desk | Optional effort |
+| `MESOFORGE_AI_INPUT_USD_PER_MILLION` | AI desk | Optional price; `..._OUTPUT_USD_PER_MILLION` pairs with it |
+| `MESOFORGE_AI_<FIELD>` | AI desk | Optional `DeskConfig` budget override (see the AI desk section) |
+| `MESOFORGE_IMAGE` | Compose | Image tag for every role |
+| `MESOFORGE_PG_DB` | Compose | Database name |
+| `MESOFORGE_PG_USER` | Compose | Owner role (migrations, admin) |
+| `MESOFORGE_PG_PASSWORD` | Compose | Owner password |
+| `MESOFORGE_PG_WORKER_USER` | Compose | Least-privilege worker role |
+| `MESOFORGE_PG_WORKER_PASSWORD` | Compose | Worker role password |
+| `MESOFORGE_MINIO_ROOT_USER` | Compose | MinIO server root user |
+| `MESOFORGE_MINIO_ROOT_PASSWORD` | Compose | MinIO server root password |
+| `MESOFORGE_GUIDANCE_MEM_LIMIT` | Compose | Guidance worker memory limit (default `8g`) |
+| `MESOFORGE_FORECAST_MEM_LIMIT` | Compose | Forecast worker memory limit (default `6g`) |
+
+The development Compose file and tests use `MESOFORGE_PG_PORT`, the MinIO port
+settings and `MESOFORGE_TEST_*` variables from [.env.example](.env.example); live
+tests use `MESOFORGE_LIVE_*`. Never point test variables at retained operational data.
+
 ## Repository map and development checks
 
 | Path | Job |
@@ -810,6 +1045,7 @@ and can never be activated or made eligible.
 | `src/mesoforge/verification/` | Matching, facts, canonicalization and read-only statistics |
 | `src/mesoforge/storage/`, `provenance/`, `contracts/` | Durable metadata/payload boundaries and identities |
 | `configs/`, `migrations/` | Current configuration inputs and PostgreSQL migrations |
+| `Dockerfile`, `deploy/hosted/` | The one image, hosted Compose stack, scheduler units and backup scripts |
 | `tests/`, `scripts/`, `Makefile` | Existing checks, scientific contracts and command wrappers |
 
 `forecast_from_snapshot`, `forward_run`, explicit selected-model preparation and
@@ -865,6 +1101,23 @@ Live tests are opt-in: `MESOFORGE_LIVE_TESTS=1`, plus explicit
 contracts, not forecast skill or production readiness.
 
 ### Verification status of this guide
+
+The hosted-deployment milestone ran both worker roles as real processes against a
+clean persistent PostgreSQL 16 cluster, initialized with the committed worker role and
+migrated by `operations migrate`, plus a local S3-compatible server (moto). Docker was
+not available on the development machine, so the image and Compose stack are
+validated by static tests and review, not by a container build. From already
+retained prepared guidance (no model download) the guidance worker built a governed
+baseline: 21 domain views, 342 MB, 775 s. The forecast worker refused the uncovered
+current hour (exit 3), then issued all three configured locations for an explicit
+replay hour in 117 s. A graceful restart kept the same baseline without rebuilding.
+A repeated trigger skipped all three locations and left database rows and objects
+unchanged, and an overlapping trigger exited without work. A database outage, loss
+of the object store (restored by object export/import with checksum-verified
+readback), a fake HTTP 429 from the desk transport and a blocked provider network
+each produced their documented category. A live metadata-only discovery probe took
+168 s (3.6 MB). The final offline run had 3,922 passes and the three pre-existing
+failures below; all 148 PostgreSQL/S3 integration and acceptance tests passed.
 
 Command arguments were checked against current parsers. The prospective operator
 milestone passed focused operator/snapshot/baseline/QPF checks and 25

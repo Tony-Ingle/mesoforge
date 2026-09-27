@@ -1,0 +1,145 @@
+# MesoForge hosted stack: one image, two worker roles, PostgreSQL and S3-compatible storage.
+#
+# Nothing is published on a host port. PostgreSQL and MinIO live on an internal network;
+# only the workers also join an egress network (model providers, observations, AI API).
+# Operators act through one-shot containers:
+#   docker compose run --rm admin mesoforge.application.operations migration-status
+# Values come from deploy/hosted/.env (see .env.example); the OpenAI key comes only from
+# deploy/hosted/ai.env and reaches only the forecast worker. Never commit either file.
+name: mesoforge-hosted
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-storage-environment: &storage-environment
+  MESOFORGE_S3_BUCKET: ${MESOFORGE_S3_BUCKET:?set MESOFORGE_S3_BUCKET in deploy/hosted/.env}
+  MESOFORGE_S3_ENDPOINT: ${MESOFORGE_S3_ENDPOINT:-http://minio:9000}
+  MESOFORGE_S3_ACCESS_KEY: ${MESOFORGE_S3_ACCESS_KEY:?set MESOFORGE_S3_ACCESS_KEY}
+  MESOFORGE_S3_SECRET_KEY: ${MESOFORGE_S3_SECRET_KEY:?set MESOFORGE_S3_SECRET_KEY}
+  AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+  MESOFORGE_FORECAST_TIMEZONE: ${MESOFORGE_FORECAST_TIMEZONE:-America/Chicago}
+  MESOFORGE_FORECAST_TIMES: ${MESOFORGE_FORECAST_TIMES:-08:00,20:00}
+  NO_PROXY: postgres,minio
+
+x-worker-environment: &worker-environment
+  <<: *storage-environment
+  # Least-privilege data role (no DDL, DELETE or TRUNCATE); see postgres-init/.
+  MESOFORGE_DATABASE_DSN: postgresql+psycopg://${MESOFORGE_PG_WORKER_USER:?set MESOFORGE_PG_WORKER_USER}:${MESOFORGE_PG_WORKER_PASSWORD:?set MESOFORGE_PG_WORKER_PASSWORD}@postgres:5432/${MESOFORGE_PG_DB:?set MESOFORGE_PG_DB}
+
+x-app: &app
+  image: ${MESOFORGE_IMAGE:?set MESOFORGE_IMAGE to the tag printed by deploy/hosted/build-image.sh}
+  init: true
+  cap_drop: ["ALL"]
+  security_opt: ["no-new-privileges:true"]
+  networks: [backend, egress]
+  volumes:
+    - runtime:/var/lib/mesoforge/runtime
+  logging: *logging
+  depends_on:
+    postgres:
+      condition: service_healthy
+    minio:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${MESOFORGE_PG_USER:?set MESOFORGE_PG_USER}
+      POSTGRES_PASSWORD: ${MESOFORGE_PG_PASSWORD:?set MESOFORGE_PG_PASSWORD}
+      POSTGRES_DB: ${MESOFORGE_PG_DB:?set MESOFORGE_PG_DB}
+      MESOFORGE_PG_WORKER_USER: ${MESOFORGE_PG_WORKER_USER:?set MESOFORGE_PG_WORKER_USER}
+      MESOFORGE_PG_WORKER_PASSWORD: ${MESOFORGE_PG_WORKER_PASSWORD:?set MESOFORGE_PG_WORKER_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    networks: [backend]
+    shm_size: 256m
+    logging: *logging
+    healthcheck:
+      # Over TCP: the first-initialization server listens on the socket only.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: ["server", "/data"]
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MESOFORGE_MINIO_ROOT_USER:?set MESOFORGE_MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MESOFORGE_MINIO_ROOT_PASSWORD:?set MESOFORGE_MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio-data:/data
+    networks: [backend]
+    logging: *logging
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Role 1: long-running bounded polling loop (refresh guidance, build baselines).
+  guidance-worker:
+    <<: *app
+    restart: unless-stopped
+    # A refresh can take ~15 minutes; the worker finishes its phase after SIGTERM.
+    stop_grace_period: 20m
+    mem_limit: ${MESOFORGE_GUIDANCE_MEM_LIMIT:-8g}
+    environment:
+      <<: *worker-environment
+    command: ["mesoforge.application.guidance_worker", "run", "--interval-seconds", "300"]
+    # Process health only (heartbeat and phase bounds); readiness is reported by status.
+    healthcheck:
+      test: ["CMD", "python", "-m", "mesoforge.application.worker_status", "guidance-health"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
+      start_period: 120s
+
+  # Role 2: one-shot issuance, started by the external scheduler:
+  #   docker compose run --rm forecast-worker
+  forecast-worker:
+    <<: *app
+    profiles: ["forecast"]
+    restart: "no"
+    stop_grace_period: 2m
+    mem_limit: ${MESOFORGE_FORECAST_MEM_LIMIT:-6g}
+    environment:
+      <<: *worker-environment
+      MESOFORGE_AI_PROVIDER: ${MESOFORGE_AI_PROVIDER:-openai}
+      MESOFORGE_AI_MODEL: ${MESOFORGE_AI_MODEL:-gpt-6-sol}
+    env_file:
+      - path: ./ai.env
+        required: false
+    command: ["mesoforge.application.forecast_worker", "run", "--scheduled"]
+
+  # Operator commands: migrate, governance, status, storage initialization and backup.
+  # The only service holding the owner (migration) credentials; no egress network, so an
+  # external S3 endpoint also needs `networks: [backend, egress]` here (override file).
+  admin:
+    <<: *app
+    profiles: ["admin"]
+    restart: "no"
+    networks: [backend]
+    environment:
+      <<: *storage-environment
+      MESOFORGE_DATABASE_DSN: postgresql+psycopg://${MESOFORGE_PG_USER}:${MESOFORGE_PG_PASSWORD}@postgres:5432/${MESOFORGE_PG_DB}
+      MESOFORGE_ALEMBIC_DSN: postgresql+psycopg://${MESOFORGE_PG_USER}:${MESOFORGE_PG_PASSWORD}@postgres:5432/${MESOFORGE_PG_DB}
+    command: ["mesoforge.application.operations", "status"]
+
+networks:
+  backend:
+    internal: true
+  egress: {}
+
+# Durable state. Back up with deploy/hosted/backup.sh; nothing here is pruned automatically.
+volumes:
+  postgres-data: {}
+  minio-data: {}
+  runtime: {}

@@ -1,0 +1,20 @@
+# One scheduled issuance run. The timer decides WHEN; MesoForge decides everything else.
+# Install: copy both units to /etc/systemd/system, set WorkingDirectory to the checkout's
+# deploy/hosted directory, then `systemctl daemon-reload && systemctl enable --now
+# mesoforge-forecast.timer`.
+[Unit]
+Description=MesoForge scheduled forecast issuance
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# EDIT: absolute path of <checkout>/deploy/hosted on this host.
+WorkingDirectory=/srv/mesoforge/deploy/hosted
+# The service command passes --scheduled: outside a slot window the run is a no-op,
+# inside it the worker waits for a ready baseline until the window closes, and a
+# duplicate trigger skips already issued locations.
+ExecStart=/usr/bin/docker compose run --rm forecast-worker
+# Readiness waiting, prior verification and the bounded AI desk for every location.
+TimeoutStartSec=3h

@@ -24,6 +24,8 @@ htmlcov/
 
 # Local runtime state (never committed)
 var/
+ai.env
+*.dump
 deploy/local/.pgdata/
 deploy/local/.miniodata/
 

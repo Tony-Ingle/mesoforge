@@ -99,6 +99,10 @@ class S3ArtifactObjectStore:
         if ensure_bucket:
             self._ensure_bucket()
 
+    def check_bucket(self) -> None:
+        """Raise ``ClientError`` unless the configured bucket exists and is reachable."""
+        self._client.head_bucket(Bucket=self._bucket)
+
     def _ensure_bucket(self) -> None:
         try:
             self._client.head_bucket(Bucket=self._bucket)

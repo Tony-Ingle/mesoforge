@@ -7,7 +7,6 @@ import hashlib
 import json
 import math
 import os
-import subprocess
 import sys
 import tempfile
 import time
@@ -23,6 +22,7 @@ from mesoforge.application.artifacts import (
     TransformationInputRef,
     TransformationRequest,
 )
+from mesoforge.application.code_revision import current_code_revision
 from mesoforge.application.configuration import ConfigurationService
 from mesoforge.catalog.configuration import load_configuration_source
 from mesoforge.common.identifiers import ArtifactId, ConfigurationSnapshotId, Digest
@@ -60,12 +60,7 @@ def _identity() -> dict[str, Any]:
         "observations/sources/mrms.py",
     )
     return {
-        "git_commit": subprocess.run(  # noqa: S603
-            ["git", "-C", str(_ROOT), "rev-parse", "HEAD"],  # noqa: S607
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip(),
+        "git_commit": current_code_revision(_ROOT),
         "source_sha256": {
             path: hashlib.sha256((_ROOT / "src/mesoforge" / path).read_bytes()).hexdigest()
             for path in paths

@@ -42,9 +42,10 @@ flowchart TD
     O[Observation / analysis providers] --> V
 ```
 
-The main boundaries are implemented as on-demand commands. There is no continuous
-hosted baseline worker or scheduler. Background means numerical preparation runs
-before a location job; it does not imply a daemon is already deployed.
+The main boundaries are implemented as commands. The hosted deployment (section N)
+runs them as two roles of one image: a polling guidance/baseline worker and a
+scheduled forecast/issuance worker. Background means numerical preparation runs
+before a location job; no VPS deployment has been performed.
 
 The issued product currently contains 36 hourly views of a local surface-weather
 canvas. Temperature, moisture, wind, QPF and temporary probability/category fields
@@ -122,9 +123,10 @@ The older `forward_run` verifies temperature, discovers/prepares guidance and bl
 inline. Its module identifies it as a development/compatibility path. It is not the
 normal baseline-consuming location path.
 
-Future hosting assigns these roles to workers sharing PostgreSQL and S3-compatible
-storage. An external scheduler may choose when to run them. Model selection,
-meteorology, cutoffs and verification belong to MesoForge, not workflow YAML.
+Hosted operation assigns these roles to two workers sharing PostgreSQL,
+S3-compatible storage and one runtime volume (section N). An external scheduler
+chooses when the forecast worker runs. Model selection, meteorology, cutoffs and
+verification belong to MesoForge, not scheduler or workflow YAML.
 
 ## C. Artifact hierarchy
 
@@ -519,8 +521,9 @@ retry B successfully
     → latest_baseline advances
 ```
 
-No discovery/download occurs in baseline construction. No scheduler, incremental
-affected-field recomputation or automatic retry daemon is implemented.
+No discovery/download occurs in baseline construction. The guidance worker
+(section N) decides when to refresh and rebuild and bounds retries; incremental
+affected-field recomputation is not implemented.
 
 ## J. Location issuance and read-only presentation
 
@@ -1216,46 +1219,83 @@ inspection, no justified edit and an accepted final review, then issuance throug
 the raw → corrected → AI stage lineage with all three stages bound. A no-credential
 batch then issued Surley and Grasston through the explicit fallback. These
 demonstrate runtime behavior, not meteorological skill or a new current-guidance
-forecast. Hosted deployment and scheduling are still unimplemented.
+forecast. The hosted forecast worker attempts the desk exactly as these jobs do.
 
 ## N. Operations and deployment
 
-Current operation is local/development and on demand. The normal commands have
-separate guidance and baseline roots plus configured PostgreSQL/object-store access
-for issuance/verification. Keep retained bytes and generated reports outside Git.
-The prospective operator command composes both roles in one invocation; it does
-not replace the separate Guidance/Baseline Worker and Forecast/Issuance Worker
-responsibilities. A future scheduler can invoke it at 08:00 and 20:00
-`America/Chicago`, using the named zone for DST. The runner obtains the date itself;
-the schedule does not supply dates, model cycles or meteorological decisions.
+**CURRENT.** One repository, one codebase and one image
+([Dockerfile](Dockerfile)) run two process roles; [README](README.md) has the
+operator procedure. The [hosted Compose stack](deploy/hosted/compose.yaml) adds
+PostgreSQL 16 and MinIO on an internal network with no published ports. Local
+development keeps the on-demand commands and `prospective_cycle`.
 
 ```mermaid
 flowchart LR
-    X[Future external scheduler] -. when .-> G[Guidance / baseline worker role]
-    X -. when .-> F[Forecast / issuance worker role]
-    P[Model providers] --> G
-    G --> R[Current filesystem guidance / baseline roots]
-    R --> F
+    X[External scheduler: systemd timer 08:00/20:00 America/Chicago] -. when .-> F
+    P[Model providers] --> G[Guidance/baseline worker: bounded poll loop]
+    G --> R[(Runtime volume: guidance/, baseline/, runs/, status/)]
+    R --> F[Forecast/issuance worker: one run per trigger]
+    O[METAR / MRMS] --> F
     F --> DB[(PostgreSQL)]
     F --> S3[(S3-compatible objects)]
-    O[MRMS / observations] --> V[Verification commands]
-    V --> DB
-    V --> S3
+    G --> DB
+    G --> S3
+    A[Admin: migrate, status, backup] --> DB
+    A --> S3
     F -. FUTURE .-> D[Delivery service]
 ```
 
-A future hosted deployment must preserve shared-path retention/locking or make an
-explicit architectural change. Current local file locks must not be advertised as
-an implemented multi-host distributed publication system.
+[`guidance_worker`](src/mesoforge/application/guidance_worker.py) wraps the existing
+`refresh_guidance` and `build_baseline` workflows; it holds no provider logic or
+science. Each poll checks the schema head (it never migrates), then refreshes only
+for missing prepared state, expiring `coverage_for` usability, configured coordinates
+outside the prepared footprint, the hour before a scheduled slot, or a newer required
+(HRRR/GFS) cycle found by the hourly `select_model_set` probe, whose selection the
+refresh reuses. It rebuilds for a new prepared snapshot, unresolved or revoked blend
+governance, changed governed blend heads, or a missing configured domain, trying each
+build-input fingerprint once. Existing publication rules keep the previous pointers
+on any failure. Hour budgets, exponential backoff, a free-space floor, persisted
+counters and in-flight phases, a single-writer lock, signal handling and a phase
+watchdog bound the loop. Registered blend candidates receive background overlays.
 
-The API is a local development/read interface, not a deployed authenticated public
-weather service. One-off prepared `/forecast` calculation remains a development
-surface; saved issuance/conditions/analysis reads do not create forecast history.
-See README for its supported commands and endpoint scope.
+[`forecast_worker`](src/mesoforge/application/forecast_worker.py) resolves the
+configured locations, applies the named-zone schedule gate
+([`forecast_schedule`](src/mesoforge/application/forecast_schedule.py)), takes a
+run-singleton advisory lock distinct from the per-location issuance lock, checks
+schema, bucket and governance, reads the baseline pointer once and applies
+[`baseline_readiness`](src/mesoforge/application/baseline_readiness.py), which uses
+issuance's own checks (`load_baseline`, timestamps, blend resolution and revocation,
+reference coverage). It passes that pointer, one request time and lookup-only
+candidate overlays to `forecast_from_baseline`, so correction, the AI desk,
+validation, presentation, issuance and prior verification are unchanged. It never
+refreshes guidance or builds a baseline; the locked lookup makes repeated triggers
+skips. A slot's acceptance window ends at the slot's UTC hour, so every accepted
+trigger maps to one reference hour and scheduled runs wait for readiness inside it.
 
-There is no operational GHA schedule, VPS worker, continuous observation poller,
-continuous MRMS ingestion, email or delivery service. Existing CI validates code;
-it is not the forecast scheduler. Hermes development orchestration remains paused.
+[`operations`](src/mesoforge/application/operations.py) provides read-only status,
+migration status, the one explicit `migrate` (which names its target database),
+explicit bucket creation and digest-verified object export/import.
+[`worker_status`](src/mesoforge/application/worker_status.py) keeps health a
+standard-library heartbeat check distinct from readiness, and
+[`runtime_log`](src/mesoforge/application/runtime_log.py) emits redacted one-line
+JSON events. Images record their commit in `MESOFORGE_CODE_REVISION` instead of
+reading Git.
+
+Both roles mount the runtime volume at one absolute path because baselines record
+absolute prepared paths and publication uses local file locks: the deployment is a
+single host. Workers log in through a least-privilege PostgreSQL group role whose
+grants `operations migrate` applies after each upgrade (read and append, activity
+status updates only, read-only governance events), so the database itself refuses a
+worker governance write; only the admin service holds owner credentials, and only
+the forecast worker receives the AI credential.
+Nothing prunes baselines, issuances, governance or verification evidence.
+
+**FUTURE.** Multi-host publication or shared object-backed guidance, delivery,
+continuous observation/MRMS polling and automatic guidance retention need explicit
+designs. Current local file locks are not a distributed publication system. The
+development HTTP interface (`mesoforge.api`) is a local read/calculation surface,
+not part of the hosted stack or an authenticated public service. Existing CI
+validates code; it is not the forecast scheduler. Hermes orchestration remains paused.
 
 ## O. Current versus future
 
@@ -1268,7 +1308,8 @@ it is not the forecast scheduler. Hermes development orchestration remains pause
 | Coherence framework | Implemented | Finite current source/Td/RH/wind/gust rules |
 | Full precipitation/thermal/fog coherence | Partially implemented | Dependencies registered; broader enforcement is future science |
 | Background baseline / `latest_baseline` | Implemented | On-demand exact configured domains/reference views |
-| Continuous/incremental baseline processing | Future | No hosted worker or model-arrival trigger |
+| Polling guidance/baseline worker | Implemented | Bounded refresh/build decisions from existing contracts; not incremental |
+| Incremental affected-field baseline processing | Future | Every build materializes all configured domains/views |
 | Baseline-consuming configured issuance | Implemented | Pin, extract, isolate failures and persist immutably |
 | Prospective operator cycle | Implemented | Current-clock composition of independent background and configured issuance boundaries; no scheduler |
 | NBM PoP/cloud/thunder and p-type agreement | Temporary scaffolding | Not the final multi-source scientific forecast |
@@ -1282,7 +1323,8 @@ it is not the forecast scheduler. Hermes development orchestration remains pause
 | Policy governance, promotion eligibility and rollback | Implemented | Append-only events, deterministic eligibility, explicit CAS activation, rollback/emergency/retire; blend/QPF/AI never eligible |
 | Broader site/regime correction science | Future | No regime classifier, per-bucket activation or additional correction science |
 | Bounded operational AI desk and current final validation | Implemented | Structured provider boundary, finite tasks/budgets, temperature/QPF tools, checkpoint fallback and common stage evaluation |
-| Scheduled hosted operation and delivery | Future | Scheduler chooses when; MesoForge keeps all meteorology |
+| Scheduled hosted operation | Implemented, not yet deployed to a VPS | One image, two roles, internal services; scheduler chooses when, MesoForge keeps all meteorology |
+| Delivery | Future | No email, SMS or delivery service |
 
 ## P. Architectural debt and retained boundaries
 
@@ -1290,8 +1332,9 @@ it is not the forecast scheduler. Hermes development orchestration remains pause
   store and read. Baseline compaction does not solve full payload normalization.
 - Background builds materialize every configured domain/reference view; this costs
   time and storage. Incremental affected-field computation is not implemented.
-- Baseline source references currently depend on retained local paths/documents.
-  Hosted retention and sharing require an explicit operational design.
+- Baseline source references currently depend on retained local paths/documents,
+  so hosted operation is single-host with one runtime volume. Guidance retention is
+  a manual operator decision; each prepared snapshot is 1.1–1.8 GB.
 - Historical schemas, retained Phase 2 consumers and development inline paths remain
   for real readers/scientific reuse. They are not equally preferred production flows.
 - Field-specific policy sophistication lags the generalized machinery. Promotion

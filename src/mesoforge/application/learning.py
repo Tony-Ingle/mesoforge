@@ -817,6 +817,42 @@ class LearningService:
             )
         )
 
+    def _candidate_overlay_key(
+        self, pinned: Any, candidate: ResolvedPolicy, analysis_cutoff: datetime
+    ) -> tuple[Any, dict[str, str], dict[str, object]]:
+        """Validated candidate payload and its idempotent overlay identity for one baseline."""
+        from mesoforge.forecasting.candidate_policy import CandidateBlendPolicy
+
+        identifier = candidate.policy_artifact_id
+        if (
+            candidate.event.event_type != "REGISTERED"
+            or candidate.event.recorded_at is None
+            or candidate.event.recorded_at > analysis_cutoff
+        ):
+            raise ValueError("Background execution requires a committed registration")
+        saved = self.read(ArtifactId(identifier))
+        if max(
+            instant(saved["registered_at"]), instant(saved["available_at"])
+        ) > analysis_cutoff or saved["content_digest"] != str(candidate.content_digest):
+            raise ValueError("Policy artifact was not available before analysis cutoff")
+        policy = CandidateBlendPolicy.model_validate_json(canonical_json_bytes(saved["payload"]))
+        policy.validate_execution(analysis_cutoff)
+        if policy.lifecycle_role != "candidate":
+            raise ValueError("Only governed candidate payloads execute as shadows")
+        governance = {
+            "policy_artifact_id": str(identifier),
+            "content_digest": str(candidate.content_digest),
+            "registration_event_id": str(candidate.registration.event_id),
+            "registered_at": _iso(candidate.event.recorded_at),
+        }
+        key: dict[str, object] = {
+            "baseline_snapshot_id": pinned.manifest["baseline_snapshot_id"],
+            "policy_digest": policy.digest,
+            "registration_event_id": governance["registration_event_id"],
+            "code_identity": _digest(self.identity),
+        }
+        return policy, governance, key
+
     def background(
         self,
         pinned: Any,
@@ -830,41 +866,14 @@ class LearningService:
         from committed governance at ``analysis_cutoff``. Payload roles never select.
         """
         from mesoforge.application.candidate_baseline import build_candidate_overlay
-        from mesoforge.forecasting.candidate_policy import CandidateBlendPolicy
 
         report: dict[str, Any] = {"overlays": [], "failures": []}
         for candidate in candidates:
             identifier = candidate.policy_artifact_id
             try:
-                if (
-                    candidate.event.event_type != "REGISTERED"
-                    or candidate.event.recorded_at is None
-                    or candidate.event.recorded_at > analysis_cutoff
-                ):
-                    raise ValueError("Background execution requires a committed registration")
-                saved = self.read(ArtifactId(identifier))
-                if max(
-                    instant(saved["registered_at"]), instant(saved["available_at"])
-                ) > analysis_cutoff or saved["content_digest"] != str(candidate.content_digest):
-                    raise ValueError("Policy artifact was not available before analysis cutoff")
-                policy = CandidateBlendPolicy.model_validate_json(
-                    canonical_json_bytes(saved["payload"])
+                policy, governance, key = self._candidate_overlay_key(
+                    pinned, candidate, analysis_cutoff
                 )
-                policy.validate_execution(analysis_cutoff)
-                if policy.lifecycle_role != "candidate":
-                    raise ValueError("Only governed candidate payloads execute as shadows")
-                governance = {
-                    "policy_artifact_id": str(identifier),
-                    "content_digest": str(candidate.content_digest),
-                    "registration_event_id": str(candidate.registration.event_id),
-                    "registered_at": _iso(candidate.event.recorded_at),
-                }
-                key = {
-                    "baseline_snapshot_id": pinned.manifest["baseline_snapshot_id"],
-                    "policy_digest": policy.digest,
-                    "registration_event_id": governance["registration_event_id"],
-                    "code_identity": _digest(self.identity),
-                }
                 existing = self.find("learning-overlay", key)
                 if existing:
                     overlay = existing[0]
@@ -881,6 +890,35 @@ class LearningService:
                 report["overlays"].append(self._reference(overlay))
             except Exception as exc:
                 report["failures"].append({"policy_artifact": str(identifier), "reason": str(exc)})
+        return report
+
+    def overlays_for(
+        self,
+        pinned: Any,
+        candidates: list[ResolvedPolicy],
+        *,
+        analysis_cutoff: datetime,
+    ) -> dict[str, Any]:
+        """Lookup-only: overlays the background already retained for this baseline.
+
+        Issuance never builds candidate blends. A candidate without a retained overlay
+        is reported as missing and simply has no shadow stage for this issuance.
+        """
+        report: dict[str, Any] = {"overlays": [], "missing": [], "failures": []}
+        for candidate in candidates:
+            identifier = str(candidate.policy_artifact_id)
+            try:
+                _, _, key = self._candidate_overlay_key(pinned, candidate, analysis_cutoff)
+                existing = self.find("learning-overlay", key)
+            except Exception as exc:
+                report["failures"].append({"policy_artifact": identifier, "reason": str(exc)})
+                continue
+            if existing:
+                report["overlays"].append(self._reference(existing[0]))
+            else:
+                report["missing"].append(
+                    {"policy_artifact": identifier, "reason": "overlay_missing"}
+                )
         return report
 
     def candidate_stages(

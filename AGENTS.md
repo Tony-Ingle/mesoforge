@@ -66,9 +66,14 @@
   remain active until explicitly replaced. Generalized machinery does not authorize
   new scientific policies or model promotion. Prove equivalence when replacing
   scaffolding, then remove superseded execution rather than stack another path.
-- Current publication is on demand. Continuous workers, scheduling, automatic
-  policy promotion and delivery remain future work. Schedulers decide WHEN;
-  MesoForge owns meteorology. Do not put forecast science in workflow/GHA YAML.
+- Hosted operation is one image with two roles: `guidance_worker` decides only when
+  to run `refresh_guidance`/`build_baseline`; `forecast_worker` pins one ready
+  baseline and calls `forecast_from_baseline`, never refreshing guidance. Keep their
+  decisions on existing contracts, with no provider logic or science of their own.
+  Workers never migrate schema or change governance; `operations migrate` is the one
+  explicit schema step. Automatic policy promotion and delivery remain future work.
+  Schedulers decide WHEN; MesoForge owns meteorology. Do not put forecast science in
+  scheduler, Compose or GHA YAML.
 - Learning uses common immutable stage/variant lineage and the existing artifact
   store/evaluator. Local temperature correction is explicitly no-op unless an
   ACTIVE policy exists; candidates/shadows never promote themselves. Build candidate

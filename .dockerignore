@@ -1,0 +1,12 @@
+# Allowlist: the image needs only locked metadata, migrations, configuration and source.
+# Never .git, .env files, caches, virtual environments, tests or runtime data.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!alembic.ini
+!migrations/
+!configs/
+!src/
+**/__pycache__
+**/*.pyc

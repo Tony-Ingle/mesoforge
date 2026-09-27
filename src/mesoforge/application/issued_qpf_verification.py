@@ -6,7 +6,6 @@ import argparse
 import hashlib
 import json
 import os
-import subprocess
 import sys
 import time
 from collections import Counter
@@ -21,6 +20,7 @@ from mesoforge.application.artifacts import (
     TransformationInputRef,
     TransformationRequest,
 )
+from mesoforge.application.code_revision import current_code_revision
 from mesoforge.application.configuration import ConfigurationService
 from mesoforge.application.issuance import (
     ForecastIssuanceService,
@@ -58,12 +58,7 @@ def _identity() -> dict[str, Any]:
         "observations/mrms.py",
     )
     return {
-        "git_commit": subprocess.run(  # noqa: S603
-            ["git", "-C", str(_ROOT), "rev-parse", "HEAD"],  # noqa: S607
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip(),
+        "git_commit": current_code_revision(_ROOT),
         "source_sha256": {
             p: hashlib.sha256((_ROOT / "src/mesoforge" / p).read_bytes()).hexdigest() for p in paths
         },

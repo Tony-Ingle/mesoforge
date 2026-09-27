@@ -1,0 +1,16 @@
+# 08:00 and 20:00 America/Chicago, including across daylight-saving changes
+# (systemd evaluates the named zone). Keep MESOFORGE_FORECAST_TIMES in agreement; the
+# worker's --scheduled gate is the authority and ignores fires outside a slot window.
+[Unit]
+Description=MesoForge forecast issuance at 08:00 and 20:00 America/Chicago
+
+[Timer]
+OnCalendar=*-*-* 08,20:00:00 America/Chicago
+AccuracySec=1s
+# A fire missed while the host was down runs at boot; the gate makes it a no-op unless
+# it still falls inside the slot window.
+Persistent=true
+Unit=mesoforge-forecast.service
+
+[Install]
+WantedBy=timers.target

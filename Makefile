@@ -85,4 +85,27 @@ services-down:
 migrate:
 	uv run alembic upgrade head
 
+# Hosted stack (deploy/hosted). Migration is always an explicit operator step.
+HOSTED = docker compose -f deploy/hosted/compose.yaml
+
+hosted-image:
+	sh deploy/hosted/build-image.sh
+
+# Usage: make hosted-migrate DB=<database name from deploy/hosted/.env>
+hosted-migrate:
+	@test -n "$(DB)" || { echo "usage: make hosted-migrate DB=<database name>"; exit 1; }
+	$(HOSTED) up -d --wait postgres minio
+	$(HOSTED) run --rm admin mesoforge.application.operations migrate --expect-database "$(DB)"
+	$(HOSTED) run --rm admin mesoforge.application.operations init-storage
+
+hosted-up:
+	$(HOSTED) run --rm admin mesoforge.application.operations migration-status
+	$(HOSTED) up -d guidance-worker
+
+hosted-status:
+	$(HOSTED) run --rm admin mesoforge.application.operations status
+
+hosted-forecast:
+	$(HOSTED) run --rm forecast-worker
+
 ci: sync quality test

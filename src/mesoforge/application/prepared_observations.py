@@ -6,7 +6,6 @@ import argparse
 import hashlib
 import json
 import os
-import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,6 +17,7 @@ from mesoforge.application.artifacts import (
     TransformationInputRef,
     TransformationRequest,
 )
+from mesoforge.application.code_revision import current_code_revision
 from mesoforge.application.configuration import ConfigurationService
 from mesoforge.application.issuance import validate_hour_selection
 from mesoforge.application.phase2_replay import parse_station_snapshot
@@ -65,12 +65,7 @@ def _identity() -> dict[str, Any]:
         identity["source_sha256"][name] = hashlib.sha256(
             (_ROOT / "src/mesoforge" / name).read_bytes()
         ).hexdigest()
-    identity["git_commit"] = subprocess.run(  # noqa: S603
-        ["git", "-C", str(_ROOT), "rev-parse", "HEAD"],  # noqa: S607
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    identity["git_commit"] = current_code_revision(_ROOT)
     return identity
 
 

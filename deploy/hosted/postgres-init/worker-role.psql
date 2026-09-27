@@ -1,0 +1,19 @@
+-- Least-privilege runtime access shared by both worker roles.
+--
+-- Creates the NOLOGIN group role mesoforge_runtime and the worker login inside it.
+-- Table privileges are applied by `operations migrate` (and `operations apply-grants`)
+-- as the owner after every upgrade: SELECT and INSERT on the data tables, UPDATE of
+-- activity status only, SELECT-only governance events, no DDL, DELETE, TRUNCATE or
+-- trigger changes. Run once per database:
+--   psql -v worker=... -v worker_password=... -v database=... -f worker-role.psql
+-- The postgres image runs it automatically on first volume initialization
+-- (10-worker-role.sh).
+\set ON_ERROR_STOP on
+SELECT 'CREATE ROLE mesoforge_runtime NOLOGIN'
+    WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mesoforge_runtime') \gexec
+CREATE ROLE :"worker" LOGIN PASSWORD :'worker_password'
+    NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS IN ROLE mesoforge_runtime;
+REVOKE ALL ON DATABASE :"database" FROM PUBLIC;
+GRANT CONNECT, TEMPORARY ON DATABASE :"database" TO mesoforge_runtime;
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO mesoforge_runtime;
