@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from collections.abc import Callable
@@ -42,7 +43,7 @@ from mesoforge.application.batch_forecast import _coordinates, load_locations
 from mesoforge.application.code_revision import current_code_revision
 from mesoforge.application.forecast_schedule import ForecastSchedule
 from mesoforge.application.prepared_snapshot import SnapshotError, derive_reference_time
-from mesoforge.application.runtime_log import event, redact
+from mesoforge.application.runtime_log import event, redact, redact_diagnostics
 from mesoforge.application.spatial_coverage import validate_coordinate
 from mesoforge.application.worker_status import (
     FORECAST_STATUS,
@@ -71,6 +72,7 @@ class ForecastSettings:
     reference_time: datetime | None = None
     verify_prior: bool = True
     readiness_poll_seconds: int = 60
+    min_free_bytes: int = 6 * 1024**3
     schedule: ForecastSchedule = field(default_factory=ForecastSchedule)
 
     def __post_init__(self) -> None:
@@ -84,6 +86,8 @@ class ForecastSettings:
                 raise ValueError("Reference time must be an exact UTC hour")
         if self.readiness_poll_seconds < 5:
             raise ValueError("Readiness poll interval must be at least 5 seconds")
+        if self.min_free_bytes < 0:
+            raise ValueError("Free-space floor must be non-negative")
 
 
 @dataclass
@@ -103,6 +107,7 @@ class ForecastDeps:
     monotonic: Callable[[], float] = time.perf_counter
     readiness: Callable[..., dict[str, Any]] = baseline_readiness
     pointer: Callable[[Path], dict[str, Any] | None] = read_baseline_pointer
+    disk_free: Callable[[Path], int] = lambda path: shutil.disk_usage(path).free
 
 
 def object_store(*, ensure_bucket: bool) -> Any:
@@ -454,6 +459,7 @@ class ForecastRun:
                         reference_time=s.reference_time,
                         pointer=pointer,
                         governance=governance,
+                        expected_code_revision=record["code_revision"],
                     )
                 except Exception as exc:
                     readiness = {
@@ -488,6 +494,22 @@ class ForecastRun:
             reference_time=readiness["reference_time"],
             uncovered_locations=readiness["uncovered_locations"],
         )
+        # In the single-host stack runtime and local service volumes normally share
+        # a filesystem. Admit no large issuance batch once that filesystem is low.
+        # This cannot establish free capacity on a remote S3 service.
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            free = d.disk_free(self.root)
+        except OSError as exc:
+            return finish(EXIT_FAILED, "failed", category="disk_unavailable", reason=_error(exc))
+        record["disk"] = {"free_bytes": free, "min_free_bytes": s.min_free_bytes}
+        if free < s.min_free_bytes:
+            return finish(
+                EXIT_FAILED,
+                "failed",
+                category="disk_low",
+                reason="Runtime free-space floor reached",
+            )
         overlays: dict[str, Any] = {"overlays": [], "missing": [], "failures": []}
         try:
             candidates = governance.blend_candidates(requested)
@@ -549,31 +571,34 @@ class ForecastRun:
 def persist(root: Path, record: dict[str, Any]) -> Path:
     """Retain the public run record and the compact latest-run status."""
     started = datetime.fromisoformat(record["started_at"])
+    record = redact(record)
     directory = root / "runs" / f"forecast-{started:%Y%m%dT%H%M%SZ}-{uuid4().hex[:8]}"
     directory.mkdir(parents=True, exist_ok=False)
     write_json(directory / "result.json", record)
     write_json(
         status_directory(root) / FORECAST_STATUS,
-        {
-            **{k: v for k, v in record.items() if k not in {"results", "readiness", "timings"}},
-            "record": str(directory / "result.json"),
-            "results": [
-                {
-                    k: v
-                    for k, v in row.items()
-                    if k
-                    in {
-                        "location",
-                        "status",
-                        "issued_forecast_id",
-                        "existing_issued_forecast_ids",
-                        "ai_desk",
-                        "reason",
+        redact(
+            {
+                **{k: v for k, v in record.items() if k not in {"results", "readiness", "timings"}},
+                "record": str(directory / "result.json"),
+                "results": [
+                    {
+                        k: v
+                        for k, v in row.items()
+                        if k
+                        in {
+                            "location",
+                            "status",
+                            "issued_forecast_id",
+                            "existing_issued_forecast_ids",
+                            "ai_desk",
+                            "reason",
+                        }
                     }
-                }
-                for row in record.get("results", [])
-            ],
-        },
+                    for row in record.get("results", [])
+                ],
+            }
+        ),
     )
     return directory
 
@@ -583,6 +608,7 @@ def run_forecast(
 ) -> tuple[int, dict[str, Any]]:
     run = ForecastRun(settings, deps, stream=stream)
     code, record = run.execute()
+    record = redact_diagnostics(record)
     if record["status"] not in {"not_due", "already_running"}:
         record["record"] = str(persist(run.root, record) / "result.json")
     return code, record
@@ -636,6 +662,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", choices=("run", "readiness", "next-run"))
     parser.add_argument("--root", type=Path, default=_default_root())
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--min-free-gb", type=float, default=6.0)
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--scheduled",
@@ -680,6 +707,7 @@ def main(argv: list[str] | None = None) -> int:
                 now=now,
                 reference_time=args.reference_time,
                 governance=governance,
+                expected_code_revision=current_code_revision(_ROOT),
             )
         except (OSError, ValueError) as exc:
             error = {"code": "invalid_request", "message": _error(exc)}
@@ -689,7 +717,7 @@ def main(argv: list[str] | None = None) -> int:
             mark_governance_unavailable(report, failure)
         report.pop("pointer", None)
         report["next_run"] = schedule.describe(now)
-        print(json.dumps(report, indent=2, default=str))
+        print(json.dumps(redact(report), indent=2, default=str))
         return EXIT_OK if report["ready"] else EXIT_NOT_READY
     try:
         settings = ForecastSettings(
@@ -699,6 +727,7 @@ def main(argv: list[str] | None = None) -> int:
             reference_time=args.reference_time,
             verify_prior=not args.skip_verification,
             schedule=schedule,
+            min_free_bytes=int(args.min_free_gb * 1024**3),
         )
         code, record = run_forecast(settings, default_deps())
     except Exception as exc:
@@ -707,7 +736,8 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return EXIT_FAILED
-    print(json.dumps(record, indent=2, default=str) if args.json else render(record))
+    display = redact(record)
+    print(json.dumps(display, indent=2, default=str) if args.json else render(display))
     return code
 
 

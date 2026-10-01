@@ -1,12 +1,14 @@
 """Deployment-level readiness of one published baseline, from existing contracts.
 
-Readiness applies exactly the checks issuance applies, without guidance bytes or
+Readiness reuses the checks issuance applies, without guidance bytes or
 provider access. It reads the pointer once and verifies that publication with
 ``load_baseline`` (manifest digest, completeness, coherence, prepared manifest digest,
 information cutoff), then checks what ``forecast_from_baseline`` refuses: timestamps
 after the request, unresolved or revoked blend governance and an uncovered reference
 hour. There is no invented age threshold: staleness means the request's reference
-hour is not covered. Age is reported for operators, not used as a gate.
+hour is not covered. Age is reported for operators, not used as a gate. Hosted
+callers additionally require a recorded baseline code revision matching their image;
+historical/development readers may omit that admission requirement.
 
 A configured coordinate without a saved domain does not make the baseline unready;
 issuance reports that one row as ``coverage_required`` and delivers the others. At
@@ -23,6 +25,7 @@ from mesoforge.application.baseline_snapshot import load_baseline, read_pointer
 from mesoforge.application.batch_forecast import _coordinates
 from mesoforge.application.prepared_snapshot import SnapshotError, derive_reference_time
 from mesoforge.application.spatial_coverage import validate_coordinate
+from mesoforge.common.identifiers import validate_code_revision
 
 
 def _instant(value: str) -> datetime:
@@ -52,6 +55,7 @@ def baseline_facts(
     blend = manifest.get("blend_governance")
     return {
         "baseline_snapshot_id": manifest.get("baseline_snapshot_id"),
+        "code_revision": manifest.get("code_revision"),
         "contributor_state_id": prepared.get("snapshot_id"),
         "published_at": _z(published),
         "built_at": manifest.get("built_at"),
@@ -89,16 +93,25 @@ def baseline_readiness(
     reference_time: datetime | None = None,
     pointer: dict[str, Any] | None = None,
     governance: Any | None = None,
+    expected_code_revision: str | None = None,
 ) -> dict[str, Any]:
     """Whether one publication can serve configured issuance at ``now``.
 
     ``pointer`` pins the exact publication a caller will issue from; without it the
     current pointer is read once. ``governance`` (a ``GovernanceService``) adds the
     rollback check issuance applies; without it the result says it was not checked.
+    Hosted callers supply their image revision. Omitting it permits explicit
+    historical/development inspection without rewriting older manifests.
     """
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("Readiness time must be timezone-aware")
     now = now.astimezone(UTC)
+    if reference_time is not None and (
+        reference_time.tzinfo is None or reference_time.utcoffset() is None
+    ):
+        raise ValueError("Reference time must be timezone-aware")
+    if expected_code_revision is not None:
+        validate_code_revision(expected_code_revision)
     derived = derive_reference_time(now)
     reference = derived if reference_time is None else reference_time.astimezone(UTC)
     if reference.minute or reference.second or reference.microsecond or reference > derived:
@@ -111,6 +124,7 @@ def baseline_readiness(
         "baseline": None,
         "uncovered_locations": [],
         "blend_revocation": "not_checked",
+        "code_revision_status": "not_checked",
         "reasons": [],
     }
     reasons: list[str] = report["reasons"]
@@ -131,7 +145,21 @@ def baseline_readiness(
         reasons.append(f"baseline_unverifiable: {type(exc).__name__}: {exc}")
         return report
     manifest = pinned.manifest
-    report["baseline"] = baseline_facts(pointer, manifest, now)
+    try:
+        report["baseline"] = baseline_facts(pointer, manifest, now)
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        reasons.append(f"baseline_metadata_invalid: {type(exc).__name__}")
+        return report
+    if expected_code_revision is not None:
+        actual_revision = manifest.get("code_revision")
+        if actual_revision is None:
+            report["code_revision_status"] = "unproven"
+            reasons.append("baseline_code_revision_unproven")
+        elif actual_revision != expected_code_revision:
+            report["code_revision_status"] = "mismatch"
+            reasons.append("baseline_code_revision_mismatch")
+        else:
+            report["code_revision_status"] = "matched"
     for label, value in (
         ("analysis_cutoff", manifest.get("analysis_cutoff")),
         ("built_at", manifest.get("built_at")),

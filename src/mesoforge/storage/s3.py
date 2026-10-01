@@ -103,6 +103,17 @@ class S3ArtifactObjectStore:
         """Raise ``ClientError`` unless the configured bucket exists and is reachable."""
         self._client.head_bucket(Bucket=self._bucket)
 
+    def check_empty_bucket(self) -> None:
+        """Restore precondition: a missing or empty bucket, without creating anything."""
+        try:
+            listing = self._client.list_objects_v2(Bucket=self._bucket, MaxKeys=1)
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in {"NoSuchBucket", "404"}:
+                return
+            raise
+        if listing.get("Contents"):
+            raise ValueError("Refusing to restore into a nonempty object bucket")
+
     def _ensure_bucket(self) -> None:
         try:
             self._client.head_bucket(Bucket=self._bucket)

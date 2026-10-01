@@ -11,6 +11,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -162,6 +163,49 @@ def test_forecast_worker_fails_clearly_for_missing_bucket(
         probe.check_bucket()  # the worker did not create it
 
 
+def test_forecast_run_lock_excludes_an_independent_process_then_releases(
+    postgres_dsn: str,
+) -> None:
+    """The hosted run key is shared by processes, not just connections in one process."""
+    script = """
+import json
+import os
+from mesoforge.application.forecast_worker import FORECAST_RUN_LOCK
+from mesoforge.storage.postgres.idempotency_lock import AdvisoryLockBusy, PostgresIdempotencyLock
+
+lock = PostgresIdempotencyLock(os.environ["MESOFORGE_TEST_LOCK_DSN"])
+try:
+    with lock.try_acquire(FORECAST_RUN_LOCK):
+        status = "acquired"
+except AdvisoryLockBusy:
+    status = "busy"
+print(json.dumps({"status": status, "pid": os.getpid()}))
+"""
+
+    def probe() -> str:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=REPO,
+            env={
+                **os.environ,
+                "MESOFORGE_TEST_LOCK_DSN": postgres_dsn,
+                "PYTHONPATH": str(REPO / "src") + os.pathsep + os.environ.get("PYTHONPATH", ""),
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        outcome = json.loads(result.stdout)
+        assert outcome["pid"] != os.getpid()
+        return str(outcome["status"])
+
+    with PostgresIdempotencyLock(postgres_dsn).try_acquire(FORECAST_RUN_LOCK):
+        assert probe() == "busy"
+    assert probe() == "acquired"
+
+
 def test_migration_is_an_explicit_operator_step(
     clean_postgres_dsn: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -293,6 +337,13 @@ def test_least_privilege_worker_role_cannot_change_schema_governance_or_delete(
             assert allowed == (True, False, False)
             for statement in (
                 "INSERT INTO governance_events (id) VALUES (gen_random_uuid())",
+                "UPDATE governance_events SET reason = 'worker rewrite'",
+                "DELETE FROM governance_events",
+                "TRUNCATE governance_events",
+                "INSERT INTO alembic_version (version_num) VALUES ('forged')",
+                "UPDATE alembic_version SET version_num = 'forged'",
+                "DELETE FROM alembic_version",
+                "UPDATE artifacts SET attributes = '{}'::jsonb",
                 "UPDATE stored_objects SET byte_size = 2",
                 "DELETE FROM stored_objects",
                 "TRUNCATE stored_objects",

@@ -1252,11 +1252,16 @@ for missing prepared state, expiring `coverage_for` usability, configured coordi
 outside the prepared footprint, the hour before a scheduled slot, or a newer required
 (HRRR/GFS) cycle found by the hourly `select_model_set` probe, whose selection the
 refresh reuses. It rebuilds for a new prepared snapshot, unresolved or revoked blend
-governance, changed governed blend heads, or a missing configured domain, trying each
-build-input fingerprint once. Existing publication rules keep the previous pointers
+governance, changed governed blend heads, missing/different code revision, or a
+missing configured domain. Deterministic failure fingerprints suppress repeated
+attempts; interrupted fingerprints have two total attempts, including orphan markers
+recovered on restart. A successful fingerprint permits rebuilding a missing/obsolete
+publication. Existing publication rules keep the previous pointers
 on any failure. Hour budgets, exponential backoff, a free-space floor, persisted
 counters and in-flight phases, a single-writer lock, signal handling and a phase
-watchdog bound the loop. Registered blend candidates receive background overlays.
+watchdog bound the loop. The start gate is checked again after discovery. Local disk
+admission applies to refresh, baseline and candidate-overlay builds. Registered blend
+candidates receive background overlays.
 
 [`forecast_worker`](src/mesoforge/application/forecast_worker.py) resolves the
 configured locations, applies the named-zone schedule gate
@@ -1265,7 +1270,9 @@ run-singleton advisory lock distinct from the per-location issuance lock, checks
 schema, bucket and governance, reads the baseline pointer once and applies
 [`baseline_readiness`](src/mesoforge/application/baseline_readiness.py), which uses
 issuance's own checks (`load_baseline`, timestamps, blend resolution and revocation,
-reference coverage). It passes that pointer, one request time and lookup-only
+reference coverage, and baseline code revision matching the image). Older manifests
+remain readable historically but require a background rebuild for hosted admission.
+It checks local runtime free space before issuance and passes that pointer, one request time and lookup-only
 candidate overlays to `forecast_from_baseline`, so correction, the AI desk,
 validation, presentation, issuance and prior verification are unchanged. It never
 refreshes guidance or builds a baseline; the locked lookup makes repeated triggers
@@ -1278,17 +1285,34 @@ explicit bucket creation and digest-verified object export/import.
 [`worker_status`](src/mesoforge/application/worker_status.py) keeps health a
 standard-library heartbeat check distinct from readiness, and
 [`runtime_log`](src/mesoforge/application/runtime_log.py) emits redacted one-line
-JSON events. Images record their commit in `MESOFORGE_CODE_REVISION` instead of
-reading Git.
+JSON events, including short credential and signed-URL authorization redaction.
+Malformed/future heartbeat evidence fails health explicitly; provider availability is
+not process health. Images record their commit in `MESOFORGE_CODE_REVISION` instead
+of reading Git; new baseline manifests retain that identity explicitly.
 
 Both roles mount the runtime volume at one absolute path because baselines record
 absolute prepared paths and publication uses local file locks: the deployment is a
 single host. Workers log in through a least-privilege PostgreSQL group role whose
 grants `operations migrate` applies after each upgrade (read and append, activity
-status updates only, read-only governance events), so the database itself refuses a
-worker governance write; only the admin service holds owner credentials, and only
+status updates only, read-only governance events, no persistent DDL; temporary tables
+are allowed), so the database itself refuses a
+worker governance write; only the admin application role holds owner credentials, and only
 the forecast worker receives the AI credential.
 Nothing prunes baselines, issuances, governance or verification evidence.
+
+Backups pause guidance before the database dump, require suspended forecast triggers,
+retain all runtime guidance plus referenced objects, and publish a private completed
+directory only after checksum generation and successful worker restart. Restore
+validates backup contents and empty database/bucket/runtime destinations before writes;
+PostgreSQL restores transactionally, but the three stores are not one restore
+transaction. Disk guards measure the local runtime filesystem, not remote store capacity.
+
+The former upstream MinIO image is unavailable. An auxiliary image builds the exact
+official 2025-10-15 security-release source with pinned compiler/base digests; the
+application still has one image for both roles. Upstream MinIO is archived, so this
+does not establish ongoing maintenance. Shell failure injection and native local
+PostgreSQL/MinIO tests do not prove container behavior: the image builds, complete
+Compose run and full-stack restore still require an isolated Linux Docker exercise.
 
 **FUTURE.** Multi-host publication or shared object-backed guidance, delivery,
 continuous observation/MRMS polling and automatic guidance retention need explicit

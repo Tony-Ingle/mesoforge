@@ -26,7 +26,7 @@ x-storage-environment: &storage-environment
 
 x-worker-environment: &worker-environment
   <<: *storage-environment
-  # Least-privilege data role (no DDL, DELETE or TRUNCATE); see postgres-init/.
+  # Least-privilege data role (no persistent DDL, DELETE or TRUNCATE); see postgres-init/.
   MESOFORGE_DATABASE_DSN: postgresql+psycopg://${MESOFORGE_PG_WORKER_USER:?set MESOFORGE_PG_WORKER_USER}:${MESOFORGE_PG_WORKER_PASSWORD:?set MESOFORGE_PG_WORKER_PASSWORD}@postgres:5432/${MESOFORGE_PG_DB:?set MESOFORGE_PG_DB}
 
 x-app: &app
@@ -68,9 +68,15 @@ services:
       retries: 10
 
   minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # The former upstream image was unavailable during audit. Build its pinned security
+    # release locally; this remains MinIO with the same S3 contract and volume layout.
+    image: mesoforge-minio:RELEASE.2025-10-15T17-29-55Z
+    build:
+      context: ./minio
     command: ["server", "/data"]
     restart: unless-stopped
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
     environment:
       MINIO_ROOT_USER: ${MESOFORGE_MINIO_ROOT_USER:?set MESOFORGE_MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MESOFORGE_MINIO_ROOT_PASSWORD:?set MESOFORGE_MINIO_ROOT_PASSWORD}

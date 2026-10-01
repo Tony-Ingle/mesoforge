@@ -99,15 +99,20 @@ def phase_bound(phase: str | None) -> int:
 
 def guidance_health(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
     """Process health of the guidance worker from its heartbeat and status files."""
-    now = (now or datetime.now(UTC)).astimezone(UTC)
     directory = status_directory(root)
     status = read_json(directory / GUIDANCE_STATUS)
     heartbeat = read_json(directory / GUIDANCE_HEARTBEAT)
+    # Read first: a concurrent heartbeat must not appear to come from the future
+    # merely because it was written after this healthcheck began reading files.
+    now = (now or datetime.now(UTC)).astimezone(UTC)
     result: dict[str, Any] = {"role": "guidance-worker", "checked_at": iso(now), "healthy": False}
     if status is None or heartbeat is None:
         result["reason"] = "no_status"
         return result
     result["state"] = status.get("state")
+    if not isinstance(status.get("state"), str):
+        result["reason"] = "status_unreadable"
+        return result
     if status.get("state") in {"stopped", "failed"}:
         result["reason"] = f"worker_{status.get('state')}"
         return result
@@ -116,14 +121,25 @@ def guidance_health(root: Path, *, now: datetime | None = None) -> dict[str, Any
         result["reason"] = "heartbeat_unreadable"
         return result
     result["heartbeat_age_seconds"] = round((now - beat).total_seconds(), 1)
+    if beat > now:
+        result["reason"] = "heartbeat_in_future"
+        return result
     if (now - beat).total_seconds() > HEARTBEAT_STALE_SECONDS:
         result["reason"] = "heartbeat_stale"
         return result
     poll_started = parse_instant(heartbeat.get("poll_started_at"))
+    if heartbeat.get("poll_started_at") is not None and (
+        poll_started is None or poll_started > now
+    ):
+        result["reason"] = "poll_time_unreadable"
+        return result
     if poll_started is not None and (now - poll_started).total_seconds() > POLL_BOUND_SECONDS:
         result["reason"] = "poll_exceeded_bound"
         return result
     due = parse_instant(heartbeat.get("next_poll_at"))
+    if heartbeat.get("next_poll_at") is not None and due is None:
+        result["reason"] = "next_poll_time_unreadable"
+        return result
     if (
         heartbeat.get("state") == "sleeping"
         and due is not None
@@ -132,12 +148,17 @@ def guidance_health(root: Path, *, now: datetime | None = None) -> dict[str, Any
         result["reason"] = "poll_overdue"
         return result
     in_flight = heartbeat.get("in_flight")
+    if in_flight is not None and (
+        not isinstance(in_flight, dict) or not isinstance(in_flight.get("phase"), str)
+    ):
+        result["reason"] = "phase_unreadable"
+        return result
     if isinstance(in_flight, dict):
         started = parse_instant(in_flight.get("started_at"))
         bound = phase_bound(in_flight.get("phase"))
         age = (now - started).total_seconds() if started else None
         result["in_flight"] = {**in_flight, "age_seconds": age, "bound_seconds": bound}
-        if age is None or age > bound:
+        if age is None or age < 0 or age > bound:
             result["reason"] = "phase_exceeded_bound"
             return result
     result.update(healthy=True, reason="progressing")

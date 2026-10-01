@@ -829,11 +829,14 @@ Every `--interval-seconds` (default 300) one poll composes the existing workflow
 3. **Build** (existing `build_baseline` with governed blend resolution) when the latest
    baseline is missing, pins an older prepared snapshot, lacks resolved blend
    governance, was rolled back (`blend_revoked`), pins different governed blend heads,
-   or lacks a configured coordinate the prepared snapshot covers. Each build-input
+   uses another/unproven code revision, or lacks a configured coordinate the prepared
+   snapshot covers. Each build-input
    fingerprint (prepared snapshot and digest, coordinates, code revision, governed
-   heads) is attempted once, so a deterministic failure cannot loop; a transient
-   failure backs off and retries, and a build killed mid-way (watchdog, memory limit,
-   forced stop) is retried at most twice.
+   heads) suppresses repeated deterministic failures; a transient failure backs off
+   and retries. Interrupted builds (watchdog, memory limit, forced stop) have two
+   total attempts. A previously successful fingerprint does not prevent recovery of
+   a missing or obsolete publication. Restart also recovers orphaned in-flight
+   fingerprint markers.
 4. Build overlays for registered blend candidates on the current baseline (existing
    Learning Core background; already retained overlays are reused).
 5. Record readiness, guidance and next-slot coverage in `status/guidance-worker.json`.
@@ -850,7 +853,10 @@ second signal exits at once and the abandoned phase is recorded. A watchdog exit
 phase or poll that exceeds its bound so the restart policy recovers the process. Only
 an unexpected internal error slows the poll cadence; a database outage or an
 unmigrated schema keeps polling at the normal interval so recovery is noticed
-promptly. One process may own a runtime root (`worker_busy` otherwise).
+promptly. The refresh-start gate and stop signal are checked again after a discovery
+probe. One process may own a runtime root (`worker_busy` otherwise). Baseline and
+candidate-overlay builds also require the local free-space floor; unknown capacity
+fails closed.
 
 `--refresh off` builds from the retained `latest_complete` only (recovery; no
 downloads). `--no-hourly-probe` refreshes only for coverage, footprint and pre-slot
@@ -873,6 +879,8 @@ performs prior verification, extraction, correction, the always-attempted AI des
 validation, presentation and issuance per location. One location's failure never
 stops the next; the existing locked lookup turns a repeated trigger into
 `skipped_already_issued`, never a second issuance. It never refreshes guidance.
+Before entering issuance it checks local runtime free space (`--min-free-gb`,
+default 6); low or unreadable capacity returns an infrastructure failure.
 
 With `--scheduled`, readiness is rechecked every minute until the slot window closes
 (the window is clipped to the slot's UTC hour, so the reference hour cannot change).
@@ -887,10 +895,16 @@ network-free desk configuration check. `readiness` and `next-run` are read-only;
 ### Readiness, health and status
 
 Health is process health only: the guidance worker's heartbeat is fresh and no phase
-exceeds its bound. Readiness is separate and never an age threshold: the pinned
+exceeds its bound. Corrupt or future heartbeat timestamps fail health explicitly.
+Docker health status alone does not restart a container; the worker's watchdog
+terminates a stuck process so its restart policy can act. Readiness is separate and
+never an age threshold: the pinned
 publication verifies (`load_baseline`), timestamps precede the request, blend
 governance is resolved and not revoked, the request's reference hour is covered and
-at least one configured coordinate has a domain (others fail per location). Both
+at least one configured coordinate has a domain (others fail per location). Hosted
+readiness also requires the baseline's recorded code revision to match the running
+image; older manifests without that proof require a background rebuild. Historical
+readers remain compatible. Both
 report the baseline and contributor-state IDs, publication and build times,
 information cutoff, reference views, contributor cycles, age and reasons.
 
@@ -901,7 +915,8 @@ location's AI desk outcome; recent refresh/build failures; the latest issuance p
 location; and the next scheduled run. Other commands: `migration-status`,
 `migrate --expect-database NAME`, `apply-grants --expect-database NAME`,
 `init-storage`, `baseline`, `issuances`, `export-objects --destination DIR`,
-`import-objects --source DIR`. Governance stays an explicit CLI, run through the admin
+`validate-export --source DIR`, `check-empty-storage`, and `import-objects --source DIR`.
+Imports validate the entire export before any object writes. Governance stays an explicit CLI, run through the admin
 service (`docker compose run --rm admin mesoforge.application.governance ...`); the
 worker database role cannot append governance events, and nothing is served over HTTP.
 
@@ -931,6 +946,7 @@ No inbound port needs to be opened.
 cp deploy/hosted/.env.example deploy/hosted/.env      # fill in generated secrets
 cp deploy/hosted/ai.env.example deploy/hosted/ai.env  # optional: OpenAI key/budgets
 sh deploy/hosted/build-image.sh                       # set MESOFORGE_IMAGE to the tag
+docker compose -f deploy/hosted/compose.yaml build minio # pinned upstream source build
 make hosted-migrate DB=mesoforge                      # explicit: migrate, then create bucket
 make hosted-up                                        # verifies head, starts the worker
 make hosted-status
@@ -945,6 +961,19 @@ can never race a migration. To upgrade: build the new commit, back up, stop the
 guidance worker, migrate, then start it; run both roles from one image tag (overlay
 identities include the code identity).
 
+Set `MESOFORGE_AI_PROVIDER` and `MESOFORGE_AI_MODEL` in `deploy/hosted/.env` (or
+the invoking shell); defaults are `openai` and `gpt-6-sol`. Compose's explicit
+environment entries override those two names in `ai.env`. Put the API key and
+desk budgets in `ai.env`, which reaches only the forecast worker.
+
+The former MinIO image is no longer anonymously pullable. Compose now builds
+[the upstream security release](https://github.com/minio/minio/releases/tag/RELEASE.2025-10-15T17-29-55Z)
+from an exact commit using [the auxiliary Dockerfile](deploy/hosted/minio/Dockerfile).
+This preserves the S3 contract and volume layout. [Upstream is archived and
+unmaintained](https://github.com/minio/minio); this is a supervised first-deployment
+option, not a maintenance guarantee. The source build and complete Compose stack
+still require validation on a Docker host.
+
 ### Storage, backups and retention
 
 | Volume | Contents |
@@ -954,23 +983,39 @@ identities include the code identity).
 | `runtime` (`/var/lib/mesoforge/runtime`) | `guidance/` snapshots and `latest_complete`, `baseline/` baselines and `latest_baseline`, `runs/`, `status/`, `observations/` |
 
 Both workers mount `runtime` at the same absolute path (baselines record absolute
-prepared paths; publication locks are local), so the stack runs on one host. Nothing
+prepared paths; publication locks are local), so the stack runs on one host.
+Native development artifacts with different absolute source paths cannot simply be
+copied into this volume and treated as portable hosted baselines. Nothing
 is deleted automatically: baselines, issuances, governance history and verification
 evidence are permanent. A prepared snapshot is 1.1–1.8 GB and a failed refresh
 leaves about 1 GB; expect several refreshes per day. The worker reports free space
-and stops refreshing below its floor. Removing old guidance is an explicit operator
+and stops refresh/build/issuance admission below its floor. This is an admission
+check on the runtime filesystem, not a reservation or a remote PostgreSQL/S3 capacity
+guarantee; monitor those volumes and backup space separately. Removing old guidance is an explicit operator
 decision: a snapshot directory is safe to delete only if `latest_complete` does not
 name it and no retained baseline manifest references it.
 
 [backup.sh](deploy/hosted/backup.sh) (`sh deploy/hosted/backup.sh DEST`) dumps
 PostgreSQL (`pg_dump -Fc`, verified by `pg_restore --list`), then exports every
-referenced object with digest verification, then archives the runtime volume with the
-guidance worker paused (snapshot manifests only unless `--with-guidance`) and restarts
-it if it was running, also after an interruption. The destination must be outside the
-repository; avoid the 08:00/20:00 slot windows. [restore.sh](deploy/hosted/restore.sh)
-restores into a new stack with empty volumes under the same bucket name the rows
-reference, checking the empty database, the bucket name and the readability of the
-export before writing anything.
+referenced object with digest verification, then archives the complete runtime volume,
+including prepared guidance. `--with-guidance` remains an accepted compatibility
+option. The guidance worker is paused before the dump and restarted if previously
+running. Suspend external forecast triggers and operator writes for the entire
+maintenance window; an already-running forecast worker makes backup fail.
+
+Backups use private permissions and a randomized `.incomplete` directory. Any failed
+component or failed guidance restart prevents a completion claim. Successful backups
+have checksums and are renamed only after all steps succeed. Full guidance retention
+can make a backup much larger than the old manifest-only default. The destination
+must be outside the repository.
+
+[restore.sh](deploy/hosted/restore.sh) requires stopped workers, an empty database,
+runtime volume and bucket, and the same database owner and bucket name as the backup.
+It validates the checksums, archive and every exported object before restoring rows.
+The database restore is transactional; the combined PostgreSQL/S3/runtime restore is
+not atomic. A later failure requires inspection and a fresh empty destination before
+retrying. Older backups without the completion/checksum contract are rejected.
+Shell failure tests cover these guards; a complete container restore remains unproven.
 
 ### Security
 
@@ -978,14 +1023,20 @@ No service publishes a host port. PostgreSQL and MinIO sit on an internal networ
 only the workers also reach the internet. Workers log in as a member of the
 [`mesoforge_runtime` group role](deploy/hosted/postgres-init/worker-role.psql), whose
 table grants `operations migrate` applies: SELECT and INSERT, UPDATE of activity status
-only, read-only governance events, and no DDL, DELETE, TRUNCATE or trigger changes.
-Only the `admin` service holds the owner credentials; for an external S3 endpoint it
+only, read-only governance events, and no persistent DDL, DELETE, TRUNCATE or trigger
+changes. Temporary tables are permitted by the database grant.
+Only the `admin` application role holds the owner credentials (PostgreSQL itself
+also needs its initialization credentials); for an external S3 endpoint admin
 also needs the egress network. The OpenAI key reaches only the forecast
-worker (`ai.env`). Containers run as uid 10001 with all capabilities dropped; the
+worker (`ai.env`). MesoForge application containers run as uid 10001 with all
+capabilities dropped; PostgreSQL uses its upstream initialization/runtime identity. The
 image contains no credentials and records its commit. Logs and status files redact
-credential values, DSN passwords and API tokens. For a bucket-scoped object-store
+credential values, DSN passwords, API tokens and signed-URL authorization values. For a bucket-scoped object-store
 credential, create a MinIO user with get/put/list on the bucket only (no delete) and
-use it as `MESOFORGE_S3_ACCESS_KEY`/`MESOFORGE_S3_SECRET_KEY`. The development HTTP
+use it as `MESOFORGE_S3_ACCESS_KEY`/`MESOFORGE_S3_SECRET_KEY`. If the root pair is
+used to bootstrap the bucket, replace the application credentials before starting
+workers. Bucket-scoped IAM provisioning is an operator step, not automated by Compose;
+the example's root bootstrap option does not enforce least privilege. The development HTTP
 interface (`mesoforge.api`) is not part of the hosted stack.
 
 A real VPS deployment needs operator-supplied inputs that this repository does not
@@ -1102,22 +1153,24 @@ contracts, not forecast skill or production readiness.
 
 ### Verification status of this guide
 
-The hosted-deployment milestone ran both worker roles as real processes against a
-clean persistent PostgreSQL 16 cluster, initialized with the committed worker role and
-migrated by `operations migrate`, plus a local S3-compatible server (moto). Docker was
-not available on the development machine, so the image and Compose stack are
-validated by static tests and review, not by a container build. From already
-retained prepared guidance (no model download) the guidance worker built a governed
-baseline: 21 domain views, 342 MB, 775 s. The forecast worker refused the uncovered
-current hour (exit 3), then issued all three configured locations for an explicit
-replay hour in 117 s. A graceful restart kept the same baseline without rebuilding.
-A repeated trigger skipped all three locations and left database rows and objects
-unchanged, and an overlapping trigger exited without work. A database outage, loss
-of the object store (restored by object export/import with checksum-verified
-readback), a fake HTTP 429 from the desk transport and a blocked provider network
-each produced their documented category. A live metadata-only discovery probe took
-168 s (3.6 MB). The final offline run had 3,922 passes and the three pre-existing
-failures below; all 148 PostgreSQL/S3 integration and acceptance tests passed.
+The original hosted milestone reported a retained-guidance process demonstration
+against PostgreSQL 16 and moto: a 21-view, 342 MB baseline built in 775 s and three
+replay issuances in 117 s, plus a 3.6 MB metadata probe. These are the original
+measurements, not independently remeasured results from the deployment review.
+
+The independent review used fresh dedicated PostgreSQL 16.2 and native MinIO
+services. It exercised real worker grants, governance protections, immutable
+issuance/idempotency and digest-verified object export/import. Shell tests with a
+Docker stub and real tar/checksums cover backup failures, incomplete publication and
+restore preconditions. The review's final offline run passed 3,981 tests with the
+same three failures independently reproduced at its starting revision (the batch
+mock signature and two typed-boundary inventory checks). All 150 integration and
+acceptance tests passed against the dedicated services.
+
+Docker, Podman and a Linux/systemd runtime were unavailable:
+the application image, source-built MinIO image, Compose lifecycle and combined
+database/object/runtime restore remain unproven. Static container checks and the
+injected-clock DST tests do not replace that first Linux deployment exercise.
 
 Command arguments were checked against current parsers. The prospective operator
 milestone passed focused operator/snapshot/baseline/QPF checks and 25

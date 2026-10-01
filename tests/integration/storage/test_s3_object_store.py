@@ -49,6 +49,23 @@ class TestContentAddressedKey:
 
 
 class TestS3ArtifactObjectStore:
+    def test_restore_target_must_be_empty_or_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Other storage tests deliberately retain objects in the configured test
+        # bucket. This precondition test needs its own initially empty target.
+        monkeypatch.setenv("MESOFORGE_TEST_S3_BUCKET", f"mesoforge-empty-{uuid.uuid4().hex}")
+        store = _make_store()
+        store.check_empty_bucket()
+        payload = _unique_bytes()
+        store.put_if_absent(Digest.of_bytes(payload), payload, "application/json")
+        with pytest.raises(ValueError, match="nonempty"):
+            store.check_empty_bucket()
+        store._bucket = f"mesoforge-missing-{uuid.uuid4().hex}"
+        store.check_empty_bucket()
+        from botocore.exceptions import ClientError
+
+        with pytest.raises(ClientError):
+            store.check_bucket()  # restore preflight never creates the target
+
     def test_put_then_get_verified_round_trip(self) -> None:
         store = _make_store()
         payload = _unique_bytes()

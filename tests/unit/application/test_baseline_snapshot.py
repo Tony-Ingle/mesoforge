@@ -113,6 +113,7 @@ def test_persisted_canvas_has_exact_lineage_and_replays_every_cell_without_blend
     pointer, source, _ = baseline_case["prepared"]
     manifest = pinned.manifest
     assert manifest["schema_version"] == baselines.BASELINE_SCHEMA
+    assert manifest["code_revision"] == background.current_code_revision(background._ROOT)
     assert manifest["prepared_snapshot"]["snapshot_id"] == source["snapshot_id"]
     assert manifest["prepared_snapshot"]["manifest_sha256"] == pointer["manifest_sha256"]
     assert manifest["field_policies"] == source["field_policies"]
@@ -138,6 +139,17 @@ def test_persisted_canvas_has_exact_lineage_and_replays_every_cell_without_blend
             canonical_json_bytes(expected)
         )
     forbidden.assert_not_called()
+
+
+def test_background_build_validates_code_identity_before_loading_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MESOFORGE_CODE_REVISION", "invalid-revision")
+    loader = Mock(side_effect=AssertionError("input loading must follow revision validation"))
+    monkeypatch.setattr(background, "resolve_latest_complete", loader)
+    with pytest.raises(ValueError):
+        background.build_baseline(tmp_path / "guidance", tmp_path / "baseline", LOCATIONS)
+    loader.assert_not_called()
 
 
 def test_two_locations_share_one_pinned_baseline_and_uncovered_location_is_isolated(

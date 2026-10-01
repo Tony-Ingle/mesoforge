@@ -3,25 +3,58 @@
 # runtime volume (baselines, pointers, run records, status). Nothing is deleted.
 #
 # Usage: sh deploy/hosted/backup.sh DEST_DIR [--with-guidance]
-#   DEST_DIR must be outside the repository. Prepared guidance payloads are large and
-#   reproducible from providers only while they are current, so by default only each
-#   snapshot's manifests are archived (enough for retained baselines to verify);
-#   --with-guidance archives the complete snapshots. Avoid the 08:00/20:00 slot
-#   windows: a running forecast worker keeps writing run records.
+#   DEST_DIR must be outside the repository. All runtime data, including prepared
+#   guidance, is retained. --with-guidance remains a compatibility alias for this
+#   complete default. Suspend external forecast triggers for the backup window.
 set -eu
+umask 077
 dest=${1:?usage: backup.sh DEST_DIR [--with-guidance]}
 mode=${2:-}
+case "$mode" in
+    ""|--with-guidance) ;;
+    *) echo "Unknown backup option: $mode" >&2; exit 1 ;;
+esac
+[ "$#" -le 2 ] || { echo "Too many backup arguments" >&2; exit 1; }
 here=$(cd "$(dirname "$0")" && pwd)
-repo=$(cd "$here/../.." && pwd)
+repo=$(cd "$here/../.." && pwd -P)
 mkdir -p "$dest"
-dest=$(cd "$dest" && pwd)
+dest=$(cd "$dest" && pwd -P)
 case "$dest/" in
     "$repo"/*) echo "Refusing to write backups inside the repository" >&2; exit 1 ;;
 esac
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-target="$dest/mesoforge-$stamp"
-mkdir "$target" "$target/objects"
+target=$(mktemp -d --suffix=.incomplete "$dest/mesoforge-$stamp-XXXXXX")
+complete=${target%.incomplete}
+mkdir "$target/objects"
 cd "$here"
+
+forecast_running=$(docker compose ps --all --status running -q forecast-worker)
+if [ -n "$forecast_running" ]; then
+    echo "Refusing to back up while a forecast worker is running; suspend its scheduler" >&2
+    exit 1
+fi
+was_running=$(docker compose ps --all --status running -q guidance-worker)
+finish_backup() {
+    status=$?
+    trap - EXIT HUP INT TERM
+    if [ -n "$was_running" ]; then
+        docker compose start guidance-worker >/dev/null || status=1
+    fi
+    if [ "$status" -eq 0 ]; then
+        mv "$target" "$complete" || exit 1
+        echo "Backup complete: $complete"
+    else
+        echo "Backup incomplete: $target" >&2
+    fi
+    exit "$status"
+}
+trap finish_backup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if [ -n "$was_running" ]; then
+    docker compose stop guidance-worker
+fi
 
 echo "1/3 PostgreSQL (custom-format dump, verified by listing)"
 docker compose exec -T postgres sh -c 'pg_dump -Fc -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
@@ -36,37 +69,11 @@ docker compose run --rm -T --no-deps --user "$(id -u):$(id -g)" -e HOME=/tmp \
     -v "$target/objects:/backup" admin \
     mesoforge.application.operations export-objects --destination /backup
 
-echo "3/3 Runtime volume (guidance worker paused)"
-was_running=$(docker compose ps --status running -q guidance-worker)
-restart_worker() {
-    if [ -n "$was_running" ]; then
-        docker compose start guidance-worker >/dev/null
-    fi
-}
-# Signals exit through the EXIT trap, so an interrupted backup restarts the worker.
-trap restart_worker EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
-if [ -n "$was_running" ]; then
-    docker compose stop guidance-worker
-fi
-if [ "$mode" = "--with-guidance" ]; then
-    exclude=""
-else
-    exclude="--exclude=./guidance/snapshots/*/*/*"
-fi
-# GNU tar exits 1 when a file changed while being read; that archive is still usable.
-status=0
-# shellcheck disable=SC2086
+echo "3/3 Complete runtime volume (guidance worker paused)"
+# Every nonzero result is a failure, including changed files and a failed Docker run.
 docker compose run --rm -T --no-deps --entrypoint tar admin \
-    --numeric-owner --warning=no-file-changed --warning=no-file-removed \
-    -C /var/lib/mesoforge/runtime $exclude -czf - . \
-    > "$target/runtime.tar.gz" || status=$?
-if [ "$status" -gt 1 ]; then
-    echo "Runtime archive failed (tar exit $status)" >&2
-    exit "$status"
-fi
+    --numeric-owner -C /var/lib/mesoforge/runtime -czf - . \
+    > "$target/runtime.tar.gz"
 
 docker compose config --images > "$target/images.txt"
-echo "Backup complete: $target"
+(cd "$target" && sha256sum postgres.dump runtime.tar.gz objects/objects-manifest.json images.txt > SHA256SUMS)

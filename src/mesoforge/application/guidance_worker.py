@@ -57,7 +57,7 @@ from mesoforge.application.prepared_snapshot import (
     derive_reference_time,
     resolve_latest_complete,
 )
-from mesoforge.application.runtime_log import event, redact
+from mesoforge.application.runtime_log import event, redact, redact_diagnostics
 from mesoforge.application.spatial_coverage import validate_coordinate
 from mesoforge.application.worker_status import (
     GUIDANCE_HEARTBEAT,
@@ -374,7 +374,7 @@ class GuidanceWorker:
 
     def save(self) -> None:
         self.state["updated_at"] = iso(self.deps.clock())
-        write_json(self.status_path, self.state)
+        write_json(self.status_path, redact_diagnostics(self.state))
 
     def beat(self) -> None:
         """Best effort: a reader holding the file open must not stop the worker."""
@@ -423,6 +423,23 @@ class GuidanceWorker:
     def recover_interrupted(self) -> dict[str, Any] | None:
         """An unfinished phase from a previous process counts as that phase's failure."""
         interrupted = self.state.get("in_flight")
+        if not isinstance(interrupted, dict):
+            # Finishing a phase and recording its result are separate durable writes.
+            # A crash between them must not strand a build fingerprint forever.
+            pending = next(
+                (
+                    attempt
+                    for attempt in self.state["build"]["fingerprints"].values()
+                    if attempt.get("outcome") == "in_flight"
+                ),
+                None,
+            )
+            if pending is not None:
+                interrupted = {
+                    "phase": "build",
+                    "started_at": pending.get("at"),
+                    "reason": "unfinished_build_bookkeeping",
+                }
         if not isinstance(interrupted, dict):
             return None
         now = self.deps.clock()
@@ -507,6 +524,8 @@ class GuidanceWorker:
                     categories.append("schema_not_at_head")
                     self.log("schema_not_at_head", **schema)
                     return
+        if self._stopping(outcome):
+            return
         try:
             free: int | None = d.disk_free(self.settings.root)
         except OSError:
@@ -538,6 +557,8 @@ class GuidanceWorker:
                     ),
                 }
             self.state["governance"] = outcome["governance"]
+        if self._stopping(outcome):
+            return
         if governance is None or snapshot is None:
             outcome["build"] = {
                 "decision": "deferred",
@@ -610,7 +631,9 @@ class GuidanceWorker:
         allowed = parse_instant(info.get("next_allowed_at"))
         if s.refresh == "off":
             return "refresh_disabled"
-        if free is not None and free < s.min_free_bytes:
+        if free is None:
+            return "disk_unavailable"
+        if free < s.min_free_bytes:
             return "disk_low"
         if hour in info["succeeded_hours"]:
             return "refreshed_this_hour"
@@ -629,8 +652,8 @@ class GuidanceWorker:
         reasons = self.refresh_reasons(locations, now)
         blocked = self.refresh_gate(now, free)
         if blocked is not None:
-            if blocked == "disk_low" and reasons:
-                categories.append("disk_low")
+            if blocked in {"disk_low", "disk_unavailable"} and reasons:
+                categories.append(blocked)
             return {
                 "decision": "deferred" if reasons else "none",
                 "reasons": reasons,
@@ -657,7 +680,33 @@ class GuidanceWorker:
             if not reasons:
                 return {"decision": "no_material_change", "reasons": [], "probe": probe}
             probe_selection = Path(probe.pop("selection_directory"))
+            # Metadata discovery can consume the rest of the permitted hour or
+            # receive a shutdown request. Recheck admission before acquisition.
+            blocked = "stop_requested" if self.stop.is_set() else self._write_blocker(categories)
+            blocked = blocked or self.refresh_gate(
+                self.deps.clock(), self.state["disk"]["free_bytes"]
+            )
+            if blocked is not None:
+                return {"decision": "deferred", "reasons": reasons, "blocked_by": blocked}
         return self._run_refresh(reasons, locations, probe_selection, categories)
+
+    def _write_blocker(self, categories: list[str]) -> str | None:
+        """Recheck local capacity before each large writing phase, including retries."""
+        try:
+            free: int | None = self.deps.disk_free(self.settings.root)
+        except OSError:
+            free = None
+        self.state["disk"] = {"free_bytes": free, "min_free_bytes": self.settings.min_free_bytes}
+        blocked = (
+            "disk_unavailable"
+            if free is None
+            else "disk_low"
+            if free < self.settings.min_free_bytes
+            else None
+        )
+        if blocked is not None and blocked not in categories:
+            categories.append(blocked)
+        return blocked
 
     def _probe(self) -> dict[str, Any]:
         d = self.deps
@@ -834,6 +883,8 @@ class GuidanceWorker:
         reasons = []
         if baseline["prepared_snapshot"]["snapshot_id"] != prepared_pointer["snapshot_id"]:
             reasons.append("new_prepared_snapshot")
+        if baseline.get("code_revision") != self.code_revision:
+            reasons.append("code_revision_changed")
         blend = baseline.get("blend_governance")
         if not isinstance(blend, dict) or blend.get("status") != "resolved":
             reasons.append("baseline_governance_unproven")
@@ -873,12 +924,15 @@ class GuidanceWorker:
         pointer, _, directory, heads, fingerprint = inputs
         with self.phase("governance"):
             reasons = self.build_reasons(governance, pointer, directory, heads, locations)
+        if self.stop.is_set():
+            return {"decision": "deferred", "reasons": reasons, "blocked_by": "stop_requested"}
         if not reasons:
             return {"decision": "current", "fingerprint": fingerprint}
         previous = info["fingerprints"].get(fingerprint)
         retry = (
             previous is None
             or previous.get("outcome") == "retryable_failure"
+            or str(previous.get("outcome", "")).startswith("published")
             or (
                 previous.get("outcome") == "interrupted"
                 and int(previous.get("interruptions", 0)) < MAX_BUILD_INTERRUPTIONS
@@ -895,6 +949,9 @@ class GuidanceWorker:
         allowed = parse_instant(info.get("next_allowed_at"))
         if allowed is not None and d.clock() < allowed:
             return {"decision": "deferred", "reasons": reasons, "blocked_by": "backoff"}
+        blocked = self._write_blocker(categories)
+        if blocked is not None:
+            return {"decision": "deferred", "reasons": reasons, "blocked_by": blocked}
         self.log("build_started", reasons=reasons, prepared_snapshot_id=pointer["snapshot_id"])
         timer = d.monotonic()
         outcome: dict[str, Any]
@@ -983,6 +1040,9 @@ class GuidanceWorker:
         """Registered blend candidates shadow the current baseline; find() makes it idempotent."""
         if not candidates:
             return {"status": "no_registered_candidates"}
+        blocked = self._write_blocker(categories)
+        if blocked is not None:
+            return {"status": "deferred", "blocked_by": blocked}
         try:
             pointer = read_baseline_pointer(self.baseline_root)
         except (SnapshotError, OSError, ValueError):
@@ -1032,7 +1092,11 @@ class GuidanceWorker:
         else:
             self.state["guidance"] = None
         readiness = self.deps.readiness(
-            self.baseline_root, locations, now=now, governance=governance
+            self.baseline_root,
+            locations,
+            now=now,
+            governance=governance,
+            expected_code_revision=self.code_revision,
         )
         readiness.pop("pointer", None)
         self.state["readiness"] = readiness
@@ -1100,6 +1164,9 @@ class GuidanceWorker:
             if not owned:
                 self.log("worker_busy", root=str(self.settings.root))
                 return 2
+            # Construction may precede a previous owner's final writes. Only the
+            # lock owner may choose the durable retry counters it will continue.
+            self.state = load_state(self.status_path)
             try:
                 self.code_revision = self.deps.read_revision()
             except Exception as exc:
@@ -1253,7 +1320,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if health["healthy"] else 1
     if args.command == "status":
         status = read_json(status_directory(args.root) / GUIDANCE_STATUS)
-        print(json.dumps(status or {"state": "no_status"}, indent=2, default=str))
+        print(json.dumps(redact(status or {"state": "no_status"}), indent=2, default=str))
         return 0 if status is not None else 1
     try:
         settings = WorkerSettings(
@@ -1276,7 +1343,7 @@ def main(argv: list[str] | None = None) -> int:
     deps = default_deps(settings)
     if args.command == "discover":
         result = discover_once(settings, deps, keep=args.keep)
-        print(json.dumps(result, indent=2, default=str))
+        print(json.dumps(redact(result), indent=2, default=str))
         return 0 if result["status"] == "selected" else 1
     try:
         worker = GuidanceWorker(settings, deps)

@@ -10,6 +10,8 @@ import hashlib
 import io
 import json
 import signal
+import subprocess
+import sys
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -121,6 +123,7 @@ def publish_baseline(
     heads: dict[str, Any] | None = None,
     locations: list[dict] = LOCATIONS,
     failed: list[dict] | None = None,
+    code_revision: str = "a" * 40,
 ) -> str:
     baseline = root / "baseline"
     identity = uuid4().hex
@@ -129,6 +132,7 @@ def publish_baseline(
     manifest = {
         "schema_version": BASELINE_SCHEMA,
         "baseline_snapshot_id": identity,
+        "code_revision": code_revision,
         "completeness": {"status": "complete"},
         "prepared_snapshot": {"snapshot_id": prepared_id},
         "blend_governance": {"status": status, "heads": heads or {}},
@@ -671,6 +675,32 @@ def test_single_writer_refuses_a_second_worker_on_the_same_root(tmp_path: Path) 
     assert any(row["event"] == "worker_busy" for row in harness.events())
 
 
+def test_single_writer_lock_excludes_an_independent_process_and_releases(tmp_path: Path) -> None:
+    root = tmp_path / "runtime"
+    script = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from mesoforge.application.guidance_worker import single_writer\n"
+        "with single_writer(Path(sys.argv[1])) as owned:\n"
+        "    print('owned' if owned else 'busy')\n"
+    )
+
+    def independent_attempt() -> str:
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(root)],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        return result.stdout.strip()
+
+    with single_writer(root) as owned:
+        assert owned
+        assert independent_attempt() == "busy"
+    assert independent_attempt() == "owned"
+
+
 def test_signal_stops_the_loop_after_the_current_poll(tmp_path: Path) -> None:
     harness = Harness(tmp_path, refresh="off")
     worker = harness.worker()
@@ -888,3 +918,198 @@ def test_discover_command_retains_nothing_by_default(tmp_path: Path) -> None:
     result = worker_module.discover_once(harness.settings, harness.deps)
     assert result["status"] == "selected"
     assert not any((harness.root / "discovery").iterdir())
+
+
+def test_new_code_revision_rebuilds_retained_guidance(tmp_path: Path) -> None:
+    harness = Harness(tmp_path, refresh="off")
+    pointer = publish_prepared(harness.root, harness.hour() - timedelta(hours=1))
+    publish_baseline(harness.root, pointer["snapshot_id"], code_revision="b" * 40)
+    outcome = harness.worker().poll_once()
+    assert outcome["build"]["reasons"] == ["code_revision_changed"]
+    assert outcome["build"]["outcome"] == "published"
+    assert len(harness.build_calls) == 1 and not harness.refresh_calls
+
+
+def test_missing_publication_can_be_rebuilt_after_the_same_inputs_previously_succeeded(
+    tmp_path: Path,
+) -> None:
+    harness = Harness(tmp_path, refresh="off")
+    publish_prepared(harness.root, harness.hour() - timedelta(hours=1))
+    worker = harness.worker()
+    assert worker.poll_once()["build"]["outcome"] == "published"
+    (harness.root / "baseline" / "latest_baseline.json").unlink()
+    recovered = harness.worker().poll_once()
+    assert recovered["build"]["reasons"] == ["no_baseline"]
+    assert recovered["build"]["outcome"] == "published"
+    assert len(harness.build_calls) == 2
+
+
+def test_orphaned_build_marker_recovers_after_phase_exit_crash(tmp_path: Path) -> None:
+    harness = Harness(tmp_path, refresh="off")
+    publish_prepared(harness.root, harness.hour() - timedelta(hours=1))
+    worker = harness.worker()
+    inputs = worker.build_inputs(harness.governance.snapshot("", None, START), LOCATIONS)
+    assert inputs is not None
+    fingerprint = inputs[-1]
+    worker.state["build"]["fingerprints"][fingerprint] = {
+        "outcome": "in_flight",
+        "interruptions": 0,
+        "at": _iso(START),
+    }
+    # phase() finished and saved, but the process died before build result accounting.
+    worker.state["in_flight"] = None
+    worker.save()
+    restarted = harness.worker()
+    record = restarted.recover_interrupted()
+    assert record is not None and record["reason"] == "unfinished_build_bookkeeping"
+    assert restarted.state["build"]["fingerprints"][fingerprint]["interruptions"] == 1
+    assert restarted.poll_once()["build"]["blocked_by"] == "backoff"
+    harness.clock.advance(minutes=5)
+    assert restarted.poll_once()["build"]["outcome"] == "published"
+
+
+def test_retry_state_is_reloaded_after_obtaining_the_singleton_lock(tmp_path: Path) -> None:
+    harness = Harness(tmp_path)
+    harness.refresh_result = {"status": "failed", "steps": []}
+    stale_instance = harness.worker()
+    assert harness.worker().run(once=True, install_signals=False) == 1
+    assert stale_instance.run(once=True, install_signals=False) == 0
+    assert stale_instance.state["polls"]["last"]["refresh"]["blocked_by"] == "backoff"
+    assert len(harness.refresh_calls) == 1
+
+
+@pytest.mark.parametrize("stop", [False, True])
+def test_probe_rechecks_refresh_admission_at_its_phase_boundary(tmp_path: Path, stop: bool) -> None:
+    harness = Harness(tmp_path)
+    pointer = publish_prepared(harness.root, harness.hour() - timedelta(hours=1))
+    publish_baseline(harness.root, pointer["snapshot_id"])
+    harness.discovered["selected_cycles"]["HRRR"] = "2026-07-01T07:00:00+00:00"
+    worker = harness.worker()
+    original = harness.discover
+
+    def delayed(directory: Path) -> dict:
+        result = original(directory)
+        if stop:
+            worker.stop.set()
+        else:
+            harness.clock.advance(minutes=36)
+        return result
+
+    harness.deps.discover = delayed
+    outcome = worker.poll_once()
+    expected = "stop_requested" if stop else "too_late_in_hour"
+    assert outcome["refresh"]["blocked_by"] == expected
+    assert harness.refresh_calls == []
+
+
+def test_stop_during_schema_check_does_not_start_refresh(tmp_path: Path) -> None:
+    harness = Harness(tmp_path)
+    worker = harness.worker()
+
+    def stop_schema() -> dict:
+        worker.stop.set()
+        return harness.schema()
+
+    harness.deps.schema = stop_schema
+    assert worker.poll_once()["stopped_early"] == "stop_requested"
+    assert not harness.refresh_calls and not harness.build_calls
+
+
+def test_stop_during_governance_check_does_not_start_build(tmp_path: Path) -> None:
+    harness = Harness(tmp_path, refresh="off")
+    publish_prepared(harness.root, harness.hour() - timedelta(hours=1))
+    worker = harness.worker()
+
+    def stop_governance() -> Any:
+        worker.stop.set()
+        return harness.governance
+
+    harness.deps.governance = stop_governance
+    assert worker.poll_once()["stopped_early"] == "stop_requested"
+    assert not harness.build_calls
+
+
+def test_disk_floor_blocks_build_and_candidate_background_without_spending_attempt(
+    tmp_path: Path,
+) -> None:
+    harness = Harness(tmp_path, refresh="off")
+    publish_prepared(harness.root, harness.hour() - timedelta(hours=1))
+    harness.governance.shadows = [SimpleNamespace(policy_artifact_id="candidate")]
+    harness.free = 1
+    worker = harness.worker()
+    outcome = worker.poll_once()
+    assert outcome["build"]["blocked_by"] == "disk_low"
+    assert outcome["background"]["blocked_by"] == "disk_low"
+    assert not harness.build_calls and not harness.governance.learning.background_calls
+    assert worker.state["build"]["fingerprints"] == {}
+    harness.free = 100 * 1024**3
+    harness.governance.shadows = []
+    assert worker.poll_once()["build"]["outcome"] == "published"
+
+
+def test_refresh_can_consume_the_build_reserve(tmp_path: Path) -> None:
+    harness = Harness(tmp_path)
+    original = harness.refresh
+
+    def consuming(*args: Any) -> dict:
+        result = original(*args)
+        harness.free = 1
+        return result
+
+    harness.deps.refresh = consuming
+    outcome = harness.worker().poll_once()
+    assert outcome["refresh"]["status"] == "published"
+    assert outcome["build"]["blocked_by"] == "disk_low"
+    assert not harness.build_calls
+
+
+def test_unknown_disk_capacity_does_not_allow_large_writes(tmp_path: Path) -> None:
+    harness = Harness(tmp_path)
+
+    def unavailable(path: Path) -> int:
+        raise OSError("filesystem unavailable")
+
+    harness.deps.disk_free = unavailable
+    assert harness.worker().poll_once()["refresh"]["blocked_by"] == "disk_unavailable"
+    assert not harness.refresh_calls
+
+
+def test_persisted_worker_state_redacts_downstream_readiness_details(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = Harness(tmp_path)
+    test_credential = "sk-regression-not-real-0123456789"
+    monkeypatch.setenv("OPENAI_API_KEY", test_credential)
+    harness.deps.readiness = lambda *a, **k: {
+        "ready": False,
+        "reasons": [f"downstream error {test_credential}"],
+        "baseline": None,
+    }
+    worker = harness.worker()
+    worker.poll_once()
+    assert test_credential in worker.state["readiness"]["reasons"][0]
+    assert test_credential not in worker.status_path.read_text("utf-8")
+
+
+@pytest.mark.parametrize("test_credential", ["2026", "mesoforge"])
+def test_short_credential_overlap_preserves_durable_retry_control(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, test_credential: str
+) -> None:
+    monkeypatch.setenv("MESOFORGE_PG_WORKER_PASSWORD", test_credential)
+    harness = Harness(tmp_path)
+    harness.refresh_result = {
+        "status": "failed",
+        "error": f"provider said {test_credential}",
+        "steps": [],
+    }
+    assert harness.worker().run(once=True, install_signals=False) == 1
+    saved = read_json(harness.root / "status" / GUIDANCE_STATUS)
+    assert saved is not None
+    assert saved["schema_version"] == worker_module.STATUS_SCHEMA
+    assert worker_module.parse_instant(saved["refresh"]["next_allowed_at"]) is not None
+    assert saved["refresh"]["attempts"] == {_iso(harness.hour()): 1}
+    assert test_credential not in saved["refresh"]["last_attempt"]["error"]
+    restarted = harness.worker()
+    assert restarted.run(once=True, install_signals=False) == 0
+    assert restarted.state["polls"]["last"]["refresh"]["blocked_by"] == "backoff"
+    assert len(harness.refresh_calls) == 1

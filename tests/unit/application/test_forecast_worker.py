@@ -113,6 +113,7 @@ class Harness:
         )
         self.overlay_calls: list[Any] = []
         self.candidates: list[Any] = []
+        self.free = 100 * 1024**3
         self.settings = ForecastSettings(root=self.root, config=self.config, **settings)
 
     def _overlays(self, pinned: Any, candidates: list[Any], *, analysis_cutoff: datetime) -> dict:
@@ -178,6 +179,7 @@ class Harness:
             monotonic=lambda: self.now.timestamp(),
             readiness=self.readiness,
             pointer=lambda root: dict(POINTER),
+            disk_free=lambda path: self.free,
         )
 
     def run(self) -> tuple[int, dict[str, Any]]:
@@ -205,6 +207,7 @@ def test_run_pins_the_ready_pointer_and_issues_every_location(tmp_path: Path) ->
     assert call["issue"] is True and call["verify_prior"] is True
     assert call["request_time"] == harness.readiness_calls[0]["now"]  # one clock sample
     assert harness.readiness_calls[0]["pointer"] == POINTER
+    assert harness.readiness_calls[0]["expected_code_revision"] == "c" * 40
     assert [row["issued_forecast_id"] for row in record["results"]] == ["id-0", "id-1", "id-2"]
     assert record["results"][0]["ai_desk"] == {
         "completion_reason": "provider_rate_limited",
@@ -233,6 +236,80 @@ def test_no_ready_baseline_fails_clearly_without_refreshing(tmp_path: Path) -> N
     assert (code, record["status"]) == (EXIT_NOT_READY, "baseline_not_ready")
     assert record["reason"] == "reference_hour_not_covered"
     assert harness.forecast_calls == [] and harness.sleeps == []
+
+
+def test_disk_floor_stops_issuance_before_overlay_lookup_and_paid_desk(tmp_path: Path) -> None:
+    harness = Harness(tmp_path)
+    harness.free = harness.settings.min_free_bytes - 1
+    harness.candidates = [SimpleNamespace(policy_artifact_id="candidate")]
+    code, record = harness.run()
+    assert (code, record["category"]) == (EXIT_FAILED, "disk_low")
+    assert record["disk"]["free_bytes"] == harness.free
+    assert not harness.forecast_calls and not harness.overlay_calls
+    harness.free = harness.settings.min_free_bytes
+    harness.candidates = []
+    assert harness.run()[0] == EXIT_OK
+
+
+def test_disk_capacity_error_is_explicit_and_prevents_issuance(tmp_path: Path) -> None:
+    harness = Harness(tmp_path)
+    deps = harness.deps()
+
+    def unavailable(path: Path) -> int:
+        raise OSError("filesystem unavailable")
+
+    deps.disk_free = unavailable
+    code, record = run_forecast(harness.settings, deps, stream=harness.stream)
+    assert (code, record["category"]) == (EXIT_FAILED, "disk_unavailable")
+    assert not harness.forecast_calls
+
+
+def test_returned_and_persisted_run_details_are_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = Harness(tmp_path)
+    test_credential = "sk-regression-not-real-0123456789"
+    monkeypatch.setenv("OPENAI_API_KEY", test_credential)
+    harness.readiness_results = [
+        ready(ready=False, reasons=[f"service returned {test_credential}"])
+    ]
+    _, record = harness.run()
+    assert test_credential not in json.dumps(record)
+    assert test_credential not in Path(record["record"]).read_text("utf-8")
+    assert test_credential not in (harness.root / "status" / FORECAST_STATUS).read_text("utf-8")
+
+
+def test_readiness_cli_redacts_downstream_details(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    harness = Harness(tmp_path)
+    test_credential = "sk-regression-not-real-0123456789"
+    monkeypatch.setenv("OPENAI_API_KEY", test_credential)
+    monkeypatch.setattr(module, "default_deps", harness.deps)
+    monkeypatch.setattr(module, "current_code_revision", lambda root: "c" * 40)
+    monkeypatch.setattr(
+        module, "baseline_readiness", lambda *a, **k: ready(ready=False, reasons=[test_credential])
+    )
+    code = module.main(["readiness", "--root", str(harness.root), "--config", str(harness.config)])
+    assert code == EXIT_NOT_READY
+    assert test_credential not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("test_credential", ["2026", "mesoforge"])
+def test_short_credential_overlap_cannot_break_successful_run_persistence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, test_credential: str
+) -> None:
+    monkeypatch.setenv("MESOFORGE_PG_WORKER_PASSWORD", test_credential)
+    harness = Harness(tmp_path)
+    harness.forecast_result["results"][0]["reason"] = f"downstream credential {test_credential}"
+    code, record = harness.run()
+    assert (code, record["status"]) == (EXIT_OK, "completed")
+    assert record["schema_version"] == module.RUN_SCHEMA
+    assert datetime.fromisoformat(record["started_at"]) == harness.now
+    assert Path(record["record"]).is_file()
+    assert test_credential not in record["results"][0]["reason"]
+    saved = json.loads(Path(record["record"]).read_text("utf-8"))
+    assert test_credential not in saved["results"][0]["reason"]
 
 
 def test_scheduled_run_waits_for_readiness_inside_the_slot_window(tmp_path: Path) -> None:

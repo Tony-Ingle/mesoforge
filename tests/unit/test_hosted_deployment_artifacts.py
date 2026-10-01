@@ -79,6 +79,21 @@ def test_no_service_publishes_ports_and_storage_is_internal() -> None:
         assert set(services[role]["networks"]) == {"backend", "egress"}
 
 
+def test_minio_build_pins_official_security_release_and_nonroot_data_ownership() -> None:
+    minio = compose()["services"]["minio"]
+    assert minio["build"]["context"] == "./minio"
+    assert minio["image"] == "mesoforge-minio:RELEASE.2025-10-15T17-29-55Z"
+    dockerfile = (HOSTED / "minio" / "Dockerfile").read_text("utf-8")
+    assert "https://github.com/minio/minio.git" in dockerfile
+    assert "9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a" in dockerfile
+    assert "golang:1.24.8-bookworm" in dockerfile and "GOTOOLCHAIN=local" in dockerfile
+    assert "-mod=readonly" in dockerfile
+    assert "USER 10001:10001" in dockerfile and "chown 10001:10001 /data" in dockerfile
+    assert "ENV HOME=/var/lib/minio" in dockerfile
+    assert "mkdir /data /var/lib/minio" in dockerfile
+    assert minio["cap_drop"] == ["ALL"]
+
+
 def test_health_restart_and_shutdown_belong_to_the_long_running_worker() -> None:
     services = compose()["services"]
     guidance = services["guidance-worker"]

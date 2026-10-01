@@ -24,6 +24,7 @@ from mesoforge.application.baseline_readiness import (
     mark_governance_unavailable,
 )
 from mesoforge.application.batch_forecast import _coordinates, load_locations
+from mesoforge.application.code_revision import current_code_revision
 from mesoforge.application.forecast_schedule import ForecastSchedule
 from mesoforge.application.forecast_worker import object_store
 from mesoforge.application.prepared_snapshot import (
@@ -42,6 +43,7 @@ from mesoforge.application.worker_status import (
     status_directory,
 )
 from mesoforge.common.identifiers import Digest
+from mesoforge.storage.s3 import content_addressed_key
 
 _ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG = _ROOT / "configs/locations.json"
@@ -154,10 +156,10 @@ def _stored_objects() -> list[dict[str, Any]]:
 
 
 def _object_path(directory: Path, digest: str) -> Path:
-    algorithm, _, value = digest.partition(":")
-    if algorithm != "sha256" or len(value) != 64:
-        raise ValueError(f"Unsupported content digest {digest!r}")
-    return directory / "objects" / "sha256" / value[:2] / value[2:]
+    path = directory / content_addressed_key(Digest(digest))
+    if not path.resolve().is_relative_to(directory.resolve()):
+        raise ValueError("Export object path escapes its backup directory")
+    return path
 
 
 def _file_digest(path: Path) -> str:
@@ -182,16 +184,23 @@ def export_objects(destination: Path) -> dict[str, Any]:
     exporting after the dump covers every row the dump contains.
     """
     destination = _outside_repository(destination)
+    destination.mkdir(parents=True, exist_ok=True)
     rows = _stored_objects()
     store = object_store(ensure_bucket=False)
     copied = present = total = 0
     for row in rows:
         path = _object_path(destination, row["content_digest"])
         total += int(row["byte_size"])
-        if path.is_file() and _file_digest(path) == row["content_digest"]:
+        if (
+            path.is_file()
+            and path.stat().st_size == row["byte_size"]
+            and _file_digest(path) == row["content_digest"]
+        ):
             present += 1
             continue
         data = store.get_verified(row["storage_uri"], Digest(row["content_digest"]))
+        if len(data) != row["byte_size"]:
+            raise ValueError("Stored object byte size differs from the database reference")
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.tmp")
         temporary.write_bytes(data)
@@ -203,9 +212,12 @@ def export_objects(destination: Path) -> dict[str, Any]:
         "bucket": os.environ.get("MESOFORGE_S3_BUCKET"),
         "objects": rows,
     }
-    (destination / EXPORT_MANIFEST).write_text(
+    manifest_path = destination / EXPORT_MANIFEST
+    temporary_manifest = manifest_path.with_suffix(".tmp")
+    temporary_manifest.write_text(
         json.dumps(manifest, indent=2, default=str) + "\n", encoding="utf-8"
     )
+    os.replace(temporary_manifest, manifest_path)
     return {
         "objects": len(rows),
         "copied": copied,
@@ -215,15 +227,58 @@ def export_objects(destination: Path) -> dict[str, Any]:
     }
 
 
-def import_objects(source: Path) -> dict[str, Any]:
-    """Restore an export into the configured bucket, verifying every digest."""
+def _validated_export(source: Path) -> dict[str, Any]:
+    """Read and verify the entire export before any restore writes begin."""
     manifest = json.loads((source / EXPORT_MANIFEST).read_text(encoding="utf-8"))
     bucket = os.environ.get("MESOFORGE_S3_BUCKET")
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != (
+        "mesoforge.object-export.v1"
+    ):
+        raise ValueError("Unsupported object export schema")
+    if not bucket or manifest.get("bucket") != bucket:
+        raise ValueError("Restore into the bucket the database rows reference")
+    if not isinstance(manifest.get("objects"), list):
+        raise ValueError("Object export must contain an objects list")
+    seen: set[str] = set()
+    for row in manifest["objects"]:
+        if not isinstance(row, dict):
+            raise ValueError("Invalid object export row")
+        digest = Digest(row["content_digest"])
+        if digest in seen:
+            raise ValueError("Duplicate object digest in export")
+        seen.add(digest)
+        if row.get("storage_uri") != f"s3://{bucket}/{content_addressed_key(digest)}":
+            raise ValueError("Export object key differs from its canonical database reference")
+        if not isinstance(row.get("media_type"), str) or not row["media_type"]:
+            raise ValueError("Invalid object media type")
+        if type(row.get("byte_size")) is not int or row["byte_size"] < 0:
+            raise ValueError("Invalid object byte size")
+        path = _object_path(source, row["content_digest"])
+        if _file_digest(path) != digest:
+            raise ValueError(f"Export file differs from its digest: {path}")
+        if path.stat().st_size != row["byte_size"]:
+            raise ValueError(f"Export file differs from its byte size: {path}")
+    return manifest
+
+
+def validate_export(source: Path) -> dict[str, Any]:
+    """Read-only preflight used before restoring the database or any objects."""
+    manifest = _validated_export(source)
+    return {"objects": len(manifest["objects"]), "bucket": manifest["bucket"], "valid": True}
+
+
+def check_empty_storage() -> dict[str, Any]:
+    """Refuse an occupied restore target; a missing bucket is acceptable."""
+    object_store(ensure_bucket=False).check_empty_bucket()
+    return {"bucket": os.environ["MESOFORGE_S3_BUCKET"], "empty": True}
+
+
+def import_objects(source: Path) -> dict[str, Any]:
+    """Restore an export after verifying all files, rechecking each before its write."""
+    manifest = _validated_export(source)
     store = object_store(ensure_bucket=False)
     restored = 0
     for row in manifest["objects"]:
-        if not str(row["storage_uri"]).startswith(f"s3://{bucket}/"):
-            raise ValueError("Restore into the bucket the database rows reference")
         path = _object_path(source, row["content_digest"])
         data = path.read_bytes()
         if f"sha256:{hashlib.sha256(data).hexdigest()}" != row["content_digest"]:
@@ -232,7 +287,7 @@ def import_objects(source: Path) -> dict[str, Any]:
         if stored.storage_uri != row["storage_uri"]:
             raise ValueError("Restored object key differs from the database reference")
         restored += 1
-    return {"objects": restored, "bucket": bucket}
+    return {"objects": restored, "bucket": manifest["bucket"]}
 
 
 def _guidance(root: Path, now: datetime) -> dict[str, Any] | None:
@@ -290,6 +345,27 @@ def _section(report: dict[str, Any], name: str, function: Any) -> None:
         report[name] = {"status": "unavailable", "error": _error(exc)}
 
 
+def _baseline_readiness(
+    root: Path, locations: list[Any], *, now: datetime, governance: Any
+) -> dict[str, Any]:
+    revision, failure = None, None
+    try:
+        revision = current_code_revision(_ROOT)
+    except Exception as exc:
+        failure = exc
+    report = baseline_readiness(
+        root,
+        locations,
+        now=now,
+        governance=governance,
+        expected_code_revision=revision,
+    )
+    if failure is not None:
+        report["ready"] = False
+        report["reasons"].append(f"code_revision_unavailable: {_error(failure)}")
+    return report
+
+
 def status(root: Path, config: Path, *, now: datetime | None = None) -> dict[str, Any]:
     """Read-only deployment status; each section fails independently."""
     now = (now or datetime.now(UTC)).astimezone(UTC)
@@ -332,7 +408,7 @@ def status(root: Path, config: Path, *, now: datetime | None = None) -> dict[str
     except Exception as exc:
         governance, failure = None, exc
         report["policies"] = {"status": "unavailable", "error": _error(exc)}
-    readiness = baseline_readiness(root / "baseline", locations, now=now, governance=governance)
+    readiness = _baseline_readiness(root / "baseline", locations, now=now, governance=governance)
     if failure is not None:
         mark_governance_unavailable(readiness, failure)
     readiness.pop("pointer", None)
@@ -434,10 +510,13 @@ def main(argv: list[str] | None = None) -> int:
     grants = commands.add_parser("apply-grants", help="Re-apply least-privilege worker grants")
     grants.add_argument("--expect-database", required=True)
     commands.add_parser("init-storage", help="Explicitly create the configured bucket")
+    commands.add_parser("check-empty-storage", help="Read-only empty restore-target check")
     export = commands.add_parser("export-objects")
     export.add_argument("--destination", type=Path, required=True)
     restore = commands.add_parser("import-objects")
     restore.add_argument("--source", type=Path, required=True)
+    validate = commands.add_parser("validate-export", help="Read-only complete export validation")
+    validate.add_argument("--source", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "migration-status":
@@ -452,6 +531,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "init-storage":
             print(json.dumps(init_storage(), indent=2))
+            return 0
+        if args.command == "check-empty-storage":
+            print(json.dumps(check_empty_storage(), indent=2))
+            return 0
+        if args.command == "validate-export":
+            print(json.dumps(validate_export(args.source), indent=2))
             return 0
         if args.command == "export-objects":
             print(json.dumps(export_objects(args.destination), indent=2))
@@ -473,7 +558,7 @@ def main(argv: list[str] | None = None) -> int:
                 governance = configured_governance()
             except Exception as exc:
                 failure = exc
-            report = baseline_readiness(
+            report = _baseline_readiness(
                 args.root.resolve() / "baseline",
                 load_locations(args.config),
                 now=datetime.now(UTC),

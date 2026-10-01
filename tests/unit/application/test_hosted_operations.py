@@ -72,6 +72,31 @@ def test_code_revision_prefers_the_image_build_argument(monkeypatch: pytest.Monk
     assert len(revision) == 40 and int(revision, 16) >= 0
 
 
+def test_storage_identities_use_image_revision_without_git(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mesoforge.application import (
+        issued_qpf_verification,
+        prepared_mrms,
+        prepared_observations,
+        station_discovery,
+    )
+
+    monkeypatch.setenv("MESOFORGE_CODE_REVISION", "b" * 40)
+
+    def no_git(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("Image code identity attempted a Git subprocess")
+
+    monkeypatch.setattr("mesoforge.application.code_revision.subprocess.run", no_git)
+    for module in (
+        issued_qpf_verification,
+        prepared_mrms,
+        prepared_observations,
+        station_discovery,
+    ):
+        assert module._identity()["git_commit"] == "b" * 40
+
+
 def test_database_target_never_includes_the_password() -> None:
     target = operations.database_target("postgresql+psycopg://svc:pw123456789@db:5432/mesoforge")
     assert target == {
@@ -175,6 +200,93 @@ def test_status_sections_fail_independently_and_render(
     text = operations.render_status(report)
     assert "Guidance worker: NOT healthy" in text
     assert "Next scheduled run: 2026-07-01T08:00:00-05:00" in text
+
+
+def test_empty_object_export_creates_a_valid_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MESOFORGE_S3_BUCKET", "prod")
+    monkeypatch.setattr(operations, "_stored_objects", lambda: [])
+    monkeypatch.setattr(operations, "object_store", lambda ensure_bucket: FakeStore("prod"))
+    destination = tmp_path / "new" / "backup"
+    assert operations.export_objects(destination)["objects"] == 0
+    assert operations.validate_export(destination) == {
+        "objects": 0,
+        "bucket": "prod",
+        "valid": True,
+    }
+
+
+@pytest.mark.parametrize("defect", ["digest", "size", "key", "schema", "duplicate", "bucket"])
+def test_import_validates_entire_export_before_any_object_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str
+) -> None:
+    rows = []
+    for payload in (b"first", b"second"):
+        digest = str(Digest.of_bytes(payload))
+        path = operations._object_path(tmp_path, digest)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        value = digest.split(":")[1]
+        rows.append(
+            {
+                "content_digest": digest,
+                "storage_uri": f"s3://prod/objects/sha256/{value[:2]}/{value[2:]}",
+                "media_type": "application/json",
+                "byte_size": len(payload),
+            }
+        )
+    manifest: dict[str, Any] = {
+        "schema_version": "mesoforge.object-export.v1",
+        "bucket": "prod",
+        "objects": rows,
+    }
+    if defect == "digest":
+        operations._object_path(tmp_path, rows[-1]["content_digest"]).write_bytes(b"corrupt")
+    elif defect == "size":
+        rows[-1]["byte_size"] += 1
+    elif defect == "key":
+        rows[-1]["storage_uri"] += "-wrong-key"
+    elif defect == "schema":
+        manifest["schema_version"] = "unsupported"
+    elif defect == "duplicate":
+        rows.append(rows[-1])
+    else:
+        manifest["bucket"] = "other"
+    (tmp_path / operations.EXPORT_MANIFEST).write_text(json.dumps(manifest), "utf-8")
+    monkeypatch.setenv("MESOFORGE_S3_BUCKET", "prod")
+
+    def forbidden(**kwargs: Any) -> None:
+        pytest.fail("Invalid export reached the destination object store")
+
+    monkeypatch.setattr(operations, "object_store", forbidden)
+    with pytest.raises(ValueError):
+        operations.import_objects(tmp_path)
+
+
+def test_object_export_rejects_non_hex_digest_paths(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        operations._object_path(tmp_path, "sha256:" + "../" * 21 + "x")
+
+
+def test_operations_readiness_checks_runtime_revision_and_fails_if_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    revisions = []
+
+    def readiness(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        revisions.append(kwargs["expected_code_revision"])
+        return {"ready": True, "reasons": []}
+
+    monkeypatch.setattr(operations, "baseline_readiness", readiness)
+    monkeypatch.setenv("MESOFORGE_CODE_REVISION", "b" * 40)
+    now = datetime(2026, 7, 1, tzinfo=UTC)
+    assert operations._baseline_readiness(tmp_path, [], now=now, governance=None)["ready"]
+    monkeypatch.setenv("MESOFORGE_CODE_REVISION", "invalid")
+    result = operations._baseline_readiness(tmp_path, [], now=now, governance=None)
+    assert not result["ready"]
+    assert result["reasons"][0].startswith("code_revision_unavailable:")
+    assert revisions == ["b" * 40, None]
 
 
 def test_worker_status_health_command_exit_codes(tmp_path: Path) -> None:

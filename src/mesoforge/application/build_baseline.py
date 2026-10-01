@@ -28,6 +28,7 @@ from mesoforge.application.baseline_snapshot import (
     write_manifest,
 )
 from mesoforge.application.batch_forecast import _coordinates, load_locations
+from mesoforge.application.code_revision import current_code_revision
 from mesoforge.application.governance import GovernanceService
 from mesoforge.application.prepared_snapshot import (
     SnapshotError,
@@ -135,6 +136,7 @@ def build_baseline(
     """
     if baseline_root.resolve().is_relative_to(_ROOT):
         raise ValueError("Baseline artifacts must remain outside the repository")
+    code_revision = current_code_revision(_ROOT)
     started = time.perf_counter()
     built = datetime.now(UTC)
     cutoff = analysis_cutoff or built
@@ -298,6 +300,7 @@ def build_baseline(
         "schema_version": BASELINE_SCHEMA,
         "baseline_snapshot_id": identity,
         "kind": "mesoforge_numerical_baseline",
+        "code_revision": code_revision,
         "built_at": _iso(built),
         "analysis_cutoff": _iso(cutoff),
         "completed_at": _iso(datetime.now(UTC)),
