@@ -67,6 +67,29 @@ def test_docker_context_is_an_allowlist() -> None:
     }
 
 
+def test_image_uses_local_eccodes_loading_and_checks_native_shutdown_in_both_orders() -> None:
+    runtime = runtime_stage((ROOT / "Dockerfile").read_text("utf-8"))
+    packages = "/app/.venv/lib/python3.12/site-packages"
+    assert "FINDLIBS_DISABLE_PACKAGE=yes" in runtime
+    assert f"ECCODES_HOME={packages}/eccodeslib" in runtime
+    assert f"LD_LIBRARY_PATH={packages}/eckitlib/lib64:{packages}/eccodeslib/lib64" in runtime
+    assert "PSYCOPG_IMPL=python" not in runtime  # The locked binary driver is unchanged.
+    # Real subprocess exit status is checked by Docker at build time. Keep both
+    # import orders in independent interpreters under the actual non-root user.
+    smoke = runtime.split("USER 10001:10001", 1)[1]
+    commands = re.findall(r'python -c "([^"]+)"', smoke)
+    assert len(commands) == 2
+    assert commands[0].startswith("import eccodes; import psycopg;")
+    assert commands[1].startswith("import psycopg; import eccodes;")
+    assert '&& python -c "' in smoke
+    for command in commands:
+        assert "psycopg.pq.__impl__ == 'binary'" in command
+        assert "psycopg.pq.version() > 0" in command
+        assert "codes_grib_new_from_samples('regular_ll_sfc_grib2')" in command
+        assert "codes_get_values(handle)" in command
+        assert "codes_release(handle)" in command
+
+
 def test_no_service_publishes_ports_and_storage_is_internal() -> None:
     stack = compose()
     services = stack["services"]

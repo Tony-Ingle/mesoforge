@@ -68,7 +68,8 @@ new enforcement rules. Conditions do not promote evidence-only fields.
 ### What is not implemented
 
 The hosted worker roles, image, Compose stack and scheduler units exist (see
-[Hosted deployment](#hosted-deployment)); no VPS deployment has been performed.
+[Hosted deployment](#hosted-deployment)). The isolated VPS fixture proof is complete;
+production and unattended operation remain disabled.
 No correction or blend policy has been activated, and there is no delivery/email
 service, adaptive production weighting or calibrated multi-source precipitation
 blend. Only an explicitly activated governed temperature correction changes values
@@ -971,8 +972,15 @@ The former MinIO image is no longer anonymously pullable. Compose now builds
 from an exact commit using [the auxiliary Dockerfile](deploy/hosted/minio/Dockerfile).
 This preserves the S3 contract and volume layout. [Upstream is archived and
 unmaintained](https://github.com/minio/minio); this is a supervised first-deployment
-option, not a maintenance guarantee. The source build and complete Compose stack
-still require validation on a Docker host.
+option, not a maintenance guarantee. Both images and the Compose stack have been
+exercised on Debian 12 with Docker 29.7.2 / Compose 5.5.0 using isolated synthetic
+data; this does not establish live-provider capacity or unattended readiness.
+
+The application image retains the locked ecCodes/eckit and Psycopg binaries but
+uses native local library loading instead of globally preloading every eckit
+library. Global preloading caused a Linux interpreter-shutdown crash when ecCodes
+loaded before Psycopg. Two non-root, fresh-process GRIB/libpq checks in the image
+build cover both import orders and require normal process exit.
 
 ### Storage, backups and retention
 
@@ -1015,7 +1023,9 @@ It validates the checksums, archive and every exported object before restoring r
 The database restore is transactional; the combined PostgreSQL/S3/runtime restore is
 not atomic. A later failure requires inspection and a fresh empty destination before
 retrying. Older backups without the completion/checksum contract are rejected.
-Shell failure tests cover these guards; a complete container restore remains unproven.
+Shell failure tests cover these guards. The supervised Linux proof also ran these
+scripts against meaningful isolated state and restored into new PostgreSQL, object
+store and runtime volumes with identical database rows, object digests and issuances.
 
 ### Security
 
@@ -1167,10 +1177,23 @@ same three failures independently reproduced at its starting revision (the batch
 mock signature and two typed-boundary inventory checks). All 150 integration and
 acceptance tests passed against the dedicated services.
 
-Docker, Podman and a Linux/systemd runtime were unavailable:
-the application image, source-built MinIO image, Compose lifecycle and combined
-database/object/runtime restore remain unproven. Static container checks and the
-injected-clock DST tests do not replace that first Linux deployment exercise.
+The subsequent supervised Debian 12 Docker proof built both images, migrated an
+isolated database, checked worker privileges and produced a Linux-native synthetic
+baseline for the three configured locations. Twelve domain/reference views took
+204 s and retained 10.3 MB; the three-location issuance took 36.8 s and the repeat
+skipped all three in under a second. Concurrent workers respected the database lock.
+The proof exercised service outages/restarts, corrupt pointers, schema/revision
+checks, unavailable AI and fake HTTP 429 fallback without paid calls.
+
+The actual backup/restore scripts preserved 12 database tables, 24 verified objects
+(162.4 MB), five readable synthetic issuances, verification records and register/retire
+governance history in fresh volumes. Three issuances were the configured worker
+batch; two were separate historical verification fixtures. No policy was activated.
+Native systemd unit validation and both America/Chicago DST transitions passed;
+no timer was installed or enabled. These are fixture deployment measurements, not
+real-weather verification, a live guidance memory benchmark or authorization for
+unattended operation. Test object storage used bootstrap credentials; a live stack
+still needs the bucket-scoped application credential described above.
 
 Command arguments were checked against current parsers. The prospective operator
 milestone passed focused operator/snapshot/baseline/QPF checks and 25

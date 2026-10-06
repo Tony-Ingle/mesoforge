@@ -52,6 +52,13 @@ RUN groupadd --system --gid 10001 mesoforge \
     && mkdir -p /var/lib/mesoforge/runtime \
     && chown -R 10001:10001 /var/lib/mesoforge
 COPY --from=build /app /app
+# Keep the locked ecCodes/eckit binaries, but resolve their dependencies through the
+# native loader instead of findlibs' RTLD_GLOBAL preload of every eckit library.
+# The latter makes ecCodes-before-Psycopg terminate with SIGSEGV on Linux. The
+# package search must be disabled because it otherwise precedes ECCODES_HOME.
+ENV FINDLIBS_DISABLE_PACKAGE=yes \
+    ECCODES_HOME=/app/.venv/lib/python3.12/site-packages/eccodeslib \
+    LD_LIBRARY_PATH=/app/.venv/lib/python3.12/site-packages/eckitlib/lib64:/app/.venv/lib/python3.12/site-packages/eccodeslib/lib64
 ENV PATH=/app/.venv/bin:${PATH} \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -64,6 +71,22 @@ ENV PATH=/app/.venv/bin:${PATH} \
 # working directory matters because some configuration paths are relative to it.
 WORKDIR /app
 USER 10001:10001
+# Both fresh interpreters must finish normally: successful imports/prints alone
+# miss the native shutdown crash. Exercise GRIB and libpq without network or data.
+RUN python -c "import eccodes; import psycopg; \
+assert psycopg.pq.__impl__ == 'binary'; \
+assert psycopg.pq.version() > 0; \
+handle = eccodes.codes_grib_new_from_samples('regular_ll_sfc_grib2'); \
+assert eccodes.codes_get(handle, 'edition') == 2; \
+assert len(eccodes.codes_get_values(handle)) > 0; \
+eccodes.codes_release(handle)" \
+    && python -c "import psycopg; import eccodes; \
+assert psycopg.pq.__impl__ == 'binary'; \
+assert psycopg.pq.version() > 0; \
+handle = eccodes.codes_grib_new_from_samples('regular_ll_sfc_grib2'); \
+assert eccodes.codes_get(handle, 'edition') == 2; \
+assert len(eccodes.codes_get_values(handle)) > 0; \
+eccodes.codes_release(handle)"
 VOLUME ["/var/lib/mesoforge/runtime"]
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["python", "-m"]

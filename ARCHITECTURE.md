@@ -45,7 +45,8 @@ flowchart TD
 The main boundaries are implemented as commands. The hosted deployment (section N)
 runs them as two roles of one image: a polling guidance/baseline worker and a
 scheduled forecast/issuance worker. Background means numerical preparation runs
-before a location job; no VPS deployment has been performed.
+before a location job. The isolated VPS fixture proof is complete; production and
+unattended operation remain disabled.
 
 The issued product currently contains 36 hourly views of a local surface-weather
 canvas. Temperature, moisture, wind, QPF and temporary probability/category fields
@@ -1310,9 +1311,13 @@ transaction. Disk guards measure the local runtime filesystem, not remote store 
 The former upstream MinIO image is unavailable. An auxiliary image builds the exact
 official 2025-10-15 security-release source with pinned compiler/base digests; the
 application still has one image for both roles. Upstream MinIO is archived, so this
-does not establish ongoing maintenance. Shell failure injection and native local
-PostgreSQL/MinIO tests do not prove container behavior: the image builds, complete
-Compose run and full-stack restore still require an isolated Linux Docker exercise.
+does not establish ongoing maintenance. The supervised Debian 12 Docker proof built
+both images, issued all three configured locations from a Linux-native synthetic
+baseline, and restored meaningful database/object/runtime state into fresh volumes
+with exact identities and digests. No live guidance or paid AI was used, and no
+scheduler was installed. This proves the fixture deployment path, not unattended
+capacity under live acquisition. The application image isolates native ecCodes
+library loading and tests both ecCodes/Psycopg import orders through normal shutdown.
 
 **FUTURE.** Multi-host publication or shared object-backed guidance, delivery,
 continuous observation/MRMS polling and automatic guidance retention need explicit
@@ -1347,7 +1352,7 @@ validates code; it is not the forecast scheduler. Hermes orchestration remains p
 | Policy governance, promotion eligibility and rollback | Implemented | Append-only events, deterministic eligibility, explicit CAS activation, rollback/emergency/retire; blend/QPF/AI never eligible |
 | Broader site/regime correction science | Future | No regime classifier, per-bucket activation or additional correction science |
 | Bounded operational AI desk and current final validation | Implemented | Structured provider boundary, finite tasks/budgets, temperature/QPF tools, checkpoint fallback and common stage evaluation |
-| Scheduled hosted operation | Implemented, not yet deployed to a VPS | One image, two roles, internal services; scheduler chooses when, MesoForge keeps all meteorology |
+| Scheduled hosted operation | Implemented; supervised Linux fixture proof complete, unattended operation not enabled | One image, two roles, internal services; scheduler chooses when, MesoForge keeps all meteorology |
 | Delivery | Future | No email, SMS or delivery service |
 
 ## P. Architectural debt and retained boundaries
