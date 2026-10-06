@@ -1197,12 +1197,12 @@ class GuidanceWorker:
                 if console_break is not None:
                     signal.signal(console_break, self._handle_signal)
             done = threading.Event()
-            watchdog = None
-            if not once:
-                watchdog = threading.Thread(
-                    target=self._watchdog, args=(done, exit_process), daemon=True
-                )
-                watchdog.start()
+            # A single poll can spend minutes in refresh/build too. Keep its
+            # heartbeat and existing phase bounds active just as in the loop.
+            watchdog = threading.Thread(
+                target=self._watchdog, args=(done, exit_process), daemon=True
+            )
+            watchdog.start()
             status = 0
             try:
                 while not self.stop.is_set():
@@ -1225,8 +1225,7 @@ class GuidanceWorker:
                     self._sleep(delay)
             finally:
                 done.set()
-                if watchdog is not None:
-                    watchdog.join(timeout=5)
+                watchdog.join(timeout=5)
                 self.state.update(state="stopped", stopped_at=iso(self.deps.clock()))
                 self.save()
                 self.beat()

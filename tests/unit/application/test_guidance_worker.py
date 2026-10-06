@@ -36,6 +36,7 @@ from mesoforge.application.prepared_snapshot import POINTER_SCHEMA, SNAPSHOT_SCH
 from mesoforge.application.worker_status import (
     GUIDANCE_HEARTBEAT,
     GUIDANCE_STATUS,
+    HEARTBEAT_STALE_SECONDS,
     guidance_health,
     read_json,
     write_json,
@@ -722,6 +723,87 @@ def test_signal_stops_the_loop_after_the_current_poll(tmp_path: Path) -> None:
     assert "stop_requested" in names and names[-1] == "worker_stopped"
     with pytest.raises(SystemExit):
         worker._handle_signal(signal.SIGTERM, None)
+
+
+@pytest.mark.parametrize("once", [True, False])
+def test_long_poll_keeps_heartbeat_fresh_in_once_and_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, once: bool
+) -> None:
+    harness = Harness(tmp_path)
+    worker = harness.worker()
+    worker.heartbeat_seconds = 0.01
+    advanced, beat_seen, watchdog_finished = threading.Event(), threading.Event(), threading.Event()
+    health: list[dict[str, Any]] = []
+    original_beat, original_watchdog = worker.beat, worker._watchdog
+    original_refresh, original_poll = harness.deps.refresh, worker.poll_once
+
+    def beat() -> None:
+        before = harness.clock()
+        original_beat()
+        if advanced.is_set() and before == harness.clock():
+            beat_seen.set()
+
+    def watchdog(done: threading.Event, exit_process: Any) -> None:
+        try:
+            original_watchdog(done, exit_process)
+        finally:
+            watchdog_finished.set()
+
+    def refresh(config: Path, root: Path, probe: Path | None) -> dict[str, Any]:
+        harness.clock.advance(seconds=HEARTBEAT_STALE_SECONDS + 1)
+        advanced.set()
+        assert beat_seen.wait(timeout=5), "Busy worker did not refresh its heartbeat"
+        health.append(guidance_health(harness.root, now=harness.clock()))
+        return original_refresh(config, root, probe)
+
+    def poll() -> dict[str, Any]:
+        outcome = original_poll()
+        if not once:
+            worker.stop.set()  # Stop the normal loop after the same one-poll exercise.
+        return outcome
+
+    monkeypatch.setattr(worker, "beat", beat)
+    monkeypatch.setattr(worker, "_watchdog", watchdog)
+    monkeypatch.setattr(worker, "poll_once", poll)
+    harness.deps.refresh = refresh
+    exits: list[int] = []
+    assert worker.run(once=once, install_signals=False, exit_process=exits.append) == 0
+    assert len(health) == 1 and health[0]["healthy"] is True
+    assert health[0]["heartbeat_age_seconds"] == 0
+    assert health[0]["in_flight"]["phase"] == "refresh"
+    assert health[0]["in_flight"]["age_seconds"] == HEARTBEAT_STALE_SECONDS + 1
+    assert worker.state["polls"]["count"] == 1 and watchdog_finished.is_set()
+    assert not exits
+    assert guidance_health(harness.root, now=harness.clock())["reason"] == "worker_stopped"
+
+
+@pytest.mark.parametrize("bound", ["phase", "poll"])
+def test_once_enforces_existing_watchdog_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bound: str
+) -> None:
+    harness = Harness(tmp_path)
+    worker = harness.worker()
+    worker.heartbeat_seconds = 0.01
+    expired = threading.Event()
+    exits: list[int] = []
+
+    def exit_process(code: int) -> None:
+        exits.append(code)  # Production uses os._exit; never terminate the test process.
+        expired.set()
+
+    def blocked_poll(outcome: dict[str, Any], categories: list[str]) -> None:
+        if bound == "phase":
+            with worker.phase("refresh"):
+                harness.clock.advance(seconds=worker_module.phase_bound("refresh") + 1)
+                assert expired.wait(timeout=5), "Single-poll phase bound was not enforced"
+        else:
+            harness.clock.advance(seconds=worker_module.POLL_BOUND_SECONDS + 1)
+            assert expired.wait(timeout=5), "Single-poll total bound was not enforced"
+
+    monkeypatch.setattr(worker, "_poll", blocked_poll)
+    worker.run(once=True, install_signals=False, exit_process=exit_process)
+    assert exits == [70]
+    assert any(row["event"] == "watchdog_exit" for row in harness.events())
 
 
 def test_watchdog_exits_when_a_phase_exceeds_its_bound(tmp_path: Path) -> None:

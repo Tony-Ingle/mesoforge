@@ -1,7 +1,6 @@
 {
   "locations": [
     {"id": "minneapolis", "name": "Minneapolis", "lat": 44.98861, "lon": -93.25553, "display_timezone": "America/Chicago"},
-    {"id": "surley", "name": "Surley", "lat": 44.97304, "lon": -93.20901, "display_timezone": "America/Chicago"},
     {"id": "grasston", "name": "Grasston", "lat": 45.80268, "lon": -93.07952, "display_timezone": "America/Chicago"}
   ]
 }

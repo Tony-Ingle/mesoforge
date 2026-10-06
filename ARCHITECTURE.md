@@ -99,8 +99,9 @@ does not invalidate the previous numerical baseline if building its replacement 
 
 [`prospective_cycle`](src/mesoforge/application/prospective_cycle.py) is the on-demand
 development/operator composition of these boundaries. Its default registry is
-[`configs/locations.json`](configs/locations.json). It reads an aware runtime UTC
-clock, refreshes shared guidance once, builds the baseline, then pins the exact
+[`configs/locations.json`](configs/locations.json), currently Minneapolis and
+Grasston. It reads an aware runtime UTC clock, refreshes shared guidance once,
+builds the baseline, then pins the exact
 returned baseline for the configured batch. The location analysis clock is sampled
 after background completion and its UTC hour is floored using the existing rule.
 An explicit replay-reference override is separate from this normal current-time path.
@@ -1232,7 +1233,7 @@ development keeps the on-demand commands and `prospective_cycle`.
 
 ```mermaid
 flowchart LR
-    X[External scheduler: systemd timer 08:00/20:00 America/Chicago] -. when .-> F
+    X[External scheduler: 08:00/20:00 America/Chicago; not enabled] -. when .-> F
     P[Model providers] --> G[Guidance/baseline worker: bounded poll loop]
     G --> R[(Runtime volume: guidance/, baseline/, runs/, status/)]
     R --> F[Forecast/issuance worker: one run per trigger]
@@ -1260,7 +1261,8 @@ recovered on restart. A successful fingerprint permits rebuilding a missing/obso
 publication. Existing publication rules keep the previous pointers
 on any failure. Hour budgets, exponential backoff, a free-space floor, persisted
 counters and in-flight phases, a single-writer lock, signal handling and a phase
-watchdog bound the loop. The start gate is checked again after discovery. Local disk
+watchdog bound both `run` and the single-poll `once` command; `once` exits after
+that poll without scheduling another. The start gate is checked again after discovery. Local disk
 admission applies to refresh, baseline and candidate-overlay builds. Registered blend
 candidates receive background overlays.
 
@@ -1312,8 +1314,8 @@ The former upstream MinIO image is unavailable. An auxiliary image builds the ex
 official 2025-10-15 security-release source with pinned compiler/base digests; the
 application still has one image for both roles. Upstream MinIO is archived, so this
 does not establish ongoing maintenance. The supervised Debian 12 Docker proof built
-both images, issued all three configured locations from a Linux-native synthetic
-baseline, and restored meaningful database/object/runtime state into fresh volumes
+both images, issued the three locations configured at that time from a Linux-native
+synthetic baseline, and restored meaningful database/object/runtime state into fresh volumes
 with exact identities and digests. No live guidance or paid AI was used, and no
 scheduler was installed. This proves the fixture deployment path, not unattended
 capacity under live acquisition. The application image isolates native ecCodes

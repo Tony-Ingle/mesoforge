@@ -154,13 +154,17 @@ point them only at dedicated disposable test storage, never application history.
 
 ## Configure locations
 
-The initial prospective registry is [configs/locations.json](configs/locations.json):
+The maintained prospective registry is [configs/locations.json](configs/locations.json):
 
 | ID | Name | Latitude | Longitude | Display timezone |
 | --- | --- | --- | --- | --- |
 | `minneapolis` | Minneapolis | 44.98861 | -93.25553 | `America/Chicago` |
-| `surley` | Surley | 44.97304 | -93.20901 | `America/Chicago` |
 | `grasston` | Grasston | 45.80268 | -93.07952 | `America/Chicago` |
+
+The current hosted rollout selects Minneapolis only through the existing alternate
+location file (`--config` on both workers). Grasston remains in the maintained
+registry. Surley is no longer an operational target; its historical artifacts and
+verification records remain valid and are not removed.
 
 An alternate file uses the same `{"locations": [{"lat": ..., "lon": ...}]}`
 structure; pass its path with `--config`.
@@ -861,7 +865,9 @@ fails closed.
 
 `--refresh off` builds from the retained `latest_complete` only (recovery; no
 downloads). `--no-hourly-probe` refreshes only for coverage, footprint and pre-slot
-reasons: fewer downloads, less current intermediate guidance. `once` runs one poll; `status` prints the state file; `health` exits 0/1;
+reasons: fewer downloads, less current intermediate guidance. `once` runs one poll
+with the same busy heartbeat and phase/poll watchdog bounds as `run`, then exits;
+it does not schedule another poll. `status` prints the state file; `health` exits 0/1;
 `discover` runs a read-only availability probe and deletes its evidence (`--keep`
 retains it under `discovery/manual-*`; the worker clears only its own
 `discovery/worker/` scratch).
@@ -923,19 +929,39 @@ worker database role cannot append governance events, and nothing is served over
 
 ### Scheduling at 08:00 and 20:00 America/Chicago
 
-Install [the systemd timer](deploy/hosted/systemd/mesoforge-forecast.timer) and
-[service](deploy/hosted/systemd/mesoforge-forecast.service) (edit
-`WorkingDirectory`); `OnCalendar=*-*-* 08,20:00:00 America/Chicago` follows daylight
-saving. Alternatives that stay DST-safe through the worker's own gate:
+Scheduling is **not enabled**. The intended rollout uses GitHub Actions on the
+existing self-hosted deployment runner; no forecast workflow is currently committed.
+After explicit owner enablement, a workflow on the repository's default branch can
+use `cron: "0 8,20 * * *"` with `timezone: America/Chicago`, then invoke the existing
+forecast service with `--scheduled` and the deployment's Minneapolis-only config.
+[GitHub's schedule contract](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
+supports IANA time zones/DST, runs scheduled workflows only from the default branch,
+and warns that dispatch can be delayed or dropped. The worker's own named-zone gate,
+readiness checks and issuance locks remain authoritative; a late trigger must not
+be backdated or bypass the gate.
+
+Before enabling, select the exact deployed image/configuration, approve recurring
+AI expenditure, establish retention and off-host backups, and arrange serialization
+with heavy Guidance work on a small host. Merely scheduling two forecasts does not
+limit the polling Guidance worker to two refreshes per day. Use actionable worker
+exit/status output and prevent overlapping scheduler invocations. No scheduled job
+should modify its deployment checkout or run arbitrary repository-supplied commands
+with the live credentials.
+
+An hourly UTC trigger is an alternative: the worker's `--scheduled` gate remains
+DST-aware and returns `not_due` outside the configured slots:
 
 ```text
 5 * * * * cd /path/to/checkout/deploy/hosted && docker compose run --rm forecast-worker
 ```
 
-(any cron, hourly in UTC), or a GitHub Actions workflow with `cron: "5 * * * *"` on a
-**self-hosted runner on the deployment host** running the same command (hosted
-runners cannot reach the internal network or the runtime volume). Keep
-`MESOFORGE_FORECAST_TIMEZONE`/`MESOFORGE_FORECAST_TIMES` equal to the timer.
+(any cron, hourly in UTC), or a GitHub Actions workflow with `cron: "5 * * * *"`.
+GitHub-hosted runners cannot access the internal services/runtime volume. The
+existing [systemd timer](deploy/hosted/systemd/mesoforge-forecast.timer) and
+[service](deploy/hosted/systemd/mesoforge-forecast.service) remain an alternative,
+not a second schedule to install alongside GHA. Keep
+`MESOFORGE_FORECAST_TIMEZONE`/`MESOFORGE_FORECAST_TIMES` consistent with the selected
+scheduler. None of these examples authorizes unattended paid inference.
 
 ### Deploying the stack
 
@@ -1179,8 +1205,8 @@ acceptance tests passed against the dedicated services.
 
 The subsequent supervised Debian 12 Docker proof built both images, migrated an
 isolated database, checked worker privileges and produced a Linux-native synthetic
-baseline for the three configured locations. Twelve domain/reference views took
-204 s and retained 10.3 MB; the three-location issuance took 36.8 s and the repeat
+baseline for the three locations configured at that time. Twelve domain/reference
+views took 204 s and retained 10.3 MB; the three-location issuance took 36.8 s and the repeat
 skipped all three in under a second. Concurrent workers respected the database lock.
 The proof exercised service outages/restarts, corrupt pointers, schema/revision
 checks, unavailable AI and fake HTTP 429 fallback without paid calls.
@@ -1203,9 +1229,9 @@ contracts, lock consistency, documentation/links and repository hygiene were che
 Examples remain usage instructions, not a claim that their chosen paths, archive
 hours or local services exist.
 
-A real computer-clock prospective run refreshed current guidance and issued all
-three configured locations against one baseline, with checksum-verified 36-hour
-readback. The same-hour repeat skipped all three issuances without provider
+A real computer-clock prospective run refreshed current guidance and issued the
+three locations configured at that time against one baseline, with checksum-verified
+36-hour readback. The same-hour repeat skipped all three issuances without provider
 acquisition or changes to PostgreSQL rows/MinIO objects. Both verification fields
 reported `nothing_to_verify` at these exact coordinates; the new forward hours had
 not matured. Temporary validation services were stopped afterward.

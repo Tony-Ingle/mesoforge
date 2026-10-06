@@ -229,7 +229,6 @@ def test_default_registry_is_exact_owner_configuration():
     locations = load_locations(cycle.DEFAULT_CONFIG)
     assert [(r["id"], r["name"], *_coordinates(r), r["display_timezone"]) for r in locations] == [
         ("minneapolis", "Minneapolis", 44.98861, -93.25553, "America/Chicago"),
-        ("surley", "Surley", 44.97304, -93.20901, "America/Chicago"),
         ("grasston", "Grasston", 45.80268, -93.07952, "America/Chicago"),
     ]
 
