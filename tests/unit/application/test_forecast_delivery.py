@@ -17,7 +17,7 @@ def test_same_issuance_render_is_read_only_repeatable_and_cannot_send_fixture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    saved = five_day_saved()
+    saved = five_day_saved(count=36)
     original = deepcopy(saved)
     reader = Mock(return_value=saved)
     monkeypatch.setattr(delivery, "read_issued_forecast", reader)
@@ -64,6 +64,8 @@ def test_current_36_hour_issuance_cannot_be_labeled_five_days(
                 saved["issued_forecast_id"],
                 "--location",
                 "grasston",
+                "--product",
+                "5-day",
                 "--pdf",
                 str(path),
             ]
@@ -103,6 +105,27 @@ def test_message_is_derived_from_saved_document_without_internal_identifiers() -
     assert "sha256:" not in plain
     assert "<html>" in rich
     assert "America/Chicago" in plain
+
+
+def test_operational_outlook_uses_exact_36_hour_window_and_product_identity() -> None:
+    from mesoforge.application.email_delivery import delivery_identity
+    from mesoforge.common.identifiers import IssuedForecastId
+
+    saved = five_day_saved(reference="2026-10-08T02:00:00Z", count=36)
+    document = build_forecast_document(saved, location=LOCATION, hours=36)
+    subject, plain, _ = delivery.email_content(document)
+    assert "36-Hour Weather Outlook" in subject and "5-Day" not in subject
+    assert "Oct 07, 2026 21:00 CDT" in plain
+    assert "Oct 09, 2026 09:00 CDT" in plain
+    assert document["issued_forecast_id"] not in plain
+    pdf = render_forecast_pdf(document)
+    assert delivery.validate_pdf(pdf, document)["pages"] == 2
+    identifier = IssuedForecastId(saved["issued_forecast_id"])
+    assert delivery_identity(identifier, "user@example.test", document["document_policy"]) != (
+        delivery_identity(
+            identifier, "user@example.test", "mesoforge-five-local-day-presentation.v1"
+        )
+    )
 
 
 def test_failure_output_does_not_echo_storage_credentials(

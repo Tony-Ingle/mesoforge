@@ -20,7 +20,7 @@ from mesoforge.application.email_delivery import MAX_ATTACHMENT_BYTES, SmtpSetti
 from mesoforge.application.issuance import read_issued_forecast
 from mesoforge.common.identifiers import Digest, IssuedForecastId
 from mesoforge.presentation.forecast_document import (
-    DOCUMENT_POLICY,
+    HOURS_DOCUMENT_POLICY,
     ForecastCoverageError,
     build_forecast_document,
 )
@@ -33,7 +33,7 @@ def validate_pdf(data: bytes, document: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Expected an email-sized PDF")
     reader = PdfReader(BytesIO(data), strict=True)
     if len(reader.pages) != 2:
-        raise ValueError("The five-day product must contain two pages")
+        raise ValueError("The outlook must contain two pages")
     text = "\n".join(page.extract_text() for page in reader.pages)
     if any(word not in text for word in ("MesoForge", document["location"]["name"])):
         raise ValueError("PDF text does not identify its configured forecast")
@@ -43,7 +43,7 @@ def validate_pdf(data: bytes, document: dict[str, Any]) -> dict[str, Any]:
 
 
 def saved_document(
-    issued_id: IssuedForecastId, config: Path, location_selector: str
+    issued_id: IssuedForecastId, config: Path, location_selector: str, product: str = "36-hour"
 ) -> dict[str, Any]:
     issued_id = IssuedForecastId(str(issued_id))
     # The selector is an operator-supplied registry key, validated by unique membership.
@@ -54,7 +54,11 @@ def saved_document(
     saved = read_issued_forecast(UUID(issued_id))
     if IssuedForecastId(saved["issued_forecast_id"]) != issued_id:
         raise ValueError("Issued forecast identity mismatch")
-    return build_forecast_document(saved, location=locations[0])
+    if product not in {"36-hour", "5-day"}:
+        raise ValueError("Unsupported presentation product")
+    return build_forecast_document(
+        saved, location=locations[0], hours=36 if product == "36-hour" else None
+    )
 
 
 def reviewed_pdf(document: dict[str, Any], data: bytes, *, now: datetime) -> dict[str, Any]:
@@ -77,11 +81,18 @@ def email_content(document: dict[str, Any]) -> tuple[str, str, str]:
     zone = ZoneInfo(document["display_timezone"])
     issue_date = datetime.fromisoformat(document["issued_at"]).astimezone(zone).date()
     name = document["location"]["name"]
-    subject = f"MesoForge 5-Day Forecast — {name} — {issue_date}"
+    title = (
+        "36-Hour Weather Outlook"
+        if document["document_policy"] == HOURS_DOCUMENT_POLICY
+        else "5-Day Forecast"
+    )
+    subject = f"MesoForge {title} — {name} — {issue_date}"
+    start = datetime.fromisoformat(document["valid_start"]).astimezone(zone)
+    end = datetime.fromisoformat(document["valid_end"]).astimezone(zone)
     summary = (
         f"{document['headline']}.\n\n"
         f"The complete MesoForge outlook for {name} is attached. "
-        f"It covers {document['days'][0]['date']} through {document['days'][-1]['date']} "
+        f"It covers {start:%b %d, %Y %H:%M %Z} through {end:%b %d, %Y %H:%M %Z} "
         f"in {document['display_timezone']}.\n\n"
         f"AI desk: {document['ai']['display_status']}.\n"
         "Forecasts are subject to change as new weather guidance becomes available."
@@ -106,6 +117,12 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--location", required=True)
         command.add_argument("--config", type=Path, default=Path("configs/locations.json"))
         command.add_argument("--pdf", type=Path, required=True)
+        command.add_argument(
+            "--product",
+            choices=("36-hour", "5-day"),
+            default="36-hour",
+            help="36-hour operational outlook; five complete local days remain coverage-gated",
+        )
         if name == "send":
             command.add_argument("--recipient", required=True)
             command.add_argument("--confirm-reviewed", action="store_true", required=True)
@@ -118,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
                 "events": configured_journal().events(Digest(args.delivery_id))
             }
         else:
-            document = saved_document(args.issued_id, args.config, args.location)
+            document = saved_document(args.issued_id, args.config, args.location, args.product)
             if args.command == "render":
                 pdf = render_forecast_pdf(document)
                 result = validate_pdf(pdf, document)
@@ -147,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
                     html=rich,
                     attachment=pdf,
                     settings=SmtpSettings.environment(),
-                    product_version=DOCUMENT_POLICY,
+                    product_version=document["document_policy"],
                 )
     except ForecastCoverageError as exc:
         print(json.dumps({"status": "unsupported_coverage", "reason": str(exc)}))

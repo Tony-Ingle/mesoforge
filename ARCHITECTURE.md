@@ -1261,7 +1261,7 @@ flowchart LR
     A --> S3
     DB --> D[Explicit saved-issuance PDF / SMTP command]
     S3 --> D
-    D --> E[SMTP provider; five-day send blocked by current forecast horizon]
+    D --> E[SMTP provider; validated 36-hour outlook]
 ```
 
 [`guidance_worker`](src/mesoforge/application/guidance_worker.py) wraps the existing
@@ -1358,10 +1358,16 @@ same database/object exports as verification, AI and Governance. Raw/runtime bac
 coverage remains required while retained baseline dependencies need it. Deployment
 AI and SMTP secret files are provisioned separately and excluded from those exports.
 
-### Five-day presentation and explicit email delivery
+### 36-hour presentation and explicit email delivery
 
-**CURRENT infrastructure; blocked real five-day product.** The numerical forecast
-still has 36 hours. The current temperature recipe requires HRRR and GFS, with no
+**CURRENT.** The operational PDF is a two-page 36-hour local weather outlook from
+the saved final issued grid. Its exact 36-hour interval, hourly trends, covered-period
+extrema/totals and transitions are deterministic. Partial local days remain labeled
+as covered periods, not complete daily forecasts. Rendering and SMTP are separate
+from issuance; neither calls guidance, blending or the AI desk.
+
+**Deferred five-day product.** The numerical forecast still has 36 hours.
+The current temperature recipe requires HRRR and GFS, with no
 approved GFS-only temperature fallback beyond HRRR's native horizon. Active field
 lead bands end at 36 hours. RAP also expires within the short range; IFS remains a
 three-hour shadow. GFS hourly cadence ends at source lead 120, which is earlier
@@ -1372,9 +1378,10 @@ QPF. Those contracts remain unchanged; no real five-day forecast or email can be
 claimed from a 36-hour issuance.
 
 [`forecast_document`](src/mesoforge/presentation/forecast_document.py) validates the
-saved final grid digest and exact point before deriving five complete local calendar
-days. It reuses current condition rules, preserves accumulation windows, uses hourly
-temperature extrema and vector-mean wind, and labels maximum hourly PoP distinctly
+saved final grid digest and exact point before aggregating the 36-hour product.
+The separate five-day fixture path still requires five complete local calendar days.
+Both reuse current condition rules, preserve accumulation windows, use hourly
+temperature extrema and vector-mean wind, and label maximum hourly PoP distinctly
 from daily occurrence probability. Incomplete field coverage stays unavailable.
 Named-zone boundaries account for DST; a rolling 120-hour interval may contain
 partial calendar days and is rejected when five complete days are absent.
@@ -1448,7 +1455,7 @@ validates code; it is not the forecast scheduler. Hermes orchestration remains p
 | Bounded operational AI desk and current final validation | Implemented | Structured provider boundary, finite tasks/budgets, temperature/QPF tools, checkpoint fallback and common stage evaluation |
 | Scheduled hosted operation | Implemented; supervised Linux proofs complete, unattended operation not enabled | One image, two forecast roles, internal services; scheduler chooses when, MesoForge keeps all meteorology |
 | Guidance retention planning/pins | Partially implemented | Explicit dry-run and case protection; all deletion refused while permanent reference closure is unproven |
-| Five-day aggregation/PDF and SMTP | Infrastructure implemented; real product blocked | Saved-issuance-only renderer and immutable delivery audit; current 36-hour science cannot pass the five-day gate |
+| 36-hour outlook/PDF and SMTP | Implemented | Saved-final-issuance renderer and immutable delivery audit; separate five-day fixture gate remains strict |
 | Recurring delivery and approved 120-hour numerical coverage | Future | No unattended email enabled; long-range scientific contracts remain unresolved |
 
 ## P. Architectural debt and retained boundaries

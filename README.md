@@ -40,7 +40,7 @@ reblend fields, rerun baseline coherence or download guidance.
 | Learning stages | Explicit local temperature correction/no-op, immutable candidate policy data, background shadow overlays and one temperature/QPF variant evaluator |
 | Policy governance | Append-only lifecycle events; explicit register/evaluate/activate/rollback/retire; deterministic identical-sample eligibility; nothing is active by default |
 | AI forecast desk | Always attempted after correction; bounded structured provider actions, deterministic field edits, validated checkpoints and automatic fallback |
-| PDF/email infrastructure | Deterministic two-page renderer and explicit SMTP delivery from saved issuances; five-day delivery is blocked until numerical coverage is approved |
+| PDF/email | Deterministic two-page 36-hour outlook and explicit SMTP delivery from saved final issuances; five-day coverage remains deferred |
 | Retention | Explicit dry-run, cycle preferences and case pins; deletion remains blocked by unresolved filesystem references |
 
 ### Current numerical policies
@@ -74,8 +74,8 @@ The hosted worker roles, image, Compose stack and scheduler units exist (see
 commissioning have completed; unattended operation remains disabled.
 No correction or blend policy has been activated. There is no automatic delivery,
 adaptive production weighting or calibrated multi-source precipitation blend.
-The explicit PDF/SMTP command exists, but the current 36-hour forecast cannot pass
-its five-complete-day coverage gate. Only an explicitly activated governed temperature correction changes values
+The explicit PDF/SMTP command supports the current 36-hour outlook. The separate
+five-day coverage gate remains unmet. Only an explicitly activated governed temperature correction changes values
 in the correction stage. No approved promotion rule exists for blend, QPF or AI
 policies, so those families are never eligible. The operational AI desk may make
 bounded edits to this forecast; it cannot promote policies or change persistent
@@ -1145,10 +1145,16 @@ assume: the provider and host, its Linux distribution, SSH access, disk capacity
 generated secrets and optionally an OpenAI key. DNS names and public ports are not
 needed.
 
-### Five-day PDF and explicit email delivery
+### 36-hour PDF and explicit email delivery
 
-The two-page server-side ReportLab renderer is implemented and tested with clearly
-marked fixtures. **A real five-day product is not yet scientifically supported.**
+The operational presentation product is **MesoForge 36-Hour Weather Outlook**.
+The two-page server-side ReportLab renderer reads the saved final issuance, including
+validated AI edits or the recorded deterministic fallback. It presents the exact
+36-hour window, hourly trends, interval QPF and covered-period summaries; a partial
+local day is never presented as a complete daily forecast.
+
+**A real five-day product is not yet scientifically supported.** Its separate
+fixture renderer and coverage gate remain available with `--product 5-day`.
 The active temperature recipe requires both HRRR and GFS; HRRR ends at 48 hours
 (many cycles end at 18), and approved field lead bands end at 36 hours. RAP does not
 extend beyond its native 21/51-hour horizon. GFS/IFS/NBM availability alone does not
@@ -1157,11 +1163,12 @@ IFS is currently a three-hour shadow, and current NBM attachments are short-rang
 Prepared coverage, baseline views, issuance and AI/presentation contracts also remain
 36-hour contracts. No weight, fallback, forecast horizon or missingness rule was changed.
 
-The renderer requires **five complete local calendar days**, with 23/25-hour DST
+The five-day renderer requires **five complete local calendar days**, with 23/25-hour DST
 days respected. A rolling 120-hour forecast beginning mid-day usually contains only
 four complete days. A future scientific/product decision must resolve that distinction
 and approve later-range contributors/cadences before real delivery can pass this gate.
-The current 36-hour issuance fails explicitly; presentation never extends guidance.
+The current 36-hour issuance fails that five-day gate explicitly; presentation never
+extends guidance. The default command below selects the supported 36-hour product.
 
 These commands read an existing issuance. They cannot acquire guidance, reblend,
 invoke AI, reissue a forecast or change stored forecast state:
@@ -1173,7 +1180,7 @@ uv run --locked python -m mesoforge.application.forecast_delivery status --deliv
 ```
 
 `--config` optionally selects the existing location-registry format. Render verifies
-the final saved grid digest and exact point, then derives daily hourly-sample highs/lows,
+the final saved grid digest and exact point, then derives covered-period hourly-sample extrema,
 vector-mean wind, maximum gust, consecutive-interval QPF, most frequent hourly conditions
 and transitions. Maximum hourly PoP is labeled as such, never called a daily probability.
 Missing fields remain unavailable. Charts include overnight hours. No externally hosted
@@ -1195,8 +1202,8 @@ The delivery service has worker-scoped storage credentials and no AI secret or p
 For a deployed compatible image, `docker compose run --rm delivery
 mesoforge.application.forecast_delivery ...` invokes the same command; place its output
 under `/var/lib/mesoforge/runtime/delivery/` or an explicit operator output mount.
-No SMTP secret was available in the inspected live deployment; it was not provisioned
-or changed by this milestone.
+Provision the SMTP secret before using `send`; never borrow another application's
+credentials. PDF rendering requires no SMTP credentials.
 
 STARTTLS with certificate verification is the default; implicit TLS is supported.
 Unauthenticated plaintext is allowed only for a loopback test server. Timeout is capped

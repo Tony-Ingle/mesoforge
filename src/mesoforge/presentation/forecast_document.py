@@ -1,8 +1,8 @@
-"""Five complete local-day summaries from an immutable final forecast canvas.
+"""Bounded product summaries from an immutable final forecast canvas.
 
 This boundary cannot extend a horizon or fill a field. The current 36-hour product
-deliberately fails its coverage gate. Longer fixtures exercise presentation only,
-not approval of a longer numerical forecast policy.
+is explicit; five complete local days still require independently sufficient saved
+coverage. Longer fixtures do not approve a longer numerical forecast policy.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from mesoforge.forecasting.conditions import RULESET_ID, _describe_hour
 from mesoforge.forecasting.transitions import build_transitions
 
 DOCUMENT_POLICY = "mesoforge-five-local-day-presentation.v1"
+HOURS_DOCUMENT_POLICY = "mesoforge-36-hour-presentation.v1"
 _HOUR = timedelta(hours=1)
 
 
@@ -87,9 +88,12 @@ def _complete_values(hours: list[dict[str, Any]], field: str) -> list[float] | N
 
 
 def _daily_summary(hours: list[dict[str, Any]], start: datetime, end: datetime) -> dict[str, Any]:
-    expected = int((end.astimezone(UTC) - start.astimezone(UTC)).total_seconds() // 3600)
+    duration = (end.astimezone(UTC) - start.astimezone(UTC)).total_seconds() / 3600
+    expected = int(duration)
+    if expected != duration:
+        raise ForecastCoverageError("A presentation boundary cannot split a native hourly interval")
     if len(hours) != expected:
-        raise ForecastCoverageError("A local calendar day is incomplete")
+        raise ForecastCoverageError("A presentation interval is incomplete")
     temperatures = _complete_values(hours, "temperature")
     gusts = _complete_values(hours, "wind_gust")
     qpf = _complete_values(hours, "qpf")
@@ -151,9 +155,9 @@ def _validated_point(saved: dict[str, Any], location: dict[str, Any]) -> dict[st
 
 
 def build_forecast_document(
-    saved: dict[str, Any], *, location: dict[str, Any], days: int = 5
+    saved: dict[str, Any], *, location: dict[str, Any], days: int = 5, hours: int | None = None
 ) -> dict[str, Any]:
-    """Build five complete local days, never extending/reissuing an existing forecast.
+    """Build an explicit 36-hour outlook or five complete local days from saved fields.
 
     The interval belongs to its local starting day: an amount ending at midnight
     closes the preceding day. Hourly instantaneous extrema use those same endpoint
@@ -164,10 +168,15 @@ def build_forecast_document(
     """
     if days != 5:
         raise ValueError("This product supports exactly five complete local days")
+    if hours not in (None, 36) or isinstance(hours, bool):
+        raise ValueError("The explicit hourly product supports exactly 36 hours")
+    hourly_product = hours == 36
     zone = ZoneInfo(location.get("display_timezone", "UTC"))
     forecast = saved["forecast"]
     source_hours = forecast["hours"]
-    if len(source_hours) < 119:
+    if hourly_product and len(source_hours) < 36:
+        raise ForecastCoverageError("The 36-hour product requires all 36 saved forecast hours")
+    if not hourly_product and len(source_hours) < 119:
         raise ForecastCoverageError(
             "Five complete local days are required; the saved forecast has "
             f"{len(source_hours)} hours. Presentation cannot extend its scientific horizon."
@@ -180,12 +189,23 @@ def build_forecast_document(
     ):
         raise IntegrityError("Saved hours must form the exact continuous reference-hour sequence")
     local_reference = reference.astimezone(zone)
-    first_date = local_reference.date()
-    if local_reference.timetz().replace(tzinfo=None) != time(0):
-        first_date += timedelta(days=1)
-    boundaries = [
-        datetime.combine(first_date + timedelta(days=i), time(0), zone) for i in range(days + 1)
-    ]
+    if hourly_product:
+        start, end = reference, reference + 36 * _HOUR
+        boundaries = [local_reference]
+        # Only local midnights strictly inside the saved 36-hour window split cards.
+        # UTC comparisons keep DST folds from duplicating or dropping an hour.
+        for i in range(1, 4):
+            midnight = datetime.combine(local_reference.date() + timedelta(days=i), time(0), zone)
+            if start < midnight.astimezone(UTC) < end:
+                boundaries.append(midnight)
+        boundaries.append(end.astimezone(zone))
+    else:
+        first_date = local_reference.date()
+        if local_reference.timetz().replace(tzinfo=None) != time(0):
+            first_date += timedelta(days=1)
+        boundaries = [
+            datetime.combine(first_date + timedelta(days=i), time(0), zone) for i in range(days + 1)
+        ]
     start, end = boundaries[0].astimezone(UTC), boundaries[-1].astimezone(UTC)
     if reference > start or times[-1] < end:
         raise ForecastCoverageError(
@@ -203,12 +223,12 @@ def build_forecast_document(
         for index, hour in enumerate(source_hours)
         if start < _time(hour["valid_time"]) <= end
     ]
-    hours = [_display_hour(hour) for hour in described]
+    display_hours = [_display_hour(hour) for hour in described]
     summaries = [
         _daily_summary(
             [
                 hour
-                for hour in hours
+                for hour in display_hours
                 if left.astimezone(UTC) < _time(hour["valid_time"]) <= right.astimezone(UTC)
             ],
             left,
@@ -216,6 +236,12 @@ def build_forecast_document(
         )
         for left, right in zip(boundaries, boundaries[1:], strict=False)
     ]
+    for row in summaries:
+        left, right = datetime.fromisoformat(row["start"]), datetime.fromisoformat(row["end"])
+        row["partial_local_day"] = left.timetz().replace(tzinfo=None) != time(
+            0
+        ) or right.timetz().replace(tzinfo=None) != time(0)
+    summary = _daily_summary(display_hours, boundaries[0], boundaries[-1])
     # Reuse the existing deterministic transition detector/rendering unchanged.
     transitions = build_transitions(
         {
@@ -243,13 +269,18 @@ def build_forecast_document(
         ai_status = "AI assessment not available"
     available_highs = [day["high_k"] for day in summaries if day["high_k"] is not None]
     available_lows = [day["low_k"] for day in summaries if day["low_k"] is not None]
-    headline = "Your five-day weather outlook"
-    if len(available_highs) == days and len(available_lows) == days:
+    span_label = "36 hours" if hourly_product else "five days"
+    headline = "Your 36-hour weather outlook" if hourly_product else "Your five-day weather outlook"
+    if len(available_highs) == len(summaries) and len(available_lows) == len(summaries):
         low = (min(available_lows) - 273.15) * 1.8 + 32
         high = (max(available_highs) - 273.15) * 1.8 + 32
-        headline = f"Temperatures from {low:.0f} to {high:.0f} F across five days"
+        headline = f"Temperatures from {low:.0f} to {high:.0f} F across {span_label}"
     return {
-        "document_policy": DOCUMENT_POLICY,
+        "document_policy": HOURS_DOCUMENT_POLICY if hourly_product else DOCUMENT_POLICY,
+        "product_title": "36-Hour Weather Outlook" if hourly_product else "5-Day Forecast",
+        "summary_kind": "covered_local_day_portions"
+        if hourly_product
+        else "five_complete_local_days",
         "issued_forecast_id": saved["issued_forecast_id"],
         "issued_payload_digest": str(canonical_json_digest(saved)),
         "fixture": fixture,
@@ -264,8 +295,9 @@ def build_forecast_document(
         "valid_end": _iso(end),
         "source_valid_start": _iso(reference),
         "source_valid_end": _iso(times[-1]),
-        "hours": hours,
+        "hours": display_hours,
         "days": summaries,
+        "summary": summary,
         "headline": headline,
         "transitions": [item["text"] for item in transitions["rendering"]["items"]],
         "ai": {
@@ -277,10 +309,12 @@ def build_forecast_document(
         "revision": saved.get("code_identity", {}).get("git_commit", "unavailable"),
         "notes": [
             "High/low are extrema of hourly forecast samples, including overnight hours.",
+            "Cards cover only their stated intervals; partial dates do not imply "
+            "full-day coverage.",
             "Precipitation chance is the maximum native hourly PoP, not a daily probability. "
             "Each hourly event is more than 0.01 inches of liquid precipitation.",
-            "Daily liquid totals sum exact, consecutive hourly intervals. Missing hours "
-            "make the daily total unavailable; they are never treated as zero.",
+            "Liquid totals sum exact, consecutive hourly intervals. Missing hours "
+            "make the interval total unavailable; they are never treated as zero.",
             "Wind is the vector mean of hourly U/V. Conditions show the most frequent "
             "approved hourly wording; transitions describe changes separately.",
         ],

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 from typing import Any
 from xml.sax.saxutils import escape
@@ -14,7 +14,7 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.pdfgen.canvas import Canvas
 from reportlab.platypus import Paragraph
 
-from mesoforge.presentation.forecast_document import DOCUMENT_POLICY
+from mesoforge.presentation.forecast_document import DOCUMENT_POLICY, HOURS_DOCUMENT_POLICY
 
 _INK = "#152D3A"
 _MUTED = "#506874"
@@ -162,11 +162,89 @@ def _wind(day: dict[str, Any]) -> str:
     return f"{compass} {speed / 0.44704:.0f} mph"
 
 
+def _clock_range(row: dict[str, Any], zone: ZoneInfo) -> str:
+    start, end = (datetime.fromisoformat(row[key]).astimezone(zone) for key in ("start", "end"))
+    return f"{start:%I %p %Z} - {end:%I %p %Z}".replace(" 0", " ").lstrip("0")
+
+
+def _hours_card(
+    canvas: Canvas, row: dict[str, Any], x: float, top: float, width: float, zone: ZoneInfo
+) -> None:
+    """Intervals inside local dates, explicitly not full-day high/low forecasts."""
+    left, available = x + 12, width - 24
+    date = datetime.fromisoformat(row["date"])
+    _text(
+        canvas,
+        date.strftime("%A, %b %d"),
+        left,
+        top + 11,
+        available,
+        size=11,
+        color=_TEAL,
+        bold=True,
+    )
+    _text(canvas, _clock_range(row, zone), left, top + 31, available, size=8, color=_MUTED)
+    label = "partial day" if row["partial_local_day"] else "complete day"
+    _text(
+        canvas,
+        f"{row['hours']} hours covered - {label}",
+        left,
+        top + 45,
+        available,
+        size=7.5,
+        color=_MUTED,
+    )
+    high = _value(_f(row["high_k"]) if row["high_k"] is not None else None, unit="°")
+    low = _value(_f(row["low_k"]) if row["low_k"] is not None else None, unit="°")
+    temperatures = high + " / " + low if row["high_k"] is not None else "Unavailable"
+    _text(canvas, temperatures, left, top + 68, available, size=22, bold=True)
+    _text(
+        canvas,
+        "Hourly high / low °F in this interval",
+        left,
+        top + 99,
+        available,
+        size=7,
+        color=_MUTED,
+    )
+    _text(canvas, "Most frequent outlook", left, top + 117, available, size=7, color=_MUTED)
+    _text(
+        canvas,
+        row["most_frequent_hourly_condition"],
+        left,
+        top + 131,
+        available,
+        size=9,
+        max_height=36,
+    )
+    chance, gust = row["maximum_hourly_pop"], row["max_gust_mps"]
+    _text(
+        canvas,
+        "Max hourly PoP: " + _value(chance * 100 if chance is not None else None, unit="%"),
+        left,
+        top + 172,
+        available,
+        size=8.5,
+    )
+    _text(canvas, "Liquid: " + _amount(row["qpf_kg_m2"]), left, top + 187, available, size=8.5)
+    _text(
+        canvas,
+        _wind(row) + " | Gust " + _value(gust / 0.44704 if gust is not None else None, unit=" mph"),
+        left,
+        top + 202,
+        available,
+        size=8,
+        max_height=12,
+    )
+
+
 def _outlook(canvas: Canvas, document: dict[str, Any]) -> None:
     _header(canvas, document, 1)
     location = document["location"]
     name = str(location["name"])
-    _text(canvas, "5-Day Forecast", _MARGIN, 111, 530, size=28, bold=True)
+    hourly = document["document_policy"] == HOURS_DOCUMENT_POLICY
+    title = "36-Hour Weather Outlook" if hourly else "5-Day Forecast"
+    _text(canvas, title, _MARGIN, 111, 530, size=28, bold=True)
     # State is not inferred from arbitrary coordinates or embedded in science.
     _text(canvas, name, _MARGIN, 152, 530, size=17, bold=True, max_height=24)
     _text(
@@ -184,7 +262,9 @@ def _outlook(canvas: Canvas, document: dict[str, Any]) -> None:
     last_day = datetime.fromisoformat(document["days"][-1]["date"])
     _text(
         canvas,
-        f"{start:%A, %B %d} - {last_day:%A, %B %d, %Y}",
+        f"{start:%a %b %d, %I:%M %p %Z} - {end:%a %b %d, %I:%M %p %Z}"
+        if hourly
+        else f"{start:%A, %B %d} - {last_day:%A, %B %d, %Y}",
         _MARGIN,
         199,
         530,
@@ -192,11 +272,26 @@ def _outlook(canvas: Canvas, document: dict[str, Any]) -> None:
         color=_MUTED,
     )
     _text(canvas, document["headline"], _MARGIN, 231, 532, size=17, bold=True, max_height=46)
-    gap, width, top, height = 8, 100, 294, 219
+    if hourly:
+        summary = document["summary"]
+        chance, gust = summary["maximum_hourly_pop"], summary["max_gust_mps"]
+        metrics = [
+            "36h liquid: " + _amount(summary["qpf_kg_m2"]),
+            "Max hourly PoP: " + _value(chance * 100 if chance is not None else None, unit="%"),
+            "Mean wind: " + _wind(summary),
+            "Max gust: " + _value(gust / 0.44704 if gust is not None else None, unit=" mph"),
+        ]
+        for index, metric in enumerate(metrics):
+            _text(canvas, metric, _MARGIN + index * 133, 274, 126, size=8, max_height=22)
+    gap, top, height = 8, 303 if hourly else 294, 219
+    width = (532 - gap * (len(document["days"]) - 1)) / len(document["days"])
     for index, day in enumerate(document["days"]):
         x = _MARGIN + index * (width + gap)
         canvas.setFillColor(HexColor(_PALE))
         canvas.roundRect(x, _HEIGHT - top - height, width, height, 6, fill=1, stroke=0)
+        if hourly:
+            _hours_card(canvas, day, x, top, width, zone)
+            continue
         date = datetime.fromisoformat(day["date"])
         _text(
             canvas,
@@ -298,11 +393,13 @@ def _outlook(canvas: Canvas, document: dict[str, Any]) -> None:
         for metric in day["availability"].values()
     )
     note = (
-        "Some daily fields are unavailable because their hourly guidance is incomplete. "
+        "Some interval summaries are unavailable because hourly guidance is incomplete. "
         if missing
         else ""
     )
     note += "PoP is the highest hourly chance, not the probability for the whole day. "
+    if hourly:
+        note += "Cards cover only the stated hours, including partial dates. "
     note += "Liquid totals preserve small amounts. Forecasts can change as new guidance arrives."
     _text(canvas, note, _MARGIN, 653, 532, size=8, color=_MUTED, max_height=38)
     _text(
@@ -349,11 +446,13 @@ def _chart(
         low, high = 0, 1
     rows = document["hours"]
     count = len(rows)
+    hourly = document["document_policy"] == HOURS_DOCUMENT_POLICY
     for part in range(3):
         y = plot_top + height * part / 2
         _line(canvas, left, y, width)
         amount = high - (high - low) * part / 2
-        label = f"{amount:.2f}" if unit == "in" else f"{amount:.0f}"
+        digits = 3 if high < 0.1 else 2
+        label = f"{amount:.{digits}f}" if unit == "in" else f"{amount:.0f}"
         _text(canvas, label, 40, y - 5, 25, size=7, color=_MUTED)
     legend_x = left
     for label, values, color in series:
@@ -367,7 +466,9 @@ def _chart(
             if value is None:
                 previous = None
                 continue
-            x = left + width * (i + 0.5) / count
+            # Hourly amounts occupy (start,end]; instantaneous lines use valid time.
+            position = i + 1 if hourly and not bars else i + 0.5
+            x = left + width * position / count
             y = _HEIGHT - plot_top - height + height * (value - low) / (high - low)
             if bars:
                 bottom = _HEIGHT - plot_top - height
@@ -386,16 +487,42 @@ def _chart(
             previous = (x, y)
     if not all_values:
         _text(canvas, "Guidance unavailable", left + 170, plot_top + 29, 200, size=10, color=_MUTED)
+    if hourly:
+        start = datetime.fromisoformat(document["valid_start"])
+        zone = ZoneInfo(document["display_timezone"])
+        for elapsed in range(0, count + 1, 6):
+            local = (start + timedelta(hours=elapsed)).astimezone(zone)
+            middle = left + width * elapsed / count
+            _text(
+                canvas,
+                local.strftime("%a %d"),
+                middle - 33,
+                plot_top + height + 3,
+                66,
+                size=6.4,
+                color=_MUTED,
+            )
+            _text(
+                canvas,
+                local.strftime("%I %p %Z").lstrip("0"),
+                middle - 33,
+                plot_top + height + 12,
+                66,
+                size=6.2,
+                color=_MUTED,
+            )
+        return
     elapsed = 0
     for day in document["days"]:
         middle = left + width * (elapsed + day["hours"] / 2) / count
         date = datetime.fromisoformat(day["date"])
+        label = date.strftime("%a %d")
         _text(
             canvas,
-            date.strftime("%a %d"),
-            middle - 23,
+            label,
+            middle - 38,
             plot_top + height + 6,
-            54,
+            82,
             size=7.2,
             color=_MUTED,
         )
@@ -435,7 +562,7 @@ def _detail(canvas: Canvas, document: dict[str, Any]) -> None:
         "Precipitation timing",
         [
             (
-                "Hourly PoP",
+                "Hourly PoP, hour ending",
                 [row["pop"] * 100 if row["pop"] is not None else None for row in hours],
                 _BLUE,
             )
@@ -465,14 +592,15 @@ def _detail(canvas: Canvas, document: dict[str, Any]) -> None:
         unit="mph",
     )
     _text(canvas, "SKY COVER", _MARGIN, 642, 532, size=9, color=_TEAL, bold=True)
+    sky_width = (532 - 8 * (len(document["days"]) - 1)) / len(document["days"])
     for i, day in enumerate(document["days"]):
-        x = _MARGIN + i * 108
+        x = _MARGIN + i * (sky_width + 8)
         _text(
             canvas,
             datetime.fromisoformat(day["date"]).strftime("%a %d"),
             x,
             660,
-            100,
+            sky_width,
             size=8,
             color=_MUTED,
         )
@@ -494,12 +622,21 @@ def _detail(canvas: Canvas, document: dict[str, Any]) -> None:
         for j, hour in enumerate(subset):
             canvas.setFillColor(HexColor(shades.get(hour["sky"], "#FFFFFF")))
             canvas.rect(
-                x + 100 * j / len(subset), _HEIGHT - 684, 100 / len(subset), 12, fill=1, stroke=0
+                x + sky_width * j / len(subset),
+                _HEIGHT - 684,
+                sky_width / len(subset),
+                12,
+                fill=1,
+                stroke=0,
             )
     _text(
         canvas,
         "Sky timeline: pale = clearer, dark = cloudier, white = unavailable. "
-        "Each strip runs midnight to midnight.",
+        + (
+            "Each strip covers the card's stated hours."
+            if document["document_policy"] == HOURS_DOCUMENT_POLICY
+            else "Each strip runs midnight to midnight."
+        ),
         _MARGIN,
         692,
         532,
@@ -509,7 +646,7 @@ def _detail(canvas: Canvas, document: dict[str, Any]) -> None:
     _text(
         canvas,
         "Hourly chance refers to more than 0.01 in liquid. "
-        "Wind uses vector means; gusts are maxima.",
+        "Card wind uses vector means; card gusts are maxima.",
         _MARGIN,
         709,
         532,
@@ -521,11 +658,19 @@ def _detail(canvas: Canvas, document: dict[str, Any]) -> None:
 
 def render_forecast_pdf(document: dict[str, Any]) -> bytes:
     """Render a verified product summary without retaining secrets or internal paths."""
-    if document.get("document_policy") != DOCUMENT_POLICY or len(document.get("days", [])) != 5:
+    hourly = document.get("document_policy") == HOURS_DOCUMENT_POLICY
+    if document.get("document_policy") not in (DOCUMENT_POLICY, HOURS_DOCUMENT_POLICY):
+        raise ValueError("A validated forecast document is required")
+    if hourly:
+        if len(document["hours"]) != 36 or not 2 <= len(document["days"]) <= 3:
+            raise ValueError("A 36-hour document must contain all 36 hours")
+    elif len(document.get("days", [])) != 5:
         raise ValueError("A validated five-day forecast document is required")
     for day in document["days"]:
-        if day["hours"] not in (23, 24, 25):
+        if not hourly and day["hours"] not in (23, 24, 25):
             raise ValueError("Only complete local calendar days can be rendered")
+        if hourly and not 1 <= day["hours"] <= 25:
+            raise ValueError("Invalid local-day interval")
     if len(document["hours"]) != sum(day["hours"] for day in document["days"]):
         raise ValueError("Daily and hourly PDF coverage differs")
     name = document["location"]["name"]
@@ -533,7 +678,8 @@ def render_forecast_pdf(document: dict[str, Any]) -> bytes:
         raise ValueError("Invalid display name")
     stream = BytesIO()
     canvas = Canvas(stream, pagesize=(_WIDTH, _HEIGHT), invariant=1, pageCompression=1)
-    canvas.setTitle("MesoForge 5-Day Forecast - " + name)
+    title = "36-Hour Weather Outlook" if hourly else "5-Day Forecast"
+    canvas.setTitle("MesoForge " + title + " - " + name)
     canvas.setAuthor("MesoForge")
     canvas.setCreator("MesoForge deterministic forecast presentation")
     _outlook(canvas, document)
