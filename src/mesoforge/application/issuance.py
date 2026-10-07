@@ -25,6 +25,10 @@ from mesoforge.storage.s3 import S3ArtifactObjectStore
 FORWARD_RUN_LOCK = Digest.of_bytes(b"mesoforge.forward-run.v1")
 
 
+class ForecastExpiredError(ValueError):
+    """A prospective baseline's first valid hour passed before issuance began."""
+
+
 def acquire_issuance_run_lock(*, wait: bool = False) -> AbstractContextManager[None]:
     """Serialize the decision-window lookup and issuance across PostgreSQL sessions.
 
@@ -283,12 +287,24 @@ class ForecastIssuanceService:
                     raise ValueError("Forecast analysis cutoff must be timezone-aware")
                 if analysis_cutoff > issued_at:
                     raise ValueError("Forecast analysis cutoff cannot follow issuance time")
-        issued_forecast_id = uuid4()
         target = datetime.fromisoformat(forecast["target_reference_time"])
         if target.tzinfo is None:
             raise ValueError("Target reference time must be timezone-aware")
         if [hour["horizon_hours"] for hour in forecast["hours"]] != list(range(1, 37)):
             raise ValueError("Issued temperature forecasts must contain hours 1..36")
+        if forecast.get("baseline_snapshot", {}).get("reference_time_source") == "request_hour":
+            # Readiness preceded extraction, correction, the desk and presentation.
+            # Check the actual issuance clock again before any immutable write. An
+            # explicit replay reference (or a legacy payload without this lineage)
+            # retains its historical contract; never backdate or shorten a normal job.
+            first_valid = datetime.fromisoformat(forecast["hours"][0]["valid_time"])
+            if first_valid.tzinfo is None or first_valid.utcoffset() is None:
+                raise ValueError("First forecast valid time must be timezone-aware")
+            if first_valid <= issued_at:
+                raise ForecastExpiredError(
+                    "Prospective forecast first valid hour is no longer future; nothing was issued"
+                )
+        issued_forecast_id = uuid4()
         metadata = {
             "schema_version": "issued-forecast.v1",
             "issued_forecast_id": str(issued_forecast_id),

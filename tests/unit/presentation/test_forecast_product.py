@@ -352,3 +352,28 @@ def test_pdf_qpf_missing_hour_is_visibly_distinguished_from_numeric_zero(hours):
     assert "X = unavailable hour; zero = no bar" in missing_page.extract_text()
     assert document["hours"][8]["qpf"] is None
     assert document["summary"]["qpf_kg_m2"] is None
+
+
+def test_pdf_revision_uses_saved_final_stage_when_issuer_retains_source_hashes_only():
+    saved = five_day_saved(count=36)
+    saved["code_identity"] = {
+        "source_sha256": {"application/issuance.py": "b" * 64},
+        "dependency_versions": {"pydantic": "2.0"},
+    }
+    saved["forecast"]["learning_stage"] = {
+        "transformation_type": "ai_adjusted",
+        "code_identity": {"git_commit": "c" * 40, "source_sha256": {}},
+    }
+    before = deepcopy(saved)
+    document = build_forecast_document(saved, location=LOCATION, hours=36)
+    assert document["revision"] == "c" * 40
+    assert saved == before
+    assert (
+        "Rev cccccccc" in PdfReader(BytesIO(render_forecast_pdf(document))).pages[0].extract_text()
+    )
+    # An explicit issuance identity remains authoritative, even for older artifacts.
+    saved["code_identity"]["git_commit"] = "a" * 40
+    assert build_forecast_document(saved, location=LOCATION, hours=36)["revision"] == "a" * 40
+    del saved["code_identity"]["git_commit"]
+    del saved["forecast"]["learning_stage"]
+    assert build_forecast_document(saved, location=LOCATION, hours=36)["revision"] == "unavailable"

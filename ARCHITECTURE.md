@@ -1298,6 +1298,10 @@ validation, presentation, issuance and prior verification are unchanged. It neve
 refreshes guidance or builds a baseline; the locked lookup makes repeated triggers
 skips. A slot's acceptance window ends at the slot's UTC hour, so every accepted
 trigger maps to one reference hour and scheduled runs wait for readiness inside it.
+After the desk and presentation, normal prospective issuance rejects a first hourly
+valid endpoint at or before its actual issuance clock, before any issuance write;
+it neither backdates, shortens nor retries the desk, while explicit historical
+reference-time replay retains its existing behavior.
 
 [`operations`](src/mesoforge/application/operations.py) provides read-only status,
 migration status, the one explicit `migrate` (which names its target database),

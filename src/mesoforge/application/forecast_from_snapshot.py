@@ -31,6 +31,7 @@ from mesoforge.application.batch_forecast import (
 from mesoforge.application.hourly_report import build_hourly_report, render_hourly_report
 from mesoforge.application.issuance import (
     FORWARD_RUN_LOCK,
+    ForecastExpiredError,
     ForecastIssuanceService,
     acquire_issuance_run_lock,
 )
@@ -358,6 +359,10 @@ def _deliver_locations(
                                 forecast, batch_run_id=batch_run_id, location_index=index
                             )
                             row["issuance_seconds"] = time.perf_counter() - clock
+                except ForecastExpiredError as exc:
+                    row.update(
+                        status="error", error={"code": "forecast_expired", "message": str(exc)}
+                    )
                 except GovernanceBlockedError as exc:
                     row.update(status="error", error={"code": exc.code, "message": str(exc)})
                 except Exception:

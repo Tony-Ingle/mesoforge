@@ -15,7 +15,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from mesoforge.application import forecast_from_snapshot as fast
-from mesoforge.application.issuance import ForecastIssuanceService
+from mesoforge.application.issuance import ForecastExpiredError, ForecastIssuanceService
 from tests.support.in_memory_uow import InMemoryObjectStore, InMemoryUnitOfWorkFactory
 
 REFERENCE = datetime(2026, 9, 17, 12, tzinfo=UTC)
@@ -162,3 +162,102 @@ def test_historical_issuance_without_analysis_cutoff_reads_back_unchanged() -> N
     record = service.issue(forecast, batch_run_id=uuid4(), location_index=0)
     assert forecast == original
     assert service.read(record.issued_forecast_id)["forecast"] == original
+
+
+@pytest.mark.parametrize("offset_microseconds", [-1, 0, 1])
+def test_prospective_baseline_requires_first_hour_strictly_after_issuance_clock(
+    offset_microseconds: int,
+) -> None:
+    objects, uow = InMemoryObjectStore(), InMemoryUnitOfWorkFactory()
+    first_valid = REFERENCE + timedelta(hours=1)
+    issued_at = first_valid + timedelta(microseconds=offset_microseconds)
+    service = ForecastIssuanceService(objects, uow, code_identity={}, clock=lambda: issued_at)
+    forecast = fixture_forecast(45.8, -93.1)
+    forecast["baseline_snapshot"] = {
+        "reference_time_source": "request_hour",
+        "forecast_analysis_cutoff": REQUEST.isoformat(),
+    }
+    original = deepcopy(forecast)
+    if offset_microseconds >= 0:
+        with pytest.raises(ForecastExpiredError, match="no longer future"):
+            service.issue(forecast, batch_run_id=uuid4(), location_index=0)
+        assert not objects.objects and not objects.metadata
+        assert not uow.stored_objects and not uow.issued_forecasts
+    else:
+        record = service.issue(forecast, batch_run_id=uuid4(), location_index=0)
+        assert record.issued_at == issued_at
+        assert service.read(record.issued_forecast_id)["forecast"] == original
+    assert forecast == original
+
+
+@pytest.mark.parametrize("reference_source", [None, "explicit"])
+def test_explicit_replay_and_legacy_baseline_issuance_remain_readable(
+    reference_source: str | None,
+) -> None:
+    service = ForecastIssuanceService(
+        InMemoryObjectStore(),
+        InMemoryUnitOfWorkFactory(),
+        code_identity={},
+        clock=lambda: REFERENCE + timedelta(days=2),
+    )
+    forecast = fixture_forecast(45.8, -93.1)
+    forecast["baseline_snapshot"] = {"forecast_analysis_cutoff": REQUEST.isoformat()}
+    if reference_source is not None:
+        forecast["baseline_snapshot"]["reference_time_source"] = reference_source
+    original = deepcopy(forecast)
+    record = service.issue(forecast, batch_run_id=uuid4(), location_index=0)
+    assert service.read(record.issued_forecast_id)["forecast"] == original
+    assert forecast == original
+
+
+@pytest.mark.parametrize("expiry_phase", ["desk", "presentation"])
+def test_hour_expiring_during_desk_or_presentation_is_not_issued_or_retried(
+    monkeypatch: pytest.MonkeyPatch,
+    expiry_phase: str,
+) -> None:
+    """The real issuance boundary rechecks time after both expensive operations."""
+    objects, uow = InMemoryObjectStore(), InMemoryUnitOfWorkFactory()
+    clock = SimpleNamespace(now=REQUEST)
+    service = ForecastIssuanceService(objects, uow, code_identity={}, clock=lambda: clock.now)
+    extract = Mock(side_effect=fixture_forecast)
+
+    def stage(forecast):
+        if expiry_phase == "desk" and forecast["latitude"] == LOCATIONS[1]["lat"]:
+            clock.now = REFERENCE + timedelta(hours=1)
+        return forecast, {"status": "no_policy"}
+
+    desk = Mock(side_effect=stage)
+
+    def present(forecast, **_kwargs):
+        if expiry_phase == "presentation" and forecast["latitude"] == LOCATIONS[1]["lat"]:
+            clock.now = REFERENCE + timedelta(hours=1)
+        return {"text": "fixture"}
+
+    monkeypatch.setattr(fast, "build_hourly_report", present)
+    result = fast._deliver_locations(
+        SimpleNamespace(forecast=extract),
+        LOCATIONS,
+        reference_time=REFERENCE,
+        display_timezone="UTC",
+        issue=True,
+        issuer=service,
+        reissue=False,
+        run_lock=nullcontext,
+        lineage={
+            "baseline_snapshot": {
+                "reference_time_source": "request_hour",
+                "forecast_analysis_cutoff": REQUEST.isoformat(),
+            }
+        },
+        build_timing_key="baseline_extraction_seconds",
+        stage_processor=desk,
+    )
+    assert result["summary"] == {"ok": 1, "issued": 1, "skipped": 0, "failed": 2}
+    assert [row["status"] for row in result["results"]] == ["ok", "error", "error"]
+    for row in result["results"][1:]:
+        assert row["error"]["code"] == "forecast_expired"
+        assert "issued" not in row
+        assert len(row["forecast"]["hours"]) == 36
+        assert row["forecast"]["target_reference_time"] == REFERENCE.isoformat()
+    assert extract.call_count == desk.call_count == len(LOCATIONS)
+    assert len(objects.objects) == len(uow.stored_objects) == len(uow.issued_forecasts) == 1

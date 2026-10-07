@@ -154,6 +154,18 @@ def _validated_point(saved: dict[str, Any], location: dict[str, Any]) -> dict[st
     return cast(dict[str, Any], centers[0])
 
 
+def _saved_revision(saved: dict[str, Any]) -> Any:
+    """Use retained issuance/final-stage identity, never the rendering checkout."""
+    identity = saved.get("code_identity", {})
+    if isinstance(identity, dict) and "git_commit" in identity:
+        return identity["git_commit"]
+    stage = saved["forecast"].get("learning_stage")
+    identity = stage.get("code_identity") if isinstance(stage, dict) else None
+    return (
+        identity.get("git_commit", "unavailable") if isinstance(identity, dict) else "unavailable"
+    )
+
+
 def build_forecast_document(
     saved: dict[str, Any], *, location: dict[str, Any], days: int = 5, hours: int | None = None
 ) -> dict[str, Any]:
@@ -306,7 +318,7 @@ def build_forecast_document(
             "outcome": outcome,
             "display_status": ai_status,
         },
-        "revision": saved.get("code_identity", {}).get("git_commit", "unavailable"),
+        "revision": _saved_revision(saved),
         "notes": [
             "High/low are extrema of hourly forecast samples, including overnight hours.",
             "Cards cover only their stated intervals; partial dates do not imply "
