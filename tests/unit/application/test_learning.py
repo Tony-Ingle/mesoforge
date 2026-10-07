@@ -143,7 +143,8 @@ def test_no_policy_stage_and_binding_are_compact_idempotent_and_keep_historical_
     assert changed["hours"] == forecast["hours"]
     assert changed["local_grid_baseline"] is forecast["local_grid_baseline"]
     assert report["status"] == "no_policy"
-    assert report["candidate_status"] == "insufficient_evidence"
+    assert report["candidate_status"] == "not_generated"
+    assert report["policy_generation"] == "operator_only"
     assert report["failures"] == []
     assert report["operational_stage"]["overlay"]["predictions"] == []
     assert report["operational_stage"]["parent_stage_id"] == report["control_stage"]["variant_id"]
@@ -167,6 +168,37 @@ def test_no_policy_stage_and_binding_are_compact_idempotent_and_keep_historical_
     assert case.service.issuer.read(record.issued_forecast_id) == historical
 
 
+@pytest.mark.parametrize("qualified", [False, True])
+def test_operational_evidence_never_generates_persistent_policy(learning, monkeypatch, qualified):
+    service, forecast, case = learning.service, learning.forecast, learning.case
+    analysis = _analysis(qualified=qualified)
+    analysis["evaluation"]["evidence_cutoff"] = DECISION.isoformat()
+    evidence = Mock(return_value=analysis)
+    monkeypatch.setattr(service, "evidence", evidence)
+    monkeypatch.setattr(
+        "mesoforge.application.corrections.propose_temperature_policy",
+        Mock(side_effect=AssertionError("Operational forecast must not propose policy")),
+    )
+    monkeypatch.setattr(
+        service,
+        "register_policy",
+        Mock(side_effect=AssertionError("Operational forecast must not register policy")),
+    )
+    before = canonical_json_bytes(forecast)
+    corrected, report = service.local_stage(forecast)
+    evidence.assert_called_once_with(LAT, LON, DECISION)
+    assert canonical_json_bytes(forecast) == before
+    assert corrected["hours"] == forecast["hours"]
+    assert report["status"] == "no_policy"
+    assert report["candidate_status"] == "not_generated"
+    assert report["policy_generation"] == "operator_only"
+    assert report["evidence"] == analysis["correction_readiness"]
+    assert report["desk_evidence"]["evaluation"] == analysis["evaluation"]
+    assert report["failures"] == [] and "candidate" not in report
+    assert service.find("learning-policy", {}) == []
+    assert len(case.factory.artifacts) >= 2  # Control/corrected evidence still persists.
+
+
 def test_active_fixture_changes_only_qualified_temperature_bucket_and_records_coherence(learning):
     service, forecast = learning.service, learning.forecast
     governed = govern(learning, _policy())
@@ -175,6 +207,7 @@ def test_active_fixture_changes_only_qualified_temperature_bucket_and_records_co
     before = canonical_json_bytes(forecast)
     corrected, report = service.local_stage(forecast, governance=scope)
     assert report["status"] == "applied" and report["failures"] == []
+    assert report["policy_generation"] == "operator_only"
     assert corrected["hours"][0]["temperature"]["value"] == 289
     assert corrected["hours"][6]["temperature"]["value"] == 290
     assert (

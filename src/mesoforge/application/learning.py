@@ -22,7 +22,7 @@ from uuid import UUID
 from mesoforge.application.artifacts import TransformationInputRef, TransformationRequest
 from mesoforge.application.issued_qpf_verification import IssuedQpfVerificationService
 from mesoforge.application.site_verification_analysis import analyze_site_verification
-from mesoforge.common.identifiers import ArtifactId, Digest, LearningPolicyId
+from mesoforge.common.identifiers import ArtifactId, Digest
 from mesoforge.contracts.forecast_variants import (
     instant,
     seal_variant,
@@ -293,11 +293,10 @@ class LearningService:
         the batch decision time. None means no policy may execute (no active policy and
         no shadows). A resolved ACTIVE policy executes under its operational grant;
         registered candidates execute only as shadows under their registration grant.
+        Site evidence is read-only here: normal forecasts do not propose or persist
+        new policies. Operators retain the separate proposal/registration interfaces.
         """
-        from mesoforge.application.corrections import (
-            apply_temperature_correction,
-            propose_temperature_policy,
-        )
+        from mesoforge.application.corrections import apply_temperature_correction
         from mesoforge.contracts.policy_governance import GovernanceBlockedError
 
         started = time.perf_counter()
@@ -307,6 +306,8 @@ class LearningService:
             "shadows": [],
             "shadow_attempts": [],
             "failures": [],
+            "candidate_status": "not_generated",
+            "policy_generation": "operator_only",
         }
         if governance is not None:
             if governance.error is not None:
@@ -324,25 +325,6 @@ class LearningService:
                 key: analysis[key]
                 for key in ("coordinate", "evaluation", "evidence_policy", "correction_readiness")
             }
-            proposal = propose_temperature_policy(
-                analysis,
-                policy_id=LearningPolicyId("temperature-site-bias"),
-                version=_digest({"samples": analysis["samples"], "cutoff": _iso(cutoff)}).split(
-                    ":"
-                )[1][:16],
-                evidence_cutoff=cutoff,
-                created_at=self.clock(),
-            )
-            report["candidate_status"] = proposal["lifecycle_role"]
-            if proposal["lifecycle_role"] == "candidate":
-                # PROPOSED only: an automatic proposal never shadows or activates itself.
-                existing = self.find(
-                    "learning-policy",
-                    {"policy_id": proposal["policy_id"], "version": proposal["version"]},
-                )
-                report["candidate"] = self._reference(
-                    existing[0] if existing else self.register_policy(proposal)
-                )
         except Exception as exc:
             report["failures"].append({"phase": "evidence_update", "reason": str(exc)})
         active = governance.active if governance is not None else None

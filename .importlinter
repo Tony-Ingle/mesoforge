@@ -56,6 +56,19 @@ forbidden_modules =
     h5netcdf
     pyproj
 
+[importlinter:contract:presentation-is-read-only]
+name = Saved-forecast presentation has no application, storage or delivery access
+type = forbidden
+source_modules =
+    mesoforge.presentation
+forbidden_modules =
+    mesoforge.application
+    mesoforge.storage
+    smtplib
+    requests
+    boto3
+    sqlalchemy
+
 [importlinter:contract:domain-no-infrastructure]
 name = contracts/catalog/provenance never import infrastructure libraries
 type = forbidden

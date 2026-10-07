@@ -98,7 +98,7 @@ def test_no_service_publishes_ports_and_storage_is_internal() -> None:
     assert services["postgres"]["networks"] == ["backend"]
     assert services["minio"]["networks"] == ["backend"]
     assert services["admin"]["networks"] == ["backend"]
-    for role in ("guidance-worker", "forecast-worker"):
+    for role in ("guidance-worker", "forecast-worker", "delivery"):
         assert set(services[role]["networks"]) == {"backend", "egress"}
 
 
@@ -127,7 +127,9 @@ def test_health_restart_and_shutdown_belong_to_the_long_running_worker() -> None
     assert minutes >= 15
     assert "healthcheck" not in services["forecast-worker"]
     assert "healthcheck" not in services["admin"]
+    assert "healthcheck" not in services["delivery"]
     assert services["forecast-worker"]["restart"] == "no"
+    assert services["delivery"]["restart"] == "no"
     assert "--scheduled" in services["forecast-worker"]["command"]
 
 
@@ -147,17 +149,31 @@ def test_secrets_are_required_interpolations_scoped_per_service() -> None:
         {"path": "./ai-settings.env", "required": False},
         {"path": "${MESOFORGE_AI_SECRET_FILE:-/etc/mesoforge/ai.env}", "required": False},
     ]
-    assert all("env_file" not in services[name] for name in services if name != "forecast-worker")
+    assert services["delivery"]["env_file"] == [
+        {"path": "./email-settings.env", "required": False},
+        {"path": "${MESOFORGE_EMAIL_SECRET_FILE:-/etc/mesoforge/email.env}", "required": False},
+    ]
+    assert all(
+        "env_file" not in service
+        for name, service in services.items()
+        if name not in {"forecast-worker", "delivery"}
+    )
     # Neither inherited anchors nor another role may gain the credential or secret file.
     for name, service in services.items():
         assert "OPENAI_API_KEY" not in service.get("environment", {})
         if name != "forecast-worker":
             assert "MESOFORGE_AI_SECRET_FILE" not in str(service)
             assert "/etc/mesoforge/ai.env" not in str(service)
+        if name != "delivery":
+            assert "MESOFORGE_EMAIL_SECRET_FILE" not in str(service)
+            assert "/etc/mesoforge/email.env" not in str(service)
+        assert "MESOFORGE_SMTP_PASSWORD" not in service.get("environment", {})
     for path in (ROOT / "Dockerfile", HOSTED / "build-image.sh", HOSTED / "minio" / "Dockerfile"):
         assert "OPENAI_API_KEY" not in path.read_text("utf-8")
         assert "MESOFORGE_AI_SECRET_FILE" not in path.read_text("utf-8")
-    for role in ("guidance-worker", "forecast-worker"):
+        assert "MESOFORGE_SMTP_PASSWORD" not in path.read_text("utf-8")
+        assert "MESOFORGE_EMAIL_SECRET_FILE" not in path.read_text("utf-8")
+    for role in ("guidance-worker", "forecast-worker", "delivery"):
         environment = services[role]["environment"]
         assert "MESOFORGE_ALEMBIC_DSN" not in environment
         assert "MESOFORGE_PG_WORKER_USER" in environment["MESOFORGE_DATABASE_DSN"]
@@ -169,7 +185,7 @@ def test_secrets_are_required_interpolations_scoped_per_service() -> None:
 
 
 def test_examples_hold_placeholders_only() -> None:
-    for name in (".env.example", "ai-settings.env.example"):
+    for name in (".env.example", "ai-settings.env.example", "email-settings.env.example"):
         text = (HOSTED / name).read_text("utf-8")
         for line in text.splitlines():
             if line.startswith("#") or "=" not in line:
@@ -179,6 +195,26 @@ def test_examples_hold_placeholders_only() -> None:
                 assert value == "REPLACE_ME", line
     assert "OPENAI_API_KEY" not in (HOSTED / "ai-settings.env.example").read_text("utf-8")
     assert not (HOSTED / "ai.env.example").exists()
+
+
+def test_delivery_is_explicit_one_shot_least_privilege_without_forecast_or_ai_access() -> None:
+    delivery = compose()["services"]["delivery"]
+    assert delivery["profiles"] == ["delivery"]
+    assert delivery["command"] == ["mesoforge.application.forecast_delivery", "--help"]
+    assert delivery["restart"] == "no" and delivery["init"] is True
+    assert delivery["cap_drop"] == ["ALL"]
+    assert delivery["security_opt"] == ["no-new-privileges:true"]
+    assert "ports" not in delivery and "healthcheck" not in delivery
+    assert delivery["mem_limit"] == "${MESOFORGE_DELIVERY_MEM_LIMIT:-3g}"
+    environment = delivery["environment"]
+    assert not any(key.startswith("MESOFORGE_AI_") for key in environment)
+    assert "MESOFORGE_ALEMBIC_DSN" not in environment
+    assert "MESOFORGE_PG_WORKER_USER" in environment["MESOFORGE_DATABASE_DSN"]
+    assert "MINIO_ROOT_PASSWORD" not in environment and "MINIO_ROOT_USER" not in environment
+    assert not any("/etc/mesoforge" in mount for mount in delivery.get("volumes", []))
+    example = (HOSTED / "email-settings.env.example").read_text("utf-8")
+    assert not re.search(r"^MESOFORGE_SMTP_(?:USERNAME|PASSWORD)=", example, re.MULTILINE)
+    assert "MESOFORGE_SMTP_SECURITY=starttls" in example
 
 
 def test_database_worker_role_cannot_change_schema_governance_or_delete() -> None:

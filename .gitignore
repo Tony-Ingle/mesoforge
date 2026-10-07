@@ -26,6 +26,8 @@ htmlcov/
 var/
 ai.env
 ai-settings.env
+email-settings.env
+email.env
 *.dump
 deploy/local/.pgdata/
 deploy/local/.miniodata/

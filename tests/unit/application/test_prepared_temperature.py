@@ -567,7 +567,15 @@ def test_36_hour_preparation_rejects_cycle_too_old_before_io(tmp_path: Path, mod
 
 
 @pytest.mark.parametrize(
-    "horizons", [(), (1, 2), tuple(range(1, 36)), tuple(range(1, 44)), tuple(range(2, 38))]
+    "horizons",
+    [
+        (),
+        (1, 2),
+        tuple(range(1, 36)),
+        tuple(range(1, 44)),
+        tuple(range(1, 121)),
+        tuple(range(2, 38)),
+    ],
 )
 def test_preparation_rejects_unsupported_horizons_before_io(
     tmp_path: Path, horizons: tuple[int, ...]

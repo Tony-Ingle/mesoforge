@@ -71,7 +71,7 @@
   baseline and calls `forecast_from_baseline`, never refreshing guidance. Keep their
   decisions on existing contracts, with no provider logic or science of their own.
   Workers never migrate schema or change governance; `operations migrate` is the one
-  explicit schema step. Automatic policy promotion and delivery remain future work.
+  explicit schema step. Automatic policy promotion and recurring delivery remain future work.
   Schedulers decide WHEN; MesoForge owns meteorology. Do not put forecast science in
   scheduler, Compose or GHA YAML.
 - Learning uses common immutable stage/variant lineage and the existing artifact
@@ -79,6 +79,12 @@
   ACTIVE policy exists; candidates/shadows never promote themselves. Build candidate
   blends in the background with FieldBlendEngine, retain compact overlays and enforce
   evidence/creation/activation cutoffs. Reuse current coherence only for affected fields.
+  Normal v1 jobs collect verification/site evidence without generating persistent
+  learned candidates. Explicit operator Learning/Governance remains available.
+- PDF/email reads saved final issuances only; it never acquires, blends or calls AI.
+  Reject unsupported coverage rather than advertising five days from 36 hours.
+  Protect all unresolved filesystem lineage during retention; cycle preferences
+  alone never authorize deletion. Email secrets reach only the explicit delivery role.
 - Persistent policy changes only through explicit append-only governance events
   (`python -m mesoforge.application.governance`). Forecast jobs, learning code, the
   AI desk and providers only read committed governance; none may register, evaluate

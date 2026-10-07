@@ -23,11 +23,33 @@ from __future__ import annotations
 
 import os
 import shutil
+import smtplib
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def no_real_email_in_tests(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch):
+    """Offline tests use injected SMTP clients, never inherited operator credentials."""
+    if request.node.get_closest_marker("live") is not None:
+        yield
+        return
+    for name in list(os.environ):
+        if name.startswith(("MESOFORGE_SMTP_", "MESOFORGE_EMAIL_")):
+            monkeypatch.delenv(name)
+    attempts = []
+
+    def forbidden(*args, **kwargs):
+        attempts.append(True)
+        raise AssertionError("Real SMTP is forbidden in ordinary tests")
+
+    monkeypatch.setattr(smtplib, "SMTP", forbidden)
+    monkeypatch.setattr(smtplib, "SMTP_SSL", forbidden)
+    yield
+    assert not attempts, "An offline test attempted real SMTP"
 
 
 @pytest.fixture(autouse=True)

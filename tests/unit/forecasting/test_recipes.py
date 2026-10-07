@@ -102,6 +102,15 @@ def test_absent_models_report_all_required_missing_members_in_recipe_order():
     assert result.missing_models == ("HRRR", "THIRD")
 
 
+def test_expired_short_range_guidance_does_not_promote_gfs_to_temperature_control():
+    # Native HRRR expiration is missing guidance, not an approved long-range policy.
+    recipe = DEFAULT_CONFIGURATION.control_recipe
+    before = recipe.model_dump()
+    result = evaluate_recipe(recipe, {"HRRR": None, "GFS": 290.0})
+    assert result.value is None and result.missing_models == ("HRRR",)
+    assert recipe.model_dump() == before
+
+
 @pytest.mark.parametrize("value", [True, "280"])
 def test_recipe_rejects_nonnumeric_values(value):
     with pytest.raises(ValueError, match="numeric scalars"):

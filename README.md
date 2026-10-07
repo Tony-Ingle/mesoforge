@@ -40,6 +40,8 @@ reblend fields, rerun baseline coherence or download guidance.
 | Learning stages | Explicit local temperature correction/no-op, immutable candidate policy data, background shadow overlays and one temperature/QPF variant evaluator |
 | Policy governance | Append-only lifecycle events; explicit register/evaluate/activate/rollback/retire; deterministic identical-sample eligibility; nothing is active by default |
 | AI forecast desk | Always attempted after correction; bounded structured provider actions, deterministic field edits, validated checkpoints and automatic fallback |
+| PDF/email infrastructure | Deterministic two-page renderer and explicit SMTP delivery from saved issuances; five-day delivery is blocked until numerical coverage is approved |
+| Retention | Explicit dry-run, cycle preferences and case pins; deletion remains blocked by unresolved filesystem references |
 
 ### Current numerical policies
 
@@ -68,11 +70,12 @@ new enforcement rules. Conditions do not promote evidence-only fields.
 ### What is not implemented
 
 The hosted worker roles, image, Compose stack and scheduler units exist (see
-[Hosted deployment](#hosted-deployment)). The isolated VPS fixture proof is complete;
-production and unattended operation remain disabled.
-No correction or blend policy has been activated, and there is no delivery/email
-service, adaptive production weighting or calibrated multi-source precipitation
-blend. Only an explicitly activated governed temperature correction changes values
+[Hosted deployment](#hosted-deployment)). Supervised Linux and real Minneapolis
+commissioning have completed; unattended operation remains disabled.
+No correction or blend policy has been activated. There is no automatic delivery,
+adaptive production weighting or calibrated multi-source precipitation blend.
+The explicit PDF/SMTP command exists, but the current 36-hour forecast cannot pass
+its five-complete-day coverage gate. Only an explicitly activated governed temperature correction changes values
 in the correction stage. No approved promotion rule exists for blend, QPF or AI
 policies, so those families are never eligible. The operational AI desk may make
 bounded edits to this forecast; it cannot promote policies or change persistent
@@ -528,6 +531,12 @@ are no promoted corrections or real blend candidates in the shipped configuratio
 the deterministic stage and current weights remain unchanged without an active
 correction. The subsequent AI desk is a separately traceable per-forecast stage.
 
+For v1, normal jobs retain verification and read-only site evidence but do **not**
+automatically create or register persistent correction candidates. Reports identify
+this as `policy_generation: operator_only`. Learning/Governance, explicit proposals,
+registered shadows and ACTIVE governed policy resolution remain available unchanged.
+Verification, AI and immutable control/corrected/final stages continue normally.
+
 Temperature proposals reuse canonical site evidence independently in the 1–6,
 7–18 and 19–36 hour buckets: at least 30 samples, 10 UTC decision dates, no date
 above 25% of samples, and a decision-date-clustered 95% bias interval excluding
@@ -549,7 +558,7 @@ uv run --locked python -m mesoforge.application.learning read --artifact-id ARTI
 uv run --locked python -m mesoforge.application.learning stage-issued --issued-forecast-id ISSUED_ID
 ```
 
-Storing a policy does not make it execute. An automatic proposal stays PROPOSED.
+Storing a policy does not make it execute. An operator-created proposal stays PROPOSED.
 Only a governance `register` event (below) makes a candidate shadow, and only an
 explicit `activate` event makes it operational. `learning stage-issued` never
 consults governance and binds only an unchanged no-op stage, so no policy is
@@ -1041,9 +1050,42 @@ evidence are permanent. A prepared snapshot is 1.1–1.8 GB and a failed refresh
 leaves about 1 GB; expect several refreshes per day. The worker reports free space
 and stops refresh/build/issuance admission below its floor. This is an admission
 check on the runtime filesystem, not a reservation or a remote PostgreSQL/S3 capacity
-guarantee; monitor those volumes and backup space separately. Removing old guidance is an explicit operator
-decision: a snapshot directory is safe to delete only if `latest_complete` does not
-name it and no retained baseline manifest references it.
+guarantee; monitor those volumes and backup space separately.
+
+The explicit retention planner defaults to a dry-run:
+
+```text
+uv run --locked python -m mesoforge.application.guidance_retention --runtime-root RUNTIME --dry-run
+uv run --locked python -m mesoforge.application.guidance_retention --runtime-root RUNTIME --pin SNAPSHOT_ID --reason "Retain this research case"
+uv run --locked python -m mesoforge.application.guidance_retention --runtime-root RUNTIME --unpin SNAPSHOT_ID
+```
+
+Defaults prefer HRRR/RAP/NBM's newest four complete cycles and GFS/IFS's newest
+three (`--keep-hrrr`, `--keep-rap`, `--keep-nbm`, `--keep-gfs`, `--keep-ifs`). These
+are retention preferences, not weights. Whole generations are protected for current
+prepared state, latest/recovery/all retained baselines, trend windows and manual pins.
+`--unpin SNAPSHOT_ID` removes only the manual protection. Pin changes use the existing
+Guidance lock; the planner rejects filesystem links and requires the managed hosted
+layout outside the repository. It never visits unrelated caches or runner state.
+
+**Working-data storage is not yet bounded.** Historical baseline/issuance lineage
+still dereferences local prepared/source documents; no compact index proves all
+permanent references closed. Even a failed refresh can finish reusable preparation
+before a later attachment fails; a historical development issuance may reference it.
+Both complete and failed generations remain protected outside the preferred cycle
+window (`permanent_artifact_reference_closure_unproven`). `--apply` prints the inventory
+and explicitly refuses deletion; there is no override. It does not delete baselines,
+S3 objects, observations, proof evidence, Docker caches, logs or runner state. These
+are not interchangeable disposable caches; none is automatically expired. A bounded
+dependency-retirement prerequisite is needed before safe rolling cleanup can ship.
+
+Keep canonical temperature/QPF analytical attributes, contributor/stage identities,
+observation quality and immutable facts indefinitely. No new feature store is added.
+The legacy temperature fact payload is still large; compact analysis attributes do
+not authorize deleting its authoritative object. Until dependency closure is solved,
+budget disk for growing complete generations, rich issuances and recovery copies,
+not a claimed fixed working set. Docker build cache may be reviewed separately by
+the operator; this command never prunes it.
 
 [backup.sh](deploy/hosted/backup.sh) (`sh deploy/hosted/backup.sh DEST`) dumps
 PostgreSQL (`pg_dump -Fc`, verified by `pg_restore --list`), then exports every
@@ -1058,6 +1100,12 @@ component or failed guidance restart prevents a completion claim. Successful bac
 have checksums and are renamed only after all steps succeed. Full guidance retention
 can make a backup much larger than the old manifest-only default. The destination
 must be outside the repository.
+
+The same procedure includes delivery intent/result artifacts, verification, AI audit
+and Governance through database/object exports. It still includes full runtime/raw
+guidance because retained baselines require it. Do not omit those dependencies yet.
+Deployment-level AI/SMTP secrets are provisioned separately and must not be placed
+inside runtime or backup manifests. A same-host recovery copy is not an off-host backup.
 
 [restore.sh](deploy/hosted/restore.sh) requires stopped workers, an empty database,
 runtime volume and bucket, and the same database owner and bucket name as the backup.
@@ -1097,6 +1145,69 @@ assume: the provider and host, its Linux distribution, SSH access, disk capacity
 generated secrets and optionally an OpenAI key. DNS names and public ports are not
 needed.
 
+### Five-day PDF and explicit email delivery
+
+The two-page server-side ReportLab renderer is implemented and tested with clearly
+marked fixtures. **A real five-day product is not yet scientifically supported.**
+The active temperature recipe requires both HRRR and GFS; HRRR ends at 48 hours
+(many cycles end at 18), and approved field lead bands end at 36 hours. RAP does not
+extend beyond its native 21/51-hour horizon. GFS/IFS/NBM availability alone does not
+approve a new long-range policy: GFS loses hourly cadence after source lead 120,
+IFS is currently a three-hour shadow, and current NBM attachments are short-range.
+Prepared coverage, baseline views, issuance and AI/presentation contracts also remain
+36-hour contracts. No weight, fallback, forecast horizon or missingness rule was changed.
+
+The renderer requires **five complete local calendar days**, with 23/25-hour DST
+days respected. A rolling 120-hour forecast beginning mid-day usually contains only
+four complete days. A future scientific/product decision must resolve that distinction
+and approve later-range contributors/cadences before real delivery can pass this gate.
+The current 36-hour issuance fails explicitly; presentation never extends guidance.
+
+These commands read an existing issuance. They cannot acquire guidance, reblend,
+invoke AI, reissue a forecast or change stored forecast state:
+
+```text
+uv run --locked python -m mesoforge.application.forecast_delivery render --issued-id ISSUED_UUID --location grasston --pdf OUTSIDE_REPOSITORY/grasston.pdf
+uv run --locked python -m mesoforge.application.forecast_delivery send --issued-id ISSUED_UUID --location grasston --pdf OUTSIDE_REPOSITORY/grasston.pdf --recipient recipient@example.com --confirm-reviewed
+uv run --locked python -m mesoforge.application.forecast_delivery status --delivery-id sha256:DELIVERY_DIGEST
+```
+
+`--config` optionally selects the existing location-registry format. Render verifies
+the final saved grid digest and exact point, then derives daily hourly-sample highs/lows,
+vector-mean wind, maximum gust, consecutive-interval QPF, most frequent hourly conditions
+and transitions. Maximum hourly PoP is labeled as such, never called a daily probability.
+Missing fields remain unavailable. Charts include overnight hours. No externally hosted
+fonts, logos or assets are used. The PDF contains compact issue/timezone/AI/revision
+provenance, not internal paths, identifiers or prompts.
+
+Before `send`, visually review both pages. The command verifies two readable pages,
+real guidance identity, unexpired coverage and byte identity with a fresh deterministic
+render of the same saved issuance. Fixture/unknown-source PDFs cannot be emailed by this
+command. Rendering and sending are independent; an email failure cannot roll back issuance.
+
+Copy [email-settings.env.example](deploy/hosted/email-settings.env.example) to
+`deploy/hosted/email-settings.env` for non-secret SMTP settings. Securely provision
+`MESOFORGE_SMTP_USERNAME` and `MESOFORGE_SMTP_PASSWORD` in the MesoForge-specific
+`/etc/mesoforge/email.env` (restricted owner permissions, outside repository/image/runtime).
+Do not supply secrets in chat or copy another application's credentials. Compose's
+explicit `delivery` profile alone reads this file; Guidance, Forecast and Admin do not.
+The delivery service has worker-scoped storage credentials and no AI secret or public port.
+For a deployed compatible image, `docker compose run --rm delivery
+mesoforge.application.forecast_delivery ...` invokes the same command; place its output
+under `/var/lib/mesoforge/runtime/delivery/` or an explicit operator output mount.
+No SMTP secret was available in the inspected live deployment; it was not provisioned
+or changed by this milestone.
+
+STARTTLS with certificate verification is the default; implicit TLS is supported.
+Unauthenticated plaintext is allowed only for a loopback test server. Timeout is capped
+at 60 seconds. One recipient is sent per command. A PostgreSQL advisory lock and durable
+content-addressed intent precede SMTP. Issuance + recipient + document-policy identity
+suppresses duplicate attempts even after a crash or ambiguous DATA response. The compact
+audit retains intent/result, attachment digest/size and sanitized status/code; it excludes
+SMTP credentials and raw server text. SMTP `250` means server acceptance, not inbox proof.
+An intent without a result is ambiguous: inspect/reconcile with the provider; do not
+blindly retry or bypass the key. Automatic resend and recurring delivery are not enabled.
+
 ### Environment variables
 
 Application commands read the process environment; they never import `.env` files.
@@ -1124,6 +1235,15 @@ Application commands read the process environment; they never import `.env` file
 | `MESOFORGE_AI_REASONING_EFFORT` | AI desk | Optional effort |
 | `MESOFORGE_AI_INPUT_USD_PER_MILLION` | AI desk | Optional price; `..._OUTPUT_USD_PER_MILLION` pairs with it |
 | `MESOFORGE_AI_<FIELD>` | AI desk | Optional `DeskConfig` budget override (see the AI desk section) |
+| `MESOFORGE_SMTP_HOST` | Explicit delivery | SMTP server hostname |
+| `MESOFORGE_SMTP_PORT` | Explicit delivery | Port, default `587` |
+| `MESOFORGE_SMTP_SECURITY` | Explicit delivery | `starttls` (default), `tls`, or test-only `local_plaintext` |
+| `MESOFORGE_SMTP_USERNAME` | Explicit delivery | Optional authentication username, paired with password |
+| `MESOFORGE_SMTP_PASSWORD` | Explicit delivery | Secret; provision outside repository/runtime |
+| `MESOFORGE_SMTP_TIMEOUT_SECONDS` | Explicit delivery | Network timeout, default 30; maximum 60 |
+| `MESOFORGE_EMAIL_FROM` | Explicit delivery | Plain sender mailbox; recipient is a command argument |
+| `MESOFORGE_EMAIL_SECRET_FILE` | Hosted Compose | Delivery-only secret file; default `/etc/mesoforge/email.env` |
+| `MESOFORGE_DELIVERY_MEM_LIMIT` | Hosted Compose | One-shot delivery memory limit, default `3g` |
 | `MESOFORGE_IMAGE` | Compose | Image tag for every role |
 | `MESOFORGE_PG_DB` | Compose | Database name |
 | `MESOFORGE_PG_USER` | Compose | Owner role (migrations, admin) |

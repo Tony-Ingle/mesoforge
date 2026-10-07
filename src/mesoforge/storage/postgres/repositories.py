@@ -541,6 +541,23 @@ class PostgresArtifactRepository:
         )
         return tuple(_artifact_row_to_manifest(row) for row in rows)
 
+    def find_email_delivery(self, delivery_id: Digest) -> tuple[ArtifactManifest, ...]:
+        """The immutable intent/result pair; independent of code revision on retries."""
+        delivery_id = Digest(delivery_id)
+        rows = self._session.scalars(
+            sa.select(ArtifactRow)
+            .where(
+                ArtifactRow.artifact_type == "email-delivery",
+                ArtifactRow.attributes.contains({"delivery_id": str(delivery_id)}),
+            )
+            .order_by(ArtifactRow.registered_at, ArtifactRow.id)
+            .limit(3)
+        )
+        found = tuple(_artifact_row_to_manifest(row) for row in rows)
+        if len(found) > 2:
+            raise ValueError("Ambiguous email delivery audit")
+        return found
+
     def find_learning_artifacts(
         self, artifact_type: str, *, attributes: dict[str, object], limit: int = 1000
     ) -> tuple[ArtifactManifest, ...]:

@@ -142,6 +142,21 @@ services:
       MESOFORGE_ALEMBIC_DSN: postgresql+psycopg://${MESOFORGE_PG_USER}:${MESOFORGE_PG_PASSWORD}@postgres:5432/${MESOFORGE_PG_DB}
     command: ["mesoforge.application.operations", "status"]
 
+  # Explicit delivery from an existing issuance. No AI secret and no weather work.
+  delivery:
+    <<: *app
+    profiles: ["delivery"]
+    restart: "no"
+    mem_limit: ${MESOFORGE_DELIVERY_MEM_LIMIT:-3g}
+    environment:
+      <<: *worker-environment
+    env_file:
+      - path: ./email-settings.env
+        required: false
+      - path: ${MESOFORGE_EMAIL_SECRET_FILE:-/etc/mesoforge/email.env}
+        required: false
+    command: ["mesoforge.application.forecast_delivery", "--help"]
+
 networks:
   backend:
     internal: true

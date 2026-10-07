@@ -45,8 +45,9 @@ flowchart TD
 The main boundaries are implemented as commands. The hosted deployment (section N)
 runs them as two roles of one image: a polling guidance/baseline worker and a
 scheduled forecast/issuance worker. Background means numerical preparation runs
-before a location job. The isolated VPS fixture proof is complete; production and
-unattended operation remain disabled.
+before a location job. The isolated VPS fixture proof is complete; subsequent
+supervised live commissioning has exercised the Minneapolis forecast.
+Unattended operation remains disabled.
 
 The issued product currently contains 36 hourly views of a local surface-weather
 canvas. Temperature, moisture, wind, QPF and temporary probability/category fields
@@ -60,6 +61,7 @@ The principal source packages are:
 | `guidance/` | Provider products, acquisition, decoding, normalization and capability checks |
 | `alignment/` | Native spatial/temporal extraction and wind transformations |
 | `forecasting/` | Scientific kernels, field dispatch, coherence and deterministic presentation |
+| `presentation/` | Saved final-grid aggregation and deterministic PDF layout; no model or AI execution |
 | `observations/` | Station/METAR and MRMS observation-reference semantics |
 | `verification/` | Matching eligibility, immutable-fact projections and analytical canonicalization |
 | `catalog/`, `contracts/` | Configuration, identities and typed data boundaries |
@@ -152,6 +154,7 @@ flowchart TD
 | Issued forecast | What was issued for this coordinate at this time? | Issued UUID, actual issuance, reference time, payload digest and baseline lineage |
 | Verification fact | What exact forecast/evidence comparison was evaluated? | Immutable field/stage-specific evidence and explicit status |
 | Canonical sample | Which comparisons may count analytically? | Deterministic read-only selection/deduplication of facts |
+| Email delivery audit | Was one saved issuance/PDF submitted to SMTP? | Immutable intent/result, issued UUID, recipient, product version and attachment digest; no credentials |
 
 The two current pointers have different meanings:
 
@@ -773,6 +776,15 @@ governance. It never promotes policies by itself, tunes current production weigh
 or diagnoses regimes. The operational AI desk below uses this same
 stage/evaluation architecture.
 
+For operational v1, verification and read-only evidence continue, while automatic
+persistent policy generation is dormant. `LearningService.local_stage` reports
+`policy_generation: operator_only` and `candidate_status: not_generated`; it does
+not propose or register a correction when evidence becomes sufficient. The existing
+evidence policy, explicit proposal/registration interfaces, registered shadows and
+ACTIVE governed policy resolution remain intact. A forecast still passes through
+the corrected/no-op stage and the AI desk. Nothing changes active weights or
+activates a policy automatically.
+
 ```text
 governance events (append-only) ──► resolved ACTIVE / registered CANDIDATE at a decision time
 prepared contributors → FieldBlendEngine (+ ACTIVE governed blend overrides) → baseline
@@ -813,7 +825,8 @@ stage remains authoritative in its artifact and immutable issuance.
 requires 30 canonical samples, 10 UTC decision dates, at most 25% concentration on
 one date, and a decision-date-means Student-t 95% bias interval excluding zero.
 Sample-mean error is forecast minus observation; its negative is the proposed delta.
-Other buckets remain unchanged. Sparse evidence produces no candidate.
+Other buckets remain unchanged. Explicit proposal evaluation returns insufficient
+evidence where these requirements fail; normal forecast jobs never create candidates.
 
 A proposal is either an insufficient-evidence report or a `candidate` payload.
 Payload lifecycle roles never grant execution: `apply_temperature_correction` runs
@@ -890,8 +903,10 @@ reprojected from the immutable verification payload. Ordinary final-issued analy
 and its error definition remain unchanged. The older recipe/contributor comparison
 rejects transformed stages with an explicit route to the unified evaluator.
 
-The prospective operator builds registered candidate overlays on the background
-side and composes the permanent local learning stage. No-op is the default.
+The prospective operator can still build already registered candidate overlays on
+the background side and composes the permanent local correction stage. No-op is
+the default; read-only site evidence remains available to the AI desk without
+persisting a new learned policy.
 Learning/shadow failures remain subordinate to control issuance and per-location
 isolation, and every governed shadow attempt is recorded in the issuance binding.
 Broader correction science and site/regime modeling remain future milestones.
@@ -1244,7 +1259,9 @@ flowchart LR
     G --> S3
     A[Admin: migrate, status, backup] --> DB
     A --> S3
-    F -. FUTURE .-> D[Delivery service]
+    DB --> D[Explicit saved-issuance PDF / SMTP command]
+    S3 --> D
+    D --> E[SMTP provider; five-day send blocked by current forecast horizon]
 ```
 
 [`guidance_worker`](src/mesoforge/application/guidance_worker.py) wraps the existing
@@ -1307,12 +1324,82 @@ Non-secret desk settings remain separate in Compose environment overrides or
 `deploy/hosted/ai-settings.env`; Guidance and Admin inherit neither AI file.
 Nothing prunes baselines, issuances, governance or verification evidence.
 
+### Conservative working-data retention
+
+[`guidance_retention`](src/mesoforge/application/guidance_retention.py) is an explicit
+operator command, not a worker timer. Its default dry-run identifies protected
+generations and storage outside preferred cycle windows. Configurable native-cycle preferences
+are HRRR/RAP/NBM four and GFS/IFS three; these do not alter numerical policies.
+Current prepared state, latest and recovery baselines, every retained baseline's
+dependencies, recent cycle windows and manual case pins protect whole generations.
+Malformed metadata, unknown state and unproven references fail closed.
+
+Generations retain `permanent_artifact_reference_closure_unproven`:
+historical readback dereferences prepared manifests and source documents, and there
+is no compact complete index of all permanent artifact dependencies. A generation
+that later failed can still contain prepared data consumed by an explicit development
+issuance, so failure is not proof of disposability. **Complete and failed history
+therefore remains unbounded.** The planner rejects links/path escape and `--apply`
+refuses deletion until permanent reference closure can be proven. Baselines, S3
+objects, verification, AI/Governance records, proof evidence, caches and runner
+directories remain untouched. The implemented boundary is inventory and manual
+case protection; pruning needs reference-closure work before it can bound the live
+working set without corrupting historical lineage.
+
 Backups pause guidance before the database dump, require suspended forecast triggers,
 retain all runtime guidance plus referenced objects, and publish a private completed
 directory only after checksum generation and successful worker restart. Restore
 validates backup contents and empty database/bucket/runtime destinations before writes;
 PostgreSQL restores transactionally, but the three stores are not one restore
 transaction. Disk guards measure the local runtime filesystem, not remote store capacity.
+Compact forecast-stage and temperature/QPF verification evidence remains permanent;
+this retention command cannot delete it. Delivery intent/result artifacts use the
+same database/object exports as verification, AI and Governance. Raw/runtime backup
+coverage remains required while retained baseline dependencies need it. Deployment
+AI and SMTP secret files are provisioned separately and excluded from those exports.
+
+### Five-day presentation and explicit email delivery
+
+**CURRENT infrastructure; blocked real five-day product.** The numerical forecast
+still has 36 hours. The current temperature recipe requires HRRR and GFS, with no
+approved GFS-only temperature fallback beyond HRRR's native horizon. Active field
+lead bands end at 36 hours. RAP also expires within the short range; IFS remains a
+three-hour shadow. GFS hourly cadence ends at source lead 120, which is earlier
+than the last required source lead of a 120-hour forecast from an older cycle.
+NBM's current attachments and prepared/baseline/issuance/AI contracts are short-range.
+Extending array sizes would not supply approved long-range science or exact hourly
+QPF. Those contracts remain unchanged; no real five-day forecast or email can be
+claimed from a 36-hour issuance.
+
+[`forecast_document`](src/mesoforge/presentation/forecast_document.py) validates the
+saved final grid digest and exact point before deriving five complete local calendar
+days. It reuses current condition rules, preserves accumulation windows, uses hourly
+temperature extrema and vector-mean wind, and labels maximum hourly PoP distinctly
+from daily occurrence probability. Incomplete field coverage stays unavailable.
+Named-zone boundaries account for DST; a rolling 120-hour interval may contain
+partial calendar days and is rejected when five complete days are absent.
+[`forecast_pdf`](src/mesoforge/presentation/forecast_pdf.py) uses local ReportLab fonts,
+vector charts and deterministic metadata for a two-page document. Fixture documents
+are visibly marked and cannot pass the production send gate.
+
+[`forecast_delivery`](src/mesoforge/application/forecast_delivery.py) separates
+`render`, `send` and `status` against an existing issued UUID. No command regenerates
+guidance, runs AI or writes forecast history. Sending requires exact deterministic
+PDF readback, current coverage, non-fixture evidence and explicit operator review.
+[`email_delivery`](src/mesoforge/application/email_delivery.py) uses configurable
+SMTP with verified TLS/STARTTLS and bounded timeouts; only a local test server can
+use plaintext. A dedicated opt-in Compose delivery profile receives
+`/etc/mesoforge/email.env`, never the AI or admin credential. No public port or
+scheduled delivery is introduced.
+
+[`delivery_artifacts`](src/mesoforge/application/delivery_artifacts.py) records compact
+intent/result artifacts under the existing PostgreSQL advisory lock and S3 content
+identity. Issued UUID, recipient and presentation-policy version identify one
+automatic attempt. A durable intent precedes SMTP; a repeat, crash or ambiguous DATA
+outcome cannot trigger an automatic resend, even across code revisions. Structured
+results retain bounded categories/codes and attachment identity, not provider prose,
+passwords, raw prompts or full forecast/PDF copies. SMTP acceptance is not inbox
+confirmation. Delivery failure does not invalidate a successful forecast issuance.
 
 The former upstream MinIO image is unavailable. An auxiliary image builds the exact
 official 2025-10-15 security-release source with pinned compiler/base digests; the
@@ -1325,9 +1412,10 @@ scheduler was installed. This proves the fixture deployment path, not unattended
 capacity under live acquisition. The application image isolates native ecCodes
 library loading and tests both ecCodes/Psycopg import orders through normal shutdown.
 
-**FUTURE.** Multi-host publication or shared object-backed guidance, delivery,
-continuous observation/MRMS polling and automatic guidance retention need explicit
-designs. Current local file locks are not a distributed publication system. The
+**FUTURE.** Approved long-range field policies and coverage, recurring PDF/email,
+multi-host publication or shared object-backed guidance, continuous observation/MRMS
+polling and safe complete-history pruning remain prerequisites or future work.
+Current local file locks are not a distributed publication system. The
 development HTTP interface (`mesoforge.api`) is a local read/calculation surface,
 not part of the hosted stack or an authenticated public service. Existing CI
 validates code; it is not the forecast scheduler. Hermes orchestration remains paused.
@@ -1353,13 +1441,15 @@ validates code; it is not the forecast scheduler. Hermes orchestration remains p
 | Temperature automatic matching/verification | Implemented | Bounded station/METAR path; no public registration required |
 | MRMS hourly contract and QPF facts/analysis | Implemented | Exact-event service, canonical stages and identical-sample comparison |
 | Automatic QPF observation accumulation | Implemented | Bounded on-demand attempts before issuance; explicit bounded backfill |
-| Deterministic local temperature correction | Implemented | Evidence-gated candidates executed only under governance grants; no-op default; no policy activated |
+| Deterministic local temperature correction | Implemented | No-op default; ACTIVE governed policies still resolve; new persistent policy proposals are operator-only in v1 |
 | Candidate blend and unified shadow evaluation | Implemented | Registered-candidate overlays; common canonical temperature/MRMS samples; pairwise identical-sample cohorts |
 | Policy governance, promotion eligibility and rollback | Implemented | Append-only events, deterministic eligibility, explicit CAS activation, rollback/emergency/retire; blend/QPF/AI never eligible |
 | Broader site/regime correction science | Future | No regime classifier, per-bucket activation or additional correction science |
 | Bounded operational AI desk and current final validation | Implemented | Structured provider boundary, finite tasks/budgets, temperature/QPF tools, checkpoint fallback and common stage evaluation |
-| Scheduled hosted operation | Implemented; supervised Linux fixture proof complete, unattended operation not enabled | One image, two roles, internal services; scheduler chooses when, MesoForge keeps all meteorology |
-| Delivery | Future | No email, SMS or delivery service |
+| Scheduled hosted operation | Implemented; supervised Linux proofs complete, unattended operation not enabled | One image, two forecast roles, internal services; scheduler chooses when, MesoForge keeps all meteorology |
+| Guidance retention planning/pins | Partially implemented | Explicit dry-run and case protection; all deletion refused while permanent reference closure is unproven |
+| Five-day aggregation/PDF and SMTP | Infrastructure implemented; real product blocked | Saved-issuance-only renderer and immutable delivery audit; current 36-hour science cannot pass the five-day gate |
+| Recurring delivery and approved 120-hour numerical coverage | Future | No unattended email enabled; long-range scientific contracts remain unresolved |
 
 ## P. Architectural debt and retained boundaries
 
@@ -1368,8 +1458,11 @@ validates code; it is not the forecast scheduler. Hermes orchestration remains p
 - Background builds materialize every configured domain/reference view; this costs
   time and storage. Incremental affected-field computation is not implemented.
 - Baseline source references currently depend on retained local paths/documents,
-  so hosted operation is single-host with one runtime volume. Guidance retention is
-  a manual operator decision; each prepared snapshot is 1.1–1.8 GB.
+  so hosted operation is single-host with one runtime volume. Conservative retention
+  protects complete and failed generations; cycle-count preferences cannot yet bound history.
+  Dependency closure must be established before raw/prepared scientific data expires.
+- The requested five-day product needs explicit long-range field/horizon policy
+  approval. A deterministic PDF renderer cannot replace that scientific prerequisite.
 - Historical schemas, retained Phase 2 consumers and development inline paths remain
   for real readers/scientific reuse. They are not equally preferred production flows.
 - Field-specific policy sophistication lags the generalized machinery. Promotion
