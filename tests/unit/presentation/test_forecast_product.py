@@ -330,3 +330,25 @@ def test_36_hour_document_preserves_missing_amounts_and_real_final_values():
         build_forecast_document(five_day_saved(count=35), location=LOCATION, hours=36)
     with pytest.raises(ValueError, match="exactly 36"):
         build_forecast_document(saved, location=LOCATION, hours=24)
+
+
+@pytest.mark.parametrize("hours", [None, 36])
+def test_pdf_qpf_missing_hour_is_visibly_distinguished_from_numeric_zero(hours):
+    saved = five_day_saved(count=36 if hours else 120)
+    for hour in saved["forecast"]["hours"]:
+        hour["surface"]["fields"]["liquid_equivalent_precipitation_amount_1h"]["value"] = 0.0
+    reseal(saved)
+    document = build_forecast_document(saved, location=LOCATION, hours=hours)
+    zero_page = PdfReader(BytesIO(render_forecast_pdf(document))).pages[1]
+    assert "X = unavailable hour" not in zero_page.extract_text()
+    assert document["summary"]["qpf_kg_m2"] == 0.0
+
+    saved["forecast"]["hours"][8]["surface"]["fields"]["liquid_equivalent_precipitation_amount_1h"][
+        "value"
+    ] = None
+    reseal(saved)
+    document = build_forecast_document(saved, location=LOCATION, hours=hours)
+    missing_page = PdfReader(BytesIO(render_forecast_pdf(document))).pages[1]
+    assert "X = unavailable hour; zero = no bar" in missing_page.extract_text()
+    assert document["hours"][8]["qpf"] is None
+    assert document["summary"]["qpf_kg_m2"] is None

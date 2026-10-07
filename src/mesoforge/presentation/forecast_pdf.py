@@ -447,6 +447,16 @@ def _chart(
     rows = document["hours"]
     count = len(rows)
     hourly = document["document_policy"] == HOURS_DOCUMENT_POLICY
+    if bars and any(value is None for _, values, _ in series for value in values):
+        _text(
+            canvas,
+            "X = unavailable hour; zero = no bar",
+            310,
+            top + 17,
+            260,
+            size=7.5,
+            color=_MUTED,
+        )
     for part in range(3):
         y = plot_top + height * part / 2
         _line(canvas, left, y, width)
@@ -463,12 +473,22 @@ def _chart(
         canvas.setLineWidth(1.7)
         previous: tuple[float, float] | None = None
         for i, value in enumerate(values):
-            if value is None:
-                previous = None
-                continue
             # Hourly amounts occupy (start,end]; instantaneous lines use valid time.
             position = i + 1 if hourly and not bars else i + 0.5
             x = left + width * position / count
+            if value is None:
+                if bars:
+                    # An absent amount must remain visibly different from numeric zero.
+                    middle = _HEIGHT - plot_top - height / 2
+                    canvas.saveState()
+                    canvas.setStrokeColor(HexColor(_MUTED))
+                    canvas.setLineWidth(0.65)
+                    half_width = min(2.25, width / count * 0.3)
+                    canvas.line(x - half_width, middle - 3, x + half_width, middle + 3)
+                    canvas.line(x - half_width, middle + 3, x + half_width, middle - 3)
+                    canvas.restoreState()
+                previous = None
+                continue
             y = _HEIGHT - plot_top - height + height * (value - low) / (high - low)
             if bars:
                 bottom = _HEIGHT - plot_top - height
