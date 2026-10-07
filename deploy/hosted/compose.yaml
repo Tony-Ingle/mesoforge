@@ -4,8 +4,8 @@
 # only the workers also join an egress network (model providers, observations, AI API).
 # Operators act through one-shot containers:
 #   docker compose run --rm admin mesoforge.application.operations migration-status
-# Values come from deploy/hosted/.env (see .env.example); the OpenAI key comes only from
-# deploy/hosted/ai.env and reaches only the forecast worker. Never commit either file.
+# Values come from deploy/hosted/.env (see .env.example); the AI credential comes from
+# a deployment-level host file and reaches only the forecast worker. Never commit secrets.
 name: mesoforge-hosted
 
 x-logging: &logging
@@ -121,7 +121,10 @@ services:
       MESOFORGE_AI_PROVIDER: ${MESOFORGE_AI_PROVIDER:-openai}
       MESOFORGE_AI_MODEL: ${MESOFORGE_AI_MODEL:-gpt-6-sol}
     env_file:
-      - path: ./ai.env
+      # Non-secret reasoning/pacing/budget overrides stay separate from the credential.
+      - path: ./ai-settings.env
+        required: false
+      - path: ${MESOFORGE_AI_SECRET_FILE:-/etc/mesoforge/ai.env}
         required: false
     command: ["mesoforge.application.forecast_worker", "run", "--scheduled"]
 

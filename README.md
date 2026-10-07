@@ -971,7 +971,7 @@ No inbound port needs to be opened.
 
 ```text
 cp deploy/hosted/.env.example deploy/hosted/.env      # fill in generated secrets
-cp deploy/hosted/ai.env.example deploy/hosted/ai.env  # optional: OpenAI key/budgets
+cp deploy/hosted/ai-settings.env.example deploy/hosted/ai-settings.env # optional non-secret AI settings
 sh deploy/hosted/build-image.sh                       # set MESOFORGE_IMAGE to the tag
 docker compose -f deploy/hosted/compose.yaml build minio # pinned upstream source build
 make hosted-migrate DB=mesoforge                      # explicit: migrate, then create bucket
@@ -990,8 +990,24 @@ identities include the code identity).
 
 Set `MESOFORGE_AI_PROVIDER` and `MESOFORGE_AI_MODEL` in `deploy/hosted/.env` (or
 the invoking shell); defaults are `openai` and `gpt-6-sol`. Compose's explicit
-environment entries override those two names in `ai.env`. Put the API key and
-desk budgets in `ai.env`, which reaches only the forecast worker.
+environment entries override those two names in environment files. Keep non-secret
+reasoning effort, pacing, pricing and budget overrides in `ai-settings.env` or an
+existing Forecast service environment override; application defaults are unchanged.
+
+Provision the provider credential separately in the deployment-level host file
+`/etc/mesoforge/ai.env`, containing `OPENAI_API_KEY`. Forecast alone reads it through
+Compose `env_file`; Guidance and Admin receive neither the file nor its values.
+`MESOFORGE_AI_SECRET_FILE` may select another host path without putting its contents
+in Compose interpolation. The invoking operator must be able to read the file;
+use restrictive ownership/permissions (for example, `root:<operator-group>`, file
+`0640`, directory `0750`). The file is not mounted into the container or included
+in images, runtime data or backups. Missing credentials retain the existing
+provider-unavailable fallback; verify presence separately before a paid run.
+Do not duplicate the key into the project directory, `.env`, build arguments or
+logs, or print expanded `docker compose config` output. A runtime check should emit
+only whether `OPENAI_API_KEY` is non-empty, plus the non-secret provider/model.
+When upgrading an older deployment, move only its non-secret desk settings from
+the old project `ai.env` into `ai-settings.env`; the old file is no longer read.
 
 The former MinIO image is no longer anonymously pullable. Compose now builds
 [the upstream security release](https://github.com/minio/minio/releases/tag/RELEASE.2025-10-15T17-29-55Z)
@@ -1064,7 +1080,8 @@ changes. Temporary tables are permitted by the database grant.
 Only the `admin` application role holds the owner credentials (PostgreSQL itself
 also needs its initialization credentials); for an external S3 endpoint admin
 also needs the egress network. The OpenAI key reaches only the forecast
-worker (`ai.env`). MesoForge application containers run as uid 10001 with all
+worker (the deployment-level `/etc/mesoforge/ai.env`). MesoForge application
+containers run as uid 10001 with all
 capabilities dropped; PostgreSQL uses its upstream initialization/runtime identity. The
 image contains no credentials and records its commit. Logs and status files redact
 credential values, DSN passwords, API tokens and signed-URL authorization values. For a bucket-scoped object-store
@@ -1102,6 +1119,7 @@ Application commands read the process environment; they never import `.env` file
 | `MESOFORGE_FORECAST_TIMES` | Both workers | Comma-separated local `HH:MM` slots (default `08:00,20:00`) |
 | `MESOFORGE_AI_PROVIDER` | AI desk | `openai` |
 | `MESOFORGE_AI_MODEL` | AI desk | Model, currently `gpt-6-sol` |
+| `MESOFORGE_AI_SECRET_FILE` | Hosted Compose | Host credential file; default `/etc/mesoforge/ai.env`, Forecast only |
 | `OPENAI_API_KEY` | AI desk | Provider credential (forecast worker only) |
 | `MESOFORGE_AI_REASONING_EFFORT` | AI desk | Optional effort |
 | `MESOFORGE_AI_INPUT_USD_PER_MILLION` | AI desk | Optional price; `..._OUTPUT_USD_PER_MILLION` pairs with it |

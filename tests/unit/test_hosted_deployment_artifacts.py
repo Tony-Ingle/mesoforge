@@ -140,11 +140,23 @@ def test_secrets_are_required_interpolations_scoped_per_service() -> None:
         "MESOFORGE_S3_SECRET_KEY",
     ):
         assert f"${{{name}:?" in text, name
-    assert "OPENAI_API_KEY" not in text  # only ai.env, only the forecast worker
+    assert "OPENAI_API_KEY" not in text  # only the host secret file, no interpolation
     assert "MESOFORGE_CODE_REVISION" not in text  # baked into the image, never overridden
     services = compose()["services"]
-    assert services["forecast-worker"]["env_file"] == [{"path": "./ai.env", "required": False}]
+    assert services["forecast-worker"]["env_file"] == [
+        {"path": "./ai-settings.env", "required": False},
+        {"path": "${MESOFORGE_AI_SECRET_FILE:-/etc/mesoforge/ai.env}", "required": False},
+    ]
     assert all("env_file" not in services[name] for name in services if name != "forecast-worker")
+    # Neither inherited anchors nor another role may gain the credential or secret file.
+    for name, service in services.items():
+        assert "OPENAI_API_KEY" not in service.get("environment", {})
+        if name != "forecast-worker":
+            assert "MESOFORGE_AI_SECRET_FILE" not in str(service)
+            assert "/etc/mesoforge/ai.env" not in str(service)
+    for path in (ROOT / "Dockerfile", HOSTED / "build-image.sh", HOSTED / "minio" / "Dockerfile"):
+        assert "OPENAI_API_KEY" not in path.read_text("utf-8")
+        assert "MESOFORGE_AI_SECRET_FILE" not in path.read_text("utf-8")
     for role in ("guidance-worker", "forecast-worker"):
         environment = services[role]["environment"]
         assert "MESOFORGE_ALEMBIC_DSN" not in environment
@@ -157,7 +169,7 @@ def test_secrets_are_required_interpolations_scoped_per_service() -> None:
 
 
 def test_examples_hold_placeholders_only() -> None:
-    for name in (".env.example", "ai.env.example"):
+    for name in (".env.example", "ai-settings.env.example"):
         text = (HOSTED / name).read_text("utf-8")
         for line in text.splitlines():
             if line.startswith("#") or "=" not in line:
@@ -165,7 +177,8 @@ def test_examples_hold_placeholders_only() -> None:
             key, value = line.split("=", 1)
             if any(word in key for word in ("PASSWORD", "SECRET", "ACCESS_KEY", "API_KEY")):
                 assert value == "REPLACE_ME", line
-    assert "\nOPENAI_API_KEY=" not in (HOSTED / "ai.env.example").read_text("utf-8")
+    assert "OPENAI_API_KEY" not in (HOSTED / "ai-settings.env.example").read_text("utf-8")
+    assert not (HOSTED / "ai.env.example").exists()
 
 
 def test_database_worker_role_cannot_change_schema_governance_or_delete() -> None:

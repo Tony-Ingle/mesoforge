@@ -1300,7 +1300,11 @@ grants `operations migrate` applies after each upgrade (read and append, activit
 status updates only, read-only governance events, no persistent DDL; temporary tables
 are allowed), so the database itself refuses a
 worker governance write; only the admin application role holds owner credentials, and only
-the forecast worker receives the AI credential.
+the forecast worker receives the AI credential. Compose reads the deployment-level
+host file `/etc/mesoforge/ai.env` (overridable with `MESOFORGE_AI_SECRET_FILE`) only
+for Forecast; it is neither mounted nor copied into the image/runtime/backup data.
+Non-secret desk settings remain separate in Compose environment overrides or
+`deploy/hosted/ai-settings.env`; Guidance and Admin inherit neither AI file.
 Nothing prunes baselines, issuances, governance or verification evidence.
 
 Backups pause guidance before the database dump, require suspended forecast triggers,
