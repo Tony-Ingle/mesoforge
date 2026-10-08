@@ -49,9 +49,12 @@ before a location job. The isolated VPS fixture proof is complete; subsequent
 supervised live commissioning has exercised the Minneapolis forecast.
 Unattended operation remains disabled.
 
-The issued product currently contains 36 hourly views of a local surface-weather
-canvas. Temperature, moisture, wind, QPF and temporary probability/category fields
-coexist with evidence-only fields. Missing evidence stays visible.
+The issued product contains its declared 36 or 120 hourly views of a local
+surface-weather canvas. The default remains 36 hours; explicit 120-hour guidance
+uses the provisional policy described in section N. Temperature, moisture, wind,
+QPF and temporary probability/category fields coexist with evidence-only fields.
+Accumulations and probabilities retain their exact events rather than becoming
+invented hourly values. Missing evidence stays visible.
 
 The principal source packages are:
 
@@ -270,7 +273,12 @@ Provider adapters describe native products and capability limits. Configuration 
 selection preserve source cycles, source leads, actual valid times, units, grids,
 URLs, index/message identities and acquisition evidence.
 
-| Source | Current use |
+**Historical/default 36-hour scope:** the source roles and selection/coverage
+rules below describe the unchanged default path. The explicit 120-hour native
+discovery and provisional contributor policy are documented in section N,
+“36-/120-hour presentation and explicit email delivery.”
+
+| Source | Default 36-hour use |
 |---|---|
 | HRRR | Required active temperature/surface contributor; hourly QPF evidence |
 | GFS | Required active temperature/surface contributor; interval-normalized QPF evidence |
@@ -285,9 +293,10 @@ the exact selected identities. Preparation revalidates those identities before u
 the bytes. Metadata discovery alone is not proof of decoded scientific correctness.
 
 Models align by actual valid time, not equal lead numbers or equal cycle times.
-Each required model must cover the initial 36-hour window under its native cadence.
-The background refresh can prepare an extension beyond 36 hours, up to the supported
-42-hour collection, only where accepted source cycles already provide it.
+In the default path, each required model must cover the initial 36-hour window
+under its native cadence. Its background refresh can prepare an extension beyond
+36 hours, up to the supported 42-hour collection, only where accepted source cycles
+already provide it.
 
 `refresh_guidance` explicitly permits RAP/IFS discovery or preparation shortfalls as
 missing shadow evidence. Missing required HRRR/GFS still fails. Optional shadows are
