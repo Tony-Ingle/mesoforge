@@ -41,6 +41,7 @@ from mesoforge.application.baseline_snapshot import load_baseline
 from mesoforge.application.baseline_snapshot import read_pointer as read_baseline_pointer
 from mesoforge.application.batch_forecast import _coordinates, load_locations
 from mesoforge.application.code_revision import current_code_revision
+from mesoforge.application.disk_admission import DEFAULT_MIN_FREE_BYTES, DiskPolicy
 from mesoforge.application.forecast_schedule import ForecastSchedule
 from mesoforge.application.prepared_snapshot import SnapshotError, derive_reference_time
 from mesoforge.application.runtime_log import event, redact, redact_diagnostics
@@ -73,7 +74,7 @@ class ForecastSettings:
     reference_time: datetime | None = None
     verify_prior: bool = True
     readiness_poll_seconds: int = 60
-    min_free_bytes: int = 6 * 1024**3
+    min_free_bytes: int = DEFAULT_MIN_FREE_BYTES
     expected_baseline_id: str | None = None
     schedule: ForecastSchedule = field(default_factory=ForecastSchedule)
 
@@ -697,7 +698,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", choices=("run", "readiness", "next-run"))
     parser.add_argument("--root", type=Path, default=_default_root())
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--min-free-gb", type=float, default=6.0)
+    parser.add_argument(
+        "--min-free-gb", type=float, default=DiskPolicy.from_environment().min_free_bytes / 1024**3
+    )
     parser.add_argument(
         "--expected-baseline-id",
         help="Require the exact immutable baseline published by the daily Guidance handoff",

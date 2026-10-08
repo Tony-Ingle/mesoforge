@@ -81,6 +81,10 @@
   do not install a competing timer. Shared runtime locks, fresh-baseline handoff and
   local-day receipts must prevent overlap or repeat paid work. Disk warnings never
   authorize deletion of unresolved scientific dependencies or runner state.
+  Native payload expiry needs the exact verified local-backup plan and shared lock;
+  retain JSON/baseline replay dependencies and compact permanent evidence. Recipients
+  belong to configured locations. Same-host recovery is v1 policy; no paid off-host
+  service is required. Schedule enablement never implies authorization to merge.
 - Learning uses common immutable stage/variant lineage and the existing artifact
   store/evaluator. Local temperature correction is explicitly no-op unless an
   ACTIVE policy exists; candidates/shadows never promote themselves. Build candidate

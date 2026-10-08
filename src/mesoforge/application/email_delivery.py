@@ -20,21 +20,12 @@ from email.policy import SMTP
 from email.utils import format_datetime
 from typing import Any, Protocol
 
+from mesoforge.common.email_address import address as address
 from mesoforge.common.identifiers import Digest, IssuedForecastId
 from mesoforge.contracts.serialization import canonical_json_bytes
 
 SCHEMA = "mesoforge.email-delivery.v1"
 MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
-
-
-def address(value: str) -> str:
-    """One ASCII mailbox; DNS domain is case-insensitive, local part is preserved."""
-    if len(value) > 254 or not re.fullmatch(
-        r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+", value
-    ):
-        raise ValueError("Expected one plain email address")
-    local, domain = value.rsplit("@", 1)
-    return f"{local}@{domain.lower()}"
 
 
 def delivery_identity(issued_id: IssuedForecastId, recipient: str, product_version: str) -> Digest:

@@ -41,7 +41,7 @@ reblend fields, rerun baseline coherence or download guidance.
 | Policy governance | Append-only lifecycle events; explicit register/evaluate/activate/rollback/retire; deterministic identical-sample eligibility; nothing is active by default |
 | AI forecast desk | Always attempted after correction; bounded structured provider actions, deterministic field edits, validated checkpoints and automatic fallback |
 | PDF/email | Deterministic two-page 36-hour or declared 120-hour outlook and explicit SMTP delivery from saved final issuances |
-| Retention | Explicit dry-run, cycle preferences and case pins; deletion remains blocked by unresolved filesystem references |
+| Retention | Verified-backup-bound rolling native payload expiry, case pins and protection of unresolved dependencies |
 
 ### Current numerical policies
 
@@ -963,8 +963,13 @@ SMTP release **not before 08:00**. The measured five-day Guidance cycle took rou
 29 minutes plus saved-issuance delivery reads, so starting Forecast at 08:00 would
 not achieve morning 08:00 delivery. These are operator times, not scientific rules.
 Slow builds, verification, providers or SMTP can make delivery late; no arrival SLA
-is implied. A trigger arriving after the forecast slot closes at 08:00 skips the day
-without backdating or another paid desk attempt.
+is implied. Late preparation uses the actual current reference hour and sends a valid
+completed forecast when ready. Native coverage and first-valid-hour expiry checks
+still apply; a missed reference cannot be backdated or trigger another paid attempt.
+For late runs, `forecast_min_remaining_minutes` defaults to 40 minutes: if less of
+the current reference hour remains, wait once until the next hour **before** readiness
+and paid work. This operational headroom reflects measured runtime, not meteorology;
+the final actual-clock expiry check still prevents an expired issuance.
 
 [GitHub's schedule contract](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
 supports IANA timezone/DST scheduling and warns that dispatch can be delayed or
@@ -986,11 +991,16 @@ Set `MESOFORGE_DAILY_IMAGE` in its deployment environment, and provision
 `/etc/mesoforge/daily.json` from [daily.json.example](deploy/hosted/daily.json.example).
 Use the base Compose file plus [daily.compose.yaml](deploy/hosted/daily.compose.yaml),
 not old proof overlays that clear AI credentials or select Grasston. Replace example
-paths/recipients; approve the explicit `mesoforge-120-hour-presentation.v1` template.
+paths; approve the explicit `mesoforge-120-hour-presentation.v1` template.
 Create the configured private `state_root` outside the checkout, writable by the
 runner operator. Preserve that directory in backups: it contains daily retry receipts.
 Credentials remain in the existing live environment, `/etc/mesoforge/ai.env` and
-`/etc/mesoforge/email.env`, with role-specific exposure. No recipient is hardcoded.
+`/etc/mesoforge/email.env`, with role-specific exposure. Each canonical location row
+owns an `email_recipients` list: zero, one or many plain addresses. Domains are
+normalized and exact duplicates collapse in configured order. An empty list allows
+issuance/PDF but skips SMTP. Minneapolis is configured for the owner; Grasston has
+an empty list and remains unscheduled. Change this configuration, not forecast code.
+A failed recipient does not prevent remaining recipients or backup of the issuance.
 
 The runner derives a Minneapolis-only selection from `configs/locations.json` and
 gives all roles the same selection/root. Grasston remains in the maintained registry;
@@ -1006,7 +1016,7 @@ gh workflow run mesoforge-daily.yml --ref main -f operation=run
 
 The GHA Actions UI provides the same `workflow_dispatch` choices. `run` uses the
 computer clock and today's local date; no date argument or backfill is supported.
-It refuses heavy work before 06:05 or after the forecast window, preserves phase
+It refuses heavy work before 06:05 or across a changed local day, preserves phase
 logs/receipts outside Git, and reports IDs, cycles, verification, AI outcome, PDF
 digest, delivery audit and sampled host memory/swap/load/disk in the job summary.
 Container memory peaks are not collected by this wrapper.
@@ -1031,7 +1041,7 @@ AI. Accepted deliveries are reused. An ambiguous or failed durable SMTP intent s
 suppressed pending explicit reconciliation, never automatically resent. AI failure
 uses the existing validated fallback; email failure never invalidates issuance.
 
-Enable only after storage/off-host backup prerequisites below and explicit recurring
+Enable only after storage/local recovery checks below and explicit recurring
 AI/email authorization. Set `MESOFORGE_DAILY_ENABLED=true`; to disable new runs,
 unset it or set `false`. Do not cancel an in-flight scientific phase merely to disable
 tomorrow's run. One normal forecast/day means approximately **365 bounded AI desk
@@ -1124,80 +1134,70 @@ uv run --locked python -m mesoforge.application.guidance_retention --runtime-roo
 uv run --locked python -m mesoforge.application.guidance_retention --runtime-root RUNTIME --unpin SNAPSHOT_ID
 ```
 
-Defaults prefer HRRR/RAP/NBM's newest four complete cycles and GFS/IFS's newest
-three (`--keep-hrrr`, `--keep-rap`, `--keep-nbm`, `--keep-gfs`, `--keep-ifs`). These
-are retention preferences, not weights. Whole generations are protected for current
-prepared state, latest/recovery/all retained baselines, trend windows and manual pins.
-`--unpin SNAPSHOT_ID` removes only the manual protection. Pin changes use the existing
-Guidance lock; the planner rejects filesystem links and requires the managed hosted
-layout outside the repository. It never visits unrelated caches or runner state.
+Defaults retain HRRR/RAP/NBM's newest four complete usable cycles, GFS/IFS three,
+and acquired GEFS/ECMWF ensemble generations three. Configure `retention_cycles` in
+`daily.json`, or `--keep-hrrr`, `--keep-rap`, `--keep-gfs`, `--keep-ifs`, `--keep-nbm`,
+`--keep-gefs`, `--keep-ecmwf-ens` on the operator command. These are storage settings,
+not weights. Whole bundles stay protected if any contributor is inside its window.
 
-**Working-data storage is not yet bounded.** Historical baseline/issuance lineage
-still dereferences local prepared/source documents; no compact index proves all
-permanent references closed. Even a failed refresh can finish reusable preparation
-before a later attachment fails; a historical development issuance may reference it.
-Both complete and failed generations remain protected outside the preferred cycle
-window (`permanent_artifact_reference_closure_unproven`). `--apply` prints the inventory
-and explicitly refuses deletion; there is no override. It does not delete baselines,
-S3 objects, observations, proof evidence, Docker caches, logs or runner state. These
-are not interchangeable disposable caches; none is automatically expired. A bounded
-dependency-retirement prerequisite is needed before safe rolling cleanup can ship.
+`--status` and `--dry-run` show KEEP/DELETE/PINNED/CURRENT/RECOVERY/IN-FLIGHT/UNRESOLVED
+with reasons, bytes and exact candidate digests. `--apply --backup-receipt RECEIPT`
+requires a verified same-host backup containing the exact plan and candidate bytes.
+It rechecks the protection graph under the shared worker lock, records deletion intent,
+and expires only recognized raw GRIB/index/prepared-array payloads outside all windows.
+An interrupted apply resumes only that exact protected/digested plan. All original JSON
+manifests, source documents, baseline grids and immutable scientific history remain.
+Current/previous prepared states and baselines, in-flight jobs, manual case pins and
+unresolved cross-generation dependencies prevent deletion. Links/path escapes fail closed.
 
-Keep canonical temperature/QPF analytical attributes, contributor/stage identities,
-observation quality and immutable facts indefinitely. No new feature store is added.
-The legacy temperature fact payload is still large; compact analysis attributes do
-not authorize deleting its authoritative object. Until dependency closure is solved,
-budget disk for growing complete generations, rich issuances and recovery copies,
-not a claimed fixed working set. Docker build cache may be reviewed separately by
-the operator; this command never prunes it.
+Native re-preparation of expired payloads requires a retained recovery copy or source
+reacquisition; it is no longer promised indefinitely. Saved baseline/issuance readback,
+point verification and AI recipe lineage retain their exact existing data. Pin research
+cases **before** cleanup. Failed/incomplete generations can contain reusable scientific
+state and remain UNRESOLVED; age alone never makes them disposable. Runner files,
+PostgreSQL/MinIO volumes, observation evidence and arbitrary temp directories are not
+visited. No automatic persistent Learning or new feature store is introduced.
+
+**Complete storage is not a fixed-size working set yet.** Historical baseline grids
+remain necessary for full-grid controls/candidate inheritance/AI recipe replay. Point
+stage summaries cannot replace them safely. The measured baseline cost is about 393 MB
+per daily build, plus roughly 60 MB per issuance, observations and verification. Recent
+raw/prepared cycles are bounded where references permit; those permanent artifacts
+continue growing. Legacy temperature facts also retain their authoritative large payload.
+Do not advertise indefinite disk capacity or delete those dependencies to meet a floor.
 
 The central [disk policy](src/mesoforge/application/disk_admission.py) reports normal
-above 30 GiB, warning at 20–30 GiB, and refuses heavy Guidance below 20 GiB. Configure
-`MESOFORGE_GUIDANCE_MIN_FREE_GB` and `MESOFORGE_GUIDANCE_WARN_FREE_GB` centrally in
-the deployment environment (and invoking host environment if overriding its defaults).
-Warnings never trigger scientific deletion. The dry-run inventory explicitly protects
-current/previous complete Guidance and baselines, pinned cases, recorded in-flight
-work and unresolved retained references. Absence of an in-flight status is not proof
-that deletion is safe; deletion remains refused.
+above30 GiB, warning at20–30 GiB and refusal below20 GiB. The same defaults apply before
+acquisition, baseline writes, issuance persistence and backup creation. Configure
+`MESOFORGE_GUIDANCE_MIN_FREE_GB`/`MESOFORGE_GUIDANCE_WARN_FREE_GB` in the deployment and
+host environment when overriding. Guards never delete protected data. They measure the
+local filesystem, not capacity reserved on an external database/object service.
 
-The October 8 read-only capacity audit found 35.80 GiB free. A comparable daily cycle
-adds at least 2.73 GB (prepared/raw 2.274 GB, baseline 393 MB, issuance 60 MB), **plus**
-observations, verification and backups. Roughly six such cycles reach the 20 GiB floor.
-There is no bounded steady state yet. Docker reported 9.07 GB reclaimable build cache,
-but shared ownership was unproven; no global prune is authorized. Synthetic proof
-volumes, old images and recovery backups require explicit classification. Runner
-state, live scientific artifacts and history are never cleanup candidates here.
+The daily pipeline calls [backup.sh](deploy/hosted/backup.sh) after delivery attempts.
+It uses the existing `pg_dump -Fc`/`pg_restore --list`, checksummed object export and
+complete runtime archive; retains daily receipts and non-secret deployment metadata;
+and holds the shared worker lock across creation and validation. The
+preflight estimates the complete recovery copy without assuming compression savings;
+it refuses work if that copy would cross the central disk reserve. Interrupted copies
+stop only their own named client/export containers, never PostgreSQL or MinIO. The
+[`local_backup`](src/mesoforge/application/local_backup.py) validator rereads archive
+bytes, verifies every exported object and proves planned deletion bytes exist in the
+archive before publishing `local-backup-receipt.json`. Failed backup means no pruning.
+Secrets stay in deployment-level files and are never copied into recovery manifests.
 
-[backup.sh](deploy/hosted/backup.sh) (`sh deploy/hosted/backup.sh DEST`) dumps
-PostgreSQL (`pg_dump -Fc`, verified by `pg_restore --list`), then exports every
-referenced object with digest verification, then archives the complete runtime volume,
-including prepared guidance. `--with-guidance` remains an accepted compatibility
-option. The guidance worker is paused before the dump and restarted if previously
-running. Suspend external forecast triggers and operator writes for the entire
-maintenance window; an already-running forecast worker makes backup fail.
+Standalone `sh deploy/hosted/backup.sh DEST` still requires an operator maintenance
+window with external triggers suspended; it pauses/restores an existing Guidance loop
+and refuses a running Forecast worker. Private `.incomplete` sets never count as good
+backups. Restore never overwrites live state. The daily recovery root keeps the newest
+two validated sets and the current set; only unchanged sets created by this receipt
+contract can expire. Legacy backups, unknown additions and incomplete sets are retained
+for explicit inspection. This does not prune other backup directories.
 
-Backups use private permissions and a randomized `.incomplete` directory. Any failed
-component or failed guidance restart prevents a completion claim. Successful backups
-have checksums and are renamed only after all steps succeed. Full guidance retention
-can make a backup much larger than the old manifest-only default. The destination
-must be outside the repository.
-
-The same procedure includes delivery intent/result artifacts, verification, AI audit
-and Governance through database/object exports. It still includes full runtime/raw
-guidance because retained baselines require it. Do not omit those dependencies yet.
-Deployment-level AI/SMTP secrets are provisioned separately and must not be placed
-inside runtime or backup manifests. A same-host recovery copy is not an off-host backup.
-
-Unattended enablement requires a verified off-host copy. No destination is currently
-provisioned, and the latest same-host backup predates the five-day issuance. A minimal
-option is one private S3-compatible backup bucket/prefix (for example Backblaze B2),
-with a separate restricted backup-only key. The owner must provide endpoint, region,
-bucket/prefix, credentials outside Git, retention duration and approval for the initial
-multi-GB transfer. Create a fresh quiesced backup with the committed procedure; retain
-DB, objects, required runtime, daily receipts and non-secret deployment configuration.
-Keep secrets separately. Verify uploaded bytes by streaming them back against
-`SHA256SUMS`/object digests; a multipart ETag is not a SHA256 checksum. Do not omit raw
-dependencies until the reference-retirement prerequisite is actually implemented.
+Same-host recovery is the owner-approved v1 mechanism. It **does not protect against
+loss of the VPS**. Off-host backup is a future hardening recommendation, not a v1
+scheduling prerequisite; no paid storage service or off-host credentials are required.
+Manual Docker cleanup must classify exact MesoForge-only images/volumes first, retain
+current/rollback images and preserve runner data. No global cache/system prune is used.
 
 [restore.sh](deploy/hosted/restore.sh) requires stopped workers, an empty database,
 runtime volume and bucket, and the same database owner and bucket name as the backup.

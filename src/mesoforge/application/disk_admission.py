@@ -4,13 +4,28 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 GIB = 1024**3
 DEFAULT_MIN_FREE_BYTES = 20 * GIB
 DEFAULT_WARN_FREE_BYTES = 30 * GIB
+
+
+def require_runtime_capacity() -> None:
+    """Recheck the hosted filesystem immediately before immutable publication.
+
+    Lower-level in-memory/replay tools without a configured hosted root retain
+    their existing contract. This never deletes anything or measures remote S3.
+    """
+    configured = os.environ.get("MESOFORGE_PROSPECTIVE_ROOT")
+    if configured:
+        report = DiskPolicy.from_environment().report(shutil.disk_usage(Path(configured)).free)
+        if not report["heavy_work_admitted"]:
+            raise OSError("Runtime disk reserve reached before persistence")
 
 
 @dataclass(frozen=True)

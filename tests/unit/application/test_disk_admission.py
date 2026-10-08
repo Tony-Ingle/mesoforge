@@ -47,3 +47,34 @@ def test_inverted_reserves_and_unknown_disk_are_not_admitted() -> None:
         DiskPolicy(30 * GIB, 20 * GIB)
     with pytest.raises(ValueError, match="Free disk"):
         DiskPolicy().report(-1)
+
+
+def test_publication_guard_rechecks_current_capacity(monkeypatch, tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from mesoforge.application import disk_admission as disk
+
+    monkeypatch.setenv("MESOFORGE_PROSPECTIVE_ROOT", str(tmp_path))
+    monkeypatch.setenv("MESOFORGE_GUIDANCE_MIN_FREE_GB", "20")
+    monkeypatch.setattr(disk.shutil, "disk_usage", lambda _: SimpleNamespace(free=19 * GIB))
+    with pytest.raises(OSError, match="before persistence"):
+        disk.require_runtime_capacity()
+    monkeypatch.setattr(disk.shutil, "disk_usage", lambda _: SimpleNamespace(free=21 * GIB))
+    disk.require_runtime_capacity()
+    monkeypatch.delenv("MESOFORGE_PROSPECTIVE_ROOT")
+    monkeypatch.setattr(
+        disk.shutil, "disk_usage", lambda _: pytest.fail("Replay does not probe disk")
+    )
+    disk.require_runtime_capacity()
+
+
+def test_low_disk_never_writes_baseline_artifact(monkeypatch, tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from mesoforge.application import baseline_snapshot, disk_admission
+
+    monkeypatch.setenv("MESOFORGE_PROSPECTIVE_ROOT", str(tmp_path))
+    monkeypatch.setattr(disk_admission.shutil, "disk_usage", lambda _: SimpleNamespace(free=0))
+    with pytest.raises(OSError, match="disk reserve"):
+        baseline_snapshot.write_artifact(tmp_path, "never.json.gz", {"valid": True})
+    assert not (tmp_path / "never.json.gz").exists()

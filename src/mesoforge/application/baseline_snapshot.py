@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from mesoforge.application.baseline_codec import CompactCodec
+from mesoforge.application.disk_admission import require_runtime_capacity
 from mesoforge.application.local_surface_grid import extract_grid_point
 from mesoforge.application.prepared_snapshot import (
     SnapshotError,
@@ -63,6 +64,7 @@ def write_artifact(directory: Path, filename: str, value: Any) -> dict[str, Any]
     """Exclusive creation: completed or partially written files are never replaced."""
     raw = canonical_json_bytes(value)
     payload = gzip.compress(raw, compresslevel=6, mtime=0)
+    require_runtime_capacity()
     with (directory / filename).open("xb") as stream:
         stream.write(payload)
         stream.flush()
@@ -78,6 +80,7 @@ def write_artifact(directory: Path, filename: str, value: Any) -> dict[str, Any]
 
 def write_manifest(directory: Path, manifest: dict[str, Any]) -> tuple[Path, str]:
     payload = canonical_json_bytes(manifest)
+    require_runtime_capacity()
     path = directory / MANIFEST_FILE
     with path.open("xb") as stream:
         stream.write(payload)

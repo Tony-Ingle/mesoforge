@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import subprocess
 import sys
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -42,8 +44,8 @@ def configuration(tmp_path: Path) -> dict[str, Any]:
         "env_file": str(tmp_path / "deployment.env"),
         "compose_files": [str(tmp_path / "compose.yaml")],
         "state_root": str(tmp_path / "daily-state"),
+        "backup_root": str(tmp_path / "backups"),
         "runtime_root": "/var/lib/mesoforge/runtime/minneapolis-v1",
-        "recipients": ["customer@example.test"],
         "approved_template": "mesoforge-120-hour-presentation.v1",
     }
     path = tmp_path / "daily.json"
@@ -62,6 +64,16 @@ class FakeCycle(daily.DailyCycle):
 
     def no_heavy_worker(self) -> None:
         self.heavy_checks += 1
+
+    def preflight(self) -> dict[str, Any]:
+        return {"status": "ready", "backup_kind": "same_host_recovery_copy"}
+
+    def backup(self) -> dict[str, Any]:
+        return self.command("backup", "backup", "offline.backup", [])
+
+    def retention(self, backup: dict[str, Any]) -> dict[str, Any]:
+        assert backup["status"] == "verified"
+        return self.command("retention", "admin", "offline.retention", [])
 
     def baseline(self) -> dict[str, Any]:
         morning = self.slot.replace(hour=self.slot.hour - 1, minute=0)
@@ -119,6 +131,10 @@ class FakeCycle(daily.DailyCycle):
             assert args[args.index("--not-before") + 1] == daily.iso(self.delivery)
             self.test_clock.value = max(self.test_clock(), self.delivery)
             return {"status": "accepted", "delivery_id": "existing-authoritative-delivery"}
+        if phase == "backup":
+            return {"status": "verified", "backup_id": "verified-offline-backup"}
+        if phase == "retention":
+            return {"status": "completed", "deleted": []}
         raise AssertionError(f"Unexpected boundary: {phase}")
 
 
@@ -126,6 +142,14 @@ class FakeCycle(daily.DailyCycle):
 def isolated_disk_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MESOFORGE_GUIDANCE_MIN_FREE_GB", raising=False)
     monkeypatch.delenv("MESOFORGE_GUIDANCE_WARN_FREE_GB", raising=False)
+    registry = daily.load_locations(ROOT / "configs/locations.json")
+    locations = [
+        {**row, "email_recipients": ["customer@example.test"]}
+        if row.get("id") == "minneapolis"
+        else row
+        for row in registry
+    ]
+    monkeypatch.setattr(daily, "load_locations", lambda _: locations)
 
 
 @pytest.mark.parametrize(
@@ -154,6 +178,8 @@ def test_one_serial_cycle_per_chicago_day_across_cst_cdt(
         "forecast",
         "pdf",
         "email-0",
+        "backup",
+        "retention",
     ]
     assert cycle.heavy_checks == len(cycle.calls)
     forecast_args = next(call[3] for call in cycle.calls if call[0] == "forecast")
@@ -161,7 +187,7 @@ def test_one_serial_cycle_per_chicago_day_across_cst_cdt(
         forecast_args[forecast_args.index("--expected-baseline-id") + 1]
         == "baseline-for-this-local-day"
     )
-    assert "--scheduled" in forecast_args and "--reference-time" not in forecast_args
+    assert "--scheduled" not in forecast_args and "--reference-time" not in forecast_args
     guidance_args = cycle.calls[0][3]
     assert guidance_args[0] == "once" and "--no-hourly-probe" not in guidance_args
     assert "--forecast-horizon-hours" in guidance_args and "120" in guidance_args
@@ -196,6 +222,7 @@ def test_same_minneapolis_only_selection_reaches_every_role(tmp_path: Path) -> N
                 "lat": 44.98861,
                 "lon": -93.25553,
                 "display_timezone": "America/Chicago",
+                "email_recipients": ["customer@example.test"],
             }
         ]
     }
@@ -328,11 +355,13 @@ def test_low_disk_refuses_without_provider_cleanup_or_forecast(tmp_path: Path) -
     assert cycle.record["disk_after"]["heavy_work_admitted"] is False
 
 
-def test_late_start_does_not_backdate_or_run_any_worker(tmp_path: Path) -> None:
+def test_late_start_issues_with_actual_current_reference_and_no_fixed_slot(tmp_path: Path) -> None:
     cycle = FakeCycle(configuration(tmp_path), Clock(datetime(2026, 7, 15, 13, tzinfo=UTC)))
-    with pytest.raises(daily.DailyError, match="forecast_window_closed"):
-        cycle.execute()
-    assert cycle.calls == []
+    assert cycle.execute()["status"] == "completed"
+    args = next(call[3] for call in cycle.calls if call[0] == "forecast")
+    assert "--scheduled" not in args and "--reference-time" not in args
+    assert cycle.record["phases"]["forecast"]["started_at"] == "2026-07-15T14:00:00Z"
+    assert cycle.record["analysis_window"]["waited_seconds"] == 600
 
 
 def test_delivery_retry_reuses_saved_forecast_and_duplicate_suppression(tmp_path: Path) -> None:
@@ -345,7 +374,7 @@ def test_delivery_retry_reuses_saved_forecast_and_duplicate_suppression(tmp_path
             raise daily.DailyError("email-0_exit_1; immutable_issuance_remains_valid")
 
     cycle.hook = fail_email
-    with pytest.raises(daily.DailyError, match="email-0_exit_1"):
+    with pytest.raises(daily.DailyError, match="delivery_failed"):
         cycle.execute()
     assert cycle.record["phases"]["forecast"]["status"] == "completed"
     assert cycle.record["phases"]["pdf"]["status"] == "completed"
@@ -357,7 +386,8 @@ def test_delivery_retry_reuses_saved_forecast_and_duplicate_suppression(tmp_path
         else None
     )
     assert retry.execute()["status"] == "completed"
-    assert [call[0] for call in retry.calls] == ["email-0"]
+    assert [call[0] for call in retry.calls] == ["email-0", "backup", "retention"]
+    assert retry.record["maintenance"]["fingerprint"] != cycle.record["maintenance"]["fingerprint"]
 
 
 def test_interrupted_forecast_requires_inspection_not_another_ai_job(tmp_path: Path) -> None:
@@ -521,3 +551,671 @@ def test_configuration_refuses_runner_state_and_runtime_path_escape(
     path.write_text(json.dumps(config), encoding="utf-8")
     with pytest.raises(daily.DailyError):
         daily.load_config(path)
+
+
+def set_recipients(monkeypatch: pytest.MonkeyPatch, values: list[str]) -> None:
+    locations = daily.load_locations(ROOT / "configs/locations.json")
+    monkeypatch.setattr(
+        daily,
+        "load_locations",
+        lambda _: [
+            {**row, "email_recipients": values} if row["id"] == "minneapolis" else row
+            for row in locations
+        ],
+    )
+
+
+def test_empty_recipients_still_issue_and_back_up_without_email(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    set_recipients(monkeypatch, [])
+    cycle = FakeCycle(configuration(tmp_path), Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC)))
+    result = cycle.execute()
+    assert result["status"] == "completed"
+    assert result["delivery"] == {"status": "no_recipients", "recipient_count": 0, "errors": {}}
+    assert "forecast" in [row[0] for row in cycle.calls]
+    assert not any(row[0].startswith("email-") for row in cycle.calls)
+    assert [row[0] for row in cycle.calls][-2:] == ["backup", "retention"]
+
+
+def test_recipient_failure_isolated_and_valid_issuance_backed_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    set_recipients(monkeypatch, ["first@example.test", "second@example.test", "first@example.test"])
+    cycle = FakeCycle(configuration(tmp_path), Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC)))
+
+    def fail_first(phase: str) -> None:
+        if phase == "email-0":
+            raise daily.DailyError("smtp_rejected")
+
+    cycle.hook = fail_first
+    with pytest.raises(daily.DailyError, match="delivery_failed"):
+        cycle.execute()
+    assert [row[0] for row in cycle.calls][-4:] == ["email-0", "email-1", "backup", "retention"]
+    assert cycle.record["phases"]["email-1"]["result"]["status"] == "accepted"
+    assert cycle.record["delivery"]["errors"] == {"first@example.test": "smtp_rejected"}
+    assert cycle.record["maintenance"]["backup"]["status"] == "verified"
+    assert cycle.record["phases"]["forecast"]["status"] == "completed"
+
+
+def test_unchanged_delivery_failure_reuses_verified_backup(tmp_path: Path) -> None:
+    config = configuration(tmp_path)
+    clock = Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC))
+    cycle = FakeCycle(config, clock)
+    cycle.hook = lambda phase: (
+        {"status": "duplicate_suppressed", "previous_outcome": {"status": "ambiguous"}}
+        if phase == "email-0"
+        else None
+    )
+    with pytest.raises(daily.DailyError, match="delivery_failed"):
+        cycle.execute()
+    first_fingerprint = cycle.record["maintenance"]["fingerprint"]
+    retry = FakeCycle(config, clock)
+    retry.hook = cycle.hook
+    with pytest.raises(daily.DailyError, match="delivery_failed"):
+        retry.execute()
+    assert retry.record["maintenance"]["fingerprint"] == first_fingerprint
+    assert [row[0] for row in retry.calls] == ["email-0"]
+
+
+@pytest.mark.parametrize("failure", ["exception", "unverified"])
+def test_backup_failure_preserves_forecast_and_blocks_retention(
+    tmp_path: Path, failure: str
+) -> None:
+    cycle = FakeCycle(configuration(tmp_path), Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC)))
+
+    def fail_backup(phase: str) -> dict[str, Any] | None:
+        if phase == "backup":
+            if failure == "exception":
+                raise daily.DailyError("backup_failed")
+            return {"status": "incomplete"}
+        return None
+
+    cycle.hook = fail_backup
+    with pytest.raises(daily.DailyError, match="backup"):
+        cycle.execute()
+    assert cycle.record["phases"]["forecast"]["status"] == "completed"
+    assert cycle.record["phases"]["email-0"]["result"]["status"] == "accepted"
+    assert "retention" not in [row[0] for row in cycle.calls]
+
+
+def test_missing_backup_storage_fails_before_guidance_or_ai(tmp_path: Path) -> None:
+    cycle = FakeCycle(configuration(tmp_path), Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC)))
+
+    def fail_preflight() -> dict[str, Any]:
+        raise daily.DailyError("backup_storage_unavailable")
+
+    cycle.preflight = fail_preflight
+    with pytest.raises(daily.DailyError, match="backup_storage_unavailable"):
+        cycle.execute()
+    assert cycle.calls == []
+
+
+def test_recipient_changes_require_review_of_same_day_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = configuration(tmp_path)
+    clock = Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC))
+    first = FakeCycle(config, clock)
+    first.execute()
+    original = first.receipt.read_bytes()
+    set_recipients(monkeypatch, ["new-recipient@example.test"])
+    retry = FakeCycle(config, clock)
+    with pytest.raises(daily.DailyError, match="daily_configuration_changed"):
+        retry.execute()
+    assert retry.calls == []
+    assert retry.receipt.read_bytes() == original
+
+
+@pytest.mark.parametrize("key", ["state_root", "backup_root"])
+def test_private_roots_cannot_target_runner_workspaces(tmp_path: Path, key: str) -> None:
+    config = configuration(tmp_path)
+    config[key] = str(tmp_path / "actions-runner-mesoforge" / "state")
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps(config), "utf-8")
+    with pytest.raises(daily.DailyError, match="runner_workspaces"):
+        daily.load_config(path)
+
+
+def test_global_recipient_fallback_is_rejected(tmp_path: Path) -> None:
+    config = configuration(tmp_path)
+    config["recipients"] = ["global@example.test"]
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps(config), "utf-8")
+    with pytest.raises(daily.DailyError, match="global_recipients_not_supported"):
+        daily.load_config(path)
+
+
+def test_execution_does_not_roll_an_in_progress_job_into_another_local_day(tmp_path: Path) -> None:
+    clock = Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC))
+    cycle = FakeCycle(configuration(tmp_path), clock)
+    clock.value += timedelta(days=1)
+    with pytest.raises(daily.DailyError, match="local_day_changed"):
+        cycle.execute()
+    assert cycle.calls == []
+
+
+@pytest.mark.parametrize(
+    "counts", [None, [], {"unknown": 4}, {"hrrr": 0}, {"gfs": -1}, {"ifs": True}, {"rap": 1.5}]
+)
+def test_bad_retention_configuration_fails_before_work(tmp_path: Path, counts: object) -> None:
+    config = configuration(tmp_path)
+    config["retention_cycles"] = counts
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps(config), "utf-8")
+    with pytest.raises(daily.DailyError, match="retention_cycles_requires"):
+        daily.load_config(path)
+
+
+def test_actual_backup_preflight_uses_local_storage_reserve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = configuration(tmp_path)
+    cycle = daily.DailyCycle(
+        config,
+        clock=Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC)),
+        disk_free=lambda _: 40 * 1024**3,
+    )
+    calls: list[tuple[str, str, str, list[str]]] = []
+
+    def estimate(phase: str, role: str, module: str, args: list[str]) -> dict[str, Any]:
+        calls.append((phase, role, module, args))
+        return {"status": "estimated", "backup_bytes": 5 * 1024**3}
+
+    monkeypatch.setattr(cycle, "command", estimate)
+    assert not Path(config["backup_root"]).exists()
+    result = cycle.preflight()
+    assert result["recovery"] == "same_host" and result["off_host"] is False
+    assert result["estimate"]["backup_bytes"] == 5 * 1024**3
+    assert calls == [
+        (
+            "backup-estimate",
+            "guidance-worker",
+            "mesoforge.application.local_backup",
+            ["estimate", "--runtime-root", "/var/lib/mesoforge/runtime"],
+        )
+    ]
+    assert Path(config["backup_root"]).is_dir()
+    cycle.disk_free = lambda _: 19 * 1024**3
+    with pytest.raises(daily.DailyError, match="backup_disk_reserve"):
+        cycle.preflight()
+
+
+def test_actual_backup_preflight_refuses_links(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = configuration(tmp_path)
+    root = Path(config["backup_root"])
+    monkeypatch.setattr(Path, "is_symlink", lambda path: path == root)
+    cycle = daily.DailyCycle(
+        config,
+        clock=Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC)),
+        disk_free=lambda _: 40 * 1024**3,
+    )
+    with pytest.raises(daily.DailyError, match="must_not_follow_links"):
+        cycle.preflight()
+    assert not root.exists()
+
+
+def test_actual_retention_passes_verified_receipt_and_cycle_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = configuration(tmp_path)
+    config["retention_cycles"] = {"hrrr": 5, "ecmwf-ens": 2}
+    cycle = daily.DailyCycle(config, clock=Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC)))
+    cycle.prepare()
+    source = Path(config["backup_root"]) / "complete-recovery-set"
+    source.mkdir(parents=True)
+    receipt = {"status": "verified", "host_directory": str(source), "manifest_sha256": "a" * 64}
+    calls: list[tuple[str, str, str, list[str]]] = []
+
+    def command(phase: str, role: str, module: str, args: list[str]) -> dict[str, Any]:
+        calls.append((phase, role, module, args))
+        return {"status": "complete", "deleted_bytes": 0}
+
+    monkeypatch.setattr(cycle, "command", command)
+    assert cycle.retention(receipt)["status"] == "complete"
+    assert len(calls) == 2
+    phase, role, module, args = calls[0]
+    assert (phase, role, module) == (
+        "retention-apply",
+        "guidance-worker",
+        "mesoforge.application.guidance_retention",
+    )
+    assert args == [
+        "--runtime-root",
+        cycle.runtime,
+        "--apply",
+        "--backup-receipt",
+        "/run/mesoforge/backup-receipt.json",
+        "--keep-ecmwf-ens",
+        "2",
+        "--keep-hrrr",
+        "5",
+    ]
+    retained = json.loads((cycle.directory / "verified-backup.json").read_bytes())
+    assert retained == receipt
+    override = json.loads((cycle.directory / "retention.override.json").read_bytes())
+    assert override["services"]["guidance-worker"]["volumes"] == [
+        f"{cycle.directory / 'verified-backup.json'}:/run/mesoforge/backup-receipt.json:ro"
+    ]
+    assert cycle.compose[-2:] == ["-f", str(cycle.directory / "retention.override.json")]
+    assert calls[1] == (
+        "backup-prune",
+        "admin",
+        "mesoforge.application.local_backup",
+        [
+            "prune",
+            "--root",
+            "/recovery",
+            "--keep",
+            "2",
+            "--current-backup",
+            f"/recovery/{source.name}",
+            "--apply",
+        ],
+    )
+
+
+def test_actual_retention_rejects_backup_outside_private_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cycle = daily.DailyCycle(
+        configuration(tmp_path), clock=Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC))
+    )
+    monkeypatch.setattr(cycle, "command", lambda *_: pytest.fail("must not start cleanup"))
+    with pytest.raises(daily.DailyError, match="backup_path_outside_configured_root"):
+        cycle.retention({"status": "verified", "host_directory": str(tmp_path / "other")})
+
+
+def test_backup_validator_uses_host_identity_but_runtime_archive_keeps_worker_identity(
+    tmp_path: Path,
+) -> None:
+    cycle = daily.DailyCycle(
+        configuration(tmp_path), clock=Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC))
+    )
+    cycle.prepare()
+    override = json.loads(cycle.override.read_bytes())
+    admin = override["services"]["admin"]
+    import os
+
+    assert admin["user"] == (
+        f"{getattr(os, 'getuid', lambda: 1000)()}:{getattr(os, 'getgid', lambda: 1000)()}"
+    )
+    assert admin["volumes"] == [f"{cycle.config['backup_root']}:/recovery"]
+    shell = (ROOT / "deploy/hosted/backup.sh").read_text("utf-8")
+    assert "--user 10001:10001 --entrypoint tar admin" in shell
+
+
+def test_actual_backup_creation_validation_and_resume_without_recopy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = configuration(tmp_path)
+    cycle = daily.DailyCycle(
+        config,
+        clock=Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC)),
+        disk_free=lambda _: 40 * 1024**3,
+    )
+    cycle.prepare()
+    cycle.record = {"maintenance": {"fingerprint": "a" * 64}, "phases": {}}
+    cycle.save()
+    commands: list[str] = []
+    subprocesses: list[list[str]] = []
+    held = False
+    validation_fails = True
+    source = Path(config["backup_root"]) / "mesoforge-fixed-complete"
+
+    @contextmanager
+    def lock():
+        nonlocal held
+        assert not held
+        held = True
+        try:
+            yield
+        finally:
+            held = False
+
+    def command(phase: str, role: str, module: str, args: list[str]) -> dict[str, Any]:
+        commands.append(phase)
+        if phase == "backup-estimate":
+            assert not held and role == "guidance-worker"
+            return {"status": "estimated", "backup_bytes": 1024}
+        if phase == "retention-dry-run":
+            assert not held
+            assert "--dry-run" in args and "--apply" not in args
+            return {"plan_sha256": "b" * 64}
+        assert phase == "backup-validation" and role == "admin"
+        assert held  # Validation finishes before allowing workers to mutate state.
+        assert args == ["validate", "--source", f"/recovery/{source.name}"]
+        if validation_fails:
+            raise daily.DailyError("validation_temporarily_failed")
+        return {"status": "verified", "backup_id": "verified-test-recovery"}
+
+    class CompletedProcess:
+        returncode = 0
+
+        def poll(self) -> int:
+            return 0
+
+    def create(args: list[str], **kwargs: Any) -> CompletedProcess:
+        assert held
+        assert args == ["/bin/sh", str(ROOT / "deploy/hosted/backup.sh"), config["backup_root"]]
+        subprocesses.append(args)
+        env = kwargs["env"]
+        assert env["COMPOSE_PROJECT_NAME"] == config["project"]
+        assert env["COMPOSE_ENV_FILES"] == config["env_file"]
+        assert json.loads(Path(env["MESOFORGE_BACKUP_RETENTION_PLAN"]).read_bytes()) == {
+            "plan_sha256": "b" * 64
+        }
+        assert Path(env["MESOFORGE_BACKUP_DAILY_RECEIPTS"]).is_file()
+        source.mkdir()
+        kwargs["stdout"].write(f"Backup complete: {source}\n")
+        return CompletedProcess()
+
+    monkeypatch.setattr(cycle, "backup_lock", lock)
+    monkeypatch.setattr(cycle, "command", command)
+    monkeypatch.setattr(cycle, "no_heavy_worker", lambda: None)
+    monkeypatch.setattr(daily.subprocess, "Popen", create)
+    with pytest.raises(daily.DailyError, match="validation_temporarily_failed"):
+        cycle.backup()
+    assert not held
+    validation_fails = False
+    result = cycle.backup()
+    assert result["status"] == "verified" and Path(result["host_directory"]) == source
+    assert len(subprocesses) == 1  # Retry rereads the completed immutable recovery set.
+    assert commands == ["backup-estimate", "retention-dry-run", "backup-validation"] * 2
+    assert not held
+
+
+def test_backup_lock_failure_never_enters_work_and_closes_owned_pipes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cycle = daily.DailyCycle(
+        configuration(tmp_path), clock=Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC))
+    )
+    cycle.prepare()
+    calls: list[list[str]] = []
+
+    class Holder:
+        stdin = io.StringIO()
+        stdout = io.StringIO('{"status":"busy"}\n')
+        waits: list[int] = []
+
+        def wait(self, *, timeout: int) -> int:
+            self.waits.append(timeout)
+            return 3
+
+    holder = Holder()
+
+    def create(args: list[str], **kwargs: Any) -> Holder:
+        calls.append(args)
+        return holder
+
+    monkeypatch.setattr(daily.subprocess, "Popen", create)
+    monkeypatch.setattr(daily.select, "select", lambda streams, *_: (streams, [], []))
+    with pytest.raises(daily.DailyError, match="backup_runtime_lock_unavailable"):
+        with cycle.backup_lock():
+            pytest.fail("Busy lock must prevent backup work")
+    assert holder.stdin.closed and holder.stdout.closed
+    assert holder.waits == [30]
+    assert len(calls) == 1
+    assert calls[0][-6:] == [
+        "-T",
+        "admin",
+        "mesoforge.application.local_backup",
+        "hold-lock",
+        "--runtime-root",
+        cycle.runtime,
+    ]
+
+
+def test_backup_lock_timeout_stops_only_its_owned_holder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cycle = daily.DailyCycle(
+        configuration(tmp_path), clock=Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC))
+    )
+    cycle.prepare()
+    launches: list[list[str]] = []
+    stops: list[list[str]] = []
+
+    class Holder:
+        stdin = io.StringIO()
+        stdout = io.StringIO()
+        waits = 0
+
+        def wait(self, *, timeout: int) -> int:
+            self.waits += 1
+            if self.waits == 1:
+                raise subprocess.TimeoutExpired("owned lock holder", timeout)
+            return 0
+
+    holder = Holder()
+
+    def create(args: list[str], **kwargs: Any) -> Holder:
+        launches.append(args)
+        return holder
+
+    def stop(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        stops.append(args)
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(daily.subprocess, "Popen", create)
+    monkeypatch.setattr(daily.subprocess, "run", stop)
+    monkeypatch.setattr(daily.select, "select", lambda *_: ([], [], []))
+    with pytest.raises(daily.DailyError, match="backup_runtime_lock_unavailable"):
+        with cycle.backup_lock():
+            pytest.fail("Timed out lock must prevent backup work")
+    name = launches[0][launches[0].index("--name") + 1]
+    assert stops == [[daily.DOCKER, "stop", "--time", "10", name]]
+    assert holder.stdin.closed and holder.stdout.closed and holder.waits == 2
+
+
+@pytest.mark.parametrize(
+    ("start", "ready", "waited"),
+    [
+        ("2026-07-15T12:15:00.125+00:00", "2026-07-15T12:15:00.125000Z", 0),
+        ("2026-07-15T12:20:00+00:00", "2026-07-15T12:20:00Z", 0),
+        ("2026-07-15T12:35:00+00:00", "2026-07-15T13:00:00Z", 1500),
+    ],
+)
+def test_analysis_headroom_is_bounded_operator_timing_not_reference_override(
+    tmp_path: Path, start: str, ready: str, waited: int
+) -> None:
+    clock = Clock(datetime.fromisoformat(start))
+    cycle = FakeCycle(configuration(tmp_path), clock)
+    result = cycle.wait_for_analysis_window()
+    assert result["ready_at"] == ready
+    assert result["waited_seconds"] == waited
+    assert result["remaining_seconds"] >= 40 * 60
+    assert len(clock.sleeps) <= 121
+    assert cycle.calls == []
+
+
+def test_analysis_headroom_rechecks_readiness_after_wait(tmp_path: Path) -> None:
+    clock = Clock(datetime(2026, 7, 15, 13, tzinfo=UTC))
+    cycle = FakeCycle(configuration(tmp_path), clock)
+
+    def expired(phase: str) -> dict[str, Any] | None:
+        if phase == "readiness":
+            assert clock() == datetime(2026, 7, 15, 14, tzinfo=UTC)
+            return {"ready": False, "reason": "coverage_expired"}
+        return None
+
+    cycle.hook = expired
+    with pytest.raises(daily.DailyError, match="fresh_120h_baseline_not_ready"):
+        cycle.execute()
+    assert "forecast" not in [call[0] for call in cycle.calls]
+
+
+def test_slow_readiness_cannot_consume_headroom_then_start_paid_forecast(tmp_path: Path) -> None:
+    config = configuration(tmp_path)
+    clock = Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC))
+    cycle = FakeCycle(config, clock)
+
+    def slow_readiness(phase: str) -> dict[str, Any] | None:
+        if phase == "readiness":
+            clock.value += timedelta(minutes=30)
+            return {"ready": True, "baseline": cycle.baseline()}
+        return None
+
+    cycle.hook = slow_readiness
+    with pytest.raises(daily.DailyError, match="forecast_headroom_consumed_before_launch"):
+        cycle.execute()
+    assert "forecast" not in [call[0] for call in cycle.calls]
+    assert cycle.record["phases"]["forecast"]["status"] == "failed"
+    retry = FakeCycle(config, clock)
+    with pytest.raises(daily.DailyError, match="forecast_outcome_requires_operator_inspection"):
+        retry.execute()
+    assert "forecast" not in [call[0] for call in retry.calls]
+
+
+def test_analysis_headroom_stalled_clock_never_waits_indefinitely(tmp_path: Path) -> None:
+    clock = Clock(datetime(2026, 7, 15, 12, 35, tzinfo=UTC))
+    cycle = FakeCycle(configuration(tmp_path), clock)
+    sleeps: list[float] = []
+    cycle.sleep = sleeps.append
+    with pytest.raises(daily.DailyError, match="analysis_window_wait_clock_failed"):
+        cycle.wait_for_analysis_window()
+    assert len(sleeps) == 121
+    assert cycle.calls == []
+
+
+@pytest.mark.parametrize("minutes", [0, 60, True, "40", 1.5, None])
+def test_analysis_headroom_configuration_is_explicit_and_bounded(
+    tmp_path: Path, minutes: object
+) -> None:
+    config = configuration(tmp_path)
+    config["forecast_min_remaining_minutes"] = minutes
+    path = tmp_path / "invalid.json"
+    path.write_text(json.dumps(config), "utf-8")
+    with pytest.raises(daily.DailyError, match="forecast_min_remaining_minutes"):
+        daily.load_config(path)
+
+
+def test_projected_backup_overflow_stops_cycle_before_guidance_or_paid_forecast(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cycle = daily.DailyCycle(
+        configuration(tmp_path),
+        clock=Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC)),
+        disk_free=lambda _: 40 * 1024**3,
+    )
+    calls: list[str] = []
+
+    def command(phase: str, role: str, module: str, args: list[str]) -> dict[str, Any]:
+        calls.append(phase)
+        assert phase == "backup-estimate"
+        return {"status": "estimated", "backup_bytes": 21 * 1024**3}
+
+    monkeypatch.setattr(cycle, "command", command)
+    with pytest.raises(daily.DailyError, match="backup_would_cross_disk_reserve"):
+        cycle.execute()
+    assert calls == ["backup-estimate"]
+    assert cycle.record["phases"] == {}
+    assert cycle.record["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    "estimate",
+    [
+        {"status": "unavailable"},
+        {"status": "estimated", "backup_bytes": None},
+        {"status": "estimated", "backup_bytes": -1},
+        {"status": "estimated", "backup_bytes": True},
+        {"status": "estimated", "backup_bytes": 1.5},
+    ],
+)
+def test_unproven_backup_size_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, estimate: dict[str, Any]
+) -> None:
+    cycle = daily.DailyCycle(
+        configuration(tmp_path),
+        clock=Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC)),
+        disk_free=lambda _: 40 * 1024**3,
+    )
+    monkeypatch.setattr(cycle, "command", lambda *_: estimate)
+    with pytest.raises(daily.DailyError, match="backup_size_unproven"):
+        cycle.preflight()
+
+
+def test_heavy_role_admission_is_host_wide_without_touching_any_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commands: list[list[str]] = []
+
+    def docker(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        commands.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="another-project-worker\n", stderr="")
+
+    monkeypatch.setattr(daily.subprocess, "run", docker)
+    cycle = daily.DailyCycle(
+        configuration(tmp_path), clock=Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC))
+    )
+    with pytest.raises(daily.DailyError, match="existing_guidance-worker_running"):
+        cycle.no_heavy_worker()
+    assert len(commands) == 1
+    assert commands[0] == [
+        daily.DOCKER,
+        "ps",
+        "-q",
+        "--filter",
+        "label=com.docker.compose.service=guidance-worker",
+    ]
+
+
+def test_backup_stops_owned_copy_when_reserve_is_consumed_mid_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cycle = daily.DailyCycle(
+        configuration(tmp_path),
+        clock=Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC)),
+        disk_free=lambda _: 40 * 1024**3,
+    )
+    cycle.prepare()
+    cycle.record = {"maintenance": {"fingerprint": "a" * 64}, "phases": {}}
+    held = False
+    terminated = False
+
+    @contextmanager
+    def lock():
+        nonlocal held
+        held = True
+        try:
+            yield
+        finally:
+            held = False
+
+    def command(phase: str, role: str, module: str, args: list[str]) -> dict[str, Any]:
+        assert phase in {"backup-estimate", "retention-dry-run"}
+        if phase == "backup-estimate":
+            return {"status": "estimated", "backup_bytes": 1024}
+        return {"plan_sha256": "b" * 64}
+
+    class Copy:
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            nonlocal terminated
+            terminated = True
+
+        def wait(self, *, timeout: int) -> int:
+            assert timeout == 120 and terminated
+            return 1
+
+    def create(args: list[str], **kwargs: Any) -> Copy:
+        assert held
+        cycle.disk_free = lambda _: 19 * 1024**3
+        return Copy()
+
+    monkeypatch.setattr(cycle, "backup_lock", lock)
+    monkeypatch.setattr(cycle, "command", command)
+    monkeypatch.setattr(cycle, "no_heavy_worker", lambda: None)
+    monkeypatch.setattr(cycle, "sample_resources", lambda: None)
+    monkeypatch.setattr(daily.subprocess, "Popen", create)
+    with pytest.raises(
+        daily.DailyError, match="backup_disk_reserve_reached; inspect_incomplete_set"
+    ):
+        cycle.backup()
+    assert terminated and not held

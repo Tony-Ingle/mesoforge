@@ -1,9 +1,12 @@
-"""Retention protects scientific lineage before preferring any cycle-count window."""
+"""Native cache expiration is separate from immutable forecast/evidence retention."""
 
 from __future__ import annotations
 
+import hashlib
 import json
+import tarfile
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +16,9 @@ from mesoforge.application import guidance_retention as retention
 from mesoforge.application.baseline_snapshot import BASELINE_SCHEMA, write_artifact
 from mesoforge.application.prepared_snapshot import SNAPSHOT_SCHEMA
 
+COUNTS = retention.CycleCounts(1, 1, 1, 1, 1, 1, 1)
+NOW = datetime(2026, 10, 8, tzinfo=UTC)
+
 
 def _write(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -20,11 +26,11 @@ def _write(path: Path, value: Any) -> None:
 
 
 @pytest.fixture
-def runtime(tmp_path: Path) -> Path:
+def runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.delenv("MESOFORGE_WORKER_LOCK_ROOT", raising=False)
     root = tmp_path / "runtime"
     (root / "guidance/snapshots").mkdir(parents=True)
     (root / "baseline/baselines").mkdir(parents=True)
-
     return root
 
 
@@ -32,13 +38,17 @@ def _generation(root: Path, hour: int, *, failed: bool = False) -> Path:
     directory = root / "guidance/snapshots" / f"20261007T{hour:02d}0000Z-12345678"
     directory.mkdir()
     (directory / "source.grib2").write_bytes(b"raw meteorology")
+    (directory / "prepared.nc").write_bytes(b"prepared meteorology")
     if failed:
         _write(directory / "failure.json", {"status": "failed"})
         _write(directory / "result.json", {"status": "failed"})
         return directory
     cycle = f"2026-10-07T{hour:02d}:00:00Z"
-    contributors = {model: {"cycle": cycle} for model in ("HRRR", "GFS", "RAP", "IFS")}
-    contributors["NBM"] = {"products": {"cloud": {"cycle": cycle}}}
+    contributors = {
+        model: {"cycle": cycle, "status": "complete", "valid_times": [cycle]}
+        for model in ("HRRR", "GFS", "RAP", "IFS")
+    }
+    contributors["NBM"] = {"products": {"cloud": {"cycle": cycle, "status": "complete"}}}
     _write(
         directory / "snapshot.json",
         {
@@ -57,7 +67,13 @@ def _baseline(root: Path, prepared: Path, identity: str, *refs: Path) -> None:
     metadata = write_artifact(
         directory,
         "metadata.json.gz",
-        {"source_documents": [{"path": str(path)} for path in refs], "metadata": []},
+        {
+            "source_documents": [
+                {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                for path in refs
+            ],
+            "metadata": [],
+        },
     )
     _write(
         directory / "baseline.json",
@@ -74,205 +90,358 @@ def _rows(plan: dict[str, Any]) -> dict[str, Any]:
     return {row["snapshot_id"]: row for row in plan["generations"]}
 
 
-def test_cycle_windows_current_previous_and_all_retained_baselines(runtime: Path) -> None:
-    generations = [_generation(runtime, hour) for hour in range(6)]
+def _receipt(root: Path, plan: dict[str, Any]) -> Path:
+    path = root.parent / "verified-backup-receipt.json"
+    _write(
+        path,
+        {
+            "schema_version": retention.BACKUP_RECEIPT_SCHEMA,
+            "status": "verified",
+            "runtime_root": str(root),
+            "backup_id": "test-recovery-copy",
+            "manifest_sha256": "a" * 64,
+            "retention_plan_sha256": plan["plan_sha256"],
+            "verified_at": NOW.isoformat(),
+        },
+    )
+    return path
+
+
+def test_cycle_windows_and_current_recovery_protection(runtime: Path) -> None:
+    generations = [_generation(runtime, hour) for hour in range(7)]
     _write(
         runtime / "guidance/latest_complete.json",
-        {"snapshot_id": generations[-1].name, "previous_snapshot_id": generations[-2].name},
+        {
+            "snapshot_id": generations[-1].name,
+            "previous_snapshot_id": generations[-2].name,
+        },
     )
     for index in range(3):
-        _baseline(runtime, generations[index], f"baseline-{index}")
+        _baseline(
+            runtime, generations[index], f"baseline-{index}", generations[index] / "snapshot.json"
+        )
     _write(
         runtime / "baseline/latest_baseline.json",
-        {"baseline_snapshot_id": "baseline-2", "previous_baseline_snapshot_id": "baseline-1"},
+        {
+            "baseline_snapshot_id": "baseline-2",
+            "previous_baseline_snapshot_id": "baseline-1",
+        },
     )
     report = retention.plan_retention(runtime)
     rows = _rows(report)
-    assert report["cycle_counts"] == {"HRRR": 4, "RAP": 4, "GFS": 3, "IFS": 3, "NBM": 4}
+    assert report["cycle_counts"] == {
+        "HRRR": 4,
+        "RAP": 4,
+        "GFS": 3,
+        "IFS": 3,
+        "NBM": 4,
+        "GEFS": 3,
+        "ECMWF_ENS": 3,
+    }
     assert sum("recent_HRRR_cycle_window" in row["reasons"] for row in rows.values()) == 4
     assert sum("recent_GFS_cycle_window" in row["reasons"] for row in rows.values()) == 3
-    assert "latest_prepared" in rows[generations[-1].name]["reasons"]
-    assert "previous_prepared_recovery" in rows[generations[-2].name]["reasons"]
+    assert "CURRENT" in rows[generations[-1].name]["labels"]
+    assert "RECOVERY" in rows[generations[-2].name]["labels"]
     assert "latest_baseline_dependency" in rows[generations[2].name]["reasons"]
     assert "previous_baseline_recovery_dependency" in rows[generations[1].name]["reasons"]
-    assert "retained_baseline_dependency" in rows[generations[0].name]["reasons"]
-    assert report["removable_bytes"] == 0
+    # Old baseline references require JSON, not perpetually retained native arrays.
+    assert rows[generations[0].name]["action"] == "expire_payloads"
+    assert report["removable_bytes"] == 35
     assert report["bounded_complete_history"] is False
-    baselines = {row["baseline_snapshot_id"]: row for row in report["baselines"]}
-    assert "latest_baseline" in baselines["baseline-2"]["reasons"]
-    assert "previous_baseline_recovery" in baselines["baseline-1"]["reasons"]
-    assert all(row["action"] == "retain" for row in baselines.values())
-    assert report["retained_baseline_bytes"] == sum(row["bytes"] for row in baselines.values())
-    changed = _rows(retention.plan_retention(runtime, counts=retention.CycleCounts(HRRR=1)))
-    assert sum("recent_HRRR_cycle_window" in row["reasons"] for row in changed.values()) == 1
-    assert all(row["action"] == "retain" for row in changed.values())
+    assert all(row["action"] == "retain" for row in report["baselines"])
 
 
-def test_obsolete_complete_generation_stays_until_permanent_reference_closure(
-    runtime: Path,
+def test_usable_cycle_counts_include_native_nbm_gefs_and_ensemble(runtime: Path) -> None:
+    generations = [_generation(runtime, hour) for hour in range(3)]
+    for index, directory in enumerate(generations):
+        manifest = json.loads((directory / "snapshot.json").read_bytes())
+        descriptors = []
+        for source_id in ("GEFS_6H", "ECMWF_ENS_24H"):
+            source = directory / source_id
+            _write(
+                source / "manifest.json",
+                {
+                    "source_id": source_id,
+                    "events": [{"source_cycle": f"2026-10-07T0{index}:00:00Z"}],
+                },
+            )
+            descriptors.append(
+                {
+                    "source_id": source_id,
+                    "status": "prepared",
+                    "directory": str(source),
+                    "manifest_sha256": retention._digest(source / "manifest.json"),
+                }
+            )
+        manifest["evidence"] = {"probability_sources": descriptors}
+        if index == 2:
+            # Unavailable newer discovery must not count as a retained complete cycle.
+            manifest["contributors"]["GFS"]["status"] = "unavailable"
+        _write(directory / "snapshot.json", manifest)
+    rows = _rows(retention.plan_retention(runtime, counts=COUNTS))
+    assert "recent_GFS_cycle_window" in rows[generations[1].name]["reasons"]
+    assert "recent_GFS_cycle_window" not in rows[generations[2].name]["reasons"]
+    assert "recent_GEFS_cycle_window" in rows[generations[2].name]["reasons"]
+    assert "recent_ECMWF_ENS_cycle_window" in rows[generations[2].name]["reasons"]
+    assert "recent_NBM_cycle_window" in rows[generations[2].name]["reasons"]
+
+
+def test_apply_expires_only_backed_up_payload_and_is_idempotent(runtime: Path) -> None:
+    old, new = _generation(runtime, 1), _generation(runtime, 2)
+    _baseline(runtime, old, "historical", old / "snapshot.json")
+    immutable = {
+        path: path.read_bytes()
+        for path in runtime.rglob("*")
+        if path.is_file() and path.suffix not in {".grib2", ".nc"}
+    }
+    plan = retention.plan_retention(runtime, counts=COUNTS)
+    assert {row["snapshot_id"] for row in plan["candidates"]} == {old.name}
+    receipt = _receipt(runtime, plan)
+    result = retention.apply_retention(runtime, counts=COUNTS, backup_receipt=receipt, now=NOW)
+    assert result["status"] == "complete" and result["deleted_bytes"] == 35
+    assert not (old / "source.grib2").exists() and not (old / "prepared.nc").exists()
+    assert (new / "source.grib2").exists()
+    assert all(path.read_bytes() == data for path, data in immutable.items())
+    repeated = retention.apply_retention(runtime, counts=COUNTS, backup_receipt=receipt, now=NOW)
+    assert repeated["operation"] == "already_applied"
+    assert len(list((runtime / "retention/transactions").glob("*.json"))) == 1
+    expired = _rows(retention.plan_retention(runtime, counts=COUNTS))[old.name]
+    assert expired["native_replay"] == "unavailable_after_retention"
+    assert expired["expired_payload_bytes"] == 35
+    with pytest.raises(ValueError, match="restore the recovery copy"):
+        retention.pin_case(runtime, old.name, reason="Too late to protect original input bundle")
+    (old / "source.grib2").write_bytes(b"raw meteorology")
+    (old / "prepared.nc").write_bytes(b"prepared meteorology")
+    retention.pin_case(runtime, old.name, reason="Exact source bundle restored from recovery copy")
+    restored = _rows(retention.plan_retention(runtime, counts=COUNTS))[old.name]
+    assert restored["native_replay"] == "retained"
+    assert "PINNED" in restored["labels"]
+
+
+@pytest.mark.parametrize(
+    "mutation", ["receipt", "root", "new_payload", "pin", "metadata", "future_receipt"]
+)
+def test_backup_must_cover_exact_current_plan(runtime: Path, mutation: str) -> None:
+    old = _generation(runtime, 1)
+    _generation(runtime, 2)
+    plan = retention.plan_retention(runtime, counts=COUNTS)
+    receipt = _receipt(runtime, plan)
+    document = json.loads(receipt.read_bytes())
+    if mutation == "receipt":
+        document["status"] = "pending"
+    elif mutation == "root":
+        document["runtime_root"] = str(runtime.parent)
+    elif mutation == "future_receipt":
+        document["verified_at"] = "2030-01-01T00:00:00Z"
+    elif mutation == "new_payload":
+        (old / "source.grib2").write_bytes(b"changed raw")
+    elif mutation == "pin":
+        retention.pin_case(runtime, old.name, reason="protect")
+    else:
+        _write(old / "new-reference.json", {"metadata": "new"})
+    _write(receipt, document)
+    with pytest.raises(ValueError):
+        retention.apply_retention(runtime, counts=COUNTS, backup_receipt=receipt, now=NOW)
+    assert (old / "source.grib2").exists()
+
+
+def test_interrupted_unlink_resumes_only_original_authorized_remaining_files(
+    runtime: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     old = _generation(runtime, 1)
     _generation(runtime, 2)
-    counts = retention.CycleCounts(1, 1, 1, 1, 1)
-    reasons = _rows(retention.plan_retention(runtime, counts=counts))[old.name]["reasons"]
-    assert reasons == ["permanent_artifact_reference_closure_unproven"]
+    plan = retention.plan_retention(runtime, counts=COUNTS)
+    receipt = _receipt(runtime, plan)
+    unlink = Path.unlink
+    first = True
+
+    def crash_after_unlink(path: Path, *args: Any, **kwargs: Any) -> None:
+        nonlocal first
+        unlink(path, *args, **kwargs)
+        if first and path.suffix in {".nc", ".grib2"}:
+            first = False
+            raise OSError("simulated interruption after unlink")
+
+    monkeypatch.setattr(Path, "unlink", crash_after_unlink)
+    with pytest.raises(OSError, match="interruption"):
+        retention.apply_retention(runtime, counts=COUNTS, backup_receipt=receipt, now=NOW)
+    monkeypatch.setattr(Path, "unlink", unlink)
+    assert len([path for path in old.iterdir() if path.suffix in {".grib2", ".nc"}]) == 1
+    outcome = retention.apply_retention(runtime, counts=COUNTS, backup_receipt=receipt, now=NOW)
+    assert outcome["status"] == "complete" and len(outcome["deleted"]) == 2
+    assert (old / "snapshot.json").exists()
 
 
-def test_failed_generation_dry_run_and_apply_refusal_never_access_database_or_delete(
-    runtime: Path, capsys: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from mesoforge.storage.postgres import database
-
-    def forbidden(*args: Any, **kwargs: Any) -> None:
-        raise AssertionError("Retention must not access database credentials or delete data")
-
-    monkeypatch.setattr(database, "resolve_database_dsn", forbidden)
-    monkeypatch.setattr(Path, "unlink", forbidden)
-    failed = _generation(runtime, 1, failed=True)
-    _generation(runtime, 2)
-    assert retention.main(["--runtime-root", str(runtime)]) == 0
-    report = json.loads(capsys.readouterr().out)
-    assert report["operation"] == "dry_run"
-    assert _rows(report)[failed.name]["action"] == "retain"
-    assert report["deletion_supported"] is False
-    assert report["removable_bytes"] == 0
-    before = {str(path): path.read_bytes() for path in runtime.rglob("*") if path.is_file()}
-    for _ in range(2):
-        assert retention.main(["--runtime-root", str(runtime), "--apply"]) == 2
-        result = capsys.readouterr()
-        assert json.loads(result.out) == report
-        assert "Nothing was deleted" in result.err
-    assert {str(path): path.read_bytes() for path in runtime.rglob("*") if path.is_file()} == before
-
-
-def test_failed_generation_can_have_unindexed_external_replay_dependency(
-    runtime: Path, tmp_path: Path
-) -> None:
-    failed = _generation(runtime, 1, failed=True)
-    external = tmp_path / "historical-development-case/preparation.json"
-    _write(external, {"source_directory": str(failed), "raw_file": str(failed / "source.grib2")})
-    report = retention.plan_retention(runtime)
-    row = _rows(report)[failed.name]
-    assert row["state"] == "terminal_failed"
-    # An empty local reference scan is not proof of global absence. We retain
-    # without traversing arbitrary operator/research/runner directories.
-    assert row["reasons"] == ["permanent_artifact_reference_closure_unproven"]
-    assert row["action"] == "retain"
-    assert report["removable_bytes"] == 0
-    assert external.is_file() and (failed / "source.grib2").is_file()
-
-
-def test_pin_protects_whole_case_and_unpin_is_explicit(runtime: Path) -> None:
-    failed = _generation(runtime, 1, failed=True)
-    retention.pin_case(runtime, failed.name, reason="Keep severe-weather acquisition failure")
-    assert "operator_case_pin" in _rows(retention.plan_retention(runtime))[failed.name]["reasons"]
-    retention.pin_case(runtime, failed.name, reason="", remove=True)
-    row = _rows(retention.plan_retention(runtime))[failed.name]
-    assert "operator_case_pin" not in row["reasons"]
-    assert row["action"] == "retain"
-
-
-def test_source_reference_protects_failed_generation(runtime: Path) -> None:
-    failed = _generation(runtime, 1, failed=True)
-    complete = _generation(runtime, 2)
-    _baseline(runtime, complete, "current", failed / "source.grib2")
-    assert (
-        "retained_local_metadata_dependency"
-        in _rows(retention.plan_retention(runtime))[failed.name]["reasons"]
-    )
-    assert retention.plan_retention(runtime)["removable_bytes"] == 0
-
-
-@pytest.mark.parametrize("state", ["in_flight", "malformed", "unknown_baseline"])
-def test_unproven_reference_inventory_fails_closed(runtime: Path, state: str) -> None:
-    failed = _generation(runtime, 1, failed=True)
-    if state == "in_flight":
-        incomplete = _generation(runtime, 2, failed=True)
-        (incomplete / "failure.json").unlink()
-        assert _rows(retention.plan_retention(runtime))[incomplete.name]["action"] == "retain"
-        _write(incomplete / "preparation.json", {"directory": str(failed)})
-    elif state == "malformed":
-        (failed / "broken.json").write_text("{", encoding="utf-8")
-    else:
-        _write(runtime / "baseline/baselines/unfinished/partial.json", {})
-    report = retention.plan_retention(runtime)
-    assert report["removable_bytes"] == 0
-    assert failed.is_dir()
-
-
-def test_guidance_lock_serializes_pin_changes(
+def test_interrupted_cleanup_refuses_new_pin(
     runtime: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    failed = _generation(runtime, 1, failed=True)
+    old = _generation(runtime, 1)
+    _generation(runtime, 2)
+    receipt = _receipt(runtime, retention.plan_retention(runtime, counts=COUNTS))
+
+    unlink = Path.unlink
+
+    def failure(path: Path, *args: Any, **kwargs: Any) -> None:
+        if path.suffix in {".nc", ".grib2"}:
+            raise OSError("no unlink")
+        unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", failure)
+    with pytest.raises(OSError):
+        retention.apply_retention(runtime, counts=COUNTS, backup_receipt=receipt, now=NOW)
+    retention.pin_case(runtime, old.name, reason="important case")
+    with pytest.raises(ValueError, match="Protected dependencies changed"):
+        retention.apply_retention(runtime, counts=COUNTS, backup_receipt=receipt, now=NOW)
+    assert (old / "source.grib2").exists()
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_failed_unknown_and_cross_generation_dependencies_remain_protected(
+    runtime: Path, relative: bool
+) -> None:
+    failed = _generation(runtime, 0, failed=True)
+    old = _generation(runtime, 1)
+    newer = _generation(runtime, 2)
+    _write(
+        newer / "external-replay.json",
+        {"raw": f"../{old.name}/source.grib2" if relative else str(old / "source.grib2")},
+    )
+    rows = _rows(retention.plan_retention(runtime, counts=COUNTS))
+    assert "UNRESOLVED" in rows[failed.name]["labels"]
+    assert "retained_local_metadata_dependency" in rows[old.name]["reasons"]
+    assert all(row["action"] == "retain" for row in rows.values())
+
+
+@pytest.mark.parametrize(
+    "state", ["busy", "in_flight", "malformed", "unknown_baseline", "unknown_file"]
+)
+def test_unproven_reference_inventory_fails_closed(runtime: Path, state: str) -> None:
+    old = _generation(runtime, 1)
+    _generation(runtime, 2)
+    if state in {"busy", "in_flight"}:
+        _write(
+            runtime / "status/guidance-worker.json",
+            {state: True} if state == "in_flight" else {"state": "busy"},
+        )
+    elif state == "malformed":
+        (old / "broken.json").write_text("{", encoding="utf-8")
+    elif state == "unknown_file":
+        (old / "opaque.data").write_bytes(b"unknown retained consumer")
+    else:
+        _write(runtime / "baseline/baselines/unfinished/partial.json", {})
+    report = retention.plan_retention(runtime, counts=COUNTS)
+    assert report["removable_bytes"] == 0
+    assert old.is_dir()
+
+
+def test_pin_and_shared_worker_lock(runtime: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    old = _generation(runtime, 1)
+    _generation(runtime, 2)
+    retention.pin_case(runtime, old.name, reason="research")
+    assert "PINNED" in _rows(retention.plan_retention(runtime, counts=COUNTS))[old.name]["labels"]
+    retention.pin_case(runtime, old.name, reason="", remove=True)
+    receipt = _receipt(runtime, retention.plan_retention(runtime, counts=COUNTS))
 
     @contextmanager
     def busy(_root: Path):
         yield False
 
     monkeypatch.setattr(retention, "single_writer", busy)
-    with pytest.raises(RuntimeError, match="Guidance worker"):
-        retention.pin_case(runtime, failed.name, reason="Protect case")
-    assert failed.exists()
+    with pytest.raises(RuntimeError):
+        retention.pin_case(runtime, old.name, reason="protect")
+    with pytest.raises(RuntimeError):
+        retention.apply_retention(runtime, counts=COUNTS, backup_receipt=receipt, now=NOW)
+    assert (old / "source.grib2").exists()
 
 
-def test_cli_does_not_echo_untrusted_infrastructure_exception(
+def test_status_dry_run_has_no_writes_and_apply_needs_backup(
+    runtime: Path, capsys: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _generation(runtime, 1)
+    from mesoforge.storage.postgres import database
+
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("read-only inventory must not access database or delete")
+
+    monkeypatch.setattr(database, "resolve_database_dsn", forbidden)
+    monkeypatch.setattr(Path, "unlink", forbidden)
+    before = {path: path.read_bytes() for path in runtime.rglob("*") if path.is_file()}
+    for flag in ("--status", "--dry-run"):
+        assert retention.main(["--runtime-root", str(runtime), flag]) == 0
+        assert json.loads(capsys.readouterr().out)["operation"] == "dry_run"
+    assert retention.main(["--runtime-root", str(runtime), "--apply"]) == 2
+    assert "ValueError" in capsys.readouterr().err
+    assert {path: path.read_bytes() for path in runtime.rglob("*") if path.is_file()} == before
+
+
+def test_untrusted_exception_redaction(
     runtime: Path, monkeypatch: pytest.MonkeyPatch, capsys: Any
 ) -> None:
     def broken(*args: Any, **kwargs: Any) -> None:
         raise OSError("private://credential-and-provider-error")
 
     monkeypatch.setattr(retention, "plan_retention", broken)
-    assert retention.main(["--runtime-root", str(runtime), "--apply"]) == 2
+    assert retention.main(["--runtime-root", str(runtime)]) == 2
     result = capsys.readouterr()
-    assert "OSError" in result.err
-    assert "credential" not in result.err
-    assert not result.out
+    assert "OSError" in result.err and "credential" not in result.err
 
 
-def test_links_path_escape_and_unmanaged_data_never_deleted(runtime: Path, tmp_path: Path) -> None:
-    failed = _generation(runtime, 1, failed=True)
+def test_links_escape_and_runner_data_are_never_touched(runtime: Path, tmp_path: Path) -> None:
+    old = _generation(runtime, 1)
     runner = tmp_path / "actions-runner/_work"
-    runner.mkdir(parents=True)
-    marker = runner / "keep.txt"
-    marker.write_text("protected runner", encoding="utf-8")
+    _write(runner / "keep.json", {"important": "another application"})
+    before = (runner / "keep.json").read_bytes()
     with pytest.raises(ValueError, match="managed snapshot"):
         retention.pin_case(runtime, "../../actions-runner", reason="escape")
+    with pytest.raises(ValueError):
+        retention._candidate_path(
+            runtime, {"path": "guidance/snapshots/../../source.grib2", "snapshot_id": old.name}
+        )
+    with pytest.raises(ValueError, match="infrastructure"):
+        retention.plan_retention(runner)
+    assert (runner / "keep.json").read_bytes() == before
     try:
-        (failed / "linked").symlink_to(runner, target_is_directory=True)
+        (old / "linked").symlink_to(runner, target_is_directory=True)
     except OSError:
         pytest.skip("Host does not permit creating symlinks")
     with pytest.raises(ValueError, match="links"):
         retention.plan_retention(runtime)
-    assert marker.read_text(encoding="utf-8") == "protected runner"
+    assert (runner / "keep.json").read_bytes() == before
 
 
-def test_unknown_schema_and_invalid_cycle_configuration_fail_closed(runtime: Path) -> None:
+def test_unknown_schema_and_invalid_counts_fail_closed(runtime: Path) -> None:
     with pytest.raises(ValueError, match="positive integer"):
-        retention.CycleCounts(GFS=0)
-    failed = _generation(runtime, 1, failed=True)
-    _write(failed / "snapshot.json", {"schema_version": "future-schema"})
+        retention.CycleCounts(GEFS=0)
+    old = _generation(runtime, 1)
+    _write(old / "snapshot.json", {"schema_version": "future-schema"})
     with pytest.raises(ValueError, match="Unsupported prepared"):
         retention.plan_retention(runtime)
-    assert failed.exists()
 
 
-def test_inflight_status_and_pinned_baseline_are_explicit_without_runner_traversal(
-    runtime: Path, tmp_path: Path
-) -> None:
-    prepared = _generation(runtime, 1)
-    _baseline(runtime, prepared, "protected")
-    retention.pin_case(runtime, prepared.name, reason="Research case")
-    _write(runtime / "status/guidance-worker.json", {"in_flight": {"phase": "build"}})
-    _write(runtime / "status/forecast-worker.json", {"state": "busy"})
-    runner = tmp_path / "actions-runner/_work"
-    _write(runner / "keep.json", {"important": "other application"})
-    before = (runner / "keep.json").read_bytes()
-    report = retention.plan_retention(runtime)
-    assert report["in_flight_workers"] == ["guidance-worker.json", "forecast-worker.json"]
-    for row in [*report["generations"], *report["baselines"]]:
-        assert "worker_in_flight_reference_closure_unproven" in row["reasons"]
-        assert row["action"] == "retain"
-    assert "operator_case_pin_dependency" in report["baselines"][0]["reasons"]
-    assert report["removable_bytes"] == 0
-    assert "actions-runner" not in json.dumps(report)
-    assert (runner / "keep.json").read_bytes() == before
+def test_verified_local_recovery_archive_authorizes_exact_native_expiry(runtime: Path) -> None:
+    from mesoforge.application import local_backup
+    from tests.unit.test_local_backup import checksums, recovery_set
+
+    old = _generation(runtime, 1)
+    _generation(runtime, 2)
+    plan = retention.plan_retention(runtime, counts=COUNTS)
+    source = recovery_set(runtime.parent)
+    _write(source / "retention-plan.json", plan)
+    _write(
+        source / "deployment.json",
+        {"runtime_root": str(runtime), "runtime_archive_root": str(runtime)},
+    )
+    with tarfile.open(source / "runtime.tar.gz", "w:gz") as archive:
+        for path in runtime.rglob("*"):
+            if path.is_file():
+                archive.add(path, arcname=path.relative_to(runtime).as_posix())
+    checksums(source)
+    clock = datetime(2026, 10, 9, tzinfo=UTC)
+    backup = local_backup.validate_backup(source, now=clock)
+    assert backup["retention_plan_sha256"] == plan["plan_sha256"]
+    result = retention.apply_retention(
+        runtime, counts=COUNTS, backup_receipt=source / local_backup.RECEIPT_NAME, now=clock
+    )
+    assert result["status"] == "complete"
+    assert result["backup_id"] == backup["backup_id"]
+    assert not (old / "source.grib2").exists()

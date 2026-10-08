@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
+from mesoforge.application.disk_admission import require_runtime_capacity
 from mesoforge.application.issuance_encoding import decode_issuance, encode_issuance
 from mesoforge.common.errors import IntegrityError, NotFound
 from mesoforge.common.horizon import LEGACY_HORIZON, ForecastHorizon, horizon_for
@@ -346,6 +347,7 @@ class ForecastIssuanceService:
             forecast_payload_digest=logical_digest,
             content_digest=digest,
         )
+        require_runtime_capacity()
         stored = self._objects.put_if_absent(digest, payload, media_type)
         # A failed upload/readback must never become a successful PostgreSQL issuance.
         if self._objects.get_verified(stored.storage_uri, digest) != payload:

@@ -33,6 +33,22 @@ ISSUED_AT = datetime(2026, 9, 10, 12, tzinfo=UTC)
 CODE_IDENTITY = {"git_commit": "a" * 40, "working_tree_dirty": False}
 
 
+def test_disk_fall_during_forecast_refuses_immutable_issuance(
+    memory_service, monkeypatch, tmp_path
+) -> None:
+    from types import SimpleNamespace
+
+    from mesoforge.application import disk_admission
+    from tests.unit.presentation.test_forecast_product import rolling_saved
+
+    service, factory, objects = memory_service
+    monkeypatch.setenv("MESOFORGE_PROSPECTIVE_ROOT", str(tmp_path))
+    monkeypatch.setattr(disk_admission.shutil, "disk_usage", lambda _: SimpleNamespace(free=0))
+    with pytest.raises(OSError, match="before persistence"):
+        service.issue(rolling_saved()["forecast"], batch_run_id=uuid4(), location_index=0)
+    assert not factory.issued_forecasts and not objects.objects
+
+
 def test_extended_issuance_retains_horizon_and_selects_late_hours_without_recalculation(
     memory_service,
 ) -> None:

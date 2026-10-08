@@ -1385,56 +1385,47 @@ alternative, never an additional scheduler. Owner enablement also approves the e
 presentation-policy version; automated delivery validates each saved PDF without
 claiming a daily human review. Final release uses bounded waiting and expiry rechecks.
 
-### Conservative working-data retention
+### Rolling native data and same-host recovery
 
-Central operational admission in [`disk_admission`](src/mesoforge/application/disk_admission.py)
-uses >30 GiB normal, 20–30 GiB warning and <20 GiB heavy-Guidance refusal, configurable
-without changing science. It never deletes to meet a floor. Dry-run retention now
-enumerates baseline bytes/protection in addition to Guidance, protecting current and
-previous complete generations/baselines, pins and recorded in-flight work. Missing
-in-flight status is not deletion proof. Permanent dependency closure is still incomplete,
-so neither complete nor failed scientific generations are automatically pruned.
+CURRENT: the canonical location registry owns ordered `email_recipients`; no global
+recipient fallback exists. Empty lists do not block issuance. Daily delivery attempts
+remaining recipients after one fails, then backs up the valid forecast and its audit.
+A maintenance fingerprint forces a new recovery set if a later retry adds a delivery
+result; unchanged retries reuse completed phases. Delayed runs use the real current
+reference, never a stale scheduled hour. Existing coverage/expiry rules stay authoritative.
 
-One daily cycle measured at least 2.73 GB before observation/verification/backup growth;
-this is not bounded steady-state storage. Existing rich temperature evidence also
-remains larger than its compact analytical attributes. Safe scientific retirement is
-a prerequisite to indefinite operation, not implemented cleanup hidden in scheduling.
-An off-host backup must cover database, object store, referenced runtime and daily
-receipts plus non-secret deployment configuration. Source data cannot yet be omitted
-while retained artifacts depend on local paths. Destination credentials and upload
-approval remain operator prerequisites; no archive platform or upload is implemented.
+[`guidance_retention`](src/mesoforge/application/guidance_retention.py) inventories exact
+native payloads and dependencies. Complete usable cycle defaults are HRRR/RAP/NBM 4,
+GFS/IFS 3, acquired GEFS/ECMWF ensembles 3. Current/recovery generations and baselines,
+recent cycles, pins, in-flight work and unresolved references protect bundles. Only
+known raw/prepared binary payloads in superseded unprotected generations can expire;
+all original JSON/source documents and baseline artifacts remain immutable. The apply
+transaction binds a verified local recovery receipt to the exact planned bytes and
+fresh protection graph, records intent before unlink and supports interrupted resume.
+Unknown files, links, incomplete scientific state and path escape fail closed. There
+is no generic age-based recursive deletion of scientific generations or runner caches.
 
-[`guidance_retention`](src/mesoforge/application/guidance_retention.py) is an explicit
-operator command, not a worker timer. Its default dry-run identifies protected
-generations and storage outside preferred cycle windows. Configurable native-cycle preferences
-are HRRR/RAP/NBM four and GFS/IFS three; these do not alter numerical policies.
-Current prepared state, latest and recovery baselines, every retained baseline's
-dependencies, recent cycle windows and manual case pins protect whole generations.
-Malformed metadata, unknown state and unproven references fail closed.
+This deliberately ends indefinite native re-preparation from local arrays after expiry.
+Historical issued/baseline readback stays exact. Full-grid control/candidate/AI replay
+still depends on historical baseline grids: retained point-only stage summaries do not
+prove their replacement. Those grids (~393 MB/build in the real five-day proof), rich
+issuances and observations continue growing. This is bounded native history, not a
+claim of globally normalized or fixed-size permanent storage.
 
-Generations retain `permanent_artifact_reference_closure_unproven`:
-historical readback dereferences prepared manifests and source documents, and there
-is no compact complete index of all permanent artifact dependencies. A generation
-that later failed can still contain prepared data consumed by an explicit development
-issuance, so failure is not proof of disposability. **Complete and failed history
-therefore remains unbounded.** The planner rejects links/path escape and `--apply`
-refuses deletion until permanent reference closure can be proven. Baselines, S3
-objects, verification, AI/Governance records, proof evidence, caches and runner
-directories remain untouched. The implemented boundary is inventory and manual
-case protection; pruning needs reference-closure work before it can bound the live
-working set without corrupting historical lineage.
+The daily backup holds the same persistent runtime OS lock as Guidance/Forecast,
+uses the existing full database/object/runtime procedure, and validates it before any
+retention apply. The compact local receipt checks PostgreSQL readability evidence,
+all object digests, the complete runtime archive and actual archive coverage of every
+planned deletion. Daily receipts and non-secret deployment settings are included.
+The dedicated daily backup root retains the newest two verified copies plus current;
+legacy/incomplete/foreign sets are protected. Restore requires separate empty targets.
+Same-host recovery is CURRENT v1 policy; off-host protection against VPS loss is FUTURE
+hardening, not an additional paid-infrastructure requirement.
 
-Backups pause guidance before the database dump, require suspended forecast triggers,
-retain all runtime guidance plus referenced objects, and publish a private completed
-directory only after checksum generation and successful worker restart. Restore
-validates backup contents and empty database/bucket/runtime destinations before writes;
-PostgreSQL restores transactionally, but the three stores are not one restore
-transaction. Disk guards measure the local runtime filesystem, not remote store capacity.
-Compact forecast-stage and temperature/QPF verification evidence remains permanent;
-this retention command cannot delete it. Delivery intent/result artifacts use the
-same database/object exports as verification, AI and Governance. Raw/runtime backup
-coverage remains required while retained baseline dependencies need it. Deployment
-AI and SMTP secret files are provisioned separately and excluded from those exports.
+The central disk policy uses >30 GiB normal, 20-30 GiB warning, <20 GiB refusal before
+heavy acquisition and immutable baseline/issuance/backup writes. No warning silently
+expires data. Compact verification/analytical attributes, observations, Governance,
+AI audit and delivery history stay permanent; automatic Learning remains dormant.
 
 ### 36-/120-hour presentation and explicit email delivery
 
@@ -1711,7 +1702,7 @@ validates code; it is not the forecast scheduler. Hermes orchestration remains p
 | Broader site/regime correction science | Future | No regime classifier, per-bucket activation or additional correction science |
 | Bounded operational AI desk and current final validation | Implemented | Structured provider boundary, finite tasks/budgets, temperature/QPF tools, checkpoint fallback and common stage evaluation |
 | Scheduled hosted operation | Implemented; supervised Linux proofs complete, unattended operation not enabled | One image, two forecast roles, internal services; scheduler chooses when, MesoForge keeps all meteorology |
-| Guidance retention planning/pins | Partially implemented | Explicit dry-run and case protection; all deletion refused while permanent reference closure is unproven |
+| Guidance retention planning/pins | Partially implemented | Verified-backup-bound expiry of old unreferenced native payloads; manifests/baseline history protected |
 | 36-/120-hour outlook/PDF and SMTP | Implemented | Saved-final-issuance renderer and immutable delivery audit; separate complete-calendar-day fixture gate remains strict |
 | Recurring delivery | Future | No unattended email enabled |
 
