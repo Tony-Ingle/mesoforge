@@ -117,6 +117,21 @@ def test_minio_build_pins_official_security_release_and_nonroot_data_ownership()
     assert minio["cap_drop"] == ["ALL"]
 
 
+def test_ci_reuses_the_pinned_hosted_minio_build_before_starting_storage() -> None:
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text("utf-8"))
+    steps = workflow["jobs"]["integration"]["steps"]
+    names = [step.get("name") for step in steps]
+    build = steps[names.index("Build MinIO")]["run"]
+    start = steps[names.index("Start MinIO")]["run"]
+    image = compose()["services"]["minio"]["image"]
+    assert names.index("Build MinIO") < names.index("Start MinIO")
+    assert f"docker build --tag {image}" in build
+    assert "deploy/hosted/minio" in build
+    assert f"{image} server /data" in start
+    assert "minio/minio:" not in start
+    assert "minio/health/live" in start
+
+
 def test_health_restart_and_shutdown_belong_to_the_long_running_worker() -> None:
     services = compose()["services"]
     guidance = services["guidance-worker"]

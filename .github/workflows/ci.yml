@@ -105,6 +105,12 @@ jobs:
         run: uv python install
       - name: Sync dependencies
         run: uv sync --locked --all-groups
+      - name: Build MinIO
+        # Reuse the deployment-proven, pinned upstream source build. The former
+        # minio/minio binary repository is no longer anonymously pullable.
+        run: >-
+          docker build --tag mesoforge-minio:RELEASE.2025-10-15T17-29-55Z
+          deploy/hosted/minio
       - name: Start MinIO
         # MinIO is launched with `docker run` rather than as a GitHub
         # Actions `services:` container: the `services:` block has no
@@ -114,14 +120,13 @@ jobs:
         # -- run without one it just prints its CLI help and exits,
         # which is exactly what left this job's MinIO container
         # unhealthy. Running it as a plain `docker run -d` step gives
-        # full command control while pinning the identical image tag
-        # already used in deploy/local/compose.yaml for local dev.
+        # full command control using the image built immediately above.
         run: |
           docker run -d --name mesoforge-minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=mesoforge_test \
             -e MINIO_ROOT_PASSWORD=mesoforge_test_password \
-            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+            mesoforge-minio:RELEASE.2025-10-15T17-29-55Z server /data
           for i in $(seq 1 30); do
             if curl -sf http://localhost:9000/minio/health/live >/dev/null; then
               echo "MinIO is healthy"
