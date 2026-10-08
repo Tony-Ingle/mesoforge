@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from copy import deepcopy
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -266,6 +267,67 @@ def test_extended_native_events_retain_exact_bounds_and_replay(tmp_path, decoder
     )
     xr.testing.assert_identical(views[0].dataset, copied[0].dataset)
     assert views[0].manifest["events"] == copied[0].manifest["events"]
+
+
+def test_native_probability_attachment_loads_without_legacy_hourly_pop_and_preserves_checks(
+    tmp_path, decoder, original
+):
+    from mesoforge.application.point_forecast import PreparedPointForecast
+    from mesoforge.application.spatial_preparation import PreparedRegions, attach_pop_guidance
+    from mesoforge.forecasting.recipes import PROVISIONAL_CONFIGURATION
+    from tests.unit.application.test_prepared_temperature import phase2_configuration
+
+    _, source = original
+    source["current_model_set"]["selection"].update(
+        forecast_horizon=FIVE_DAY_HORIZON.payload(), horizon_hours=list(range(1, 127))
+    )
+    descriptors = prepared.prepare_retained_sources(
+        source, tmp_path / "native-events", [_record(start=114, end=120)]
+    )
+    native = PreparedPointForecast(
+        _guidance={},
+        _target_reference_time=TARGET,
+        _projections={},
+        data_kind="real_prepared_guidance",
+        _manifest={"forecast_horizon": FIVE_DAY_HORIZON.payload()},
+        _manifest_sha256=None,
+        _horizons=FIVE_DAY_HORIZON.leads,
+        _configuration=PROVISIONAL_CONFIGURATION,
+        _shadow_views={},
+        _surface_configuration=phase2_configuration().blend_configuration,
+    )
+    attached = attach_pop_guidance(native, None, probability_sources=descriptors)
+    assert isinstance(attached, PreparedPointForecast)
+    assert attached._pop_guidance is None and attached._pop_views == []
+    assert native._probability_views == []  # The source view remains untouched.
+    event = attached._probability_views[0].manifest["events"][0]
+    assert (event["interval_start"], event["interval_end"], event["duration_hours"]) == (
+        "2026-09-15T18:00:00Z",
+        "2026-09-16T00:00:00Z",
+        6,
+    )
+    assert attached._probability_views[0].manifest["role"] == "shadow"
+    np.testing.assert_array_equal(attached._probability_views[0].dataset.probability, 0.25)
+    assert attach_pop_guidance(native, None) is native
+
+    legacy = replace(native, _manifest={})
+    for target in (legacy, PreparedRegions([native, legacy], {})):
+        with pytest.raises(ValueError, match="active NBM PoP attachment"):
+            attach_pop_guidance(target, None, probability_sources=descriptors)
+    with pytest.raises(ValueError, match="surface-grid forecast"):
+        attach_pop_guidance(
+            replace(native, _surface_configuration=None), None, probability_sources=descriptors
+        )
+    with pytest.raises(ValueError, match="target/source differs"):
+        attach_pop_guidance(
+            replace(native, _target_reference_time=TARGET + np.timedelta64(1, "h")),
+            None,
+            probability_sources=descriptors,
+        )
+    tampered = deepcopy(descriptors)
+    tampered[0]["manifest_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="checksum"):
+        attach_pop_guidance(native, None, probability_sources=tampered)
 
 
 def test_native_request_plan_is_bounded_to_selected_cycles_and_utc_events():
