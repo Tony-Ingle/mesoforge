@@ -20,14 +20,14 @@ roles; archived plans are history.
 ## What works today
 
 MesoForge can discover available model cycles, acquire and retain real guidance,
-prepare shared spatial coverage, and build a 36-hour numerical forecast for each
-configured location. A background command materializes baseline domains before
+prepare shared spatial coverage, and build a 36-hour or explicitly selected
+120-hour numerical forecast for each configured location. A background command materializes baseline domains before
 location jobs run. Location jobs pin and extract that baseline; they do not
 reblend fields, rerun baseline coherence or download guidance.
 
 | Capability | Current behavior |
 | --- | --- |
-| Guidance | HRRR/GFS active contributors; RAP/IFS zero-weight shadows where supported; NBM active for selected fields |
+| Guidance | Historical/default 36-hour policies remain available; explicit 120-hour policy uses compatible HRRR/RAP/GFS/IFS/NBM native guidance |
 | Prepared state | Immutable contributor snapshots and `latest_complete` |
 | Numerical baseline | `FieldBlendEngine`, current coherence, immutable baseline snapshots and separate `latest_baseline` |
 | Local domain | Current 7×7 grid at 6 km spacing, context/editable masks and exact configured center point |
@@ -40,10 +40,27 @@ reblend fields, rerun baseline coherence or download guidance.
 | Learning stages | Explicit local temperature correction/no-op, immutable candidate policy data, background shadow overlays and one temperature/QPF variant evaluator |
 | Policy governance | Append-only lifecycle events; explicit register/evaluate/activate/rollback/retire; deterministic identical-sample eligibility; nothing is active by default |
 | AI forecast desk | Always attempted after correction; bounded structured provider actions, deterministic field edits, validated checkpoints and automatic fallback |
-| PDF/email | Deterministic two-page 36-hour outlook and explicit SMTP delivery from saved final issuances; five-day coverage remains deferred |
+| PDF/email | Deterministic two-page 36-hour or declared 120-hour outlook and explicit SMTP delivery from saved final issuances |
 | Retention | Explicit dry-run, cycle preferences and case pins; deletion remains blocked by unresolved filesystem references |
 
 ### Current numerical policies
+
+The explicit 120-hour path uses `mesoforge.provisional-multimodel-120h.v1`: transparent
+field/lead/model-role priors, native-horizon and freshness eligibility, smooth tapers,
+and renormalization over eligible contributors. These weights are **provisional,
+not skill-optimized or verification-derived**. Temperature, dew point, vector wind,
+gust, QPF and total cloud have separate policy identities. RH uses current coherence.
+Compatible state fields use adjacent native endpoints; gust retains its native
+instantaneous times. QPF uses exact contiguous hourly or coarser accumulation events,
+never invented hourly splits. Six-hour PoP uses compatible native NBM/GEFS events
+with separate meta-model/ensemble priors (2:1), not hourly probability interpolation.
+ECMWF ENS24-hour probabilities retain their different threshold and window as evidence.
+Hourly PoP/thunder and p-type preserve their current
+event/agreement contracts and become unavailable where unsupported. Native source
+values, eligibility, missingness and applied weights remain in each saved grid.
+See the [source/field audit and policy](ARCHITECTURE.md#36-hour-presentation-and-explicit-email-delivery).
+
+The following table describes the retained **36-hour policy family**:
 
 The generalized infrastructure is implemented. Today's scientific recipes remain
 **temporary scientific scaffolding**, not the finished MesoForge blend.
@@ -74,8 +91,8 @@ The hosted worker roles, image, Compose stack and scheduler units exist (see
 commissioning have completed; unattended operation remains disabled.
 No correction or blend policy has been activated. There is no automatic delivery,
 adaptive production weighting or calibrated multi-source precipitation blend.
-The explicit PDF/SMTP command supports the current 36-hour outlook. The separate
-five-day coverage gate remains unmet. Only an explicitly activated governed temperature correction changes values
+The explicit PDF/SMTP command supports saved 36-hour and declared 120-hour outlooks.
+The legacy five-complete-calendar-day renderer retains its separate coverage gate. Only an explicitly activated governed temperature correction changes values
 in the correction stage. No approved promotion rule exists for blend, QPF or AI
 policies, so those families are never eligible. The operational AI desk may make
 bounded edits to this forecast; it cannot promote policies or change persistent
@@ -1153,22 +1170,23 @@ validated AI edits or the recorded deterministic fallback. It presents the exact
 36-hour window, hourly trends, interval QPF and covered-period summaries; a partial
 local day is never presented as a complete daily forecast.
 
-**A real five-day product is not yet scientifically supported.** Its separate
-fixture renderer and coverage gate remain available with `--product 5-day`.
-The active temperature recipe requires both HRRR and GFS; HRRR ends at 48 hours
-(many cycles end at 18), and approved field lead bands end at 36 hours. RAP does not
-extend beyond its native 21/51-hour horizon. GFS/IFS/NBM availability alone does not
-approve a new long-range policy: GFS loses hourly cadence after source lead 120,
-IFS is currently a three-hour shadow, and current NBM attachments are short-range.
-Prepared coverage, baseline views, issuance and AI/presentation contracts also remain
-36-hour contracts. No weight, fallback, forecast horizon or missingness rule was changed.
+**Five-day means 120 elapsed hours.** Select the provisional policy in background
+preparation with `MESOFORGE_FORECAST_HORIZON_HOURS=120` (Guidance Worker) or
+`refresh_guidance --forecast-hours 120 --coverage-hours 126`. The extra six
+hours are a bounded reference buffer, not a longer delivered product. The default
+remains 36 hours so an existing rollout does not change implicitly. Forecast Worker
+extracts the declared saved baseline; it never reblends or extends source horizons.
 
-The five-day renderer requires **five complete local calendar days**, with 23/25-hour DST
-days respected. A rolling 120-hour forecast beginning mid-day usually contains only
-four complete days. A future scientific/product decision must resolve that distinction
-and approve later-range contributors/cadences before real delivery can pass this gate.
-The current 36-hour issuance fails that five-day gate explicitly; presentation never
-extends guidance. The default command below selects the supported 36-hour product.
+Use `--product 120-hour` on both render and send for that saved issuance. The PDF
+shows five elapsed 24-hour periods with local start/end labels; DST and partial local
+calendar days are explicit. Temperature extrema are sampled forecast extrema.
+Canonical QPF events are summed only when completely contained: an event crossing
+a card boundary makes that card's complete total unavailable rather than distributing
+rain artificially. Maximum available hourly PoP is not a daily probability.
+
+The separate legacy `--product 5-day` fixture renderer still requires five complete
+local calendar days, including 23-/25-hour DST days. Neither renderer can turn a
+36-hour issuance into five days. The default delivery product remains 36 hours.
 
 These commands read an existing issuance. They cannot acquire guidance, reblend,
 invoke AI, reissue a forecast or change stored forecast state:
@@ -1234,6 +1252,7 @@ Application commands read the process environment; they never import `.env` file
 | `MESOFORGE_OBSERVATIONS_ARTIFACT_ID` | Observation preview | Set internally during verification; optional explicit preview input |
 | `MESOFORGE_CODE_REVISION` | Code identity | Commit baked into the image; otherwise `git rev-parse HEAD` |
 | `MESOFORGE_FORECAST_TIMEZONE` | Both workers | Slot time zone (default `America/Chicago`) |
+| `MESOFORGE_FORECAST_HORIZON_HOURS` | Guidance worker | Explicit scientific horizon: `36` (legacy default) or `120` (provisional five-day policy); prepares a six-hour reference buffer |
 | `MESOFORGE_FORECAST_TIMES` | Both workers | Comma-separated local `HH:MM` slots (default `08:00,20:00`) |
 | `MESOFORGE_AI_PROVIDER` | AI desk | `openai` |
 | `MESOFORGE_AI_MODEL` | AI desk | Model, currently `gpt-6-sol` |

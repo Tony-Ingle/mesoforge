@@ -10,10 +10,12 @@ import pytest
 from pypdf import PdfReader
 
 from mesoforge.common.errors import IntegrityError
+from mesoforge.common.horizon import FIVE_DAY_HORIZON
 from mesoforge.contracts.serialization import canonical_json_digest
 from mesoforge.forecasting.cloud_cover import CLOUD
 from mesoforge.presentation.forecast_document import (
     HOURS_DOCUMENT_POLICY,
+    ROLLING_DOCUMENT_POLICY,
     ForecastCoverageError,
     build_forecast_document,
 )
@@ -96,6 +98,192 @@ def reseal(saved):
     saved["forecast"]["local_grid"]["sha256"] = str(
         canonical_json_digest(saved["forecast"]["local_grid_baseline"])
     )
+
+
+def rolling_saved(reference="2026-10-08T15:00:00Z"):
+    saved = five_day_saved(reference, count=FIVE_DAY_HORIZON.duration_hours)
+    forecast = saved["forecast"]
+    forecast["forecast_horizon"] = FIVE_DAY_HORIZON.payload()
+    forecast["local_grid_baseline"]["forecast_horizon"] = FIVE_DAY_HORIZON.payload()
+    reseal(saved)
+    return saved
+
+
+@pytest.mark.parametrize(
+    "reference,local_hours",
+    [
+        ("2026-10-08T15:00:00Z", (10, 10)),
+        ("2026-03-07T16:00:00Z", (10, 11)),
+        ("2026-10-31T15:00:00Z", (10, 9)),
+    ],
+)
+def test_rolling_120_covers_every_hour_with_five_elapsed_periods(reference, local_hours):
+    saved = rolling_saved(reference)
+    original = deepcopy(saved)
+    document = build_forecast_document(saved, location=LOCATION, hours=120)
+    assert saved == original
+    assert document["document_policy"] == ROLLING_DOCUMENT_POLICY
+    assert document["product_title"] == "5-Day Weather Outlook"
+    assert document["summary_kind"] == "five_elapsed_24_hour_forecast_periods"
+    assert [day["hours"] for day in document["days"]] == [24] * 5
+    assert [day["forecast_period"] for day in document["days"]] == [1, 2, 3, 4, 5]
+    assert len(document["hours"]) == 120
+    assert document["valid_start"] == reference
+    assert document["valid_end"] == saved["forecast"]["hours"][-1]["valid_time"]
+    first = document["days"][0]
+    assert (
+        datetime.fromisoformat(first["start"]).hour,
+        datetime.fromisoformat(document["days"][-1]["end"]).hour,
+    ) == local_hours
+    assert first["partial_local_day"] is True
+    for index, period in enumerate(document["days"]):
+        temperatures = [
+            h["temperature"]["value"]
+            for h in saved["forecast"]["hours"][index * 24 : (index + 1) * 24]
+        ]
+        assert period["high_k"] == max(temperatures)
+        assert period["low_k"] == min(temperatures)
+    assert sum(day["qpf_kg_m2"] for day in document["days"]) == pytest.approx(6.6)
+    pdf = render_forecast_pdf(document)
+    assert pdf == render_forecast_pdf(document)
+    reader = PdfReader(BytesIO(pdf))
+    assert len(reader.pages) == 2 and len(pdf) < 250_000
+    text = "\n".join(page.extract_text() for page in reader.pages)
+    assert "5-Day Weather Outlook" in text
+    assert "24 elapsed forecast hours, not calendar days" in text
+    assert "PERIOD 5" in text and "Each strip covers the card's stated hours" in text
+    assert "midnight to midnight" not in text
+    assert not any(token in text for token in ("NaN", "None", "sha256:", '{"'))
+
+
+def test_rolling_120_requires_explicit_matching_horizon_and_honest_hourly_amounts():
+    with pytest.raises(ForecastCoverageError, match="explicit complete saved horizon"):
+        build_forecast_document(five_day_saved(), location=LOCATION, hours=120)
+    saved = rolling_saved()
+    del saved["forecast"]["local_grid_baseline"]["forecast_horizon"]
+    with pytest.raises(ForecastCoverageError, match="explicit complete saved horizon"):
+        build_forecast_document(saved, location=LOCATION, hours=120)
+    saved = rolling_saved()
+    amount = saved["forecast"]["hours"][-1]["surface"]["fields"][
+        "liquid_equivalent_precipitation_amount_1h"
+    ]
+    amount["interval_start"] = (
+        datetime.fromisoformat(amount["interval_end"]) - timedelta(hours=3)
+    ).isoformat()
+    amount["value"] = 3.0
+    reseal(saved)
+    document = build_forecast_document(saved, location=LOCATION, hours=120)
+    assert document["hours"][-1]["qpf"] is None
+    assert document["days"][-1]["qpf_kg_m2"] is None
+    assert document["summary"]["qpf_kg_m2"] is None
+    assert document["days"][-1]["availability"]["qpf"]["available_hours"] == 23
+    text = "\n".join(
+        page.extract_text() for page in PdfReader(BytesIO(render_forecast_pdf(document))).pages
+    )
+    assert "X = unavailable hour" in text and "Unavailable" in text
+
+
+def test_native_qpf_events_are_drawn_and_summed_without_splitting_or_double_counting():
+    from tests.unit.common.test_qpf_intervals import events
+
+    saved = rolling_saved()
+    forecast = saved["forecast"]
+    rows = events(datetime.fromisoformat(forecast["target_reference_time"]), coarse_start=23)
+    forecast["qpf_intervals"] = rows
+    forecast["local_grid_baseline"]["cells"][0]["qpf_intervals"] = rows
+    # Hourly values are a separate view, never added to canonical event totals.
+    for hour in forecast["hours"][23:]:
+        hour["surface"]["fields"]["liquid_equivalent_precipitation_amount_1h"]["value"] = None
+    reseal(saved)
+    document = build_forecast_document(saved, location=LOCATION, hours=120)
+    assert document["summary"]["qpf_kg_m2"] == 99.0
+    assert document["days"][0]["qpf_kg_m2"] is None
+    assert document["days"][0]["qpf_event_coverage"]["boundary_crossing_events"] == 1
+    assert len(document["qpf_intervals"]) == len(rows)
+    assert document["qpf_intervals"][23]["value"] == 3
+    pdf = render_forecast_pdf(document)
+    reader = PdfReader(BytesIO(pdf))
+    assert len(reader.pages) == 2
+    text = "\n".join(page.extract_text() for page in reader.pages)
+    assert "Native event total" in text
+    assert "whole-event amount, not a rate" in text
+    assert "crossing events are not split" in " ".join(text.split())
+    assert pdf == render_forecast_pdf(document)
+    rows[-1]["value"] = None
+    reseal(saved)
+    missing = build_forecast_document(saved, location=LOCATION, hours=120)
+    assert missing["summary"]["qpf_kg_m2"] is None
+    text = PdfReader(BytesIO(render_forecast_pdf(missing))).pages[1].extract_text()
+    assert "X = unavailable event" in text
+
+
+def six_hour_probability(end, value=0.65):
+    from mesoforge.forecasting.provisional_policy import (
+        POP6,
+        POP6_THRESHOLD,
+        PROVISIONAL_MULTIMODEL_POLICY,
+        provisional_policy,
+    )
+
+    return {
+        "value": value,
+        "unit": "1",
+        "status": "available",
+        "role": "active_blended_baseline",
+        "policy": provisional_policy(POP6).policy_id,
+        "policy_family": PROVISIONAL_MULTIMODEL_POLICY,
+        "interval_start": (end - timedelta(hours=6)).isoformat(),
+        "interval_end": end.isoformat(),
+        "interval_closure": "left_open_right_closed",
+        "temporal_semantics": "probability",
+        "event_duration_hours": 6,
+        "threshold": dict(POP6_THRESHOLD),
+        "spatial_support": {"kind": "grid_point"},
+    }
+
+
+def test_native_six_hour_probability_has_own_windows_and_labels_not_hourly_values():
+    from mesoforge.forecasting.provisional_policy import POP6
+
+    saved = rolling_saved()
+    for hour in saved["forecast"]["hours"]:
+        if hour["horizon_hours"] % 6 == 0:
+            hour["surface"]["fields"][POP6] = six_hour_probability(
+                datetime.fromisoformat(hour["valid_time"])
+            )
+        if hour["horizon_hours"] > 36:
+            hour["surface"]["fields"]["probability_of_precipitation_1h"]["value"] = None
+    reseal(saved)
+    document = build_forecast_document(saved, location=LOCATION, hours=120)
+    assert len(document["six_hour_pop_events"]) == 20
+    assert document["summary"]["maximum_hourly_pop"] is None
+    assert document["summary"]["native_six_hour_pop"]["maximum_available_six_hour_pop"] == 0.65
+    assert all(row["pop"] is None for row in document["hours"][36:])
+    assert all(day["native_six_hour_pop"]["available_events"] == 4 for day in document["days"])
+    pdf = render_forecast_pdf(document)
+    text = " ".join(page.extract_text() for page in PdfReader(BytesIO(pdf)).pages)
+    assert "6h PoP, native window" in text and "Max PoP: 1h / 6h" in text
+    assert "never daily probabilities" in " ".join(text.split())
+    assert pdf == render_forecast_pdf(document)
+    sixth = saved["forecast"]["hours"][5]["surface"]["fields"][POP6]
+    sixth["interval_start"] = sixth["interval_end"]
+    reseal(saved)
+    with pytest.raises(ValueError, match="six-hour probability"):
+        build_forecast_document(saved, location=LOCATION, hours=120)
+
+
+def test_shadow_six_hour_probability_is_not_promoted_into_presentation():
+    from mesoforge.forecasting.provisional_policy import POP6
+
+    saved = rolling_saved()
+    hour = saved["forecast"]["hours"][5]
+    hour["surface"]["fields"][POP6] = {
+        **six_hour_probability(datetime.fromisoformat(hour["valid_time"])),
+        "role": "shadow",
+    }
+    reseal(saved)
+    document = build_forecast_document(saved, location=LOCATION, hours=120)
+    assert "six_hour_pop_events" not in document
 
 
 @pytest.fixture

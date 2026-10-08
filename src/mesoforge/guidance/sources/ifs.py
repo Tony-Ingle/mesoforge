@@ -195,8 +195,12 @@ def build_grib_url(*, cycle: datetime, forecast_hour: int) -> str:
     cycle = _utc_hour(cycle)
     if cycle.hour not in (0, 6, 12, 18):
         raise ValueError("IFS source cycles must be 00/06/12/18 UTC")
-    if type(forecast_hour) is not int or forecast_hour not in range(0, 91, 3):
-        raise ValueError("This IFS adapter supports native three-hour leads from 0 through 90")
+    from mesoforge.catalog.native_horizons import native_field_contract
+
+    if type(forecast_hour) is not int or forecast_hour not in native_field_contract(
+        "IFS", "air_temperature_2m"
+    ).native_leads(cycle):
+        raise ValueError("IFS lead is outside this cycle's native three-hour/six-hour schedule")
     return (
         f"{IFS_BASE_URL}/{cycle:%Y%m%d}/{cycle:%H}z/ifs/0p25/oper/"
         f"{cycle:%Y%m%d%H}0000-{forecast_hour}h-oper-fc.grib2"

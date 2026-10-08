@@ -15,6 +15,7 @@ import math
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from functools import lru_cache
 from importlib.metadata import version
 from pathlib import Path
@@ -27,6 +28,7 @@ from mesoforge.application.spatial_coverage import (
     UnsupportedCoordinateError,
     validate_coordinate,
 )
+from mesoforge.common.horizon import horizon_for
 from mesoforge.contracts.serialization import canonical_json_digest
 
 _VERSION = "mesoforge.local-surface-baseline.v2"
@@ -154,6 +156,7 @@ def _transformation_identity() -> dict[str, Any]:
     source_files = (
         "application/local_surface_grid.py",
         "application/point_forecast.py",
+        "application/native_surface_inputs.py",
         "application/surface_forecast.py",
         "application/precipitation_forecast.py",
         "application/probability_forecast.py",
@@ -167,6 +170,7 @@ def _transformation_identity() -> dict[str, Any]:
         "application/ice.py",
         "forecasting/surface.py",
         "forecasting/field_blend.py",
+        "forecasting/provisional_policy.py",
         "forecasting/coherence.py",
         "forecasting/snowfall_amount.py",
         "forecasting/cloud_cover.py",
@@ -183,6 +187,11 @@ def _transformation_identity() -> dict[str, Any]:
         "alignment/spatial.py",
         "alignment/station_frame.py",
         "alignment/temporal.py",
+        "alignment/state_interpolation.py",
+        "catalog/native_horizons.py",
+        "guidance/precipitation.py",
+        "common/horizon.py",
+        "common/qpf_intervals.py",
     )
     lock = package.parent.parent / "uv.lock"
     return {
@@ -417,10 +426,15 @@ def build_local_surface_grid(
     center_y = layout["point_target"]["y_index"]
     editable_edge = layout["domains"]["editable"]["bounds_m"]["x_max"]
     center = calculate_column(latitude=latitude, longitude=longitude)
+    horizon = horizon_for(center)
+    if "forecast_horizon" in center:
+        horizon.validate_hour_rows(
+            center["hours"], datetime.fromisoformat(center["target_reference_time"])
+        )
     context = {
         key: deepcopy(value)
         for key, value in center.items()
-        if key not in ("latitude", "longitude", "hours")
+        if key not in ("latitude", "longitude", "hours", "qpf_intervals")
     }
     cells: list[dict[str, Any]] = []
     for y_index, y_m in enumerate(layout["y_m"]):
@@ -448,12 +462,37 @@ def build_local_surface_grid(
                         missing_reasons=[reason],
                         hours=_missing_hours(center["hours"], reason),
                     )
+                    if "qpf_intervals" in center:
+                        cell["qpf_intervals"] = [
+                            {
+                                "interval_start": row["interval_start"],
+                                "interval_end": row["interval_end"],
+                                "interval_closure": "left_open_right_closed",
+                                "unit": "kg/m^2",
+                                "value": None,
+                                "weights": {},
+                                "status": "unavailable",
+                                "missing_reasons": [reason],
+                            }
+                            for row in center["qpf_intervals"]
+                        ]
                     cells.append(cell)
                     continue
+            if "forecast_horizon" in center or "forecast_horizon" in column:
+                if horizon_for(column) != horizon:
+                    raise ValueError("Local grid columns have inconsistent forecast horizons")
+                horizon.validate_hour_rows(
+                    column["hours"], datetime.fromisoformat(center["target_reference_time"])
+                )
             cell["hours"] = column["hours"] if columns_owned else deepcopy(column["hours"])
+            if "qpf_intervals" in column:
+                cell["qpf_intervals"] = (
+                    column["qpf_intervals"] if columns_owned else deepcopy(column["qpf_intervals"])
+                )
             cells.append(cell)
     return {
         "version": _VERSION,
+        **({"forecast_horizon": horizon.payload()} if "forecast_horizon" in center else {}),
         "policy": _POLICY,
         "transformation": deepcopy(_transformation_identity()),
         "geometry": layout,
@@ -478,6 +517,8 @@ def extract_grid_point(
     validate_coordinate(latitude, longitude)
     if grid["version"] not in (_VERSION, _LEGACY_VERSION):
         raise ValueError("Unsupported local surface-grid version")
+    if horizon_for(grid) != horizon_for(grid["forecast_context"]):
+        raise ValueError("Local grid horizon differs from its forecast context")
     center = grid["geometry"]["center"]
     if latitude != center["latitude"] or longitude != center["longitude"]:
         raise CoverageRequiredError(
@@ -494,11 +535,16 @@ def extract_grid_point(
         raise ValueError("Local grid point target does not match the configured coordinate")
     if cell["status"] != "calculated":
         raise CoverageRequiredError("Local grid center baseline is unavailable")
+    if "forecast_horizon" in grid:
+        horizon_for(grid).validate_hour_rows(
+            cell["hours"], datetime.fromisoformat(grid["forecast_context"]["target_reference_time"])
+        )
     return {
         **deepcopy(grid["forecast_context"]),
         "latitude": latitude,
         "longitude": longitude,
         "hours": deepcopy(cell["hours"]),
+        **({"qpf_intervals": deepcopy(cell["qpf_intervals"])} if "qpf_intervals" in cell else {}),
         "local_grid": {
             "version": grid["version"],
             "policy": grid["policy"],

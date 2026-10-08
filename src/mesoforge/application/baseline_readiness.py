@@ -25,6 +25,7 @@ from mesoforge.application.baseline_snapshot import load_baseline, read_pointer
 from mesoforge.application.batch_forecast import _coordinates
 from mesoforge.application.prepared_snapshot import SnapshotError, derive_reference_time
 from mesoforge.application.spatial_coverage import validate_coordinate
+from mesoforge.common.horizon import horizon_for
 from mesoforge.common.identifiers import validate_code_revision
 
 
@@ -55,6 +56,7 @@ def baseline_facts(
     blend = manifest.get("blend_governance")
     return {
         "baseline_snapshot_id": manifest.get("baseline_snapshot_id"),
+        "forecast_horizon_hours": horizon_for(manifest).duration_hours,
         "code_revision": manifest.get("code_revision"),
         "contributor_state_id": prepared.get("snapshot_id"),
         "published_at": _z(published),

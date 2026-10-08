@@ -17,6 +17,7 @@ from typing import Any
 from mesoforge.application.prepared_ifs import IFS_CONFIGURATION
 from mesoforge.application.prepared_temperature import BoundedHttpTransport, _code_identity, _iso
 from mesoforge.catalog.configuration import Phase2Configuration, load_configuration_source
+from mesoforge.common.horizon import LEGACY_HORIZON, ForecastHorizon
 from mesoforge.forecasting.recipes import with_qpf_fields, with_surface_fields
 from mesoforge.guidance.coverage import COVERAGE_POLICY, REQUIRED_HOURS, prepared_horizons
 from mesoforge.guidance.cycle_selection import generate_candidate_reference_times
@@ -47,6 +48,7 @@ def select_model_set(
     qpf_fields: bool = False,
     coverage_hours: int = REQUIRED_HOURS,
     require_complete_shadows: bool = True,
+    forecast_horizon: ForecastHorizon = LEGACY_HORIZON,
 ) -> dict[str, Any]:
     """Newest metadata-complete cycles, or an explicit failure with retained evidence.
 
@@ -56,6 +58,19 @@ def select_model_set(
     reject a cycle or fail the selection. Background refresh may explicitly tolerate
     undiscoverable zero-weight RAP/IFS shadows; required HRRR/GFS remain strict.
     """
+    if forecast_horizon.duration_hours == 120:
+        from mesoforge.application.native_discovery import select_native_model_set
+
+        return select_native_model_set(
+            directory,
+            configuration=configuration,
+            transport=transport,
+            clock=clock,
+            sleeper=sleeper,
+            decision_time=decision_time,
+            coverage_hours=coverage_hours,
+            probe=probe,
+        )
     if qpf_fields and not surface_fields:
         raise ValueError("QPF selection requires surface_fields")
     extension_hours = prepared_horizons(coverage_hours)[REQUIRED_HOURS:]

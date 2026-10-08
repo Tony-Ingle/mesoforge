@@ -73,6 +73,7 @@ class IssuedForecastRow(Base):
         CheckConstraint("location_index >= 0", name="ck_issued_forecasts_location_index"),
         CheckConstraint("latitude BETWEEN -90 AND 90", name="ck_issued_forecasts_latitude"),
         CheckConstraint("longitude BETWEEN -180 AND 180", name="ck_issued_forecasts_longitude"),
+        CheckConstraint("forecast_horizon_hours IN (36, 120)", name="ck_issued_forecasts_horizon"),
         UniqueConstraint(
             "batch_run_id", "location_index", name="uq_issued_forecasts_batch_location"
         ),
@@ -87,6 +88,8 @@ class IssuedForecastRow(Base):
     longitude: Mapped[float] = mapped_column(nullable=False)
     issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     target_reference_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    forecast_horizon_hours: Mapped[int] = mapped_column(nullable=False, server_default="36")
+    forecast_payload_digest: Mapped[str | None] = mapped_column(nullable=True)
     content_digest: Mapped[str] = mapped_column(
         ForeignKey("stored_objects.content_digest"), nullable=False
     )

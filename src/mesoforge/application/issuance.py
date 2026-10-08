@@ -10,7 +10,9 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
+from mesoforge.application.issuance_encoding import decode_issuance, encode_issuance
 from mesoforge.common.errors import IntegrityError, NotFound
+from mesoforge.common.horizon import LEGACY_HORIZON, ForecastHorizon, horizon_for
 from mesoforge.common.identifiers import Digest
 from mesoforge.common.time import IntervalClosure, IntervalDefinition
 from mesoforge.contracts.issued_forecasts import IssuedForecastRecord
@@ -151,24 +153,25 @@ def validate_hour_selection(
     )
 
 
-# Every issued version is validated to hold exactly these horizons, each valid at the
-# target reference time plus its horizon, so issuance metadata alone bounds its hours.
-ISSUED_HORIZON_HOURS = (1, 36)
-VERSION_PREFILTER = "target_reference_time_plus_horizons_1_to_36"
+# Metadata retains each issuance's own duration. Legacy headers default to their
+# actual 36-hour contract; a new default never expands historical opportunity counts.
+VERSION_PREFILTER = "target_reference_time_plus_declared_forecast_horizon"
 
 
-def possible_valid_window(target_reference_time: datetime) -> tuple[datetime, datetime]:
+def possible_valid_window(
+    target_reference_time: datetime, forecast_horizon_hours: int = LEGACY_HORIZON.duration_hours
+) -> tuple[datetime, datetime]:
     """Earliest and latest valid times any saved hour of one version can have."""
-    first, last = ISSUED_HORIZON_HOURS
+    last = ForecastHorizon(forecast_horizon_hours).duration_hours
     return (
-        target_reference_time + timedelta(hours=first),
+        target_reference_time + timedelta(hours=1),
         target_reference_time + timedelta(hours=last),
     )
 
 
 def version_may_overlap(record: IssuedForecastRecord, window: IntervalDefinition) -> bool:
     """Metadata-only test against a start-inclusive, end-exclusive window; no object read."""
-    first, last = possible_valid_window(record.target_reference_time)
+    first, last = possible_valid_window(record.target_reference_time, record.forecast_horizon_hours)
     return first < window.end and last >= window.start
 
 
@@ -290,8 +293,13 @@ class ForecastIssuanceService:
         target = datetime.fromisoformat(forecast["target_reference_time"])
         if target.tzinfo is None:
             raise ValueError("Target reference time must be timezone-aware")
-        if [hour["horizon_hours"] for hour in forecast["hours"]] != list(range(1, 37)):
-            raise ValueError("Issued temperature forecasts must contain hours 1..36")
+        horizon = horizon_for(forecast)
+        if [hour["horizon_hours"] for hour in forecast["hours"]] != list(horizon.leads):
+            raise ValueError(f"Issued forecasts must contain hours 1..{horizon.duration_hours}")
+        horizon.validate_hour_rows(forecast["hours"], target)
+        grid = forecast.get("local_grid_baseline")
+        if grid is not None and horizon_for(grid) != horizon:
+            raise ValueError("Issued forecast and saved grid horizons differ")
         if forecast.get("baseline_snapshot", {}).get("reference_time_source") == "request_hour":
             # Readiness preceded extraction, correction, the desk and presentation.
             # Check the actual issuance clock again before any immutable write. An
@@ -315,9 +323,16 @@ class ForecastIssuanceService:
             "issued_at": issued_at.isoformat().replace("+00:00", "Z"),
             "target_reference_time": target.astimezone(UTC).isoformat().replace("+00:00", "Z"),
         }
-        payload = self._serializer.serialize(
-            {**metadata, "code_identity": self._code_identity, "forecast": forecast}
-        )
+        if "forecast_horizon" in forecast:
+            metadata["forecast_horizon_hours"] = horizon.duration_hours
+        saved = {**metadata, "code_identity": self._code_identity, "forecast": forecast}
+        logical_digest = None
+        if horizon.duration_hours == 120:
+            payload, logical_digest = encode_issuance(saved)
+            media_type = "application/gzip"
+        else:
+            payload = self._serializer.serialize(saved)
+            media_type = "application/json"
         digest = Digest.of_bytes(payload)
         record = IssuedForecastRecord(
             issued_forecast_id=issued_forecast_id,
@@ -327,9 +342,11 @@ class ForecastIssuanceService:
             longitude=forecast["longitude"],
             issued_at=issued_at,
             target_reference_time=target,
+            forecast_horizon_hours=horizon.duration_hours,
+            forecast_payload_digest=logical_digest,
             content_digest=digest,
         )
-        stored = self._objects.put_if_absent(digest, payload, "application/json")
+        stored = self._objects.put_if_absent(digest, payload, media_type)
         # A failed upload/readback must never become a successful PostgreSQL issuance.
         if self._objects.get_verified(stored.storage_uri, digest) != payload:
             raise IntegrityError("Stored issued forecast differs from the serialized forecast")
@@ -367,7 +384,18 @@ class ForecastIssuanceService:
             payload = self._objects.get_verified(stored.storage_uri, record.content_digest)
         except NotFound as exc:
             raise IntegrityError("Issued forecast payload is missing") from exc
-        return self._serializer.deserialize(payload)
+        saved = (
+            self._serializer.deserialize(payload)
+            if record.forecast_payload_digest is None
+            else decode_issuance(payload, expected_logical_digest=record.payload_digest)
+        )
+        if (
+            horizon_for(saved["forecast"]).duration_hours != record.forecast_horizon_hours
+            or saved.get("forecast_horizon_hours", LEGACY_HORIZON.duration_hours)
+            != record.forecast_horizon_hours
+        ):
+            raise IntegrityError("Saved issuance horizon differs from its searchable metadata")
+        return saved
 
     def select_hours(
         self,

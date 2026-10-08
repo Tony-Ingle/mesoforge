@@ -100,6 +100,18 @@ def test_qpf_parent_acquires_only_both_proved_gfs_candidates_and_reuses_objects(
         if "canonical_variable_id" in row
     )
     assert all(row.get("byte_start") != 0 for row in wrapper.validations)
+    proofs = wrapper.validations
+    assert wrapper.cached_range_bytes == 160
+    wrapper.release_completed_object(evidence["grib"]["url"])
+    assert wrapper.cached_range_bytes == 0
+    assert wrapper.validations == proofs
+    wrapper.assert_complete()
+    # A completed/released object is not re-fetched from a possibly changed
+    # provider. Its durable raw evidence is the only replay path.
+    before = len(underlying.calls)
+    with pytest.raises(SelectedObjectError, match="released"):
+        wrapper.get(evidence["grib"]["url"], headers={"Range": "bytes=40-99"})
+    assert len(underlying.calls) == before
 
 
 @pytest.mark.parametrize("model", ["HRRR", "GFS", "RAP", "IFS"])
@@ -275,6 +287,11 @@ def test_completeness_requires_every_selected_message_not_just_metadata():
     wrapper.head(evidence["grib"]["url"])
     with pytest.raises(SelectedObjectError, match="not acquired"):
         wrapper.assert_complete()
+    with pytest.raises(SelectedObjectError, match="incompletely acquired"):
+        wrapper.release_completed_object(evidence["grib"]["url"])
+    acquire(wrapper, evidence)
+    wrapper.release_completed_object(evidence["grib"]["url"])
+    wrapper.assert_complete()
 
 
 @pytest.mark.parametrize("mutation", ["unavailable", "late", "cutoff", "weak_etag", "range"])

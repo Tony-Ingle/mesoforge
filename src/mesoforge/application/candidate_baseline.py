@@ -27,6 +27,7 @@ from mesoforge.forecasting.coherence import (
     WIND,
 )
 from mesoforge.forecasting.field_blend import BlendState, FieldBlendEngine
+from mesoforge.forecasting.provisional_policy import ProvisionalFieldPolicy
 from mesoforge.forecasting.recipes import ContributorConfiguration, Recipe
 
 _DEPENDENT_FIELDS = {
@@ -71,6 +72,10 @@ def _engine(
     contributors = ContributorConfiguration.model_validate_json(
         json.dumps(context["contributor_configuration"])
     )
+    if contributors.field_policy_family is not None:
+        raise ValueError(
+            "Legacy fixed-weight candidate data cannot override a provisional role policy"
+        )
     configuration = Phase2BlendConfiguration.model_validate_json(
         json.dumps(
             context["current_model_set"]["selection"]["source_configuration"]["blend_configuration"]
@@ -80,6 +85,10 @@ def _engine(
         contributors=contributors, phase2=configuration, policy_overrides=parents
     )
     control = active.policy_for(policy.field)
+    if isinstance(control, ProvisionalFieldPolicy):
+        raise ValueError(
+            "Legacy fixed-weight candidate data cannot override a provisional role policy"
+        )
     identity = (
         f"{control.name}/{control.version}"
         if isinstance(control, Recipe)

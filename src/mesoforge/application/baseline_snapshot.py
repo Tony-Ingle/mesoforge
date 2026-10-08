@@ -25,6 +25,7 @@ from mesoforge.application.prepared_snapshot import (
     check_information_cutoff,
 )
 from mesoforge.application.spatial_coverage import CoverageRequiredError, validate_coordinate
+from mesoforge.common.horizon import horizon_for
 from mesoforge.contracts.serialization import canonical_json_bytes
 
 BASELINE_SCHEMA = "mesoforge.baseline-snapshot.v1"
@@ -129,6 +130,7 @@ def _resolve(root: Path, pointer: dict[str, Any]) -> tuple[dict[str, Any], Path]
     # New reports are publication facts, never an instruction to rerun the engine.
     if coherence.get("framework_version") and coherence.get("status") != "passed":
         raise SnapshotError("Baseline required coherence did not pass")
+    horizon_for(manifest)
     return manifest, directory
 
 
@@ -224,6 +226,8 @@ class BaselineView:
         grid = self.pinned.codec.decode(encoded)
         if grid["geometry"] != domain["geometry"]:
             raise SnapshotError("Restored baseline geometry differs from declared coverage")
+        if horizon_for(grid) != horizon_for(self.pinned.manifest):
+            raise SnapshotError("Restored baseline horizon differs from declared coverage")
         forecast = extract_grid_point(grid, latitude=latitude, longitude=longitude, copy_grid=False)
         if forecast["local_grid"]["sha256"] != domain["grid_sha256"]:
             raise SnapshotError("Restored baseline grid differs from its calculated identity")

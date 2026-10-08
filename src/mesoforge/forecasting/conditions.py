@@ -11,10 +11,15 @@ from copy import deepcopy
 from datetime import datetime, timedelta
 from typing import Any
 
-from mesoforge.common.errors import IntegrityError
+from mesoforge.common.errors import IntegrityError, MesoForgeError
+from mesoforge.common.horizon import horizon_for
 from mesoforge.contracts.serialization import canonical_json_digest
 from mesoforge.forecasting.cloud_cover import CLOUD, sky_category, validate_active_cloud_field
 from mesoforge.forecasting.condition_wording import WORDING_POLICY, build_wording
+from mesoforge.forecasting.provisional_policy import (
+    PROVISIONAL_MULTIMODEL_POLICY,
+    provisional_policy,
+)
 from mesoforge.forecasting.thunder import ACTIVE_POLICY, validate_thunder_event
 
 RULESET_ID = "saved-active-fields-condition-preview.v3"
@@ -84,6 +89,8 @@ _METADATA = (
     "contributor_disagreement",
     "disagreement_evidence",
     "final_gust_epsilon_floor_applied",
+    "source_influence",
+    "policy_family",
 )
 
 
@@ -127,6 +134,32 @@ def _policy_allowed(name: str, field: dict[str, Any], horizon: int) -> bool:
     if field.get("role") in ("shadow", "evidence_only") or field.get("active_weight") == 0:
         return False
     policy = field.get("policy")
+    if field.get("policy_family") == PROVISIONAL_MULTIMODEL_POLICY:
+        canonical = (
+            "wind_10m"
+            if name in {"wind_u", "wind_v", "wind_speed", "wind_direction"}
+            else _FIELDS[name][0]
+        )
+        try:
+            if policy != provisional_policy(canonical).policy_id:
+                return False
+        except (ValueError, MesoForgeError):
+            return False
+        weights = field.get("weights", {})
+        influence = field.get("source_influence", {})
+        return (
+            influence.get("policy", {}).get("family") == PROVISIONAL_MULTIMODEL_POLICY
+            and bool(weights)
+            and all(
+                type(weight) in (int, float)
+                and math.isfinite(weight)
+                and weight > 0
+                and influence.get("contributors", {}).get(model, {}).get("applied_weight") == weight
+                and influence["contributors"][model].get("eligible") is True
+                for model, weight in weights.items()
+            )
+            and math.isclose(math.fsum(weights.values()), 1.0, rel_tol=0, abs_tol=1e-12)
+        )
     if name == "temperature":
         return policy == "unchanged-temperature-control"
     if name == "relative_humidity":
@@ -246,7 +279,24 @@ def _component(
             if key in field:
                 component[key] = deepcopy(field[key])
         try:
-            validate_active_cloud_field(field, valid_time=hour["valid_time"])
+            if field.get("policy_family") == PROVISIONAL_MULTIMODEL_POLICY:
+                if not _policy_allowed("sky", field, hour["horizon_hours"]):
+                    raise ValueError(
+                        "Provisional total-cloud policy/influence cannot be established"
+                    )
+                _validate_time(name, field, hour["valid_time"])
+                fraction, percent = field["value"], field["cloud_percentage"]
+                if (
+                    field.get("unit") != "1"
+                    or type(fraction) not in (float, int)
+                    or not math.isfinite(fraction)
+                    or not 0 <= fraction <= 1
+                    or percent != fraction * 100
+                    or field.get("sky_category") != sky_category(percent)
+                ):
+                    raise ValueError("Provisional total cloud fraction/category is inconsistent")
+            else:
+                validate_active_cloud_field(field, valid_time=hour["valid_time"])
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             _reject(component, f"ineligible_saved_active_cloud: {exc}")
             return component
@@ -436,14 +486,17 @@ def build_conditions_preview(saved: dict[str, Any], *, scope: str = "point") -> 
     if seen != expected_indices:
         raise IntegrityError("Saved grid does not contain its complete declared lattice")
     reference = _time(forecast["target_reference_time"])
+    horizon = horizon_for(forecast)
+    if horizon_for(grid) != horizon:
+        raise IntegrityError("Saved grid and forecast horizons disagree")
     cells = []
     center = None
     editable_cells = 0
     for index, cell in enumerate(grid["cells"]):
         hours = cell["hours"]
-        if [hour["horizon_hours"] for hour in hours] != list(range(1, 37)):
+        if [hour["horizon_hours"] for hour in hours] != list(horizon.leads):
             raise ConditionsPreviewUnavailableError(
-                "Every saved grid cell must contain hours 1..36"
+                f"Every saved grid cell must contain hours 1..{horizon.duration_hours}"
             )
         if any(
             _time(hour["valid_time"]) != reference + timedelta(hours=hour["horizon_hours"])

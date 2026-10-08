@@ -55,8 +55,9 @@ class SelectedObjectTransport:
     """Allow only selected inventories and message ranges, with identity checks.
 
     Successful index GETs and object HEADs are cached within this preparation.
-    Every GRIB range GET is conditional on the discovery ETag and checked again;
-    no GRIB body is cached here. Existing acquisition owns raw retention/decoding.
+    Every GRIB range GET is conditional on the discovery ETag and checked again.
+    Compound-field ranges are cached until their object is released; streaming
+    preparation releases each fully decoded object. Acquisition owns raw retention.
     Identity failures remain fatal even if an adapter's retry engine catches them.
     """
 
@@ -86,6 +87,7 @@ class SelectedObjectTransport:
         self._ranges: dict[str, dict[str, dict[str, Any]]] = {}
         self._range_cache: dict[tuple[str, str], _Response] = {}
         self._acquired: set[tuple[str, str]] = set()
+        self._released: set[str] = set()
         if not probes:
             raise ValueError("At least one selected temperature probe is required")
         for original in probes:
@@ -178,6 +180,29 @@ class SelectedObjectTransport:
     def validations(self) -> list[dict[str, Any]]:
         return deepcopy(self._records)
 
+    @property
+    def cached_range_bytes(self) -> int:
+        """Bytes held solely for within-object shared-message reuse."""
+        return sum(len(response.content) for response in self._range_cache.values())
+
+    def release_completed_object(self, url: str) -> None:
+        """Release one acquired object's bytes after all region decoders finish.
+
+        Immutable validation digests and acquisition completeness remain. A
+        released object cannot be requested again through this preparation;
+        replay must use its retained raw file, never a new provider response.
+        """
+        if url not in self._gribs:
+            self._fail("Cannot release an object absent from the pinned selection")
+        expected = {(url, byte_range) for byte_range in self._ranges[url]}
+        if not expected.issubset(self._acquired):
+            raise SelectedObjectError("Cannot release an incompletely acquired selected object")
+        for key in expected:
+            self._range_cache.pop(key, None)
+        self._cache.pop(("get", self._gribs[url]["index"]["url"]), None)
+        self._cache.pop(("head", url), None)
+        self._released.add(url)
+
     def _fail(self, reason: str) -> None:
         self.failed_reason = reason
         raise SelectedObjectError(reason)
@@ -215,6 +240,8 @@ class SelectedObjectTransport:
         if is_index and method != "get":
             self._fail("Only index GET and GRIB HEAD/range GET are permitted")
         probe = (self._indexes if is_index else self._gribs)[url]
+        if probe["grib"]["url"] in self._released:
+            self._fail("Selected object was released; replay its retained raw evidence")
         expected = probe["index" if is_index else "grib"]
         message = probe["selected_message"]
         request_headers = dict(headers or {})

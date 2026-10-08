@@ -18,9 +18,9 @@ from mesoforge.application.batch_forecast import load_locations
 from mesoforge.application.delivery_artifacts import configured_journal
 from mesoforge.application.email_delivery import MAX_ATTACHMENT_BYTES, SmtpSettings, deliver
 from mesoforge.application.issuance import read_issued_forecast
+from mesoforge.common.horizon import FIVE_DAY_HORIZON, LEGACY_HORIZON
 from mesoforge.common.identifiers import Digest, IssuedForecastId
 from mesoforge.presentation.forecast_document import (
-    HOURS_DOCUMENT_POLICY,
     ForecastCoverageError,
     build_forecast_document,
 )
@@ -54,10 +54,16 @@ def saved_document(
     saved = read_issued_forecast(UUID(issued_id))
     if IssuedForecastId(saved["issued_forecast_id"]) != issued_id:
         raise ValueError("Issued forecast identity mismatch")
-    if product not in {"36-hour", "5-day"}:
+    if product not in {"36-hour", "120-hour", "5-day"}:
         raise ValueError("Unsupported presentation product")
     return build_forecast_document(
-        saved, location=locations[0], hours=36 if product == "36-hour" else None
+        saved,
+        location=locations[0],
+        hours={
+            "36-hour": LEGACY_HORIZON.duration_hours,
+            "120-hour": FIVE_DAY_HORIZON.duration_hours,
+            "5-day": None,
+        }[product],
     )
 
 
@@ -81,11 +87,7 @@ def email_content(document: dict[str, Any]) -> tuple[str, str, str]:
     zone = ZoneInfo(document["display_timezone"])
     issue_date = datetime.fromisoformat(document["issued_at"]).astimezone(zone).date()
     name = document["location"]["name"]
-    title = (
-        "36-Hour Weather Outlook"
-        if document["document_policy"] == HOURS_DOCUMENT_POLICY
-        else "5-Day Forecast"
-    )
+    title = document["product_title"]
     subject = f"MesoForge {title} — {name} — {issue_date}"
     start = datetime.fromisoformat(document["valid_start"]).astimezone(zone)
     end = datetime.fromisoformat(document["valid_end"]).astimezone(zone)
@@ -119,9 +121,9 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--pdf", type=Path, required=True)
         command.add_argument(
             "--product",
-            choices=("36-hour", "5-day"),
+            choices=("36-hour", "120-hour", "5-day"),
             default="36-hour",
-            help="36-hour operational outlook; five complete local days remain coverage-gated",
+            help="Saved 36/120-hour outlook, or coverage-gated five complete local calendar days",
         )
         if name == "send":
             command.add_argument("--recipient", required=True)

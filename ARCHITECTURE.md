@@ -1370,25 +1370,197 @@ extrema/totals and transitions are deterministic. Partial local days remain labe
 as covered periods, not complete daily forecasts. Rendering and SMTP are separate
 from issuance; neither calls guidance, blending or the AI desk.
 
-**Deferred five-day product.** The numerical forecast still has 36 hours.
-The current temperature recipe requires HRRR and GFS, with no
-approved GFS-only temperature fallback beyond HRRR's native horizon. Active field
-lead bands end at 36 hours. RAP also expires within the short range; IFS remains a
-three-hour shadow. GFS hourly cadence ends at source lead 120, which is earlier
-than the last required source lead of a 120-hour forecast from an older cycle.
-NBM's current attachments and prepared/baseline/issuance/AI contracts are short-range.
-Extending array sizes would not supply approved long-range science or exact hourly
-QPF. Those contracts remain unchanged; no real five-day forecast or email can be
-claimed from a 36-hour issuance.
+**CURRENT provisional 120-hour policy.** The owner explicitly approved a new
+versioned policy before mature verification. The default/historical 36-hour family
+remains unchanged. An explicit 120-hour Guidance configuration runs native discovery
+and preparation through the existing prepared snapshot → FieldBlendEngine → coherence
+→ baseline boundary; Forecast Worker only extracts the saved declared horizon.
 
+`mesoforge.provisional-multimodel-120h.v1` is a transparent prior, **not calibrated
+skill weighting**. Each migrated field has a distinct `mesoforge.*-role-blend.v1` ID:
+
+| Fields | Short-lead role priors → longer-lead role priors |
+| --- | --- |
+| Temperature, dew point, vector wind, gust | HRRR/RAP mesoscale 2→1; GFS/IFS global 1→2; NBM meta-model 1 |
+| Liquid QPF | HRRR convection-permitting 2→1; RAP/GFS/IFS broader deterministic 1→2; NBM meta-model 1 |
+| Total cloud | HRRR/RAP/GFS/IFS native deterministic 1; NBM meta-model 2 |
+| Six-hour precipitation probability | NBM meta-model 2; compatible GEFS ensemble probability 1 |
+
+Lead 18–48 uses smoothstep between the stated priors. Each role is divided equally
+among its registered models **before** eligibility/tapers, avoiding an expiry jump
+that doubles another member's influence. Freshness is `1/(1+cycle_age/update_period)`;
+cycle age must be 0–24 hours. Update periods are one hour for ordinary HRRR/RAP/NBM
+and six hours for extended HRRR/RAP and GFS/IFS. Native-expiry influence uses
+`smoothstep((last_native_lead+1-source_lead)/(update_period+1))`, with no contribution
+after the last native lead. Six-hour PoP uses the corresponding native NBM/GEFS
+probability horizons and cycles under its separate event contract. Eligible positive
+influences renormalize to one; an empty
+set stays unavailable. Every field records these factors, exclusion reasons, native
+values and normalized weights. NBM is correlated meta-model evidence, not another
+independent deterministic model. No automatic promotion or learning is introduced.
+
+Adjacent documented native T/Td/U/V/total-cloud states may be linearly interpolated
+with both endpoints retained. Gust is used only at compatible instantaneous native
+times; IFS interval gust maxima remain incompatible. A canonical QPF event collection
+preserves exact complete native intervals, summing compatible smaller events when
+needed. It never divides three-/six-hour totals. Coarse-covered hourly amount slots
+are explicitly unavailable, so current hourly MRMS verification cannot score invented
+amounts. Hourly PoP/thunder and p-type retain their event/agreement rules; unsupported
+later hours remain unavailable. Separately, `probability_of_precipitation_6h` combines
+only exact matching `(start,end]` six-hour gridpoint probabilities of precipitation
+**greater than 0.254 kg/m²**, from native NBM/GEFS products. It is delivered only at
+complete UTC-aligned event endpoints, with no hourly redistribution or conditions
+substitution. The PDF labels its maximum as six-hour PoP, not daily or hourly PoP.
+ECMWF ENS24-hour probability (at least 1 mm) remains incompatible separate evidence.
+No new fog, snowfall, ice or precipitation-type science.
+
+**120-hour source/field audit (2026-10-08).** This records the starting-revision
+scientific audit; the explicit policy above supersedes its pending-decision role notes. Native lead
+means hours from the **source cycle**, not from the later MesoForge reference.
+An older cycle therefore needs native coverage beyond lead 120 to supply a full
+120-hour MesoForge outlook. Public product availability does not imply an existing
+MesoForge adapter, an approved active role, or measured comparative skill.
+
+| Source | Native grid, cycles and horizon relevant to five days | Starting-revision integration | Proposed role; not yet approved or implemented |
+| --- | --- | --- | --- |
+| HRRR | CONUS 3 km; hourly cycles; 18 h normally, 48 h at 00/06/12/18 UTC | Extended cycles only; source leads through 48; active T/Td/vector wind/gust/QPF and p-type input, other native evidence | Short-range contributor only; expire at the actual last valid native lead, never extrapolate |
+| RAP | Grid 130, approximately 13.5 km; hourly cycles; 21 h normally, 51 h at 03/09/15/21 UTC | Zero-weight T/Td/wind/gust shadow through available native leads; several attachments; no prepared QPF stream | Short-range comparison/context; any promotion requires a new explicit policy; this is not a convection-permitting model |
+| GFS | Public 0.25 degree grid, 00/06/12/18 UTC; hourly through lead 120, then 3-hourly through 384 | Active surface/QPF adapter capped at lead 48; some attachment URL contracts reach 120 | Medium-range deterministic contributor; state interpolation and coarser accumulation handling require explicit contracts beyond hourly native coverage |
+| IFS | Open 0.25 degree grid; all four cycles 3-hourly through 144, 00/12 cycles then 6-hourly through 360 | Zero-weight shadow, adapter capped at 90; non-native hours missing; no interpolation; three-hour gust maxima rejected as incompatible with instantaneous gust | Medium-range independent deterministic evidence/contributor only after an explicit policy; preserve each native field's temporal meaning |
+| NBM | CONUS 2.5 km, hourly cycles; v5 extends most hourly states to 48, then published files are generally 3-hourly through 192 and 6-hourly later | Active hourly PoP/cloud/thunder only; a retained Phase 2 adapter also represents surface/QPF fields; winter/visibility evidence remains separate | Strong probabilistic/meta-model evidence, with event-specific use; not an independent vote from its constituent models and not a blanket hourly gap filler |
+| NAM / NAM nest | NAM 12 km to 84 h; CONUS nest 3 km to 60 h; 00/06/12/18 UTC; product-dependent 1-/3-hour output | No adapters | Do not add solely for model count; neither supplies five days and retirement is scheduled for 2026-11-03 |
+| RRFS / REFS | Planned 3 km successors: RRFS to 84 h at synoptic cycles, 18 h otherwise; REFS to 60 h at 00/06/12/18 UTC | No RRFS adapter; a parallel/pre-implementation REFS heavy-precipitation probability shadow exists | Future short-range evidence after operational/product validation; scheduled implementation is 2026-11-03, not yet CURRENT |
+| GEFS | Control plus 30 perturbations; selected 0.25 degree member products 3-hourly through 240; 0.5 degree products extend farther | Only a 0.5 degree bias-corrected 6-hour precipitation-probability shadow; no general member-field adapter | Possible medium-range probabilistic support under exact event contracts; not hourly PoP and not a current deterministic field blend input |
+| ECMWF ENS | Open 0.25 degree member guidance; 3-hourly through 144, with longer coarser coverage depending on cycle/product | Only a 24-hour precipitation-probability shadow at 00/12 UTC, on 12-hour steps through 240 | Possible medium-range spread/probability evidence; member ingestion and field calibration are separate work |
+| Other catalog evidence | GLMP/HREF/lightning products have their own shorter horizons and event definitions; AIFS/AIGFS/Canadian guidance also exists outside these adapters | Thunder catalog inspection is not an acquisition binding; no independent AIFS/AIGFS/Canadian adapter | No implicit integration or active role; METAR/MRMS remain observation/analysis references, not forecast contributors |
+
+Native source authorities: [HRRR](https://www.emc.ncep.noaa.gov/emc/pages/numerical_forecast_systems/hrrr.php),
+[RAP/HRRR extended cycles](https://www.weather.gov/media/notification/pdf2/scn20-46rap_v5_hrrr_v4_aab.pdf),
+[RAP products](https://www.nco.ncep.noaa.gov/pmb/products/rap/),
+[GFS products](https://www.nco.ncep.noaa.gov/pmb/products/gfs/) and
+[hourly GFS dissemination](https://www.weather.gov/media/notification/tins/tin16-11gfs_gdas_aaa.pdf),
+[ECMWF open-data schedule/fields](https://www.ecmwf.int/en/forecasts/datasets/open-data),
+[GEFS products](https://www.nco.ncep.noaa.gov/pmb/products/gens/),
+[NAM products](https://www.nco.ncep.noaa.gov/pmb/products/nam/) and
+[NAM v4 grid definitions](https://www.weather.gov/media/nws/Public_release_notes_NAM.v4.0.pdf).
+The October 2 updates set [NAM/SREF/HREF/HiResW retirement](https://www.weather.gov/media/notification/pdf_2026/scn26-47_Updated_Retirement_of_NAM_SREF_HREF_HiresW_NAM_MOS_aac.pdf)
+and [RRFS/REFS implementation](https://www.weather.gov/media/notification/pdf_2026/scn26-048_Updated_RRFS_and_REFS_Implementation_aae.pdf)
+to November 3; earlier October 14 notices are superseded.
+
+**NBM timing needs field-level inspection.** [NBM v5](https://www.weather.gov/media/notification/pdf_2026/scn26-24_Updated_NBM_V5.0_aac.pdf)
+became operational April 30, 2026. Thunder, visibility and some aviation products
+are exceptions to its general hourly extension. NOAA's published inventories show:
+[f048](https://www.nco.ncep.noaa.gov/pmb/products/blend/conus/00/blend.t00z.core.f048.co.grib2.shtml)
+has 47–48 h QPF/PoP but 3-/6-/12-hour thunder;
+[f051](https://www.nco.ncep.noaa.gov/pmb/products/blend/conus/00/blend.t00z.core.f051.co.grib2.shtml)
+has 50–51 h QPF and 48–51 h thunder, with no PoP entry;
+[f120](https://www.nco.ncep.noaa.gov/pmb/products/blend/conus/00/blend.t00z.core.f120.co.grib2.shtml)
+has 119–120 h and 114–120 h QPF, 6-/12-hour PoP/thunder, six-hour snowfall/flat ice,
+and no visibility entry. A one-hour accumulation in a file published every three
+hours does **not** supply the intervening hourly events. These catalog findings
+are validated again against acquired GRIB metadata. A bounded real index inspection
+on October 8 also established that NBM post-hourly state cadence is anchored to
+**valid UTC multiples of three**, not source lead multiples: the 13Z cycle has state
+fields at f125/f128 (18Z/21Z), while f126/f129 contain only one-hour APCP. Six-hour
+QPF/PoP likewise end at valid UTC multiples of six. The central native schedule
+retains that phase and its explicit transition bracket. This preparation retains
+state-file endpoints and compatible six-hour QPF later; additional later QPF-only
+hourly files are an explicit ingestion limitation, not a claim that those products
+do not exist. No coarse amount is divided to fill their missing hourly slots.
+
+The complete field mapping below uses the source horizon/cadence table above.
+“Available natively” and “eligible for a new policy” never mean “already active.”
+Current roles refer to the normal rich-grid path, not every older Phase 2 helper.
+
+| Forecast concept and temporal semantics | Current represented contributors / role | Five-day constraint and proposed eligible role |
+| --- | --- | --- |
+| Temperature (K), instantaneous | HRRR/GFS active; RAP/IFS shadow; NBM exists in Phase 2 | GFS/IFS/NBM native states reach five days, but current temperature requires HRRR/GFS; approve a new availability/lead policy before execution |
+| Dew point (K), instantaneous | HRRR/GFS active; RAP/IFS shadow; NBM in Phase 2 | Same eligible state sources; retain T/Td consistency and explicit interpolation provenance |
+| RH (%), diagnostic state | Bolton diagnostic of coherent blended T/Td | Derive only when coherent T/Td exist; do not independently weight native RH |
+| Wind U/V, speed/direction (m/s, degrees), instantaneous | HRRR/GFS active vectors; RAP/IFS shadow; NBM speed/direction in Phase 2 | GFS/IFS/NBM state coverage is possible; interpolate/blend earth-relative U/V, then derive speed/direction |
+| Gust (m/s), instantaneous versus interval maximum | HRRR/GFS active; RAP shadow; NBM in Phase 2; IFS three-hour maximum explicitly incompatible | GFS/NBM eligible where semantics match; do not convert IFS interval maxima into instantaneous gust |
+| Liquid QPF (mm), interval accumulation | HRRR/GFS exact-hour active; GFS cumulative buckets differenced under the current contract; NBM one-hour in Phase 2; no prepared RAP/IFS QPF stream | GFS later three-hour and NBM sparse one-/six-hour products require separately timed amounts or approved common complete intervals; never divide totals into invented hourly amounts |
+| PoP (%), interval probability and threshold | NBM one-hour active; NBM six-hour, GEFS six-hour, REFS heavy one-hour and ENS 24-hour products are separate shadows | NBM/GEFS/ENS can supply longer native events, not interchangeable hourly probabilities; REFS uses a different threshold/neighborhood definition |
+| Total cloud (%), instantaneous state / sky category | NBM temporary active; HRRR/GFS/RAP/IFS shadows | GFS/IFS/NBM total-cloud states can support five days under a selected policy; no summing cloud layers, and reuse current category thresholds |
+| Thunder (%), explicitly defined event probability | NBM one-hour temporary active; three-/six-hour products remain separate evidence | Later native three-/six-hour windows must remain labeled; do not infer hourly thunder or derive probability from CAPE/QPF/reflectivity |
+| Precipitation type, instantaneous categorical state | HRRR/GFS agreement active; RAP categorical flags, IFS categories and NBM conditional probabilities are evidence | HRRR expiration leaves the existing agreement unsupported; later category policy is a scientific decision, not temperature inference or categorical interpolation |
+| Visibility (m), instantaneous native product | HRRR/GFS/RAP/NBM evidence; no active delivery; IFS unsupported | NBM visibility does not reach lead 120 in the inspected inventory; preserve unavailable/evidence status, with no fog diagnosis |
+| Snowfall water equivalent (mm), accumulation | HRRR/RAP hourly evidence; IFS cumulative snowfall water equivalent at native three-hour times | Preserve cumulative/interval meaning and evidence-only status; GFS/NBM SWE unsupported by current extraction |
+| Native snowfall amount (m), accumulation | HRRR/RAP cycle accumulations and NBM hourly amounts are evidence; GFS/IFS snow depth is not snowfall | NBM later six-hour snowfall may remain separately timed evidence; do not treat snow depth as snowfall or fabricate hourly snow |
+| Kuchera snowfall / SLR (m, ratio), derived evidence / native ratio | RAP profile-derived Kuchera and compatible snowfall/SWE ratios; NBM native SLR evidence | Preserve separate derivation/product identities; no active snowfall delivery or universal fixed ratio |
+| Freezing-rain liquid / flat ice (mm or native mass-area equivalent), distinct accumulations | HRRR/RAP cumulative freezing-rain liquid; NBM flat/accreted ice; GFS/IFS unsupported | NBM later six-hour ice can remain evidence; freezing-rain liquid is not accreted thickness; no new accretion rule |
+
+Current implementation limits are explicit in
+[`sources`](src/mesoforge/catalog/sources.py),
+[`contributors`](src/mesoforge/catalog/contributors.py),
+[`configuration`](src/mesoforge/catalog/configuration.py),
+[`coverage`](src/mesoforge/guidance/coverage.py),
+[`field_blend`](src/mesoforge/forecasting/field_blend.py), and the field adapters in
+[`current_availability`](src/mesoforge/guidance/sources/current_availability.py),
+[`ifs`](src/mesoforge/guidance/sources/ifs.py),
+[`probabilistic`](src/mesoforge/guidance/sources/probabilistic.py) and
+[`thunder`](src/mesoforge/guidance/sources/thunder.py).
+The 42-hour prepared envelope supports later reference views of a 36-hour product;
+it is not a 120-hour contract. Existing active lead bands stop at 36 hours.
+
+**Audit rationale, now implemented under the explicit policy above.** Use eligible
+state contributors at their native times, explicit bounded state interpolation,
+and native/coarser accumulation events with missing hourly components where necessary.
+The versioned policy above supplies contributor eligibility, lead behavior, source age
+and numerical priors; probability windows remain their own product contracts. Short-range expiry must be explicit. Compatible full intervals may
+be summed to a common event, but partial/sparse intervals cannot be redistributed.
+Availability must be proven per source object before the cutoff: configured source
+maximum ages and completion deadlines are admission limits, not measured latency
+or proof of publication. Source/product/cycle/native time, effective weight,
+interpolation and missingness must remain inspectable. NBM and its constituent
+guidance are correlated evidence, not independent forecasts. None of this audit
+establishes improved skill; temperature and exact-event MRMS QPF verification
+remain the judge, with limited multi-event evidence explicitly acknowledged.
+
+**CURRENT horizon and durable readback.**
+[`common.horizon`](src/mesoforge/common/horizon.py) defines explicit 36-/120-hour
+elapsed windows with one-hour state timestamps. A missing declaration on historical
+artifacts retains their 36-hour meaning; malformed declarations fail. Baseline/grid
+validation, exact-point extraction, issuance metadata and progressive temperature/QPF
+verification preserve that declaration. PostgreSQL migration `0006` adds a searchable
+issuance duration with a historical default of 36 and optional logical payload digest;
+old payloads and digests are not rewritten. New 120-hour issuances use a self-contained,
+lossless compact encoding plus deterministic gzip. The reader validates physical and
+logical digests and returns the same rich forecast shape; no external raw-file dependency
+is introduced by this encoding. Longer lead groups are descriptive analysis only. Approved temperature
+correction buckets still stop at 36 hours, with explicit no-policy behavior afterward.
+
+[`native_horizons`](src/mesoforge/catalog/native_horizons.py) describes nominal
+source/field retrieval times, not provider completeness or active eligibility.
+[`state_interpolation`](src/mesoforge/alignment/state_interpolation.py) is an opt-in
+kernel for compatible T/Td/U/V/total-cloud states with retained adjacent native
+endpoints. It rejects gaps, extrapolation, differing spatial/physical definitions,
+accumulations and probabilities. Explicit native 120-hour acquisition and blending use
+these contracts; the 36-hour family retains its historical execution and science.
+The existing [`precipitation`](src/mesoforge/guidance/precipitation.py) module also
+provides opt-in exact interval composition: sum one contiguous cover from a single
+source/cycle/spatial support, retaining every parent. Gaps, overlaps, splitting and
+mixed identities fail; a missing input produces no total. This is groundwork for
+honest coarser QPF events used by the provisional long-range amount policy.
+
+Declared 120-hour AI context uses bounded period summaries and keeps the existing
+64 KiB context ceiling and per-request limits. `--product 120-hour` requires a complete
+declared saved issuance and renders five elapsed 24-hour periods with their actual
+local endpoints. It does not claim five complete local calendar dates. The separate
+legacy `--product 5-day` fixture path retains its complete-calendar-day gate. These
+readback/presentation contracts require a real, complete saved 120-hour issuance before
+operational delivery; fixture data cannot pass the send gate.
+
+**Current saved-issuance presentation.**
 [`forecast_document`](src/mesoforge/presentation/forecast_document.py) validates the
-saved final grid digest and exact point before aggregating the 36-hour product.
+saved final grid digest and exact point before aggregating the selected supported window.
 The separate five-day fixture path still requires five complete local calendar days.
 Both reuse current condition rules, preserve accumulation windows, use hourly
 temperature extrema and vector-mean wind, and label maximum hourly PoP distinctly
 from daily occurrence probability. Incomplete field coverage stays unavailable.
 Named-zone boundaries account for DST; a rolling 120-hour interval may contain
-partial calendar days and is rejected when five complete days are absent.
+partial calendar days and is rejected by the complete-calendar-day product when five
+complete days are absent; the explicit 120-hour product labels its elapsed periods.
 [`forecast_pdf`](src/mesoforge/presentation/forecast_pdf.py) uses local ReportLab fonts,
 vector charts and deterministic metadata for a two-page document. Fixture documents
 are visibly marked and cannot pass the production send gate.

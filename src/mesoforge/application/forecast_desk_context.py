@@ -7,16 +7,26 @@ import math
 import re
 from collections import Counter
 from dataclasses import asdict
+from datetime import timedelta
 from typing import Any
 
+from mesoforge.common.horizon import LEGACY_HORIZON, horizon_for
 from mesoforge.common.identifiers import Digest
+from mesoforge.common.qpf_intervals import (
+    interval_time,
+    summarize_qpf_intervals,
+    validate_qpf_intervals,
+)
 from mesoforge.contracts.forecast_desk import MAX_INSPECTION_ROWS, TOOLS
 from mesoforge.contracts.forecast_variants import instant
 from mesoforge.contracts.serialization import canonical_json_bytes, canonical_json_digest
 from mesoforge.forecasting.coherence import QPF, RELATIONSHIP_REGISTRY, TEMPERATURE
 from mesoforge.forecasting.ice import FLAT_ICE, FRZR
+from mesoforge.forecasting.probability_events import six_hour_events, six_hour_summary
+from mesoforge.forecasting.provisional_policy import POP6
 
 CONTEXT_VERSION = "mesoforge.forecast-desk-context.v1"
+EXTENDED_CONTEXT_VERSION = "mesoforge.forecast-desk-context.v2"
 _FIELD_KEYS = (
     "value",
     "unit",
@@ -66,6 +76,9 @@ _FIELD_KEYS = (
     "conditional_type_fractions",
     "event_id",
     "accumulation_hours",
+    "accumulation_duration_hours",
+    "event_duration_hours",
+    "spatial_support",
     "population",
     "method_description",
     "accretion_geometry",
@@ -278,6 +291,11 @@ def contributors_at(hour: dict[str, Any], field: str) -> dict[str, Any]:
         for model, row in hour.get("surface", {}).get("contributors", {}).items()
         if isinstance(row, dict) and field in row.get("fields", {})
     }
+    if field == POP6:
+        for model, native in (
+            hour.get("surface", {}).get("fields", {}).get(field, {}).get("contributors", {}).items()
+        ):
+            result[str(native.get("source_id", model))] = field_view(native)
     if field == TEMPERATURE:
         for key in ("sources", "shadow_sources"):
             for row in hour.get(key, []):
@@ -406,6 +424,86 @@ def _qpf_timing(hours: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _period_point_summary(
+    point: list[tuple[str, Any]], name: str, period_peaks: dict[int, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Five bounded elapsed-day summaries; no invented occurrence/intensity thresholds."""
+    result = []
+    for offset in range(0, len(point), 24):
+        group = point[offset : offset + 24]
+        values = [value for _, value in group if _number(value)]
+        row: dict[str, Any] = {
+            "period": offset // 24 + 1,
+            "numeric_hours": len(values),
+            "expected_hours": len(group),
+            "range": list(minimum_arc(values))
+            if values and name == DIRECTION
+            else [min(values), max(values)]
+            if values
+            else None,
+            "maximum_comparable_disagreement": period_peaks.get(offset // 24),
+        }
+        if name == QPF:
+            # This is an explicitly incomplete sum when hours are absent; never
+            # a replacement for the native interval amounts or a complete total.
+            row["sum_of_available_hourly_amounts"] = sum(values)
+            row["positive_hours"] = sum(value > 0 for value in values)
+        elif not values:
+            states = Counter(str(value) for _, value in group)
+            row["states"] = dict(sorted(states.items()))
+        result.append(row)
+    return result
+
+
+def _qpf_event_summary(rows: list[dict[str, Any]], reference: Any, duration: int) -> dict[str, Any]:
+    """Compact period context from native events; coarse events remain inspect-only."""
+    amounts = [row for row in rows if row["value"] is not None]
+    maximum = max(amounts, key=lambda row: row["value"]) if amounts else None
+    return {
+        "event_count": len(rows),
+        "event_durations_hours": sorted(
+            {
+                (
+                    interval_time(row["interval_end"]) - interval_time(row["interval_start"])
+                ).total_seconds()
+                / 3600
+                for row in rows
+            }
+        ),
+        "maximum_native_event": field_view(maximum) if maximum else None,
+        "horizon": summarize_qpf_intervals(
+            rows, start=reference, end=reference + timedelta(hours=duration)
+        ),
+        "periods": [
+            {
+                "period": offset // 24 + 1,
+                **summarize_qpf_intervals(
+                    rows,
+                    start=reference + timedelta(hours=offset),
+                    end=reference + timedelta(hours=offset + 24),
+                ),
+            }
+            for offset in range(0, duration, 24)
+        ],
+        "semantics": "Canonical partition; do not add hourly amounts again. "
+        "Coarse events are inspect-only; no temporal splitting.",
+    }
+
+
+def _native_event_at(cell: dict[str, Any], valid_time: str) -> dict[str, Any] | None:
+    instant_value = interval_time(valid_time)
+    return next(
+        (
+            row
+            for row in cell.get("qpf_intervals", [])
+            if interval_time(row["interval_start"])
+            < instant_value
+            <= interval_time(row["interval_end"])
+        ),
+        None,
+    )
+
+
 def build_context(
     forecast: dict[str, Any],
     *,
@@ -418,8 +516,22 @@ def build_context(
     pin = _pin(forecast)
     grid = forecast["local_grid_baseline"]
     cells = grid["cells"]
-    if not cells or len(cells) > 4096 or any(len(c["hours"]) != 36 for c in cells):
-        raise ValueError("Desk requires a bounded complete 36-hour saved grid")
+    horizon = horizon_for(forecast)
+    if horizon_for(grid) != horizon:
+        raise ValueError("Desk forecast and saved grid horizon differ")
+    if not cells or len(cells) > 4096:
+        raise ValueError("Desk requires a bounded complete saved grid")
+    reference = instant(forecast["target_reference_time"])
+    horizon.validate_hour_rows(forecast["hours"], reference)
+    for cell in cells:
+        horizon.validate_hour_rows(cell["hours"], reference)
+        if "qpf_intervals" in cell:
+            validate_qpf_intervals(
+                cell["qpf_intervals"],
+                start=reference,
+                end=reference + timedelta(hours=horizon.duration_hours),
+            )
+    extended = horizon != LEGACY_HORIZON
     names = sorted({name for cell in cells for hour in cell["hours"] for name in fields_at(hour)})
     if len(names) > 64:
         raise ValueError("Desk field inventory exceeds context contract")
@@ -438,15 +550,16 @@ def build_context(
         peak = None
         comparable_cell_hours = 0
         units: set[str] = set()
+        period_peaks: dict[int, dict[str, Any]] = {}
         for cell in cells:
-            for hour in cell["hours"]:
+            for hour_index, hour in enumerate(cell["hours"]):
                 field = fields_at(hour).get(name, {})
                 value = field.get("value")
                 units.add(str(field.get("unit", "unavailable")))
                 if _number(value):
                     values.append((value, hour["valid_time"], cell_id(cell)))
                     if (
-                        name in (QPF, "probability_of_precipitation_1h")
+                        name in (QPF, "probability_of_precipitation_1h", POP6)
                         and value > 0
                         and cell.get("inside_editable_domain") is True
                     ):
@@ -470,6 +583,16 @@ def build_context(
                 if groups:
                     comparable_cell_hours += 1
                     widest = max(groups, key=lambda group: group["spread"])
+                    period = hour_index // 24
+                    if extended and widest["spread"] > period_peaks.get(period, {}).get(
+                        "spread", -1
+                    ):
+                        period_peaks[period] = {
+                            "spread": widest["spread"],
+                            "unit": widest["unit"],
+                            "valid_time": hour["valid_time"],
+                            "cell_id": cell_id(cell),
+                        }
                     if spread is None or widest["spread"] > spread:
                         spread, spread_unit = widest["spread"], widest["unit"]
                         peak = {"valid_time": hour["valid_time"], "cell_id": cell_id(cell)}
@@ -541,20 +664,60 @@ def build_context(
             }
         if name == QPF:
             summary["point_sum_of_available_hourly_amounts"] = sum(v for _, v in numeric_point)
-            summary["positive_point_hours"] = [t for t, v in numeric_point if v > 0]
+            if not extended:
+                summary["positive_point_hours"] = [t for t, v in numeric_point if v > 0]
             summary["missing_hours_excluded_from_sum"] = len(point) - len(numeric_point)
             summary["point_contributor_timing"] = _qpf_timing(forecast["hours"])
+            if "qpf_intervals" in forecast:
+                centers = [cell for cell in cells if cell["is_forecast_point"]]
+                if (
+                    len(centers) != 1
+                    or centers[0].get("qpf_intervals") != forecast["qpf_intervals"]
+                ):
+                    raise ValueError("Desk point QPF partition differs from pinned grid center")
+                summary["point_native_events"] = _qpf_event_summary(
+                    forecast["qpf_intervals"], reference, horizon.duration_hours
+                )
+        if extended:
+            summary["point_forecast_periods"] = _period_point_summary(point, name, period_peaks)
+        if name == POP6:
+            events = six_hour_events(forecast["hours"])
+            summary["point_native_events"] = {
+                "event_duration_hours": 6,
+                "interpretation": "whole native six-hour event probabilities; inspect-only; "
+                "never hourly or daily probabilities",
+                **six_hour_summary(
+                    events, start=reference, end=reference + timedelta(hours=horizon.duration_hours)
+                ),
+                "periods": [
+                    {
+                        "period": offset // 24 + 1,
+                        **six_hour_summary(
+                            events,
+                            start=reference + timedelta(hours=offset),
+                            end=reference + timedelta(hours=offset + 24),
+                        ),
+                    }
+                    for offset in range(0, horizon.duration_hours, 24)
+                ],
+            }
         summaries[name] = summary
     relevant = any(
         isinstance(summaries.get(name, {}).get("range"), list) and summaries[name]["range"][1] > 0
-        for name in (QPF, "probability_of_precipitation_1h")
+        for name in (QPF, "probability_of_precipitation_1h", POP6)
     )
+    for cell in cells:
+        positive_event = any(
+            _number(row.get("value")) and row["value"] > 0 for row in cell.get("qpf_intervals", [])
+        )
+        relevant = relevant or positive_event
+        editable_relevant = editable_relevant or (positive_event and cell["inside_editable_domain"])
     geometry = grid["geometry"]
     value = {
-        "schema_version": CONTEXT_VERSION,
+        "schema_version": EXTENDED_CONTEXT_VERSION if extended else CONTEXT_VERSION,
         "pinned_evidence": pin,
         "location": {"latitude": forecast["latitude"], "longitude": forecast["longitude"]},
-        "horizon_hours": 36,
+        "horizon_hours": horizon.duration_hours,
         "valid_times": [h["valid_time"] for h in forecast["hours"]],
         "geometry": {
             key: geometry[key] for key in ("dimensions", "spacing_m", "domains", "point_target")
@@ -624,6 +787,16 @@ def build_context(
             "reason": "No cutoff-proven compact evidence supplied",
         },
     }
+    if extended:
+        value["forecast_periods"] = [
+            {
+                "period": offset // 24 + 1,
+                "start": (reference + timedelta(hours=offset)).isoformat(),
+                "end": (reference + timedelta(hours=offset + 24)).isoformat(),
+                "semantics": "elapsed_forecast_hours_not_calendar_day",
+            }
+            for offset in range(0, horizon.duration_hours, 24)
+        ]
     if evidence is not None:
         # Accept only the existing cutoff-filtered site-analysis summary contract.
         # Unproven or later evidence is excluded (never shown), not a desk failure.
@@ -798,6 +971,17 @@ def inspect_evidence(
                 if hour["valid_time"] not in times:
                     continue
                 active = fields_at(hour).get(field, {})
+                native_event = _native_event_at(cell, hour["valid_time"]) if field == QPF else None
+                event_projection = (
+                    {
+                        "native_qpf_event": {
+                            **field_view(native_event),
+                            "interpretation": "whole native event, not hourly redistribution",
+                        }
+                    }
+                    if native_event is not None
+                    else {}
+                )
                 if tool == "inspect_disagreement":
                     groups = comparable_groups(field, contributors_at(hour, field))
                     rows.append(
@@ -809,6 +993,7 @@ def inspect_evidence(
                             "unit": active.get("unit"),
                             "comparable_groups": groups[:6],
                             "status": "available" if groups else "no_comparable_pairs",
+                            **event_projection,
                         }
                     )
                     continue
@@ -817,9 +1002,17 @@ def inspect_evidence(
                     "valid_time": hour["valid_time"],
                     "field": field,
                     "baseline": field_view(active),
+                    **event_projection,
                 }
                 if tool == "inspect_contributors":
                     row["contributors"] = contributors_at(hour, field)
+                    if native_event is not None:
+                        row["native_event_contributors"] = {
+                            identity: field_view(contributor)
+                            for identity, contributor in native_event.get(
+                                "contributors", {}
+                            ).items()
+                        }
                 rows.append(row)
     total = len(rows)
     result: dict[str, Any] = {

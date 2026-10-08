@@ -849,6 +849,10 @@ def _issued_forecast_row_to_record(row: IssuedForecastRow) -> IssuedForecastReco
             "longitude": row.longitude,
             "issued_at": row.issued_at,
             "target_reference_time": row.target_reference_time,
+            "forecast_horizon_hours": row.forecast_horizon_hours,
+            "forecast_payload_digest": (
+                Digest(row.forecast_payload_digest) if row.forecast_payload_digest else None
+            ),
             "content_digest": Digest(row.content_digest),
         }
     )

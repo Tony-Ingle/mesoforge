@@ -10,7 +10,7 @@ import pytest
 from mesoforge.application import forecast_delivery as delivery
 from mesoforge.presentation.forecast_document import ForecastCoverageError, build_forecast_document
 from mesoforge.presentation.forecast_pdf import render_forecast_pdf
-from tests.unit.presentation.test_forecast_product import LOCATION, five_day_saved
+from tests.unit.presentation.test_forecast_product import LOCATION, five_day_saved, rolling_saved
 
 
 def test_same_issuance_render_is_read_only_repeatable_and_cannot_send_fixture(
@@ -74,6 +74,40 @@ def test_current_36_hour_issuance_cannot_be_labeled_five_days(
     )
     assert not path.exists()
     forbidden.assert_not_called()
+
+
+def test_rolling_product_reads_existing_issuance_without_forecast_or_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    saved = rolling_saved()
+    original = deepcopy(saved)
+    reader = Mock(return_value=saved)
+    monkeypatch.setattr(delivery, "read_issued_forecast", reader)
+    journal = Mock(side_effect=AssertionError("Rendering accessed delivery storage"))
+    monkeypatch.setattr(delivery, "configured_journal", journal)
+    path = tmp_path / "five-day-outlook.pdf"
+    args = [
+        "render",
+        "--issued-id",
+        saved["issued_forecast_id"],
+        "--location",
+        "grasston",
+        "--product",
+        "120-hour",
+        "--pdf",
+        str(path),
+    ]
+    assert delivery.main(args) == 0
+    first = path.read_bytes()
+    assert delivery.main(args) == 0
+    assert first == path.read_bytes() and saved == original
+    journal.assert_not_called()
+    assert reader.call_count == 2
+    document = build_forecast_document(saved, location=LOCATION, hours=120)
+    subject, text, _ = delivery.email_content(document)
+    assert "MesoForge 5-Day Weather Outlook" in subject
+    assert "120 hours" in text
+    assert "Oct 08, 2026 10:00 CDT" in text and "Oct 13, 2026 10:00 CDT" in text
 
 
 def test_review_gate_checks_real_evidence_expiry_and_exact_bytes() -> None:

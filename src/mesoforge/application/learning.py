@@ -613,7 +613,11 @@ class LearningService:
             for cell in grid["cells"]
             if (cell["x_index"], cell["y_index"]) == (target["x_index"], target["y_index"])
         ]
-        if len(center) != 1 or final["hours"] != center[0]["hours"]:
+        if (
+            len(center) != 1
+            or final["hours"] != center[0]["hours"]
+            or final.get("qpf_intervals") != center[0].get("qpf_intervals")
+        ):
             raise ValueError("AI issued point must equal its saved grid center")
         # Replayable lineage: checkpoint 0 is the corrected parent, each ordered recipe
         # consumes the previous validated values, and the last output is the issued grid.

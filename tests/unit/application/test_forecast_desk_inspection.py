@@ -1,11 +1,151 @@
 """Inspection limits describe omitted evidence without truncating scientific rows."""
 
+from copy import deepcopy
+from datetime import timedelta
+
 import pytest
 
 from mesoforge.application.forecast_desk_context import build_context, inspect_evidence
+from mesoforge.common.horizon import FIVE_DAY_HORIZON
 from mesoforge.contracts.serialization import canonical_json_bytes, canonical_json_digest
 from mesoforge.forecasting.coherence import QPF
+from tests.unit.application.test_corrections import DECISION
 from tests.unit.application.test_forecast_desk import forecast
+
+
+def _extended_forecast():
+    parent = forecast()
+    grid = parent["local_grid_baseline"]
+    point = next(cell for cell in grid["cells"] if cell["is_forecast_point"])
+    for cell in grid["cells"]:
+        first = cell["hours"][0]
+        hours = []
+        for lead in FIVE_DAY_HORIZON.leads:
+            hour = deepcopy(first)
+            end = DECISION + timedelta(hours=lead)
+            hour["horizon_hours"], hour["valid_time"] = lead, end.isoformat()
+            amount = hour["surface"]["fields"][QPF]
+            amount["interval_start"], amount["interval_end"] = (
+                (end - timedelta(hours=1)).isoformat(),
+                end.isoformat(),
+            )
+            hours.append(hour)
+        cell["hours"] = hours
+    parent["hours"] = point["hours"]
+    grid["forecast_horizon"] = parent["forecast_horizon"] = FIVE_DAY_HORIZON.payload()
+    grid["forecast_context"]["forecast_horizon"] = FIVE_DAY_HORIZON.payload()
+    parent["local_grid"]["sha256"] = str(canonical_json_digest(grid))
+    return parent
+
+
+def test_extended_context_is_period_summarized_with_original_inspection_limits():
+    short_context = build_context(forecast())
+    parent = _extended_forecast()
+    before = canonical_json_digest(parent)
+    context = build_context(parent)
+    assert canonical_json_digest(parent) == before
+    assert context["horizon_hours"] == 120 and len(context["valid_times"]) == 120
+    assert len(context["forecast_periods"]) == 5
+    assert context["inspection_contract"]["maximum_requested_valid_times"] == 36
+    assert context["inspection_contract"]["maximum_requested_rows"] == 144
+    periods = context["fields"][QPF]["point_forecast_periods"]
+    assert len(periods) == 5 and all(row["expected_hours"] == 24 for row in periods)
+    assert all(row["sum_of_available_hourly_amounts"] == 48 for row in periods)
+    assert "positive_point_hours" not in context["fields"][QPF]
+    assert len(canonical_json_bytes(context)) < 65536
+    assert len(canonical_json_bytes(context)) < 2 * len(canonical_json_bytes(short_context))
+    request = {
+        "tool": "inspect_baseline",
+        "field": QPF,
+        "valid_times": [context["valid_times"][-1]],
+        "region": "point",
+        "max_rows": 1,
+    }
+    inspected = inspect_evidence(parent, context, request, max_bytes=4096)
+    assert inspected["rows"][0]["valid_time"] == context["valid_times"][-1]
+    with pytest.raises(ValueError, match="outside the pinned horizon"):
+        inspect_evidence(
+            parent, context, {**request, "valid_times": context["valid_times"][:37]}, max_bytes=4096
+        )
+
+
+def test_extended_context_requires_complete_explicit_matching_horizon():
+    parent = _extended_forecast()
+    del parent["forecast_horizon"]
+    with pytest.raises(ValueError, match="horizon differ"):
+        build_context(parent)
+    parent["forecast_horizon"] = FIVE_DAY_HORIZON.payload()
+    parent["local_grid_baseline"]["cells"][0]["hours"] = parent["hours"][:-1]
+    with pytest.raises(ValueError):
+        build_context(parent)
+
+
+def test_six_hour_probability_context_retains_native_windows_and_qpf_priority():
+    from datetime import datetime
+
+    from mesoforge.application.forecast_desk_context import task_queue
+    from mesoforge.forecasting.provisional_policy import POP6
+    from tests.unit.presentation.test_forecast_product import six_hour_probability
+
+    parent = _extended_forecast()
+    for cell in parent["local_grid_baseline"]["cells"]:
+        for hour in cell["hours"]:
+            hour["surface"]["fields"][QPF]["value"] = 0
+            hour["surface"]["fields"].get("probability_of_precipitation_1h", {})["value"] = None
+            if hour["horizon_hours"] % 6 == 0:
+                hour["surface"]["fields"][POP6] = six_hour_probability(
+                    datetime.fromisoformat(hour["valid_time"])
+                )
+    context = build_context(parent)
+    native = context["fields"][POP6]["point_native_events"]
+    assert native["maximum_available_six_hour_pop"] == 0.65
+    assert len(native["periods"]) == 5 and native["available_events"] == 20
+    assert context["fields"][POP6]["edit_contract"]["operations"] == ()
+    assert context["precipitation_relevant"] and task_queue(context, 5)[0]["field"] == QPF
+    request = {
+        "tool": "inspect_baseline",
+        "field": POP6,
+        "valid_times": [context["valid_times"][-1]],
+        "region": "point",
+        "max_rows": 1,
+    }
+    result = inspect_evidence(parent, context, request, max_bytes=4096)
+    assert result["rows"][0]["baseline"]["interval_end"] == context["valid_times"][-1]
+    assert result["rows"][0]["baseline"]["value"] == 0.65
+
+
+def test_coarse_qpf_context_and_inspection_keep_native_event_and_budgets():
+    from tests.unit.common.test_qpf_intervals import events
+
+    parent = _extended_forecast()
+    rows = events(DECISION)
+    for cell in parent["local_grid_baseline"]["cells"]:
+        cell["qpf_intervals"] = deepcopy(rows)
+        for hour in cell["hours"]:
+            hour["surface"]["fields"][QPF]["value"] = None
+            hour["surface"]["fields"].get("probability_of_precipitation_1h", {})["value"] = None
+    parent["qpf_intervals"] = rows
+    context = build_context(parent)
+    summary = context["fields"][QPF]["point_native_events"]
+    assert summary["event_durations_hours"] == [1, 3]
+    assert summary["horizon"]["total_kg_m2"] == 84
+    assert len(summary["periods"]) == 5
+    assert context["precipitation_relevant"]
+    assert context["precipitation_relevant_in_editable_domain"]
+    assert len(canonical_json_bytes(context)) < 65536
+    request = {
+        "tool": "inspect_baseline",
+        "field": QPF,
+        "valid_times": [context["valid_times"][-1]],
+        "region": "point",
+        "max_rows": 1,
+    }
+    result = inspect_evidence(parent, context, request, max_bytes=4096)
+    event = result["rows"][0]["native_qpf_event"]
+    assert event["value"] == 3 and event["accumulation_duration_hours"] == 3
+    assert result["rows"][0]["baseline"]["value"] is None
+    assert event["interval_start"] == rows[-1]["interval_start"]
+    assert event["interval_end"] == rows[-1]["interval_end"]
 
 
 def test_inspection_explains_row_limit_separately_from_byte_limit():

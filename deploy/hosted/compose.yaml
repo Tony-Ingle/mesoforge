@@ -99,6 +99,7 @@ services:
     mem_limit: ${MESOFORGE_GUIDANCE_MEM_LIMIT:-8g}
     environment:
       <<: *worker-environment
+      MESOFORGE_FORECAST_HORIZON_HOURS: ${MESOFORGE_FORECAST_HORIZON_HOURS:-36}
     command: ["mesoforge.application.guidance_worker", "run", "--interval-seconds", "300"]
     # Process health only (heartbeat and phase bounds); readiness is reported by status.
     healthcheck:

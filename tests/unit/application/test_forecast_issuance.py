@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import shutil
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -14,9 +15,13 @@ import pytest
 from pydantic import ValidationError
 
 from mesoforge.application.issuance import ForecastIssuanceService
+from mesoforge.application.issuance_encoding import decode_issuance, encode_issuance
 from mesoforge.application.point_forecast import PreparedPointForecast
 from mesoforge.common.errors import IntegrityError, NotFound
+from mesoforge.common.horizon import FIVE_DAY_HORIZON
+from mesoforge.common.identifiers import Digest
 from mesoforge.contracts.issued_forecasts import IssuedForecastRecord
+from mesoforge.contracts.serialization import canonical_json_bytes, canonical_json_digest
 from tests.support.in_memory_uow import InMemoryObjectStore, InMemoryUnitOfWorkFactory
 from tests.unit.application.test_prepared_temperature import (
     EXTENDED_HORIZONS,
@@ -26,6 +31,82 @@ from tests.unit.application.test_prepared_temperature import (
 
 ISSUED_AT = datetime(2026, 9, 10, 12, tzinfo=UTC)
 CODE_IDENTITY = {"git_commit": "a" * 40, "working_tree_dirty": False}
+
+
+def test_extended_issuance_retains_horizon_and_selects_late_hours_without_recalculation(
+    memory_service,
+) -> None:
+    from tests.unit.presentation.test_forecast_product import rolling_saved
+
+    forecast = rolling_saved()["forecast"]
+    service, factory, objects = memory_service
+    record = service.issue(forecast, batch_run_id=uuid4(), location_index=0)
+    assert record.forecast_horizon_hours == FIVE_DAY_HORIZON.duration_hours
+    saved = service.read(record.issued_forecast_id)
+    assert saved["forecast"] == forecast
+    assert saved["forecast_horizon_hours"] == FIVE_DAY_HORIZON.duration_hours
+    raw = objects.objects[record.content_digest]
+    assert raw.startswith(b"\x1f\x8b")
+    assert record.payload_digest == canonical_json_digest(saved)
+    assert record.content_digest == Digest.of_bytes(raw) != record.payload_digest
+    assert len(raw) < len(canonical_json_bytes(saved)) / 4
+    assert encode_issuance(saved) == (raw, record.payload_digest)
+    envelope = json.loads(gzip.decompress(raw))
+    assert envelope["tables"]["source_documents"] == []
+    before = dict(objects.objects)
+    selection = service.select_hours(
+        latitude=forecast["latitude"],
+        longitude=forecast["longitude"],
+        start_valid_time=record.target_reference_time + timedelta(hours=119),
+        end_valid_time=record.target_reference_time + timedelta(hours=121),
+    )
+    assert [row["hour"]["horizon_hours"] for row in selection["results"]] == [119, 120]
+    assert selection["version_scan"]["versions_read"] == 1
+    assert objects.objects == before and len(factory.issued_forecasts) == 1
+    # A corrupt searchable header cannot alter the immutable object's meaning.
+    factory.issued_forecasts[record.issued_forecast_id] = record.model_copy(
+        update={"forecast_horizon_hours": 36}
+    )
+    with pytest.raises(IntegrityError, match="horizon differs"):
+        service.read(record.issued_forecast_id)
+
+
+@pytest.mark.parametrize("tamper", ["schema", "checksum", "value", "external", "malformed"])
+def test_compact_issuance_rejects_tampering_without_external_file_reads(tamper, monkeypatch):
+    from tests.unit.presentation.test_forecast_product import rolling_saved
+
+    saved = rolling_saved()
+    raw, digest = encode_issuance(saved)
+    envelope = json.loads(gzip.decompress(raw))
+    if tamper == "schema":
+        envelope["schema"] = "future-unapproved-codec"
+    elif tamper == "checksum":
+        envelope["forecast_payload_digest"] = str(Digest.of_bytes(b"other issuance"))
+    elif tamper == "value":
+        envelope["payload"]["forecast"]["latitude"] += 1
+    elif tamper == "external":
+        envelope["tables"]["source_documents"] = [{"path": "private-file", "sha256": str(digest)}]
+    monkeypatch.setattr(Path, "read_bytes", lambda *_: pytest.fail("external source read"))
+    modified = (
+        b"unreadable" if tamper == "malformed" else gzip.compress(canonical_json_bytes(envelope))
+    )
+    with pytest.raises(IntegrityError, match="compact issued"):
+        decode_issuance(modified, expected_logical_digest=digest)
+
+
+def test_long_issuance_requires_explicit_horizon_and_exact_valid_time(memory_service) -> None:
+    from tests.unit.presentation.test_forecast_product import rolling_saved
+
+    service, factory, objects = memory_service
+    forecast = rolling_saved()["forecast"]
+    del forecast["forecast_horizon"]
+    with pytest.raises(ValueError, match=r"1..36"):
+        service.issue(forecast, batch_run_id=uuid4(), location_index=0)
+    forecast["forecast_horizon"] = FIVE_DAY_HORIZON.payload()
+    forecast["hours"][-1]["valid_time"] = forecast["hours"][-2]["valid_time"]
+    with pytest.raises(ValueError, match="exact lead"):
+        service.issue(forecast, batch_run_id=uuid4(), location_index=0)
+    assert not factory.issued_forecasts and not objects.objects
 
 
 @pytest.fixture(scope="module")
@@ -74,6 +155,15 @@ def test_two_issuances_preserve_every_field_and_are_distinct_even_at_the_same_ti
     assert first.content_digest != second.content_digest
     assert first.issued_at == second.issued_at == ISSUED_AT
     assert first.target_reference_time == TARGET
+    assert first.forecast_horizon_hours == 36
+    assert first.forecast_payload_digest is None
+    assert first.payload_digest == first.content_digest
+    legacy = first.model_dump()
+    del legacy["forecast_horizon_hours"]
+    assert IssuedForecastRecord.model_validate(legacy) == first
+    for duration in (True, 0, 37, 121):
+        with pytest.raises(ValidationError):
+            IssuedForecastRecord.model_validate({**legacy, "forecast_horizon_hours": duration})
     assert (first.latitude, first.longitude) == (45.8, -93.1)
     assert len(factory.issued_forecasts) == len(factory.stored_objects) == len(store.objects) == 2
     assert store.objects[first.content_digest] == first_bytes
@@ -93,6 +183,8 @@ def test_two_issuances_preserve_every_field_and_are_distinct_even_at_the_same_ti
         # Full equality covers all hours, values, units, cycles, weights, source/raw/
         # prepared checksums, valid times, notices and explicit missing reasons.
         assert envelope["forecast"] == original
+        assert "forecast_horizon_hours" not in envelope
+        assert canonical_json_bytes(envelope) == store.objects[record.content_digest]
         assert len(envelope["forecast"]["hours"]) == 36
     forecast["hours"][0]["temperature"]["value"] = -100.0
     assert service.read(first.issued_forecast_id)["forecast"] == original

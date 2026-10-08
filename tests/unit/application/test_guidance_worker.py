@@ -41,6 +41,7 @@ from mesoforge.application.worker_status import (
     read_json,
     write_json,
 )
+from mesoforge.common.horizon import FIVE_DAY_HORIZON, LEGACY_HORIZON
 from mesoforge.contracts.policy_governance import blend_scope
 
 LOCATIONS = [
@@ -299,6 +300,57 @@ def test_settings_validation() -> None:
         WorkerSettings(root=Path("x"), interval_seconds=1)
 
 
+def test_hosted_horizon_is_explicit_and_legacy_prepared_state_cannot_satisfy_it(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("MESOFORGE_FORECAST_HORIZON_HOURS", raising=False)
+    assert worker_module.build_parser().parse_args(["once"]).forecast_horizon_hours == 36
+    monkeypatch.setenv("MESOFORGE_FORECAST_HORIZON_HOURS", "120")
+    assert worker_module.build_parser().parse_args(["once"]).forecast_horizon_hours == 120
+    legacy = WorkerSettings(root=tmp_path)
+    assert legacy.forecast_horizon == LEGACY_HORIZON and legacy.coverage_hours == 42
+    settings = WorkerSettings(root=tmp_path, forecast_horizon=FIVE_DAY_HORIZON)
+    assert settings.coverage_hours == 126
+    with pytest.raises(ValueError, match="Prepared coverage"):
+        WorkerSettings(root=tmp_path, forecast_horizon=FIVE_DAY_HORIZON, coverage_hours=42)
+    harness = Harness(tmp_path, forecast_horizon=FIVE_DAY_HORIZON)
+    pointer = publish_prepared(harness.root, harness.hour())
+    publish_baseline(harness.root, pointer["snapshot_id"])
+    worker = harness.worker()
+    assert "current_hour_not_covered" in worker.refresh_reasons(LOCATIONS, harness.clock())
+    assert worker.build_inputs(SimpleNamespace(scopes={}), LOCATIONS) is None
+
+
+@pytest.mark.parametrize("horizon", [LEGACY_HORIZON, FIVE_DAY_HORIZON])
+def test_default_dependencies_pass_one_explicit_horizon_to_existing_boundaries(
+    tmp_path, monkeypatch, horizon
+):
+    from unittest.mock import Mock
+
+    from mesoforge.application import refresh_guidance as refresh_module
+
+    discover = Mock(return_value={"status": "selected"})
+    steps = SimpleNamespace(discover=discover)
+    default = Mock(return_value=steps)
+    refresh = Mock(return_value={"status": "published"})
+    monkeypatch.setattr(refresh_module, "default_steps", default)
+    monkeypatch.setattr(refresh_module, "refresh_guidance", refresh)
+    settings = WorkerSettings(root=tmp_path, forecast_horizon=horizon)
+    deps = worker_module.default_deps(settings)
+    deps.discover(tmp_path / "probe")
+    deps.refresh(tmp_path / "locations.json", tmp_path / "guidance", None)
+    options = {"forecast_horizon": horizon} if horizon != LEGACY_HORIZON else {}
+    assert default.call_count == 2
+    default.assert_called_with(coverage_hours=horizon.duration_hours + 6, **options)
+    refresh.assert_called_once_with(
+        tmp_path / "locations.json",
+        tmp_path / "guidance",
+        coverage_hours=horizon.duration_hours + 6,
+        steps=steps,
+        **options,
+    )
+
+
 def test_first_poll_refreshes_and_builds_then_nothing_repeats_in_the_same_hour(
     tmp_path: Path,
 ) -> None:
@@ -369,6 +421,53 @@ def test_newer_required_cycle_refreshes_with_the_probe_selection_then_rebuilds(
     assert outcome["refresh"]["status"] == "published"
     assert harness.refresh_calls[0][1] is not None  # probe evidence reused, not rediscovered
     assert outcome["build"]["reasons"] == ["new_prepared_snapshot"]
+
+
+@pytest.mark.parametrize(
+    "native,selected,held,expected",
+    [
+        (True, {"NBM": "2026-07-01T07:00:00Z"}, None, ["newer_participating_cycle:NBM"]),
+        (
+            True,
+            {"GFS": "2026-07-01T06:00:00Z"},
+            "2026-07-01T00:00:00Z",
+            ["newer_participating_cycle:GFS"],
+        ),
+        (True, {"RAP": "2026-07-01T06:00:00Z"}, "2026-07-01T06:00:00Z", []),
+        (True, {}, "2026-07-01T06:00:00Z", []),
+        (False, {"NBM": "2026-07-01T07:00:00Z"}, None, []),
+    ],
+)
+def test_native_probe_refreshes_for_eligible_participating_cycles_without_required_set(
+    tmp_path: Path, monkeypatch, native: bool, selected: dict, held: str | None, expected: list
+) -> None:
+    horizon = FIVE_DAY_HORIZON if native else LEGACY_HORIZON
+    harness = Harness(tmp_path, forecast_horizon=horizon)
+    harness.discovered["selected_cycles"] = selected
+    worker = harness.worker()
+    manifest = {
+        "forecast_horizon": horizon.payload(),
+        "coverage": {"usability_rule": {"required_complete": [] if native else ["HRRR", "GFS"]}},
+        "contributors": {model: {"cycle": held} for model in ("HRRR", "RAP", "GFS", "IFS", "NBM")},
+    }
+    monkeypatch.setattr(worker, "_prepared", lambda: ({}, manifest, tmp_path))
+    # The existing coverage and spatial contracts already proved this state
+    # usable. Discovery must independently recognize changed native inputs.
+    monkeypatch.setattr(worker, "refresh_reasons", lambda locations, now: [])
+    calls = []
+
+    def refresh(reasons, locations, selection, categories):
+        calls.append(selection)
+        return {"reasons": reasons}
+
+    monkeypatch.setattr(worker, "_run_refresh", refresh)
+    result = worker._refresh_step(LOCATIONS, harness.free, [])
+    assert result["reasons"] == expected
+    assert len(calls) == bool(expected)
+    if calls:
+        assert (calls[0] / "selection.json").is_file()
+    else:
+        assert result["decision"] == "no_material_change"
 
 
 def test_reused_probe_is_copied_only_within_its_hour(tmp_path: Path) -> None:

@@ -1,14 +1,16 @@
 """Prepared-window envelope shared by discovery, preparation and snapshot consumption.
 
-Every delivered forecast still covers exactly hours 1..36 after its reference time.
-A prepared window may extend past that so one prepared snapshot can serve later
-reference hours; the extension is bounded so adapter lead envelopes stay explicit.
+Historical 36-hour windows preserve the original 36..42 envelope. Explicitly
+declared five-day windows cover 120..126 hours with native source schedules;
+the extra hours let one immutable preparation serve later reference views.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any
+
+from mesoforge.common.horizon import horizon_for
 
 REQUIRED_HOURS = 36
 MAXIMUM_PREPARED_HOURS = 42
@@ -40,6 +42,15 @@ def prepared_horizons(count: int) -> tuple[int, ...]:
 def window_hours(selection: Mapping[str, Any]) -> tuple[int, ...]:
     """The prepared window a selection declares; selections without one are 1..36."""
     horizons = selection.get("horizon_hours", list(range(1, REQUIRED_HOURS + 1)))
+    if horizon_for(selection).duration_hours == 120:
+        if (
+            not isinstance(horizons, (tuple, list))
+            or not 120 <= len(horizons) <= 126
+            or any(type(hour) is not int for hour in horizons)
+            or list(horizons) != list(range(1, len(horizons) + 1))
+        ):
+            raise ValueError("Declared five-day prepared window must cover 120..126 hours")
+        return tuple(horizons)
     if not is_prepared_window(horizons):
         raise ValueError("Selection horizon_hours must be a 1..36 to 1..42 window")
     return tuple(horizons)

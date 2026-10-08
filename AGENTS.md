@@ -62,10 +62,12 @@
 - `forecasting/coherence.py` owns finite ordering of current source checks, T/Td,
   RH and wind/gust operations. Registered future relationships are dependencies,
   not approved enforcement rules. Do not invent precipitation-family constraints.
-- Fixed weights, NBM active sources, HRRR/GFS p-type agreement and shadow roles
-  remain active until explicitly replaced. Generalized machinery does not authorize
-  new scientific policies or model promotion. Prove equivalence when replacing
-  scaffolding, then remove superseded execution rather than stack another path.
+- Historical/default 36-hour policies remain intact. Explicit 120-hour guidance uses
+  `mesoforge.provisional-multimodel-120h.v1`, the owner-approved field/lead/role prior,
+  never a skill claim. Preserve native expiry, eligibility, normalized weights and
+  adjacent-state interpolation provenance. Keep coarse QPF/probability events exact;
+  never split totals or probabilities into invented hourly values. Generalized machinery
+  alone does not authorize new science, model promotion or automatic learning.
 - Hosted operation is one image with two roles: `guidance_worker` decides only when
   to run `refresh_guidance`/`build_baseline`; `forecast_worker` pins one ready
   baseline and calls `forecast_from_baseline`, never refreshing guidance. Keep their

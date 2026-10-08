@@ -82,6 +82,59 @@ def test_qpf_atomic_copy_on_write_provenance_events_point_and_offline_replay(gri
     )
 
 
+def test_long_forecast_hourly_edit_updates_canonical_event_but_coarse_qpf_is_inspect_only():
+    from tests.unit.application.test_forecast_desk_inspection import _extended_forecast
+
+    grid = _extended_forecast()["local_grid_baseline"]
+    for cell in grid["cells"]:
+        rows = [deepcopy(hour["surface"]["fields"][QPF]) for hour in cell["hours"][:117]]
+        tail = deepcopy(cell["hours"][-1]["surface"]["fields"][QPF])
+        tail.update(interval_start=cell["hours"][116]["valid_time"], value=6.0)
+        rows.append(tail)
+        cell["qpf_intervals"] = rows
+        for hour in cell["hours"][117:]:
+            hour["surface"]["fields"][QPF]["value"] = None
+    before = canonical_json_bytes(grid)
+    validate_grid(grid)
+    changed, recipe = apply_edit(grid, proposal(grid))
+    validate_edit_scope(grid, changed, [recipe])
+    point = next(cell for cell in changed["cells"] if cell["is_forecast_point"])
+    assert (
+        point["qpf_intervals"][0]["value"]
+        == point["hours"][0]["surface"]["fields"][QPF]["value"]
+        == 2.4
+    )
+    assert point["qpf_intervals"][-1]["value"] == 6
+    assert canonical_json_bytes(replay_edits(grid, [recipe])) == canonical_json_bytes(changed)
+    assert canonical_json_bytes(grid) == before
+    late = proposal(grid)
+    late["valid_times"] = [grid["cells"][0]["hours"][-1]["valid_time"]]
+    with pytest.raises(FieldEditError, match="no-op"):
+        apply_edit(grid, late)
+    corrupt = deepcopy(changed)
+    center = next(cell for cell in corrupt["cells"] if cell["is_forecast_point"])
+    center["qpf_intervals"][0]["value"] = 90
+    with pytest.raises(FieldEditError, match="differs"):
+        validate_grid(corrupt)
+    corrupt = {
+        **changed,
+        "cells": [
+            {
+                **cell,
+                "qpf_intervals": [
+                    *cell["qpf_intervals"][:-1],
+                    {**cell["qpf_intervals"][-1], "value": 99},
+                ],
+            }
+            if cell["is_forecast_point"]
+            else cell
+            for cell in changed["cells"]
+        ],
+    }
+    with pytest.raises(FieldEditError, match="Coarse QPF"):
+        validate_edit_scope(grid, corrupt, [recipe])
+
+
 def test_temperature_add_reuses_current_dew_rejection_and_rh_without_native_edit(grid):
     for cell in grid["cells"]:
         fields = cell["hours"][0]["surface"]["fields"]

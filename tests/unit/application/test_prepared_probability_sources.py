@@ -15,6 +15,7 @@ import xarray as xr
 
 from mesoforge.application import prepared_probability_sources as prepared
 from mesoforge.application.probability_contributors import extract_probability_contributors
+from mesoforge.common.horizon import FIVE_DAY_HORIZON
 from mesoforge.guidance.sources.probabilistic import PRODUCTS
 
 CYCLE = datetime(2026, 9, 11, tzinfo=UTC)
@@ -231,3 +232,114 @@ def test_out_of_window_duplicate_requests_and_nonzero_shadow_weight_are_rejected
     descriptor["active_weight"] = 0.1
     with pytest.raises(ValueError, match="zero-weight"):
         prepared.load_probability_sources([descriptor], target_reference_time=TARGET)
+
+
+def test_extended_native_events_retain_exact_bounds_and_replay(tmp_path, decoder, original):
+    root, source = original
+    selection = source["current_model_set"]["selection"]
+    selection.update(forecast_horizon=FIVE_DAY_HORIZON.payload(), horizon_hours=list(range(1, 127)))
+    source.pop("pop_guidance")  # Native120 retains hourly NBM inside the combined source dataset.
+    (root / "preparation.json").write_text(json.dumps(source))
+    record = _record(start=114, end=120)
+    record[0].update(
+        information_cutoff="2026-09-11T02:00:00Z", index_available_at="2026-09-11T00:49:00Z"
+    )
+    result = prepared.prepare_probability_sources(
+        root, tmp_path / "extended", retained_records=[record]
+    )
+    views = prepared.load_probability_sources(
+        result["probability_sources"], target_reference_time=TARGET
+    )
+    event = views[0].manifest["events"][0]
+    assert event["interval_start"] == "2026-09-15T18:00:00Z"
+    assert event["interval_end"] == "2026-09-16T00:00:00Z"
+    assert event["duration_hours"] == 6
+    assert (
+        views[0].manifest["selection_evidence"]["selection"]["decision_time"]
+        == record[0]["information_cutoff"]
+    )
+    replay = prepared.prepare_probability_sources(
+        tmp_path / "extended", tmp_path / "replay120", from_raw=True
+    )
+    copied = prepared.load_probability_sources(
+        replay["probability_sources"], target_reference_time=TARGET
+    )
+    xr.testing.assert_identical(views[0].dataset, copied[0].dataset)
+    assert views[0].manifest["events"] == copied[0].manifest["events"]
+
+
+def test_native_request_plan_is_bounded_to_selected_cycles_and_utc_events():
+    selection = {
+        "forecast_horizon": FIVE_DAY_HORIZON.payload(),
+        "horizon_hours": list(range(1, 127)),
+        "target_reference_time": "2026-09-11T16:00:00Z",
+        "selected_cycles": {
+            "NBM": "2026-09-11T13:00:00Z",
+            "GFS": "2026-09-11T06:00:00Z",
+            "IFS": "2026-09-11T06:00:00Z",
+        },
+    }
+    requests, shortfalls = prepared.native_probability_requests(selection)
+    assert len(requests) <= 52
+    assert {row["source_id"] for row in requests} == {"NBM_6H", "GEFS_6H", "ECMWF_ENS_24H"}
+    assert not shortfalls
+    for row in requests:
+        cycle = datetime.fromisoformat(row["cycle"])
+        assert row["end_hour"] - row["start_hour"] == (
+            24 if row["source_id"] == "ECMWF_ENS_24H" else 6
+        )
+        if row["source_id"] == "ECMWF_ENS_24H":
+            assert cycle.hour == 0
+        assert (cycle.hour + row["end_hour"]) % 6 == 0
+        assert cycle + timedelta(hours=row["start_hour"]) >= datetime(2026, 9, 11, 16, tzinfo=UTC)
+        assert cycle + timedelta(hours=row["end_hour"]) <= datetime(2026, 9, 16, 22, tzinfo=UTC)
+
+
+def test_optional_probability_failure_keeps_other_events_and_explicit_cutoff(
+    tmp_path, decoder, original, monkeypatch
+):
+    from unittest.mock import Mock
+
+    from tests.support.phase1_fixture_transports import FixedClock, RecordingSleeper
+
+    root, source = original
+    selection = source["current_model_set"]["selection"]
+    selection.update(forecast_horizon=FIVE_DAY_HORIZON.payload(), horizon_hours=list(range(1, 127)))
+    (root / "preparation.json").write_text(json.dumps(source))
+    clock = FixedClock(CYCLE + timedelta(hours=2))
+
+    def acquire(**kwargs):
+        assert kwargs["information_cutoff"] == clock.now()
+        if kwargs["source_id"] == "NBM_6H":
+            raise ValueError("source unavailable")
+        return kwargs
+
+    def retain(request, acquired):
+        record = _record(request["source_id"], start=request["start_hour"], end=request["end_hour"])
+        record[0]["index_available_at"] = "2026-09-11T00:49:00Z"
+        return record
+
+    monkeypatch.setattr(prepared, "acquire_product", acquire)
+    monkeypatch.setattr(prepared, "retain_acquisition", retain)
+    requests = [
+        _record(source, start=114, end=120)[0]["request"] for source in ("NBM_6H", "GEFS_6H")
+    ]
+    result = prepared.prepare_probability_sources(
+        root,
+        tmp_path / "optional",
+        requests=requests,
+        optional_requests=True,
+        information_cutoff=clock.now(),
+        transport=Mock(spec=[], downloaded_bytes=0),
+        clock=clock,
+        sleeper=RecordingSleeper(clock),
+    )
+    assert result["probability_sources"][0]["source_id"] == "GEFS_6H"
+    assert result["probability_source_run"]["native_events"] == 1
+    assert (
+        result["probability_source_run"]["request_failures"][0]["request"]["source_id"] == "NBM_6H"
+    )
+    views = prepared.load_probability_sources(
+        result["probability_sources"], target_reference_time=TARGET
+    )
+    assert views[0].manifest["inputs"][0]["information_cutoff"] == "2026-09-11T02:00:00Z"

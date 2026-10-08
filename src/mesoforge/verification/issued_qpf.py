@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
+from mesoforge.common.horizon import horizon_for
 from mesoforge.common.identifiers import ArtifactId, Digest
 from mesoforge.contracts.forecast_variants import validate_variant
 from mesoforge.contracts.serialization import canonical_json_bytes
@@ -370,7 +371,17 @@ def evaluate_qpf_verification(
         ):
             reasons.append("forecast_coordinate_invalid")
     lead = (valid - target).total_seconds() / 3600 if target else None
-    if lead != hour.get("horizon_hours") or lead is None or not 1 <= lead <= 36:
+    try:
+        duration = horizon_for(forecast).duration_hours
+    except ValueError:
+        duration = 0
+        reasons.append("forecast_horizon_invalid")
+    if (
+        lead != hour.get("horizon_hours")
+        or lead is None
+        or not 1 <= lead <= duration
+        or lead != int(lead)
+    ):
         reasons.append("forecast_reference_lead_inconsistent")
     baseline = _baseline_reference(forecast)
     local_version = _map(forecast.get("local_grid")).get("version")
@@ -433,6 +444,11 @@ def evaluate_qpf_verification(
         "duration_seconds": 3600 if interval else None,
         "interval_closure": field.get("interval_closure"),
         "lead_hours": lead,
+        **(
+            {"forecast_horizon": deepcopy(forecast["forecast_horizon"])}
+            if "forecast_horizon" in forecast
+            else {}
+        ),
         "verification_cutoff": _iso(cutoff),
         "forecast": {
             "amount_mm": amount,

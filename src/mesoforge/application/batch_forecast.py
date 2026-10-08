@@ -291,7 +291,13 @@ def run_batch(
 
 
 def validate_current_control(configuration: ContributorConfiguration) -> None:
-    """This application milestone permits shadow additions, not a new issued recipe."""
+    """Accept the explicit provisional registry or the unchanged historical control."""
+    if configuration.field_policy_family is not None:
+        from mesoforge.forecasting.recipes import PROVISIONAL_CONFIGURATION
+
+        if configuration != PROVISIONAL_CONFIGURATION:
+            raise ValueError("Provisional source registry differs from its versioned contract")
+        return
     if configuration.control_recipe != DEFAULT_CONFIGURATION.control_recipe:
         raise ValueError("Batch issuance must retain the approved HRRR/GFS 70/30 control recipe")
     models = configuration.model_map()

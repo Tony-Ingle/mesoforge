@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo
 
 from mesoforge.catalog.units import convert
 from mesoforge.forecasting.cloud_cover import CLOUD, sky_category, validate_active_cloud_field
+from mesoforge.forecasting.probability_events import six_hour_events
+from mesoforge.forecasting.provisional_policy import POP6, PROVISIONAL_MULTIMODEL_POLICY
 from mesoforge.forecasting.visibility import visibility_miles
 
 _QPF = "liquid_equivalent_precipitation_amount_1h"
@@ -331,7 +333,9 @@ def _cloud_cells(field: dict[str, Any] | None, valid_time: str) -> tuple[list[st
     except (KeyError, TypeError, ValueError, OverflowError) as exc:
         return ["unavailable", "unavailable"], [
             *field.get("missing_reasons", []),
-            f"Active NBM cloud unavailable: {exc}",
+            f"Active cloud unavailable: {exc}"
+            if field.get("policy_family") == PROVISIONAL_MULTIMODEL_POLICY
+            else f"Active NBM cloud unavailable: {exc}",
         ]
     percent = field["cloud_percentage"]
     return [f"{percent:.6g}", sky_category(percent).replace("_", " ")], []
@@ -366,18 +370,85 @@ def _probability_support_text(support: Any) -> str:
     return str(support)
 
 
+def _provisional_fields(hours: list[dict[str, Any]]) -> bool:
+    return any(
+        field.get("policy_family") == PROVISIONAL_MULTIMODEL_POLICY
+        for hour in hours
+        for field in hour.get("surface", {}).get("fields", {}).values()
+    )
+
+
+def _render_active_probability_events(hours: list[dict[str, Any]]) -> list[str]:
+    events = six_hour_events(
+        [
+            {"valid_time": hour["valid_time_utc"], "surface": hour.get("surface", {})}
+            for hour in hours
+        ]
+    )
+    if not events:
+        return []
+    fields = {
+        datetime.fromisoformat(hour["valid_time_utc"]): hour.get("surface", {})
+        .get("fields", {})
+        .get(POP6, {})
+        for hour in hours
+    }
+    lines = [
+        "",
+        "### Active native six-hour precipitation probability",
+        "",
+        "Eligible NBM/GEFS native six-hour events contribute under the saved event policy. "
+        "These are six-hour probabilities, not hourly or daily probabilities. Threshold, "
+        "native interval and grid-point spatial support must agree; no event is split or filled.",
+        "",
+        "| Start UTC (exclusive) | End UTC (inclusive) | Threshold | Probability % | "
+        "Applied source weights | Saved policy |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for event in events:
+        value = event["value"]
+        weights = fields[datetime.fromisoformat(event["interval_end"])].get("weights", {})
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    event["interval_start"],
+                    event["interval_end"],
+                    _probability_event_text(event),
+                    "unavailable" if value is None else f"{value * 100:.6g}",
+                    ", ".join(f"{model} {weight:g}" for model, weight in sorted(weights.items()))
+                    or "none eligible",
+                    event["policy"],
+                ]
+            )
+            + " |"
+        )
+    return lines
+
+
 def _render_probability_shadows(hours: list[dict[str, Any]]) -> list[str]:
     """Keep each native event separate from the delivered hourly NBM probability."""
     if not any("probability_guidance" in hour.get("surface", {}) for hour in hours):
         return []
+    provisional = _provisional_fields(hours)
     lines = [
         "",
-        "### Native-period probability shadows",
+        "### Native-period probability evidence"
+        if provisional
+        else "### Native-period probability shadows",
         "",
-        "All contributors below have zero active weight. NBM remains the sole active "
-        "hourly PoP source. A row appears at its native interval end; six-hour and "
-        "24-hour probabilities are not hourly probabilities and are not split or filled. "
-        "Threshold, interval and event spatial support must match before comparing sources.",
+        (
+            "These native products remain separate evidence. Eligible NBM/GEFS six-hour events "
+            "may contribute to the active six-hour field under its saved policy and weights; "
+            "IFS 24-hour guidance remains comparison evidence. Hourly NBM PoP is a separate "
+            "event. No six-hour or 24-hour probability is split or filled into hourly values. "
+            "Threshold, interval and event spatial support remain explicit."
+            if provisional
+            else "All contributors below have zero active weight. NBM remains the sole active "
+            "hourly PoP source. A row appears at its native interval end; six-hour and "
+            "24-hour probabilities are not hourly probabilities and are not split or filled. "
+            "Threshold, interval and event spatial support must match before comparing sources."
+        ),
         "",
         "| End hour | Source / event | Cycle / source lead h | Native interval start UTC | "
         "Native interval end UTC | Interval closure | Threshold | Spatial support | "
@@ -460,6 +531,15 @@ def _render_probability_shadows(hours: list[dict[str, Any]]) -> list[str]:
 
 def _render_surface_report(report: dict[str, Any]) -> str:
     """Present the unchanged numerical surface baseline and native contributors."""
+    provisional = _provisional_fields(report["hours"])
+    policies = sorted(
+        {
+            f"{name}: {field['policy']}"
+            for hour in report["hours"]
+            for name, field in hour.get("surface", {}).get("fields", {}).items()
+            if field.get("policy_family") == PROVISIONAL_MULTIMODEL_POLICY and field.get("policy")
+        }
+    )
     columns: tuple[str, ...] = (
         "air_temperature_2m",
         "dew_point_temperature_2m",
@@ -485,11 +565,21 @@ def _render_surface_report(report: dict[str, Any]) -> str:
         "",
         f"Reference: {report['target_reference_time']}. "
         f"Display zone: {report['display_timezone']}.",
-        "Raw temperature baseline remains HRRR/GFS 70/30. Dew point and coupled vector wind/gust "
-        "use the retained Phase 2 rows: HRRR/GFS 70/30 at hours 1–18 and 60/40 at "
-        "19–36 when both are eligible; approved single-model fallbacks are labeled. "
-        "RAP/IFS are zero-weight shadows. "
-        "RH is derived over liquid water from temperature/dew point.",
+        (
+            "The numerical baseline uses the explicitly selected provisional field-specific "
+            "multi-model policies. Native availability and each saved field's applied weights "
+            "determine source influence; short-range guidance is not extended beyond its horizon. "
+            "RH remains derived from coherent temperature/dew point. Saved policies: "
+            + "; ".join(policies)
+            + "."
+            if provisional
+            else "Raw temperature baseline remains HRRR/GFS 70/30. "
+            "Dew point and coupled vector wind/gust "
+            "use the retained Phase 2 rows: HRRR/GFS 70/30 at hours 1–18 and 60/40 at "
+            "19–36 when both are eligible; approved single-model fallbacks are labeled. "
+            "RAP/IFS are zero-weight shadows. "
+            "RH is derived over liquid water from temperature/dew point."
+        ),
         (
             "The surface table shows the latest fully validated forecast after the bounded "
             "AI desk. Raw baseline, deterministic correction and AI edit recipes remain "
@@ -507,18 +597,33 @@ def _render_surface_report(report: dict[str, Any]) -> str:
             "numerical baseline. Delivery has not run. New issued hours are not_yet_verified; "
             "verification of previous versions is separate."
         ),
-        "Active cloud cover uses the approved temporary native NBM total-cloud baseline when "
-        "the saved field is eligible. Missing or invalid NBM guidance has no shadow fallback. "
-        "Separate native cloud evidence is shown below when prepared. "
-        "IFS instantaneous gust: unavailable because its published gust is an interval maximum. "
-        "Native three-hourly IFS gaps are preserved. Stored Kelvin, m/s, degree and percent "
-        "values are unrounded, with source cycles, leads, raw hashes, rules and exclusion reasons.",
+        (
+            "Active total cloud cover uses the saved provisional cloud policy and eligible "
+            "native contributors; individual source percentages remain separate evidence. "
+            "IFS instantaneous gust remains unavailable because its published gust is an "
+            "interval maximum. Stored units, native timing, source identities and exclusions "
+            "are preserved."
+            if provisional
+            else "Active cloud cover uses the approved temporary native NBM "
+            "total-cloud baseline when "
+            "the saved field is eligible. Missing or invalid NBM guidance has no shadow fallback. "
+            "Separate native cloud evidence is shown below when prepared. "
+            "IFS instantaneous gust: unavailable because its published gust is an "
+            "interval maximum. "
+            "Native three-hourly IFS gaps are preserved. Stored Kelvin, m/s, degree and percent "
+            "values are unrounded, with source cycles, leads, raw hashes, rules and "
+            "exclusion reasons."
+        ),
         "",
         "| Hour | UTC valid time | Local/display valid time | T °F | Td °F | RH % | "
         "Wind mph | From | Gust mph |"
         + (qpf_headers if has_qpf else "")
         + (pop_headers if has_pop else "")
-        + (" NBM cloud % | Sky category |" if has_cloud else "")
+        + (
+            (" Cloud % | Sky category |" if provisional else " NBM cloud % | Sky category |")
+            if has_cloud
+            else ""
+        )
         + " Missing / exclusions |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
         + (qpf_separator if has_qpf else "")
@@ -529,22 +634,41 @@ def _render_surface_report(report: dict[str, Any]) -> str:
     if has_qpf:
         lines.insert(
             -3,
-            "QPF is liquid-equivalent accumulation over (start, end], displayed in inches; "
-            "original unrounded kg/m² values and exact intervals remain stored. It is not "
-            "instantaneous precipitation, precipitation probability or precipitation type. "
-            "QPF uses approved Phase 2 HRRR/GFS 70/30 weights at hours 1–18 and 60/40 at "
-            "19–36 when both are eligible, with explicit approved fallbacks. Small positive "
-            "amounts remain positive; zero and unavailable are distinct.",
+            (
+                "QPF uses the saved provisional interval-aware field policy and source weights. "
+                "Amounts are liquid-equivalent accumulation over exact (start, end] intervals. "
+                "The hourly table retains only exact one-hour amounts; native multi-hour amounts "
+                "remain in the saved canonical QPF event collection and are never redistributed. "
+                "Zero and unavailable remain distinct."
+                if provisional
+                else "QPF is liquid-equivalent accumulation over (start, end], "
+                "displayed in inches; "
+                "original unrounded kg/m² values and exact intervals remain stored. It is not "
+                "instantaneous precipitation, precipitation probability or precipitation type. "
+                "QPF uses approved Phase 2 HRRR/GFS 70/30 weights at hours 1–18 and 60/40 at "
+                "19–36 when both are eligible, with explicit approved fallbacks. Small positive "
+                "amounts remain positive; zero and unavailable are distinct."
+            ),
         )
     if has_pop:
         lines.insert(
             -3,
-            "NBM PoP is the probability of liquid-equivalent accumulation strictly greater "
-            "than 0.254 kg/m² (0.01 inch) over the displayed native (start, end] period. "
-            "The current product has one-hour periods. NBM is the sole active probability source "
-            "with weight 1.0; PoP is not derived from deterministic QPF and does not identify "
-            "precipitation type. Missing native periods stay unavailable; no new probability "
-            "windows are synthesized. Percent display retains the original fraction in storage.",
+            (
+                "Hourly NBM PoP is the probability of liquid-equivalent accumulation strictly "
+                "greater than 0.254 kg/m² (0.01 inch) over its exact one-hour (start, end] event. "
+                "NBM remains the sole source for those hourly events. Separately retained active "
+                "six-hour events are displayed below; no event duration is changed. Missing "
+                "native periods remain unavailable."
+                if provisional
+                else "NBM PoP is the probability of liquid-equivalent accumulation "
+                "strictly greater "
+                "than 0.254 kg/m² (0.01 inch) over the displayed native (start, end] period. "
+                "The current product has one-hour periods. NBM is the sole active "
+                "probability source "
+                "with weight 1.0; PoP is not derived from deterministic QPF and does not identify "
+                "precipitation type. Missing native periods stay unavailable; no new probability "
+                "windows are synthesized. Percent display retains the original fraction in storage."
+            ),
         )
     reasons: dict[str, list[int]] = {}
     for hour in report["hours"]:
@@ -645,6 +769,7 @@ def _render_surface_report(report: dict[str, Any]) -> str:
         lines.extend(["", "Explicit missingness and scientific exclusions:", ""])
         for reason, hours in reasons.items():
             lines.append(f"- Hours {', '.join(str(h) for h in sorted(set(hours)))}: {reason}")
+    lines.extend(_render_active_probability_events(report["hours"]))
     lines.extend(_render_probability_shadows(report["hours"]))
     lines.extend(_render_precipitation_type(report["hours"]))
     lines.extend(_render_snowfall(report["hours"]))
@@ -957,13 +1082,21 @@ def _render_cloud_guidance(hours: list[dict[str, Any]]) -> list[str]:
         "",
         "### Native cloud-cover evidence",
         "",
-        "The approved temporary active baseline uses only eligible saved NBM total-cloud "
-        "guidance. Other models retain zero active weight; they cannot replace missing NBM. "
-        "Historical evidence without an approved saved active field remains evidence only. "
-        "Each percentage represents "
-        "native total cloud cover, not a sum or substitution of cloud layers. Native intervals "
-        "and missing times are preserved. Categories describe each unrounded native percentage; "
-        "they are not a complete weather-condition string or an observed opaque-sky amount.",
+        (
+            "The active provisional cloud field uses its saved policy and weights. Each native "
+            "contributor below remains distinct evidence, including sources excluded at a given "
+            "time. Native timing and missingness are preserved; total cloud is not a sum of "
+            "cloud layers. Categories describe each native percentage."
+            if _provisional_fields(hours)
+            else "The approved temporary active baseline uses only eligible saved NBM total-cloud "
+            "guidance. Other models retain zero active weight; they cannot replace missing NBM. "
+            "Historical evidence without an approved saved active field remains evidence only. "
+            "Each percentage represents "
+            "native total cloud cover, not a sum or substitution of cloud layers. Native intervals "
+            "and missing times are preserved. Categories describe each unrounded "
+            "native percentage; "
+            "they are not a complete weather-condition string or an observed opaque-sky amount."
+        ),
         "",
         "| Hour | Source / product | Cycle / source lead h | UTC valid time | Definition / "
         "vertical extent | Cloud % | Sky category | Native value / unit | Status / reason |",
