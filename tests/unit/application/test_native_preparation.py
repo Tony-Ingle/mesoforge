@@ -521,6 +521,42 @@ def test_native_crop_releases_full_grid_backing_array(monkeypatch):
     assert not np.shares_memory(crop, field.values)
 
 
+@pytest.mark.parametrize("earth_shape,radius", [(6, 6371229), (1, 6371000)])
+def test_hrrr_native_decode_retains_encoded_earth_figure_for_crop(earth_shape, radius):
+    import eccodes
+
+    from mesoforge.application.native_preparation import _crop
+    from mesoforge.catalog.domains import BoundingBox
+    from mesoforge.guidance.sources.native_fields import TEMPERATURE, decode_state
+    from tests.fixtures import hrrr_grib
+
+    configuration = phase2_configuration()
+    assert "radius" not in configuration.hrrr.read_keys  # Legacy configuration remains unchanged.
+    payload = hrrr_grib.make_temperature_message(
+        forecast_hour=2,
+        values_k=np.full((hrrr_grib.NY, hrrr_grib.NX), 280.0),
+        cycle_date=TARGET.strftime("%Y%m%d"),
+        cycle_hour=TARGET.hour,
+    )
+    message = eccodes.codes_new_from_message(payload)
+    try:
+        eccodes.codes_set(message, "jScansPositively", 1)
+        eccodes.codes_set(message, "shapeOfTheEarth", earth_shape)
+        if earth_shape == 1:
+            eccodes.codes_set(message, "scaleFactorOfRadiusOfSphericalEarth", 0)
+            eccodes.codes_set(message, "scaledValueOfRadiusOfSphericalEarth", radius)
+        payload = bytes(eccodes.codes_get_message(message))
+    finally:
+        eccodes.codes_release(message)
+    field = decode_state(payload, "HRRR", TEMPERATURE, TARGET, 2, configuration)
+    assert field.attrs["GRIB_shapeOfTheEarth"] == earth_shape
+    assert field.attrs["GRIB_radius"] == radius
+    values, x, y, crs = _crop(field, BoundingBox(south=45.7, north=45.9, west=-93.2, east=-92.9))
+    assert values.shape == (len(y), len(x))
+    assert np.all(values == 280.0)
+    assert crs.ellipsoid.semi_major_metre == radius
+
+
 @pytest.mark.parametrize(
     "change",
     [

@@ -227,7 +227,10 @@ def decode_state(
         return hrrr_phase2_decoding.decode_selected_message(
             payload,
             contract=contract,
-            read_keys=settings.read_keys,
+            # Legacy preparation supplies its approved projection separately.
+            # Native-grid extraction instead reconstructs it from encoded GRIB
+            # geometry, including the actual Earth figure; do not invent a radius.
+            read_keys=tuple(dict.fromkeys((*settings.read_keys, "shapeOfTheEarth", "radius"))),
             forecast_hour=lead,
             cycle_date=cycle.date(),
             cycle_hour=cycle.hour,
