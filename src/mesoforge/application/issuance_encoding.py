@@ -53,6 +53,7 @@ def decode_issuance(payload: bytes, *, expected_logical_digest: Digest) -> dict[
         ):
             raise ValueError("Unknown encoding, digest mismatch, or external source references")
         saved = CompactCodec.from_tables(envelope["tables"]).decode(envelope["payload"])
+        del envelope  # Decoded state owns its values; release compressed-table expansion.
         if canonical_json_digest(saved) != expected_logical_digest:
             raise ValueError("Decoded issuance checksum mismatch")
         return saved

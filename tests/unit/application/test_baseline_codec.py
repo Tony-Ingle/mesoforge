@@ -67,6 +67,34 @@ def test_source_checksums_are_verified_even_without_a_reference(source):
         CompactCodec.from_tables(tables)
 
 
+@pytest.mark.parametrize("child_first", [False, True])
+def test_decoded_sources_and_metadata_are_owned_with_parent_child_aliases(source, child_first):
+    descriptor, evidence, _ = source
+    tables = {
+        "source_documents": [descriptor],
+        "metadata": [{"source": {"$source": [0, "/events~1~0/0"]}, "values": [1, None]}],
+    }
+    reader = CompactCodec.from_tables(tables)
+    pointers = {"parent": {"$source": [0, ""]}, "child": {"$source": [0, "/events~1~0/0"]}}
+    if child_first:
+        pointers = dict(reversed(list(pointers.items())))
+    encoded = {**pointers, "first": {"$metadata": 0}, "second": {"$metadata": 0}}
+    before = deepcopy(encoded)
+    first = reader.decode(encoded)
+    second = reader.decode(encoded)
+    assert first == second
+    assert first["parent"]["events/~"][0] is first["child"]
+    assert first["child"] is first["first"]["source"]
+    assert first["first"] is first["second"]
+    first["child"]["cycle"] = "changed in first read only"
+    first["first"]["values"].append(3)
+    assert second["child"] == evidence
+    assert second["first"]["values"] == [1, None]
+    assert reader.decode(encoded) == second
+    assert reader.export_tables() == tables
+    assert encoded == before
+
+
 @pytest.mark.parametrize(
     "value",
     [

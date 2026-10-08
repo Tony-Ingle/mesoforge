@@ -1529,7 +1529,10 @@ issuance duration with a historical default of 36 and optional logical payload d
 old payloads and digests are not rewritten. New 120-hour issuances use a self-contained,
 lossless compact encoding plus deterministic gzip. The reader validates physical and
 logical digests and returns the same rich forecast shape; no external raw-file dependency
-is introduced by this encoding. Longer lead groups are descriptive analysis only. Approved temperature
+is introduced by this encoding. Logical checksums stream the same pinned JCS encoder's
+canonical bytes, avoiding whole-document string/bytes copies without changing identities.
+Decoded views own their values without a second full-grid copy. Longer lead groups are
+descriptive analysis only. Approved temperature
 correction buckets still stop at 36 hours, with explicit no-policy behavior afterward.
 
 [`native_horizons`](src/mesoforge/catalog/native_horizons.py) describes nominal

@@ -205,6 +205,7 @@ class CompactCodec:
         """Reconstruct an independently owned grid; never calculate a forecast."""
         cache: dict[int, Any] = {}
         resolving: set[int] = set()
+        source_memo: dict[int, Any] = {}
 
         def visit(value: Any) -> Any:
             if isinstance(value, list):
@@ -223,7 +224,11 @@ class CompactCodec:
                 ):
                     raise ValueError("Invalid baseline source reference")
                 try:
-                    return _pointer(self._documents[reference[0]], reference[1])
+                    # Source pointers alone return retained objects. Copy those
+                    # once per decode, preserving parent/child pointer aliasing.
+                    return deepcopy(
+                        _pointer(self._documents[reference[0]], reference[1]), source_memo
+                    )
                 except (IndexError, KeyError, TypeError) as exc:
                     raise ValueError("Unresolvable baseline source reference") from exc
             if "$metadata" in value:
@@ -247,7 +252,10 @@ class CompactCodec:
         result = visit(encoded)
         if not isinstance(result, dict):
             raise ValueError("Decoded baseline grid must be a JSON object")
-        return deepcopy(result)
+        # All other dicts/lists, including cached metadata, were constructed by
+        # visit for this decode. A final deepcopy would duplicate the entire
+        # owned grid while both graphs are live, without adding isolation.
+        return result
 
     @property
     def statistics(self) -> dict[str, int]:
