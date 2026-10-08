@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
@@ -25,6 +27,69 @@ from mesoforge.presentation.forecast_document import (
     build_forecast_document,
 )
 from mesoforge.presentation.forecast_pdf import render_forecast_pdf
+
+MAX_DELIVERY_WAIT_SECONDS = 3600
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _utc_timestamp(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Use a timezone-aware UTC ISO timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
+        raise argparse.ArgumentTypeError("Use a timezone-aware UTC ISO timestamp")
+    return parsed.astimezone(UTC)
+
+
+def wait_for_delivery_release(
+    not_before: datetime | None,
+    *,
+    clock: Callable[[], datetime],
+    monotonic: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> datetime:
+    """Wait only after saved-document validation, with a finite operational budget.
+
+    A clock adjustment cannot extend this into an unbounded wait. This delays
+    SMTP submission, not forecast generation or the forecast's valid interval.
+    """
+    started = clock()
+    if started.tzinfo is None:
+        raise ValueError("The delivery clock must be timezone-aware")
+    if not_before is None:
+        return started
+    if not_before.tzinfo is None:
+        raise ValueError("The delivery release time must be timezone-aware")
+    if (not_before - started).total_seconds() > MAX_DELIVERY_WAIT_SECONDS:
+        raise ValueError("Delivery release is more than 60 minutes away")
+    deadline = monotonic() + MAX_DELIVERY_WAIT_SECONDS
+    for _ in range(MAX_DELIVERY_WAIT_SECONDS // 60 + 1):
+        current = clock()
+        if current.tzinfo is None:
+            raise ValueError("The delivery clock must be timezone-aware")
+        budget = deadline - monotonic()
+        if budget < 0:
+            break
+        remaining = (not_before - current).total_seconds()
+        if remaining <= 0:
+            return current
+        if budget <= 0:
+            break
+        sleep(min(remaining, budget, 60.0))
+    raise TimeoutError("Delivery release wait exhausted its finite 60-minute budget")
+
+
+def _validate_delivery_time(document: dict[str, Any], now: datetime) -> None:
+    if now.tzinfo is None:
+        raise ValueError("The delivery clock must be timezone-aware")
+    if datetime.fromisoformat(document["issued_at"]) > now:
+        raise ValueError("An issuance dated after the delivery clock cannot be sent")
+    if datetime.fromisoformat(document["valid_end"]) <= now:
+        raise ValueError("The forecast has expired; delivery cannot turn replay into a forecast")
 
 
 def validate_pdf(data: bytes, document: dict[str, Any]) -> dict[str, Any]:
@@ -71,12 +136,7 @@ def reviewed_pdf(document: dict[str, Any], data: bytes, *, now: datetime) -> dic
     """Gate sending on real, unexpired evidence and the exact deterministic render."""
     if document["fixture"]:
         raise ValueError("Synthetic/unknown-source documents cannot be emailed by this command")
-    if now.tzinfo is None:
-        raise ValueError("The delivery clock must be timezone-aware")
-    if datetime.fromisoformat(document["issued_at"]) > now:
-        raise ValueError("An issuance dated after the delivery clock cannot be sent")
-    if datetime.fromisoformat(document["valid_end"]) <= now:
-        raise ValueError("The forecast has expired; delivery cannot turn replay into a forecast")
+    _validate_delivery_time(document, now)
     expected = render_forecast_pdf(document)
     if data != expected:
         raise ValueError("Reviewed PDF differs from the deterministic saved-issuance render")
@@ -127,7 +187,24 @@ def main(argv: list[str] | None = None) -> int:
         )
         if name == "send":
             command.add_argument("--recipient", required=True)
-            command.add_argument("--confirm-reviewed", action="store_true", required=True)
+            approval = command.add_mutually_exclusive_group(required=True)
+            approval.add_argument(
+                "--confirm-reviewed",
+                action="store_true",
+                help="Operator visually reviewed this exact PDF",
+            )
+            approval.add_argument(
+                "--approved-template",
+                metavar="POLICY_VERSION",
+                help="Owner approved this exact versioned template for automated delivery; "
+                "saved-issuance and per-document checks still run",
+            )
+            command.add_argument(
+                "--not-before",
+                type=_utc_timestamp,
+                help="Validate first, then hold SMTP submission until this UTC ISO timestamp "
+                "(at most 60 minutes; delivery arrival time is not guaranteed)",
+            )
     status = commands.add_parser("status")
     status.add_argument("--delivery-id", required=True)
     args = parser.parse_args(argv)
@@ -151,12 +228,23 @@ def main(argv: list[str] | None = None) -> int:
                     }
                 )
             else:
+                if (
+                    args.approved_template is not None
+                    and args.approved_template != document["document_policy"]
+                ):
+                    raise ValueError("Saved document policy differs from the approved template")
                 with args.pdf.open("rb") as source:
                     pdf = source.read(MAX_ATTACHMENT_BYTES + 1)
                 if len(pdf) > MAX_ATTACHMENT_BYTES:
                     raise ValueError("Reviewed PDF exceeds the attachment size limit")
-                reviewed_pdf(document, pdf, now=datetime.now(UTC))
+                reviewed_pdf(document, pdf, now=_utc_now())
                 subject, text, rich = email_content(document)
+                settings = SmtpSettings.environment()
+                released = wait_for_delivery_release(
+                    args.not_before, clock=_utc_now, monotonic=time.monotonic, sleep=time.sleep
+                )
+                # Recheck only time eligibility; no second rich issuance read or PDF render.
+                _validate_delivery_time(document, released)
                 result = deliver(
                     journal=configured_journal(),
                     issued_id=args.issued_id,
@@ -165,7 +253,7 @@ def main(argv: list[str] | None = None) -> int:
                     text=text,
                     html=rich,
                     attachment=pdf,
-                    settings=SmtpSettings.environment(),
+                    settings=settings,
                     product_version=document["document_policy"],
                 )
     except ForecastCoverageError as exc:
@@ -185,12 +273,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
     print(json.dumps(result, indent=2))
-    outcome = (
-        result.get("previous_outcome", {}).get("status")
-        if result.get("status") == "duplicate_suppressed"
-        else result.get("status")
-    )
-    return 0 if outcome not in {"failed", "ambiguous"} else 1
+    if args.command == "send":
+        outcome = (
+            result.get("previous_outcome", {}).get("status")
+            if result.get("status") == "duplicate_suppressed"
+            else result.get("status")
+        )
+        return 0 if outcome == "accepted" else 1
+    return 0
 
 
 if __name__ == "__main__":

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
+import sys
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,6 +25,7 @@ from mesoforge.application.forecast_worker import (
     location_outcome,
     run_forecast,
 )
+from mesoforge.application.worker_lock import single_writer, worker_lock_root
 from mesoforge.application.worker_status import FORECAST_STATUS, read_json
 from mesoforge.storage.postgres.idempotency_lock import AdvisoryLockBusy
 
@@ -227,6 +230,110 @@ def test_run_pins_the_ready_pointer_and_issues_every_location(tmp_path: Path) ->
     assert saved["status"] == "completed" and saved["baseline"] == "b1"
     latest = read_json(harness.root / "status" / FORECAST_STATUS)
     assert latest is not None and latest["results"][2]["issued_forecast_id"] == "id-2"
+
+
+def test_guidance_and_forecast_share_the_existing_runtime_lock(tmp_path: Path) -> None:
+    harness = Harness(tmp_path)
+    with single_writer(harness.root) as owned:
+        assert owned
+        code, record = harness.run()
+    assert (code, record["status"]) == (EXIT_NOT_READY, "guidance_busy")
+    assert not harness.forecast_calls and not harness.overlay_calls
+
+
+def test_forecast_respects_deployment_lock_from_a_different_runtime_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MESOFORGE_WORKER_LOCK_ROOT", str(tmp_path / "host-runtime"))
+    harness = Harness(tmp_path / "forecast")
+    with single_writer(worker_lock_root(tmp_path / "other-guidance")) as owned:
+        assert owned
+        code, record = harness.run()
+    assert (code, record["category"]) == (EXIT_NOT_READY, "guidance_busy")
+    assert not harness.forecast_calls
+
+
+def test_forecast_holds_process_lock_through_issuance_then_releases(tmp_path: Path) -> None:
+    harness = Harness(tmp_path)
+    deps = harness.deps()
+    script = (
+        "import sys\nfrom pathlib import Path\n"
+        "from mesoforge.application.worker_lock import single_writer\n"
+        "with single_writer(Path(sys.argv[1])) as owned:\n"
+        "    print('owned' if owned else 'busy')\n"
+    )
+
+    def forecast(*args: Any, **kwargs: Any) -> dict:
+        child = subprocess.run(
+            [sys.executable, "-c", script, str(harness.root)],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        assert child.stdout.strip() == "busy"
+        assert harness.calls[-1] != "unlock"  # DB run lock is held too.
+        return harness.forecast(*args, **kwargs)
+
+    deps.forecast = forecast
+    code, record = run_forecast(harness.settings, deps, stream=harness.stream)
+    assert (code, record["status"]) == (EXIT_OK, "completed")
+    assert record["runtime_lock"] == "held_through_issuance"
+    with single_writer(harness.root) as owned:
+        assert owned
+
+
+def test_readiness_wait_does_not_prevent_guidance_from_publishing(tmp_path: Path) -> None:
+    harness = Harness(tmp_path, scheduled=True)
+    harness.readiness_results = [ready(ready=False, reasons=["pending"]), ready()]
+    deps = harness.deps()
+
+    def readiness(*args: Any, **kwargs: Any) -> dict:
+        with single_writer(harness.root) as owned:
+            assert owned
+        return harness.readiness(*args, **kwargs)
+
+    deps.readiness = readiness
+    assert run_forecast(harness.settings, deps, stream=harness.stream)[0] == EXIT_OK
+    assert harness.sleeps == [60]
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, SystemExit])
+def test_forecast_exception_always_releases_runtime_lock(
+    tmp_path: Path, failure: type[BaseException]
+) -> None:
+    harness = Harness(tmp_path)
+    deps = harness.deps()
+
+    def forecast(*args: Any, **kwargs: Any) -> dict:
+        with single_writer(harness.root) as owned:
+            assert not owned
+        raise failure("interrupted forecast")
+
+    deps.forecast = forecast
+    if failure is SystemExit:
+        with pytest.raises(SystemExit):
+            run_forecast(harness.settings, deps, stream=harness.stream)
+    else:
+        code, record = run_forecast(harness.settings, deps, stream=harness.stream)
+        assert (code, record["category"]) == (EXIT_FAILED, "forecast_failed")
+    with single_writer(harness.root) as owned:
+        assert owned
+
+
+@pytest.mark.parametrize("expected", ["b1", "another-baseline"])
+def test_exact_guidance_handoff_rejects_another_ready_baseline(
+    tmp_path: Path, expected: str
+) -> None:
+    harness = Harness(tmp_path, expected_baseline_id=expected)
+    code, record = harness.run()
+    assert record["expected_baseline_id"] == expected
+    if expected == "b1":
+        assert code == EXIT_OK
+        assert harness.forecast_calls[0]["baseline_pointer"] == POINTER
+    else:
+        assert (code, record["category"]) == (EXIT_NOT_READY, "unexpected_baseline")
+        assert not harness.forecast_calls and not harness.overlay_calls
 
 
 def test_no_ready_baseline_fails_clearly_without_refreshing(tmp_path: Path) -> None:

@@ -21,8 +21,9 @@ from pathlib import Path
 from typing import Any
 
 from mesoforge.application.baseline_snapshot import BASELINE_SCHEMA, read_artifact
-from mesoforge.application.guidance_worker import single_writer
 from mesoforge.application.prepared_snapshot import SNAPSHOT_SCHEMA, _replace_pointer
+from mesoforge.application.worker_lock import single_writer, worker_lock_root
+from mesoforge.application.worker_status import FORECAST_STATUS, GUIDANCE_STATUS
 
 _ROOT = Path(__file__).resolve().parents[3]
 _ID = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}\Z")
@@ -118,9 +119,11 @@ def pin_case(root: Path, generation_name: str, *, reason: str, remove: bool = Fa
         raise ValueError("A managed snapshot ID and an operator reason are required")
     if not (root / "guidance/snapshots" / generation_name).is_dir():
         raise ValueError("The managed snapshot does not exist")
-    with single_writer(root) as acquired:
+    with single_writer(worker_lock_root(root)) as acquired:
         if not acquired:
-            raise RuntimeError("Guidance worker is running; stop it at a safe boundary first")
+            raise RuntimeError(
+                "Guidance worker or Forecast worker is running; wait for a safe boundary first"
+            )
         value = _pins(root)
         if remove:
             value["pins"].pop(generation_name, None)
@@ -166,9 +169,20 @@ def plan_retention(root: Path, *, counts: CycleCounts = DEFAULT_CYCLE_COUNTS) ->
     root = _root(root)
     collection = root / "guidance/snapshots"
     generations: dict[str, dict[str, Any]] = {}
+    baselines: list[dict[str, Any]] = []
     documents: list[tuple[str | None, Any]] = []
     problems: list[str] = []
     pins = _pins(root)["pins"]
+    # Known worker documents only: never traverse another application's or a
+    # runner's state. In-flight status is conservative even after an interruption.
+    in_flight_workers: list[str] = []
+    for name in (GUIDANCE_STATUS, FORECAST_STATUS):
+        path = root / "status" / name
+        if path.exists():
+            status = _read(path)
+            documents.append((None, status))
+            if status.get("in_flight") or status.get("state") == "busy":
+                in_flight_workers.append(name)
     for directory in sorted(collection.iterdir()):
         if not directory.is_dir() or not _ID.fullmatch(directory.name):
             problems.append(f"Unrecognized entry retained: {directory.name}")
@@ -233,15 +247,29 @@ def plan_retention(root: Path, *, counts: CycleCounts = DEFAULT_CYCLE_COUNTS) ->
         if not directory.is_dir():
             problems.append(f"Unrecognized baseline entry retained: {directory.name}")
             continue
-        _files(directory)  # Validate paths without inflating numerical grids.
+        files = _files(directory)  # Validate paths without inflating numerical grids.
+        row = {
+            "baseline_snapshot_id": directory.name,
+            "prepared_snapshot_id": None,
+            "bytes": sum(path.stat().st_size for path in files),
+            "state": "incomplete_or_unknown",
+            "reasons": ["permanent_artifact_reference_closure_unproven"],
+            "action": "retain",
+        }
+        baselines.append(row)
         path = directory / "baseline.json"
         if not path.exists():
+            row["reasons"].append("incomplete_or_unknown_never_age_pruned")
             problems.append(f"Incomplete baseline retained: {directory.name}")
             continue
         baseline = _read(path)
-        if baseline.get("schema_version") != BASELINE_SCHEMA:
-            raise ValueError("Unknown baseline schema prevents retention")
+        if (
+            baseline.get("schema_version") != BASELINE_SCHEMA
+            or baseline.get("baseline_snapshot_id") != directory.name
+        ):
+            raise ValueError("Unknown baseline schema or identity prevents retention")
         identity = baseline["prepared_snapshot"]["snapshot_id"]
+        row.update(prepared_snapshot_id=identity, state="complete")
         protect(identity, "retained_baseline_dependency")
         for key, reason in (
             ("baseline_snapshot_id", "latest_baseline_dependency"),
@@ -249,6 +277,9 @@ def plan_retention(root: Path, *, counts: CycleCounts = DEFAULT_CYCLE_COUNTS) ->
         ):
             if current.get(key) == baseline.get("baseline_snapshot_id"):
                 protect(identity, reason)
+                row["reasons"].append(reason.removesuffix("_dependency"))
+        if identity in pins:
+            row["reasons"].append("operator_case_pin_dependency")
         documents.append((None, baseline))
         tables = read_artifact(directory, baseline["metadata_file"])
         documents.append((None, {"source_documents": tables["source_documents"]}))
@@ -285,13 +316,20 @@ def plan_retention(root: Path, *, counts: CycleCounts = DEFAULT_CYCLE_COUNTS) ->
         )
         row["action"] = "retain"
     rows = list(generations.values())
+    for row in [*rows, *baselines]:
+        if in_flight_workers:
+            row["reasons"].append("worker_in_flight_reference_closure_unproven")
+        row["reasons"] = sorted(set(row["reasons"]))
     return {
         "operation": "dry_run",
         "root": str(root),
         "cycle_counts": asdict(counts),
         "generations": rows,
+        "baselines": baselines,
+        "in_flight_workers": in_flight_workers,
         "problems": sorted(set(problems)),
         "retained_bytes": sum(row["bytes"] for row in rows if row["action"] == "retain"),
+        "retained_baseline_bytes": sum(row["bytes"] for row in baselines),
         "removable_bytes": 0,
         "expired_preference_but_protected_bytes": sum(
             row["bytes"] for row in rows if row["outside_cycle_window"]

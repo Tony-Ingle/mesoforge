@@ -33,6 +33,7 @@ from mesoforge.application.forecast_worker import (
 from mesoforge.application.forecast_worker import default_deps as forecast_deps
 from mesoforge.application.guidance_worker import GuidanceWorker, WorkerSettings
 from mesoforge.application.guidance_worker import default_deps as guidance_deps
+from mesoforge.application.worker_lock import single_writer
 from mesoforge.common.identifiers import Digest
 from mesoforge.storage.postgres.idempotency_lock import PostgresIdempotencyLock
 from mesoforge.storage.postgres.repositories import PostgresUnitOfWork
@@ -118,6 +119,22 @@ def test_forecast_worker_issues_pinned_baseline_and_duplicate_triggers_skip(
     root, config = runtime["root"], runtime["config"]
     assert run_guidance_once(root, config)[0] == 0
     settings = ForecastSettings(root=root, config=config, reference_time=TARGET, verify_prior=False)
+    before = storage_tests.storage_inventory(migrated_dsn, object_store)
+    with single_writer(root) as owned:
+        assert owned
+        code, blocked = run_forecast(settings, forecast_deps(), stream=io.StringIO())
+    assert (code, blocked["category"]) == (3, "guidance_busy")
+    assert storage_tests.storage_inventory(migrated_dsn, object_store) == before
+    code, wrong = run_forecast(
+        replace(settings, expected_baseline_id="different-handoff"),
+        forecast_deps(),
+        stream=io.StringIO(),
+    )
+    assert (code, wrong["category"]) == (3, "unexpected_baseline")
+    assert storage_tests.storage_inventory(migrated_dsn, object_store) == before
+    handoff = read_pointer(root / "baseline")
+    assert handoff is not None
+    settings = replace(settings, expected_baseline_id=handoff["baseline_snapshot_id"])
     code, first = run_forecast(settings, forecast_deps(), stream=io.StringIO())
     assert (code, first["status"]) == (0, "completed"), first
     assert first["summary"] == {"ok": 2, "issued": 2, "skipped": 0, "failed": 0}

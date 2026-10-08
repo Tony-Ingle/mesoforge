@@ -1,0 +1,14 @@
+{
+  "project": "mesoforge-live-minneapolis-580f8c2",
+  "env_file": "/home/vpsadmin/mesoforge-live-minneapolis-580f8c2/live.env",
+  "compose_files": [
+    "/REPLACE_WITH_DEPLOYED_CHECKOUT/deploy/hosted/compose.yaml",
+    "/REPLACE_WITH_DEPLOYED_CHECKOUT/deploy/hosted/daily.compose.yaml"
+  ],
+  "state_root": "/var/lib/mesoforge/daily",
+  "runtime_root": "/var/lib/mesoforge/runtime/minneapolis-daily",
+  "forecast_time": "07:15",
+  "delivery_time": "08:00",
+  "approved_template": "mesoforge-120-hour-presentation.v1",
+  "recipients": ["REPLACE_WITH_CONFIGURED_RECIPIENT@example.com"]
+}

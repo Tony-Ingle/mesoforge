@@ -76,6 +76,11 @@
   explicit schema step. Automatic policy promotion and recurring delivery remain future work.
   Schedulers decide WHEN; MesoForge owns meteorology. Do not put forecast science in
   scheduler, Compose or GHA YAML.
+- Daily v1 orchestration is one Minneapolis Guidance `once`, then a pinned forecast,
+  then saved PDF/email. Keep the GHA opt-in disabled without owner authorization;
+  do not install a competing timer. Shared runtime locks, fresh-baseline handoff and
+  local-day receipts must prevent overlap or repeat paid work. Disk warnings never
+  authorize deletion of unresolved scientific dependencies or runner state.
 - Learning uses common immutable stage/variant lineage and the existing artifact
   store/evaluator. Local temperature correction is explicitly no-op unless an
   ACTIVE policy exists; candidates/shadows never promote themselves. Build candidate

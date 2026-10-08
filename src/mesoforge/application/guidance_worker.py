@@ -51,6 +51,12 @@ from mesoforge.application.batch_forecast import (
     location_display_timezone,
 )
 from mesoforge.application.code_revision import current_code_revision
+from mesoforge.application.disk_admission import (
+    DEFAULT_MIN_FREE_BYTES,
+    DEFAULT_WARN_FREE_BYTES,
+    GIB,
+    DiskPolicy,
+)
 from mesoforge.application.forecast_schedule import ForecastSchedule
 from mesoforge.application.prepared_snapshot import (
     SnapshotError,
@@ -60,6 +66,8 @@ from mesoforge.application.prepared_snapshot import (
 )
 from mesoforge.application.runtime_log import event, redact, redact_diagnostics
 from mesoforge.application.spatial_coverage import validate_coordinate
+from mesoforge.application.worker_lock import single_writer as single_writer
+from mesoforge.application.worker_lock import worker_lock_root
 from mesoforge.application.worker_status import (
     GUIDANCE_HEARTBEAT,
     GUIDANCE_STATUS,
@@ -103,7 +111,8 @@ class WorkerSettings:
     max_refresh_attempts_per_hour: int = 2
     backoff_base_seconds: int = 300
     backoff_cap_seconds: int = 3600
-    min_free_bytes: int = 6 * 1024**3
+    min_free_bytes: int = DEFAULT_MIN_FREE_BYTES
+    warn_free_bytes: int = DEFAULT_WARN_FREE_BYTES
     coverage_hours: int | None = None
     forecast_horizon: ForecastHorizon = LEGACY_HORIZON
     # False refreshes only for coverage, footprint and pre-slot reasons (less bandwidth).
@@ -137,6 +146,11 @@ class WorkerSettings:
             raise ValueError("Backoff cap must be at least one hour and the poll interval")
         if self.backoff_base_seconds < 1 or self.min_free_bytes < 0:
             raise ValueError("Backoff base and free-space floor must be non-negative")
+        DiskPolicy(self.min_free_bytes, self.warn_free_bytes)
+
+    @property
+    def disk_policy(self) -> DiskPolicy:
+        return DiskPolicy(self.min_free_bytes, self.warn_free_bytes)
 
     def public(self) -> dict[str, Any]:
         values = asdict(self)
@@ -344,39 +358,6 @@ def _prepared_coordinates(directory: Path) -> set[tuple[float, float]]:
         return set()
 
 
-@contextmanager
-def single_writer(root: Path) -> Iterator[bool]:
-    """Hold an exclusive, non-blocking lock on the runtime root for this process."""
-    directory = status_directory(root)
-    directory.mkdir(parents=True, exist_ok=True)
-    with (directory / "guidance-worker.lock").open("a+b") as stream:
-        stream.seek(0)
-        try:
-            if sys.platform == "win32":
-                import msvcrt
-
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            stream.seek(0)
-            if sys.platform == "win32":
-                import msvcrt
-
-                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-
-
 class GuidanceWorker:
     def __init__(
         self,
@@ -389,6 +370,7 @@ class GuidanceWorker:
         if root.is_relative_to(_ROOT):
             raise ValueError("The runtime root must remain outside the repository")
         self.settings = replace(settings, root=root)
+        self.lock_root = worker_lock_root(root)
         self.deps = deps
         self.stream = stream
         self.status_path = status_directory(root) / GUIDANCE_STATUS
@@ -566,7 +548,9 @@ class GuidanceWorker:
             free: int | None = d.disk_free(self.settings.root)
         except OSError:
             free = None
-        self.state["disk"] = {"free_bytes": free, "min_free_bytes": self.settings.min_free_bytes}
+        self.state["disk"] = self.settings.disk_policy.report(free)
+        if self.state["disk"]["status"] == "warning":
+            self.log("disk_warning", **self.state["disk"])
         outcome["refresh"] = self._refresh_step(locations, free, categories)
         if self._stopping(outcome):
             return
@@ -738,7 +722,7 @@ class GuidanceWorker:
             free: int | None = self.deps.disk_free(self.settings.root)
         except OSError:
             free = None
-        self.state["disk"] = {"free_bytes": free, "min_free_bytes": self.settings.min_free_bytes}
+        self.state["disk"] = self.settings.disk_policy.report(free)
         blocked = (
             "disk_unavailable"
             if free is None
@@ -1220,7 +1204,7 @@ class GuidanceWorker:
         install_signals: bool = True,
         exit_process: Callable[[int], None] = os._exit,
     ) -> int:
-        with single_writer(self.settings.root) as owned:
+        with single_writer(self.lock_root) as owned:
             if not owned:
                 self.log("worker_busy", root=str(self.settings.root))
                 return 2
@@ -1268,7 +1252,13 @@ class GuidanceWorker:
                 while not self.stop.is_set():
                     outcome = self.poll_once()
                     if once:
-                        failures = set(outcome["categories"]) - {"provider_incomplete"}
+                        # Optional candidate shadows cannot invalidate a published
+                        # active baseline. Keep the warning in durable status;
+                        # callers still gate the active handoff on readiness.
+                        failures = set(outcome["categories"]) - {
+                            "provider_incomplete",
+                            "candidate_background_failed",
+                        }
                         status = 1 if failures else 0
                         break
                     delay = backoff_seconds(
@@ -1362,7 +1352,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-refresh-attempts-per-hour", type=int, default=2)
     parser.add_argument("--backoff-base-seconds", type=int, default=300)
     parser.add_argument("--backoff-cap-seconds", type=int, default=3600)
-    parser.add_argument("--min-free-gb", type=float, default=6.0)
+    disk_policy = DiskPolicy.from_environment()
+    parser.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=disk_policy.min_free_bytes / GIB,
+        help="Refuse heavy Guidance work below this free GiB reserve (default 20)",
+    )
+    parser.add_argument(
+        "--warn-free-gb",
+        type=float,
+        default=disk_policy.warn_free_bytes / GIB,
+        help="Report an operator storage warning through this free GiB reserve (default 30)",
+    )
     parser.add_argument(
         "--no-hourly-probe",
         action="store_true",
@@ -1401,6 +1403,7 @@ def main(argv: list[str] | None = None) -> int:
             backoff_base_seconds=args.backoff_base_seconds,
             backoff_cap_seconds=args.backoff_cap_seconds,
             min_free_bytes=int(args.min_free_gb * 1024**3),
+            warn_free_bytes=int(args.warn_free_gb * 1024**3),
             hourly_probe=not args.no_hourly_probe,
             schedule=ForecastSchedule.from_environment(),
         )

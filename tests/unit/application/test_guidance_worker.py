@@ -737,6 +737,30 @@ def test_registered_candidates_shadow_the_current_baseline_every_poll(tmp_path: 
     assert loaded
 
 
+@pytest.mark.parametrize("raised", [False, True])
+def test_once_candidate_failure_reports_warning_without_blocking_active_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raised: bool
+) -> None:
+    harness = Harness(tmp_path)
+    harness.governance.shadows = [SimpleNamespace(policy_artifact_id="art_candidate")]
+    monkeypatch.setattr(worker_module, "load_baseline", lambda *a, **k: "pinned")
+
+    def candidate(*args: Any, **kwargs: Any) -> dict:
+        if raised:
+            raise ValueError("Candidate computation failed")
+        return {"overlays": [], "failures": ["Candidate computation failed"]}
+
+    monkeypatch.setattr(harness.governance.learning, "background", candidate)
+    worker = harness.worker()
+    assert worker.run(once=True, install_signals=False) == 0
+    outcome = worker.state["polls"]["last"]
+    assert outcome["build"]["outcome"] == "published"
+    assert outcome["categories"] == ["candidate_background_failed"]
+    assert outcome["background"]["status"] == ("failed" if raised else "partial")
+    assert worker.state["readiness"]["ready"] is True
+    assert len(harness.refresh_calls) == len(harness.build_calls) == 1
+
+
 def test_interrupted_phase_counts_as_failure_after_restart(tmp_path: Path) -> None:
     harness = Harness(tmp_path)
     status = harness.root / "status" / GUIDANCE_STATUS
@@ -773,6 +797,18 @@ def test_single_writer_refuses_a_second_worker_on_the_same_root(tmp_path: Path) 
         assert owned
         assert harness.worker().run(once=True, install_signals=False) == 2
     assert any(row["event"] == "worker_busy" for row in harness.events())
+
+
+def test_guidance_respects_deployment_lock_from_a_different_runtime_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared = tmp_path / "host-runtime"
+    monkeypatch.setenv("MESOFORGE_WORKER_LOCK_ROOT", str(shared))
+    harness = Harness(tmp_path / "guidance")
+    with single_writer(shared) as owned:
+        assert owned
+        assert harness.worker().run(once=True, install_signals=False) == 2
+    assert not harness.refresh_calls and not harness.build_calls
 
 
 def test_single_writer_lock_excludes_an_independent_process_and_releases(tmp_path: Path) -> None:
@@ -1253,6 +1289,39 @@ def test_unknown_disk_capacity_does_not_allow_large_writes(tmp_path: Path) -> No
     harness.deps.disk_free = unavailable
     assert harness.worker().poll_once()["refresh"]["blocked_by"] == "disk_unavailable"
     assert not harness.refresh_calls
+
+
+@pytest.mark.parametrize("free_gib", [20, 30, 31])
+def test_operational_disk_warning_does_not_refresh_or_delete_for_storage(
+    tmp_path: Path, free_gib: int
+) -> None:
+    harness = Harness(tmp_path, hourly_probe=False)
+    publish_prepared(harness.root, harness.hour())
+    harness.free = free_gib * 1024**3
+    worker = harness.worker()
+    outcome = worker.poll_once()
+    assert not harness.refresh_calls
+    assert outcome["build"]["outcome"] == "published"
+    assert worker.state["disk"]["status"] == ("normal" if free_gib > 30 else "warning")
+    assert "disk_low" not in outcome["categories"]
+    assert ("disk_warning" in harness.stream.getvalue()) is (free_gib <= 30)
+
+
+def test_daily_guidance_default_refuses_below_twenty_gib_and_uses_shared_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = Harness(tmp_path)
+    harness.free = 20 * 1024**3 - 1
+    worker = harness.worker()
+    outcome = worker.poll_once()
+    assert outcome["refresh"]["blocked_by"] == "disk_low"
+    assert not harness.refresh_calls and not harness.build_calls
+    assert worker.state["disk"]["status"] == "refused"
+    monkeypatch.setenv("MESOFORGE_GUIDANCE_MIN_FREE_GB", "25")
+    monkeypatch.setenv("MESOFORGE_GUIDANCE_WARN_FREE_GB", "35")
+    args = worker_module.build_parser().parse_args(["once", "--root", str(harness.root)])
+    assert args.min_free_gb == 25
+    assert args.warn_free_gb == 35
 
 
 def test_persisted_worker_state_redacts_downstream_readiness_details(

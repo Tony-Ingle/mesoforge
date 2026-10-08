@@ -953,41 +953,89 @@ Imports validate the entire export before any object writes. Governance stays an
 service (`docker compose run --rm admin mesoforge.application.governance ...`); the
 worker database role cannot append governance events, and nothing is served over HTTP.
 
-### Scheduling at 08:00 and 20:00 America/Chicago
+### Once-daily Minneapolis delivery — disabled until owner enablement
 
-Scheduling is **not enabled**. The intended rollout uses GitHub Actions on the
-existing self-hosted deployment runner; no forecast workflow is currently committed.
-After explicit owner enablement, a workflow on the repository's default branch can
-use `cron: "0 8,20 * * *"` with `timezone: America/Chicago`, then invoke the existing
-forecast service with `--scheduled` and the deployment's Minneapolis-only config.
+The [daily workflow](.github/workflows/mesoforge-daily.yml) composes existing workers
+through [daily_cycle.py](deploy/hosted/daily_cycle.py). It schedules **one** deliberate
+Guidance `once` at **06:05 America/Chicago**, forecast preparation at **07:15**, and
+SMTP release **not before 08:00**. The measured five-day Guidance cycle took roughly
+50 minutes; 70 minutes before Forecast leaves headroom. Forecast itself took about
+29 minutes plus saved-issuance delivery reads, so starting Forecast at 08:00 would
+not achieve morning 08:00 delivery. These are operator times, not scientific rules.
+Slow builds, verification, providers or SMTP can make delivery late; no arrival SLA
+is implied. A trigger arriving after the forecast slot closes at 08:00 skips the day
+without backdating or another paid desk attempt.
+
 [GitHub's schedule contract](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
-supports IANA time zones/DST, runs scheduled workflows only from the default branch,
-and warns that dispatch can be delayed or dropped. The worker's own named-zone gate,
-readiness checks and issuance locks remain authoritative; a late trigger must not
-be backdated or bypass the gate.
+supports IANA timezone/DST scheduling and warns that dispatch can be delayed or
+dropped. The workflow uses `timezone: America/Chicago`, runs on the existing `vps`
+self-hosted runner, and becomes schedulable only when present on the **default branch**
+(`main`). Feature-branch presence does not enable a schedule. There is no hourly
+Guidance loop, cron or systemd timer in this v1 daily path. Legacy systemd examples
+remain alternatives only; **do not install them alongside GitHub Actions**.
 
-Before enabling, select the exact deployed image/configuration, approve recurring
-AI expenditure, establish retention and off-host backups, and arrange serialization
-with heavy Guidance work on a small host. Merely scheduling two forecasts does not
-limit the polling Guidance worker to two refreshes per day. Use actionable worker
-exit/status output and prevent overlapping scheduler invocations. No scheduled job
-should modify its deployment checkout or run arbitrary repository-supplied commands
-with the live credentials.
+Both scheduled and manual `run` require repository variable
+`MESOFORGE_DAILY_ENABLED=true`; this change does not set it. Leave it unset or false.
+Manual `status` is read-only
+and permitted while disabled. Default-branch and repository guards also apply.
+The workflow never builds/deploys an image, migrates schema or enables policies.
 
-An hourly UTC trigger is an alternative: the worker's `--scheduled` gate remains
-DST-aware and returns `not_due` outside the configured slots:
+Before enablement, build/deploy one exact committed daily-capable image through the
+existing procedure, keeping the **existing live project, database and volumes**.
+Set `MESOFORGE_DAILY_IMAGE` in its deployment environment, and provision
+`/etc/mesoforge/daily.json` from [daily.json.example](deploy/hosted/daily.json.example).
+Use the base Compose file plus [daily.compose.yaml](deploy/hosted/daily.compose.yaml),
+not old proof overlays that clear AI credentials or select Grasston. Replace example
+paths/recipients; approve the explicit `mesoforge-120-hour-presentation.v1` template.
+Create the configured private `state_root` outside the checkout, writable by the
+runner operator. Preserve that directory in backups: it contains daily retry receipts.
+Credentials remain in the existing live environment, `/etc/mesoforge/ai.env` and
+`/etc/mesoforge/email.env`, with role-specific exposure. No recipient is hardcoded.
+
+The runner derives a Minneapolis-only selection from `configs/locations.json` and
+gives all roles the same selection/root. Grasston remains in the maintained registry;
+all historical locations remain untouched. The daily overlay selects 120h explicitly;
+historical/default 36h behavior is unchanged.
 
 ```text
-5 * * * * cd /path/to/checkout/deploy/hosted && docker compose run --rm forecast-worker
+python3 deploy/hosted/daily_cycle.py --config /etc/mesoforge/daily.json status
+python3 deploy/hosted/daily_cycle.py --config /etc/mesoforge/daily.json run
+gh workflow run mesoforge-daily.yml --ref main -f operation=status
+gh workflow run mesoforge-daily.yml --ref main -f operation=run
 ```
 
-(any cron, hourly in UTC), or a GitHub Actions workflow with `cron: "5 * * * *"`.
-GitHub-hosted runners cannot access the internal services/runtime volume. The
-existing [systemd timer](deploy/hosted/systemd/mesoforge-forecast.timer) and
-[service](deploy/hosted/systemd/mesoforge-forecast.service) remain an alternative,
-not a second schedule to install alongside GHA. Keep
-`MESOFORGE_FORECAST_TIMEZONE`/`MESOFORGE_FORECAST_TIMES` consistent with the selected
-scheduler. None of these examples authorizes unattended paid inference.
+The GHA Actions UI provides the same `workflow_dispatch` choices. `run` uses the
+computer clock and today's local date; no date argument or backfill is supported.
+It refuses heavy work before 06:05 or after the forecast window, preserves phase
+logs/receipts outside Git, and reports IDs, cycles, verification, AI outcome, PDF
+digest, delivery audit and sampled host memory/swap/load/disk in the job summary.
+Container memory peaks are not collected by this wrapper.
+
+Guidance stops before Forecast. A persistent host lock and the workers' shared
+runtime OS lock serialize heavy work; GitHub concurrency does not cancel a running
+job. The wrapper also refuses an already-running Guidance/Forecast container in
+the live project. Compose sets `MESOFORGE_WORKER_LOCK_ROOT` to the shared volume root,
+so new-image manual workers using different sub-roots also serialize. Do not start
+legacy images that lack this lock contract. The handoff requires successful Guidance,
+a 120h baseline prepared/published this morning, coverage for
+the forecast slot, normal readiness and the **exact pinned baseline ID**. Current
+same-morning eligible state may be reused; previous-day fallback is deliberately
+disallowed. Failed Guidance leaves old good pointers/history intact and skips delivery.
+Shadow-candidate failure alone remains a reported warning, not an active forecast blocker.
+
+Completed phases are reused for the local day. Existing issuance and delivery locks
+remain authoritative. A crashed/incomplete forecast attempt requires operator
+inspection of its saved worker record; the runner will not repeat uncertain paid
+work. Email-only retries read the saved issuance/PDF; they never reacquire or invoke
+AI. Accepted deliveries are reused. An ambiguous or failed durable SMTP intent stays
+suppressed pending explicit reconciliation, never automatically resent. AI failure
+uses the existing validated fallback; email failure never invalidates issuance.
+
+Enable only after storage/off-host backup prerequisites below and explicit recurring
+AI/email authorization. Set `MESOFORGE_DAILY_ENABLED=true`; to disable new runs,
+unset it or set `false`. Do not cancel an in-flight scientific phase merely to disable
+tomorrow's run. One normal forecast/day means approximately **365 bounded AI desk
+jobs/year**, with existing request/token/time limits and no implied dollar estimate.
 
 ### Deploying the stack
 
@@ -1001,18 +1049,17 @@ cp deploy/hosted/ai-settings.env.example deploy/hosted/ai-settings.env # optiona
 sh deploy/hosted/build-image.sh                       # set MESOFORGE_IMAGE to the tag
 docker compose -f deploy/hosted/compose.yaml build minio # pinned upstream source build
 make hosted-migrate DB=mesoforge                      # explicit: migrate, then create bucket
-make hosted-up                                        # verifies head, starts the worker
 make hosted-status
 ```
 
 `hosted-migrate` starts only PostgreSQL and MinIO, runs `operations migrate` through
 the owner credentials, verifies the head and applies the worker grants (after any
 other migration path, run `operations apply-grants`); `hosted-up` refuses to start the
-worker
-unless `migration-status` reports the head. Workers never migrate, so two processes
+worker unless `migration-status` reports the head. It is the manual continuous-worker
+alternative; do not use it for daily v1 operation. Workers never migrate, so two processes
 can never race a migration. To upgrade: build the new commit, back up, stop the
-guidance worker, migrate, then start it; run both roles from one image tag (overlay
-identities include the code identity).
+guidance worker, migrate, then use the daily one-shot path; run both roles from one
+image tag (overlay identities include the code identity).
 
 Set `MESOFORGE_AI_PROVIDER` and `MESOFORGE_AI_MODEL` in `deploy/hosted/.env` (or
 the invoking shell); defaults are `openai` and `gpt-6-sol`. Compose's explicit
@@ -1104,6 +1151,23 @@ budget disk for growing complete generations, rich issuances and recovery copies
 not a claimed fixed working set. Docker build cache may be reviewed separately by
 the operator; this command never prunes it.
 
+The central [disk policy](src/mesoforge/application/disk_admission.py) reports normal
+above 30 GiB, warning at 20–30 GiB, and refuses heavy Guidance below 20 GiB. Configure
+`MESOFORGE_GUIDANCE_MIN_FREE_GB` and `MESOFORGE_GUIDANCE_WARN_FREE_GB` centrally in
+the deployment environment (and invoking host environment if overriding its defaults).
+Warnings never trigger scientific deletion. The dry-run inventory explicitly protects
+current/previous complete Guidance and baselines, pinned cases, recorded in-flight
+work and unresolved retained references. Absence of an in-flight status is not proof
+that deletion is safe; deletion remains refused.
+
+The October 8 read-only capacity audit found 35.80 GiB free. A comparable daily cycle
+adds at least 2.73 GB (prepared/raw 2.274 GB, baseline 393 MB, issuance 60 MB), **plus**
+observations, verification and backups. Roughly six such cycles reach the 20 GiB floor.
+There is no bounded steady state yet. Docker reported 9.07 GB reclaimable build cache,
+but shared ownership was unproven; no global prune is authorized. Synthetic proof
+volumes, old images and recovery backups require explicit classification. Runner
+state, live scientific artifacts and history are never cleanup candidates here.
+
 [backup.sh](deploy/hosted/backup.sh) (`sh deploy/hosted/backup.sh DEST`) dumps
 PostgreSQL (`pg_dump -Fc`, verified by `pg_restore --list`), then exports every
 referenced object with digest verification, then archives the complete runtime volume,
@@ -1123,6 +1187,17 @@ and Governance through database/object exports. It still includes full runtime/r
 guidance because retained baselines require it. Do not omit those dependencies yet.
 Deployment-level AI/SMTP secrets are provisioned separately and must not be placed
 inside runtime or backup manifests. A same-host recovery copy is not an off-host backup.
+
+Unattended enablement requires a verified off-host copy. No destination is currently
+provisioned, and the latest same-host backup predates the five-day issuance. A minimal
+option is one private S3-compatible backup bucket/prefix (for example Backblaze B2),
+with a separate restricted backup-only key. The owner must provide endpoint, region,
+bucket/prefix, credentials outside Git, retention duration and approval for the initial
+multi-GB transfer. Create a fresh quiesced backup with the committed procedure; retain
+DB, objects, required runtime, daily receipts and non-secret deployment configuration.
+Keep secrets separately. Verify uploaded bytes by streaming them back against
+`SHA256SUMS`/object digests; a multipart ETag is not a SHA256 checksum. Do not omit raw
+dependencies until the reference-retirement prerequisite is actually implemented.
 
 [restore.sh](deploy/hosted/restore.sh) requires stopped workers, an empty database,
 runtime volume and bucket, and the same database owner and bucket name as the backup.
@@ -1162,9 +1237,10 @@ assume: the provider and host, its Linux distribution, SSH access, disk capacity
 generated secrets and optionally an OpenAI key. DNS names and public ports are not
 needed.
 
-### 36-hour PDF and explicit email delivery
+### Saved-forecast PDF and email delivery
 
-The operational presentation product is **MesoForge 36-Hour Weather Outlook**.
+Daily v1 uses the **120-hour outlook** described below. The historical/default
+presentation product remains **MesoForge 36-Hour Weather Outlook**.
 The two-page server-side ReportLab renderer reads the saved final issuance, including
 validated AI edits or the recorded deterministic fallback. It presents the exact
 36-hour window, hourly trends, interval QPF and covered-period summaries; a partial
@@ -1210,6 +1286,13 @@ real guidance identity, unexpired coverage and byte identity with a fresh determ
 render of the same saved issuance. Fixture/unknown-source PDFs cannot be emailed by this
 command. Rendering and sending are independent; an email failure cannot roll back issuance.
 
+The explicitly approved daily template uses `--approved-template
+mesoforge-120-hour-presentation.v1` instead of claiming a new human visual review
+each morning. The version must match the saved document policy and every PDF still
+passes deterministic content/byte validation. `--not-before` accepts an aware UTC
+instant, prepares the validated attachment first, then holds SMTP for at most 60 minutes
+and rechecks expiration. A template-version change requires fresh operator approval.
+
 Copy [email-settings.env.example](deploy/hosted/email-settings.env.example) to
 `deploy/hosted/email-settings.env` for non-secret SMTP settings. Securely provision
 `MESOFORGE_SMTP_USERNAME` and `MESOFORGE_SMTP_PASSWORD` in the MesoForge-specific
@@ -1247,6 +1330,8 @@ Application commands read the process environment; they never import `.env` file
 | `MESOFORGE_S3_SECRET_KEY` | Object storage | Secret key |
 | `AWS_DEFAULT_REGION` | Object storage | boto3 region (`us-east-1` for MinIO) |
 | `MESOFORGE_PROSPECTIVE_ROOT` | Workers, cycle, operations | Runtime root (`guidance/`, `baseline/`, `runs/`, `status/`) |
+| `MESOFORGE_WORKER_LOCK_ROOT` | Guidance, Forecast, retention pins | Optional shared lock root; hosted Compose sets the runtime volume root to serialize different sub-roots |
+| `MESOFORGE_GUIDANCE_MIN_FREE_GB` / `MESOFORGE_GUIDANCE_WARN_FREE_GB` | Guidance / daily host admission | Free-disk GiB floor/warning (20/30); no automatic deletion |
 | `MESOFORGE_OBSERVATIONS_DIR` | Temperature verification | Retained METAR/station evidence root |
 | `MESOFORGE_MRMS_DIR` | QPF verification | Retained MRMS evidence root |
 | `MESOFORGE_OBSERVATIONS_ARTIFACT_ID` | Observation preview | Set internally during verification; optional explicit preview input |

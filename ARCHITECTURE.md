@@ -1257,8 +1257,8 @@ development keeps the on-demand commands and `prospective_cycle`.
 
 ```mermaid
 flowchart LR
-    X[External scheduler: 08:00/20:00 America/Chicago; not enabled] -. when .-> F
-    P[Model providers] --> G[Guidance/baseline worker: bounded poll loop]
+    X[GitHub daily 06:05 America/Chicago; disabled] -. when .-> G
+    P[Model providers] --> G[Guidance/baseline worker: one poll then stop]
     G --> R[(Runtime volume: guidance/, baseline/, runs/, status/)]
     R --> F[Forecast/issuance worker: one run per trigger]
     O[METAR / MRMS] --> F
@@ -1270,7 +1270,7 @@ flowchart LR
     A --> S3
     DB --> D[Explicit saved-issuance PDF / SMTP command]
     S3 --> D
-    D --> E[SMTP provider; validated 36-hour outlook]
+    D --> E[SMTP provider; validated 120-hour outlook, release at 08:00]
 ```
 
 [`guidance_worker`](src/mesoforge/application/guidance_worker.py) wraps the existing
@@ -1337,7 +1337,72 @@ Non-secret desk settings remain separate in Compose environment overrides or
 `deploy/hosted/ai-settings.env`; Guidance and Admin inherit neither AI file.
 Nothing prunes baselines, issuances, governance or verification evidence.
 
+### Daily v1 handoff — implemented, not enabled
+
+The [daily workflow](.github/workflows/mesoforge-daily.yml) delegates to the small
+stdlib-only [host composition](deploy/hosted/daily_cycle.py). It invokes existing
+independent worker/delivery processes with separate role secrets, not a third
+forecast engine. The existing registry selects Minneapolis; a generated readonly
+selection is mounted into all three roles. This explicitly opts into the existing
+120-hour policy and leaves historical/default 36-hour workflows unchanged.
+
+One IANA-zone GitHub trigger starts Guidance `once` at 06:05, then stops before
+Forecast preparation at 07:15. The resulting saved PDF is released to SMTP no earlier
+than 08:00. The lead time reflects measured Guidance (~50 minutes) and Forecast (~29 minutes
+plus delivery readback), not a new scientific rule. GitHub dispatch and runtime can
+delay delivery. A late/failed Guidance phase does not silently reuse yesterday's
+baseline. The daily admission requires normal readiness, a 120-hour baseline prepared
+and published after 06:00 that local day, and a reference view covering the forecast
+slot. Same-morning already-complete state may be reused after a successful normal
+Guidance check; this is reported as reuse, not new publication.
+
+GHA concurrency and a persistent host/day receipt protect the operator pipeline.
+Guidance and Forecast share the existing persistent OS lock at
+`status/guidance-worker.lock` through [`worker_lock`](src/mesoforge/application/worker_lock.py).
+Forecast takes it after readiness and before heavy work, inside the existing PostgreSQL
+run lock, and retains it through issuance. Readiness waiting does not prevent Guidance
+from publishing. `--expected-baseline-id` rejects a changed handoff before extraction.
+Compose sets `MESOFORGE_WORKER_LOCK_ROOT` to the shared volume root so new-image
+workers with different runtime sub-roots also serialize. The unset/default contract
+retains the original runtime-root lock for development/historical commands. The host
+additionally checks for an already running worker in the live Compose project. It
+does not kill other workloads; old images must not be run concurrently.
+
+The compact daily receipt records phase intent/completion, the exact baseline and
+issuance, verification/AI outcomes, PDF digest, delivery results and sampled host
+resources. It complements authoritative issuance/SMTP locks rather than replacing
+them. Completed phases are reused for one local day; an uncertain interrupted forecast
+cannot trigger another paid desk automatically. Email retry uses only the saved
+issuance. Failed/ambiguous SMTP intents remain suppressed. Candidate background errors
+are retained warnings; required active failures still prevent handoff. Current AI
+fallback/validation and scientific cutoff behavior remain unchanged.
+
+The workflow is restricted to the repository/default branch and existing `vps` runner,
+with `MESOFORGE_DAILY_ENABLED=true` required for scheduled/manual runs. Status remains
+read-only while disabled. No timer, recurring workflow execution, automatic retry loop,
+deployment or migration is enabled by this commit. Legacy systemd examples are an
+alternative, never an additional scheduler. Owner enablement also approves the exact
+presentation-policy version; automated delivery validates each saved PDF without
+claiming a daily human review. Final release uses bounded waiting and expiry rechecks.
+
 ### Conservative working-data retention
+
+Central operational admission in [`disk_admission`](src/mesoforge/application/disk_admission.py)
+uses >30 GiB normal, 20–30 GiB warning and <20 GiB heavy-Guidance refusal, configurable
+without changing science. It never deletes to meet a floor. Dry-run retention now
+enumerates baseline bytes/protection in addition to Guidance, protecting current and
+previous complete generations/baselines, pins and recorded in-flight work. Missing
+in-flight status is not deletion proof. Permanent dependency closure is still incomplete,
+so neither complete nor failed scientific generations are automatically pruned.
+
+One daily cycle measured at least 2.73 GB before observation/verification/backup growth;
+this is not bounded steady-state storage. Existing rich temperature evidence also
+remains larger than its compact analytical attributes. Safe scientific retirement is
+a prerequisite to indefinite operation, not implemented cleanup hidden in scheduling.
+An off-host backup must cover database, object store, referenced runtime and daily
+receipts plus non-secret deployment configuration. Source data cannot yet be omitted
+while retained artifacts depend on local paths. Destination credentials and upload
+approval remain operator prerequisites; no archive platform or upload is implemented.
 
 [`guidance_retention`](src/mesoforge/application/guidance_retention.py) is an explicit
 operator command, not a worker timer. Its default dry-run identifies protected

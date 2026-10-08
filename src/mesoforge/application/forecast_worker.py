@@ -45,6 +45,7 @@ from mesoforge.application.forecast_schedule import ForecastSchedule
 from mesoforge.application.prepared_snapshot import SnapshotError, derive_reference_time
 from mesoforge.application.runtime_log import event, redact, redact_diagnostics
 from mesoforge.application.spatial_coverage import validate_coordinate
+from mesoforge.application.worker_lock import single_writer, worker_lock_root
 from mesoforge.application.worker_status import (
     FORECAST_STATUS,
     iso,
@@ -73,6 +74,7 @@ class ForecastSettings:
     verify_prior: bool = True
     readiness_poll_seconds: int = 60
     min_free_bytes: int = 6 * 1024**3
+    expected_baseline_id: str | None = None
     schedule: ForecastSchedule = field(default_factory=ForecastSchedule)
 
     def __post_init__(self) -> None:
@@ -88,6 +90,11 @@ class ForecastSettings:
             raise ValueError("Readiness poll interval must be at least 5 seconds")
         if self.min_free_bytes < 0:
             raise ValueError("Free-space floor must be non-negative")
+        if self.expected_baseline_id is not None and (
+            not self.expected_baseline_id
+            or self.expected_baseline_id.strip() != self.expected_baseline_id
+        ):
+            raise ValueError("Expected baseline identity must be non-empty and exact")
 
 
 @dataclass
@@ -272,6 +279,7 @@ class ForecastRun:
             raise ValueError("The runtime root must remain outside the repository")
         self.settings, self.deps, self.stream = settings, deps, stream
         self.root = root
+        self.lock_root = worker_lock_root(root)
         self.baseline_root = root / "baseline"
 
     def log(self, name: str, **fields: Any) -> dict[str, Any]:
@@ -397,7 +405,7 @@ class ForecastRun:
                         EXIT_FAILED, "failed", category="database_unavailable", reason=_error(exc)
                     )
             record["run_lock_waits"] = waited
-            return self._locked(record, locations, slot, finish)
+            return self._locked(record, locations, slot, finish, stack)
 
     def _locked(
         self,
@@ -405,6 +413,7 @@ class ForecastRun:
         locations: list[Any],
         slot: datetime | None,
         finish: Callable[..., tuple[int, dict[str, Any]]],
+        stack: ExitStack,
     ) -> tuple[int, dict[str, Any]]:
         d, s = self.deps, self.settings
         try:
@@ -488,6 +497,32 @@ class ForecastRun:
                 category="baseline_not_ready",
                 reason="; ".join(readiness["reasons"]),
             )
+        if s.expected_baseline_id is not None:
+            record["expected_baseline_id"] = s.expected_baseline_id
+            if pointer.get("baseline_snapshot_id") != s.expected_baseline_id:
+                return finish(
+                    EXIT_NOT_READY,
+                    "baseline_not_ready",
+                    category="unexpected_baseline",
+                    reason="Ready baseline differs from the explicit Guidance handoff",
+                )
+        # Do not hold this lock while waiting for an absent baseline: Guidance
+        # must remain able to publish it. From here through final issuance, every
+        # expensive Forecast operation shares Guidance's persistent process lock.
+        try:
+            owned = stack.enter_context(single_writer(self.lock_root))
+        except OSError as exc:
+            return finish(
+                EXIT_FAILED, "failed", category="runtime_lock_unavailable", reason=_error(exc)
+            )
+        if not owned:
+            return finish(
+                EXIT_NOT_READY,
+                "guidance_busy",
+                category="guidance_busy",
+                reason="Guidance or another heavy worker holds the runtime lock",
+            )
+        record["runtime_lock"] = "held_through_issuance"
         self.log(
             "baseline_pinned",
             baseline=readiness["baseline"],
@@ -663,6 +698,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, default=_default_root())
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--min-free-gb", type=float, default=6.0)
+    parser.add_argument(
+        "--expected-baseline-id",
+        help="Require the exact immutable baseline published by the daily Guidance handoff",
+    )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--scheduled",
@@ -715,6 +754,13 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_FAILED
         if failure is not None:
             mark_governance_unavailable(report, failure)
+        if (
+            args.expected_baseline_id is not None
+            and (report.get("baseline") or {}).get("baseline_snapshot_id")
+            != args.expected_baseline_id
+        ):
+            report["ready"] = False
+            report["reasons"] = [*report.get("reasons", []), "unexpected_baseline"]
         report.pop("pointer", None)
         report["next_run"] = schedule.describe(now)
         print(json.dumps(redact(report), indent=2, default=str))
@@ -728,6 +774,7 @@ def main(argv: list[str] | None = None) -> int:
             verify_prior=not args.skip_verification,
             schedule=schedule,
             min_free_bytes=int(args.min_free_gb * 1024**3),
+            expected_baseline_id=args.expected_baseline_id,
         )
         code, record = run_forecast(settings, default_deps())
     except Exception as exc:

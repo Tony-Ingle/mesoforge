@@ -98,6 +98,11 @@ def test_cycle_windows_current_previous_and_all_retained_baselines(runtime: Path
     assert "retained_baseline_dependency" in rows[generations[0].name]["reasons"]
     assert report["removable_bytes"] == 0
     assert report["bounded_complete_history"] is False
+    baselines = {row["baseline_snapshot_id"]: row for row in report["baselines"]}
+    assert "latest_baseline" in baselines["baseline-2"]["reasons"]
+    assert "previous_baseline_recovery" in baselines["baseline-1"]["reasons"]
+    assert all(row["action"] == "retain" for row in baselines.values())
+    assert report["retained_baseline_bytes"] == sum(row["bytes"] for row in baselines.values())
     changed = _rows(retention.plan_retention(runtime, counts=retention.CycleCounts(HRRR=1)))
     assert sum("recent_HRRR_cycle_window" in row["reasons"] for row in changed.values()) == 1
     assert all(row["action"] == "retain" for row in changed.values())
@@ -249,3 +254,25 @@ def test_unknown_schema_and_invalid_cycle_configuration_fail_closed(runtime: Pat
     with pytest.raises(ValueError, match="Unsupported prepared"):
         retention.plan_retention(runtime)
     assert failed.exists()
+
+
+def test_inflight_status_and_pinned_baseline_are_explicit_without_runner_traversal(
+    runtime: Path, tmp_path: Path
+) -> None:
+    prepared = _generation(runtime, 1)
+    _baseline(runtime, prepared, "protected")
+    retention.pin_case(runtime, prepared.name, reason="Research case")
+    _write(runtime / "status/guidance-worker.json", {"in_flight": {"phase": "build"}})
+    _write(runtime / "status/forecast-worker.json", {"state": "busy"})
+    runner = tmp_path / "actions-runner/_work"
+    _write(runner / "keep.json", {"important": "other application"})
+    before = (runner / "keep.json").read_bytes()
+    report = retention.plan_retention(runtime)
+    assert report["in_flight_workers"] == ["guidance-worker.json", "forecast-worker.json"]
+    for row in [*report["generations"], *report["baselines"]]:
+        assert "worker_in_flight_reference_closure_unproven" in row["reasons"]
+        assert row["action"] == "retain"
+    assert "operator_case_pin_dependency" in report["baselines"][0]["reasons"]
+    assert report["removable_bytes"] == 0
+    assert "actions-runner" not in json.dumps(report)
+    assert (runner / "keep.json").read_bytes() == before

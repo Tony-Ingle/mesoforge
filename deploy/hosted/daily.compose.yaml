@@ -1,0 +1,15 @@
+# Compose with the base file and EXISTING live project's environment/volumes.
+# Do not stack old proof overlays that clear AI credentials or select Grasston.
+# No service is started by this file; daily_cycle runs one-shot roles sequentially.
+services:
+  guidance-worker:
+    image: ${MESOFORGE_DAILY_IMAGE:?set an exact committed daily-capable image}
+    restart: "no"
+    mem_limit: 6g
+  forecast-worker:
+    image: ${MESOFORGE_DAILY_IMAGE:?set an exact committed daily-capable image}
+    mem_limit: 5g
+  delivery:
+    image: ${MESOFORGE_DAILY_IMAGE:?set an exact committed daily-capable image}
+  admin:
+    image: ${MESOFORGE_DAILY_IMAGE:?set an exact committed daily-capable image}

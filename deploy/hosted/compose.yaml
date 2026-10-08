@@ -22,6 +22,8 @@ x-storage-environment: &storage-environment
   AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
   MESOFORGE_FORECAST_TIMEZONE: ${MESOFORGE_FORECAST_TIMEZONE:-America/Chicago}
   MESOFORGE_FORECAST_TIMES: ${MESOFORGE_FORECAST_TIMES:-08:00,20:00}
+  # One persistent OS lock across worker sub-roots; operator pin changes share it.
+  MESOFORGE_WORKER_LOCK_ROOT: /var/lib/mesoforge/runtime
   NO_PROXY: postgres,minio
 
 x-worker-environment: &worker-environment
@@ -100,6 +102,8 @@ services:
     environment:
       <<: *worker-environment
       MESOFORGE_FORECAST_HORIZON_HOURS: ${MESOFORGE_FORECAST_HORIZON_HOURS:-36}
+      MESOFORGE_GUIDANCE_MIN_FREE_GB: ${MESOFORGE_GUIDANCE_MIN_FREE_GB:-20}
+      MESOFORGE_GUIDANCE_WARN_FREE_GB: ${MESOFORGE_GUIDANCE_WARN_FREE_GB:-30}
     command: ["mesoforge.application.guidance_worker", "run", "--interval-seconds", "300"]
     # Process health only (heartbeat and phase bounds); readiness is reported by status.
     healthcheck:
