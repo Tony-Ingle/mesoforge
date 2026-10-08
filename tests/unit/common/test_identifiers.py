@@ -19,6 +19,7 @@ from mesoforge.common.identifiers import (
     IssuedForecastId,
     MatchingPolicyId,
     MetricSetId,
+    PreparedSnapshotId,
     RunId,
     StationId,
     VariableId,
@@ -33,6 +34,30 @@ def test_issued_forecast_id_preserves_existing_uuid_and_rejects_malformed_identi
     for invalid in (raw.upper(), raw.replace("-", ""), f"art_{raw}", raw + "\n", "invalid", None):
         with pytest.raises(InvalidIdentifier):
             IssuedForecastId(invalid)
+
+
+def test_prepared_snapshot_id_preserves_labels_and_rejects_path_components() -> None:
+    for value in ("20261007T211916Z-bd52c915", "historical", "fixture_snapshot-1"):
+        assert PreparedSnapshotId(value) == value
+    for value in (
+        "",
+        ".",
+        "..",
+        "../outside",
+        "a/b",
+        "a\\b",
+        "/absolute",
+        "C:drive",
+        "trailing.",
+        "bad\n",
+        "CON",
+        "nul",
+        "LPT1",
+        "a" * 256,
+        None,
+    ):
+        with pytest.raises(InvalidIdentifier):
+            PreparedSnapshotId(value)
 
 
 class TestArtifactId:

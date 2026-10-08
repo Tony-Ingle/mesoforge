@@ -30,7 +30,7 @@ from mesoforge.application.issuance import (
 from mesoforge.application.observation_preview import preview_observation_match
 from mesoforge.application.prepared_temperature import _code_identity
 from mesoforge.common.errors import IntegrityError, NotFound
-from mesoforge.common.identifiers import ArtifactId, Digest
+from mesoforge.common.identifiers import ArtifactId, Digest, validate_code_revision
 from mesoforge.contracts.artifacts import ArtifactManifest
 from mesoforge.storage.json import CanonicalJsonSerializer
 from mesoforge.storage.postgres.database import resolve_database_dsn
@@ -81,7 +81,7 @@ class IssuedTemperatureVerificationService:
         self._read_forecast = read_forecast
         self._preview_match = preview_match
         self._code_identity = code_identity
-        self._code_revision = code_revision
+        self._code_revision = validate_code_revision(code_revision)
         self._environment_digest = environment_digest
         self._clock = clock
 

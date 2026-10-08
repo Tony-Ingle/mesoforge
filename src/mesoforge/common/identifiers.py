@@ -80,6 +80,24 @@ class IssuedForecastId(str):
         return super().__new__(cls, value)
 
 
+class PreparedSnapshotId(str):
+    """Opaque prepared-state label, safe as one portable directory component.
+
+    Keep existing timestamp/UUID labels and retained fixture/operator labels;
+    this is path validation, not a new historical identity format.
+    """
+
+    def __new__(cls, value: str) -> Self:
+        if (
+            not isinstance(value, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,254}", value)
+            or value.upper() in {"CON", "PRN", "AUX", "NUL"}
+            or re.fullmatch(r"(?:COM|LPT)[1-9]", value.upper())
+        ):
+            raise InvalidIdentifier("PreparedSnapshotId must be a safe directory component")
+        return super().__new__(cls, value)
+
+
 class ActivityId(_PrefixedUuidId):
     """Record identity for an activity manifest: ``act_<uuid4>``."""
 

@@ -28,6 +28,7 @@ from mesoforge.application.precipitation_type import POLICY as PTYPE_POLICY
 from mesoforge.application.prepared_temperature import _code_identity, _iso
 from mesoforge.application.selected_forecast import selection_contributors
 from mesoforge.application.spatial_preparation import PreparedRegions, load_prepared
+from mesoforge.common.identifiers import PreparedSnapshotId
 from mesoforge.forecasting.cloud_cover import CLOUD_ACTIVE_POLICY
 from mesoforge.forecasting.recipes import DEFAULT_CONFIGURATION
 from mesoforge.forecasting.thunder import ACTIVE_POLICY as THUNDER_ACTIVE_POLICY
@@ -198,7 +199,7 @@ def _attachment_coverage(
 
 def build_snapshot_manifest(
     *,
-    snapshot_id: str,
+    snapshot_id: PreparedSnapshotId,
     root: Path,
     preparation_path: Path,
     selection_path: Path,
@@ -208,6 +209,7 @@ def build_snapshot_manifest(
     completed_at: datetime,
 ) -> dict[str, Any]:
     """Describe one finished refresh by reference to its retained preparation artifacts."""
+    snapshot_id = PreparedSnapshotId(snapshot_id)
     preparation_bytes = preparation_path.read_bytes()
     preparation = json.loads(preparation_bytes)
     selection = preparation["current_model_set"]["selection"]
@@ -641,8 +643,11 @@ def coverage_for(manifest: dict[str, Any], reference_time: datetime) -> dict[str
     return result
 
 
-def snapshot_directory(root: Path, snapshot_id: str) -> Path:
-    return root / SNAPSHOTS_DIRECTORY / snapshot_id
+def snapshot_directory(root: Path, snapshot_id: PreparedSnapshotId) -> Path:
+    directory = root / SNAPSHOTS_DIRECTORY / PreparedSnapshotId(snapshot_id)
+    if not directory.resolve().is_relative_to(root.resolve()):
+        raise SnapshotError("Snapshot directory escapes the guidance root")
+    return directory
 
 
 def write_manifest(directory: Path, manifest: dict[str, Any]) -> tuple[Path, str]:

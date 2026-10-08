@@ -3,7 +3,8 @@ application protocol, storage protocol, concrete repository/object-store/
 lock boundary, and provenance model/function must use the typed
 ``common.identifiers`` classes (``Digest``, ``ArtifactId``, ``ActivityId``,
 ``ConfigurationSnapshotId``, ``GridId``, ``RunId``) for ID/digest
-parameters and return-object fields, never an unrestricted ``str``
+parameters and return-object fields, never an unrestricted ``str``. The
+issued-forecast.v1 issued/batch identities also support their native UUID type
 (Codex review t_f569c45c finding 3; final re-review HIGH finding
 6/t_1ecb8414: request/protocol/repository signature conformance must be
 directly asserted, not only inferred from runtime rejection tests).
@@ -28,8 +29,8 @@ method/``__init__``/annotated field via live ``typing.get_type_hints``.
 Adding a new public boundary anywhere in that scope is picked up on the
 next test run with zero changes to this file. Internal SQLAlchemy mapped
 rows are excluded by boundary kind (``__table__``), not module/class
-inventory. The only plain-string exemptions are three exact, documented
-catalog labels for which Phase 0 defines no typed value class.
+inventory. Plain-string exemptions are exact, documented catalog/provider
+sites whose values are not MesoForge artifact or run identifiers.
 ``TestDiscoveryDetectsInjectedMalformedBoundaries``
 below proves the discovery mechanism itself is exhaustive: each test
 injects a temporary malformed boundary directly onto a real in-scope
@@ -54,6 +55,7 @@ import sys
 import textwrap
 import types
 import typing
+from uuid import UUID
 
 import pytest
 
@@ -75,6 +77,7 @@ from mesoforge.common.identifiers import (
     MatchingPolicyId,
     MetricSetId,
     ModelCycleSelectionPolicyId,
+    PreparedSnapshotId,
     RunId,
     StationId,
     VariableId,
@@ -88,6 +91,7 @@ _TYPED_IDENTIFIER_CLASSES = (
     Digest,
     GridId,
     IssuedForecastId,
+    PreparedSnapshotId,
     RunId,
     VariableId,
     VerticalDefinitionId,
@@ -114,6 +118,11 @@ _TYPED_IDENTIFIER_CLASSES = (
 # every discovered code_revision boundary routes through
 # validate_code_revision instead).
 _ALLOWED_PLAIN_STR_NAMES = frozenset({"code_revision"})
+
+# issued-forecast.v1 deliberately stores unprefixed UUIDs (including native
+# PostgreSQL UUID columns). UUID is already a validated value type, not bare str.
+# Do not accept it for prefixed artifact/run IDs or content digests.
+_UUID_IDENTITY_NAMES = frozenset({"issued_forecast_id", "batch_run_id"})
 
 # Exact catalog labels deliberately represented as strings by
 # VariableDefinition. These are not artifact/activity/run identity or
@@ -165,6 +174,10 @@ _ALLOWED_PLAIN_STR_SITES: dict[str, str] = {
         "external AviationWeather.gov provider ICAO identifier, not a MesoForge "
         "StationId (see station_id on the same model) -- mirrors the identical "
         "RawMetarRecordV2.icao_id rationale above"
+    ),
+    "mesoforge.application.prepared_observations.normalize_rows.station_ids": (
+        "external provider ICAO filter, matched to StationDefinition.provider_icao_id; "
+        "normalization separately retains the resolved typed StationId"
     ),
 }
 
@@ -347,6 +360,8 @@ def _scan_named_annotation(name: str, annotation: object, label: str, failures: 
         return
 
     if not _looks_like_identifier(name):
+        return
+    if name in _UUID_IDENTITY_NAMES and annotation is UUID:
         return
     if _annotation_contains_bare_str(annotation) or not _annotation_uses_typed_identifier(
         annotation
@@ -584,17 +599,38 @@ class TestExhaustivePublicBoundaryInventory:
         """Every qualified exception must still resolve to a bare-string
         field; stale, misspelled, or module-wide exemptions are forbidden."""
         discovered_sites: set[str] = set()
-        for module in _SCOPE_MODULES.values():
-            for cls in _classes_defined_in(module):
-                hints = typing.get_type_hints(cls, include_extras=True, globalns=vars(module))
-                for field_name, annotation in hints.items():
-                    site = f"{cls.__module__}.{cls.__qualname__}.{field_name}"
-                    if site in _ALLOWED_PLAIN_STR_SITES and _annotation_contains_bare_str(
-                        annotation
-                    ):
-                        discovered_sites.add(site)
+        for site, reason in _ALLOWED_PLAIN_STR_SITES.items():
+            assert reason
+            module_name = max(
+                (name for name in _SCOPE_MODULES if site.startswith(name + ".")), key=len
+            )
+            module = _SCOPE_MODULES[module_name]
+            *owner_names, field_name = site[len(module_name) + 1 :].split(".")
+            owner = module
+            for name in owner_names:
+                owner = getattr(owner, name)
+            hints = typing.get_type_hints(owner, include_extras=True, globalns=vars(module))
+            if _annotation_contains_bare_str(hints.get(field_name)):
+                discovered_sites.add(site)
 
         assert discovered_sites == set(_ALLOWED_PLAIN_STR_SITES)
+
+    @pytest.mark.parametrize(
+        "name", ["issued_forecast_id", "batch_run_id", "artifact_id", "digest"]
+    )
+    @pytest.mark.parametrize("annotation", [UUID, str])
+    def test_native_uuid_exception_is_semantic_and_never_accepts_bare_strings(
+        self, name, annotation
+    ) -> None:
+        failures = []
+        _scan_named_annotation(name, annotation, "new_boundary", failures)
+        allowed = annotation is UUID and name in {"issued_forecast_id", "batch_run_id"}
+        assert bool(failures) is not allowed
+
+    def test_provider_station_exception_does_not_exempt_other_station_boundaries(self) -> None:
+        failures = []
+        _scan_named_annotation("station_ids", tuple[str, ...], "new_boundary", failures)
+        assert failures
 
 
 class TestCodeRevisionBoundariesUseSharedRuntimeValidator:

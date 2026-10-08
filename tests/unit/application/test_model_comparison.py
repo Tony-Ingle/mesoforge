@@ -313,6 +313,12 @@ def legacy(tmp_path):
     return directory, {"forecast": forecast, "code_identity": identity}, identity
 
 
+def test_retained_digest_is_validated_before_filesystem_lookup(tmp_path):
+    resolver = application.RetainedContributors([tmp_path / "does-not-exist"], {})
+    with pytest.raises(ValueError, match="Digest"):
+        resolver._find("not-a-digest")
+
+
 def test_legacy_recovery_checks_exact_inputs_and_reuses_loaded_point(legacy, monkeypatch):
     directory, saved, identity = legacy
     original = deepcopy(saved)

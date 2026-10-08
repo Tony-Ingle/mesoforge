@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.point_forecast import PreparedPointForecast
 from mesoforge.common.errors import IntegrityError, NotFound
+from mesoforge.contracts.issued_forecasts import IssuedForecastRecord
 from tests.support.in_memory_uow import InMemoryObjectStore, InMemoryUnitOfWorkFactory
 from tests.unit.application.test_prepared_temperature import (
     EXTENDED_HORIZONS,
@@ -58,6 +59,12 @@ def test_two_issuances_preserve_every_field_and_are_distinct_even_at_the_same_ti
     original = json.loads(json.dumps(forecast))
     first_run, second_run = uuid4(), uuid4()
     first = service.issue(forecast, batch_run_id=first_run, location_index=0)
+    assert IssuedForecastRecord.model_validate_json(first.model_dump_json()) == first
+    # Native UUIDs are the historical v1 Python/storage contract; arbitrary text
+    # must still fail rather than becoming an unchecked identifier boundary.
+    for name in ("issued_forecast_id", "batch_run_id"):
+        with pytest.raises(ValidationError):
+            IssuedForecastRecord.model_validate({**first.model_dump(), name: "not-a-uuid"})
     first_bytes = store.objects[first.content_digest]
     second = service.issue(forecast, batch_run_id=second_run, location_index=0)
 

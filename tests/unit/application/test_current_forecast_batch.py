@@ -15,6 +15,7 @@ import pytest
 from mesoforge.application import batch_forecast, cycle_selection, prepared_temperature
 from mesoforge.application.issuance import ForecastIssuanceService
 from mesoforge.application.point_forecast import PreparedPointForecast
+from mesoforge.forecasting.recipes import DEFAULT_CONFIGURATION
 from mesoforge.guidance.acquisition_v2 import acquire_gfs_lead, acquire_hrrr_phase2_lead
 from tests.support.in_memory_uow import InMemoryObjectStore, InMemoryUnitOfWorkFactory
 from tests.unit.application.test_batch_forecast import FIRST, LAST, OUTSIDE, write_config
@@ -287,7 +288,14 @@ def test_explicit_override_still_prepares_once_and_allows_historical_replay(
         hrrr_cycle=TARGET,
         gfs_cycle=GFS_CYCLE,
     )
-    run.assert_called_once_with(config, data_dir, issuer=issuer[0], require_future_hours=False)
+    run.assert_called_once_with(
+        config,
+        data_dir,
+        issuer=issuer[0],
+        require_future_hours=False,
+        contributor_configuration=DEFAULT_CONFIGURATION,
+        shadow_directories={},
+    )
 
 
 @pytest.mark.parametrize(

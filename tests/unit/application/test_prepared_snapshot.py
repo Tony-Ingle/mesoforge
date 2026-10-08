@@ -29,7 +29,8 @@ from mesoforge.application.prepared_temperature import (
     _write_prepared_file,
     prepare_temperature_guidance,
 )
-from mesoforge.common.identifiers import Digest
+from mesoforge.common.errors import InvalidIdentifier
+from mesoforge.common.identifiers import Digest, PreparedSnapshotId
 from mesoforge.contracts.serialization import canonical_json_bytes
 from mesoforge.guidance.coverage import COVERAGE_POLICY, REQUIRED_HOURS
 from tests.support.in_memory_uow import InMemoryObjectStore, InMemoryUnitOfWorkFactory
@@ -47,6 +48,40 @@ from tests.unit.application.test_prepared_temperature import (
 
 PREPARED_HOURS = 42
 DECISION = TARGET + timedelta(minutes=12)
+
+
+def test_snapshot_id_is_checked_before_path_or_manifest_io(tmp_path):
+    for unsafe in ("../outside", "a/b", "a\\b", "/absolute", "C:outside"):
+        with pytest.raises(InvalidIdentifier):
+            snapshots.snapshot_directory(tmp_path, unsafe)
+        with pytest.raises(InvalidIdentifier):
+            snapshots.build_snapshot_manifest(
+                snapshot_id=unsafe,
+                root=tmp_path,
+                preparation_path=tmp_path / "absent-preparation.json",
+                selection_path=tmp_path / "absent-selection.json",
+                steps=[],
+                downloaded_bytes=0,
+                clock=DECISION,
+                completed_at=DECISION,
+            )
+    assert list(tmp_path.iterdir()) == []
+    assert snapshots.snapshot_directory(tmp_path, PreparedSnapshotId("historical")) == (
+        tmp_path / "snapshots" / "historical"
+    )
+
+
+def test_snapshot_directory_rejects_symlink_escape(tmp_path):
+    root = tmp_path / "guidance"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    try:
+        (root / "snapshots").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("Creating symlinks requires OS permission")
+    with pytest.raises(snapshots.SnapshotError, match="escapes"):
+        snapshots.snapshot_directory(root, PreparedSnapshotId("valid-label"))
 
 
 @pytest.fixture(autouse=True)

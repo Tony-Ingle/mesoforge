@@ -667,10 +667,28 @@ def test_missing_corrected_parent_fails_before_provider_evidence_exposure():
     assert provider.requests == []
 
 
-def test_stalled_checkpoint_storage_cannot_accept_a_late_edit():
+def _isolate_timed_operation(monkeypatch, target):
+    from mesoforge.application import forecast_desk
+
+    bounded = forecast_desk._bounded_operation
+
+    def run(operation, timeout, name):
+        if name == target:
+            return bounded(operation, timeout, name)
+        # The scenario targets storage/extraction timeout, not the speed of real
+        # scientific edit setup under coverage or on a loaded test host.
+        return operation()
+
+    monkeypatch.setattr(forecast_desk, "_bounded_operation", run)
+
+
+def test_stalled_checkpoint_storage_cannot_accept_a_late_edit(monkeypatch):
     released = threading.Event()
+    entered = threading.Event()
+    _isolate_timed_operation(monkeypatch, "checkpoint_storage")
 
     def store(checkpoint):
+        entered.set()
         released.wait(5)
         return {"artifact_id": "late-immutable-checkpoint"}
 
@@ -689,6 +707,7 @@ def test_stalled_checkpoint_storage_cannot_accept_a_late_edit():
             monotonic=lambda: 0.0,
             checkpoint_sink=store,
         )
+        assert entered.is_set()
         assert final is parent
         assert report["completion_reason"] == "checkpoint_storage_timeout"
         assert report["accepted_recipes"] == []
@@ -699,8 +718,11 @@ def test_stalled_checkpoint_storage_cannot_accept_a_late_edit():
 
 def test_stalled_final_extraction_returns_complete_parent(monkeypatch):
     released = threading.Event()
+    entered = threading.Event()
+    _isolate_timed_operation(monkeypatch, "final_extraction")
 
     def extract(*args, **kwargs):
+        entered.set()
         released.wait(5)
         return {}
 
@@ -719,6 +741,7 @@ def test_stalled_final_extraction_returns_complete_parent(monkeypatch):
             ),
             monotonic=lambda: 0.0,
         )
+        assert entered.is_set()
         assert final is parent
         assert report["completion_reason"] == "final_validation_fallback"
         assert report["accepted_recipes"] == []

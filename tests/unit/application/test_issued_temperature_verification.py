@@ -13,7 +13,7 @@ import pytest
 
 from mesoforge.application import issued_temperature_verification as application
 from mesoforge.application.issuance import ForecastIssuanceService, issued_forecast_context
-from mesoforge.common.errors import IntegrityError, NotFound
+from mesoforge.common.errors import IntegrityError, InvalidIdentifier, NotFound
 from mesoforge.common.identifiers import ArtifactId, Digest
 from mesoforge.contracts.artifacts import Availability
 from mesoforge.storage.json import CanonicalJsonSerializer
@@ -46,6 +46,25 @@ def _inventory(case):
             case.objects.objects,
         )
     )
+
+
+@pytest.mark.parametrize("revision", ["", "main", "a" * 39, "A" * 40, "g" * 40])
+def test_service_rejects_malformed_revision_before_using_dependencies(revision):
+    artifacts, read, preview, clock = (Mock() for _ in range(4))
+    with pytest.raises(InvalidIdentifier, match="40-character lowercase hex Git SHA"):
+        application.IssuedTemperatureVerificationService(
+            artifacts,
+            read_forecast=read,
+            preview_match=preview,
+            code_identity={"fixture": "synthetic"},
+            code_revision=revision,
+            environment_digest=Digest.of_bytes(b"test environment"),
+            clock=clock,
+        )
+    assert artifacts.mock_calls == []
+    read.assert_not_called()
+    preview.assert_not_called()
+    clock.assert_not_called()
 
 
 @pytest.fixture()
@@ -265,6 +284,7 @@ def test_verify_round_trip_and_retry_preserve_exact_forecast_and_observation(ver
     assert len(case.uow.activities) == 1
     activity = next(iter(case.uow.activities.values()))
     assert activity.status == "succeeded"
+    assert activity.code_revision == "a" * 40
     assert [str(item.artifact_id) for item in activity.inputs] == [
         case.match["input_provenance"]["observations"]["artifact_id"],
         case.match["input_provenance"]["station_snapshots"][0]["artifact_id"],

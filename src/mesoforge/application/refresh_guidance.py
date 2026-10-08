@@ -45,6 +45,7 @@ from mesoforge.application.spatial_coverage import (
     validate_coordinate,
 )
 from mesoforge.catalog.configuration import load_configuration_source
+from mesoforge.common.identifiers import PreparedSnapshotId
 from mesoforge.guidance.coverage import MAXIMUM_PREPARED_HOURS
 from mesoforge.guidance.runtime import SystemClock, SystemSleeper
 
@@ -162,7 +163,7 @@ def refresh_guidance(
         raise ValueError("Keep the guidance root outside the repository")
     root.mkdir(parents=True, exist_ok=True)
     started = datetime.now(UTC)
-    snapshot_id = f"{started:%Y%m%dT%H%M%SZ}-{uuid4().hex[:8]}"
+    snapshot_id = PreparedSnapshotId(f"{started:%Y%m%dT%H%M%SZ}-{uuid4().hex[:8]}")
     directory = snapshot_directory(root, snapshot_id)
     directory.mkdir(parents=True, exist_ok=False)
     (directory / "locations.json").write_text(

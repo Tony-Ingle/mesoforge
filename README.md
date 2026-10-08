@@ -1389,8 +1389,12 @@ subsequent Learning Core guards. The final typed-boundary inventory adds no new
 findings to the starting revision. Learning Core validation also passed 32 distinct
 relevant PostgreSQL/MinIO integration checks. The previously corrected Windows
 MRMS-cache rename regression did not recur.
-The three pre-existing failures remain unwaived and unchanged. Check current test results
-when changing code; a saved commit does not certify the whole application.
+Those three failures have since been resolved: the batch mock now checks the current
+arguments, and the identifier inventory recognizes the existing issued/batch UUID and
+provider ICAO contracts. Prepared-snapshot path labels, retained-manifest digests and
+temperature-verification code revisions now validate at their boundaries. Historical
+identities and forecast science are unchanged. Check current test results when changing
+code; a saved commit does not certify the whole application.
 
 ## Data attribution
 

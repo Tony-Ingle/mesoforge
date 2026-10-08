@@ -67,18 +67,19 @@ class RetainedContributors:
     def __init__(self, roots: Sequence[Path], identity: dict[str, Any]) -> None:
         self._roots = tuple(roots)
         self._identity = identity
-        self._index: dict[str, Path] | None = None
+        self._index: dict[Digest, Path] | None = None
         self._loaded: dict[str, PreparedPointForecast] = {}
         self._points: dict[tuple[str, float, float], dict[str, Any]] = {}
 
-    def _find(self, digest: str) -> Path | None:
+    def _find(self, digest: Digest) -> Path | None:
+        digest = Digest(digest)
         if self._index is None:
             self._index = {}
             for root in self._roots:
                 if not root.is_dir():
                     raise ValueError(f"Retained guidance root is not a directory: {root}")
                 for path in sorted(root.rglob("manifest.json")):
-                    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+                    actual = Digest.of_bytes(path.read_bytes())
                     self._index.setdefault(actual, path.parent)
         return self._index.get(digest)
 
@@ -96,7 +97,9 @@ class RetainedContributors:
         if not digest or not self._roots:
             evidence["reasons"].append("No matching retained prepared guidance was supplied.")
             return hour, evidence
-        directory = self._find(digest)
+        # Historical payloads retain bare SHA256 hex; the lookup uses the typed
+        # digest contract without rewriting the saved representation.
+        directory = self._find(Digest(f"sha256:{digest}"))
         if directory is None:
             evidence["reasons"].append("The exact issued prepared-manifest checksum was not found.")
             return hour, evidence
