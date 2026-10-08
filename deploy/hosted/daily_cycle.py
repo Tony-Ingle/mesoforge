@@ -501,7 +501,12 @@ class DailyCycle:
     def preflight(self) -> dict[str, Any]:
         """Verify local recovery storage before acquisition or paid forecast work."""
         root = Path(self.config["backup_root"])
-        if any(p.is_symlink() or p.is_junction() for p in (root, *root.parents)):
+        # Host orchestration supports Debian's Python 3.11; junction inspection
+        # exists only on 3.12+. Linux symlinks remain explicitly rejected.
+        if any(
+            p.is_symlink() or getattr(p, "is_junction", lambda: False)()
+            for p in (root, *root.parents)
+        ):
             raise DailyError("backup_root_must_not_follow_links")
         root.mkdir(parents=True, exist_ok=True)
         root.chmod(0o700)

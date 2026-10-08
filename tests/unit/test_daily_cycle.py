@@ -707,9 +707,12 @@ def test_bad_retention_configuration_fails_before_work(tmp_path: Path, counts: o
         daily.load_config(path)
 
 
+@pytest.mark.parametrize("legacy_host_python", [False, True])
 def test_actual_backup_preflight_uses_local_storage_reserve(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_host_python: bool
 ) -> None:
+    if legacy_host_python:
+        monkeypatch.delattr(Path, "is_junction")
     config = configuration(tmp_path)
     cycle = daily.DailyCycle(
         config,
