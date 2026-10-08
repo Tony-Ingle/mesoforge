@@ -3,8 +3,8 @@ Section 4.9/4.10, Task 9 verify command).
 
 MinIO connection settings come from environment variables so this test
 works both against the local standalone MinIO binary used in this
-development sandbox (no Docker access) and the ``minio`` service
-container defined in .github/workflows/ci.yml.
+development sandbox (no Docker access) and an operator-provided dedicated
+MinIO test service.
 """
 
 from __future__ import annotations

@@ -3,12 +3,9 @@
 Includes real PostgreSQL fixtures used by both ``tests/integration/``
 and ``tests/acceptance/``. Two backends are supported:
 
-- CI (``.github/workflows/ci.yml``) declares a real ``postgres:16``
-  service container and exports ``MESOFORGE_TEST_DATABASE_DSN``; when
-  that environment variable is set, ``postgres_dsn`` connects to it
-  directly rather than spawning anything (Codex review t_9bb13e2b
-  finding 4: tests must use the declared service in CI, not
-  unconditionally spawn pgserver).
+- An operator can supply a dedicated real PostgreSQL service through
+  ``MESOFORGE_TEST_DATABASE_DSN``. When that variable is set,
+  ``postgres_dsn`` connects directly rather than spawning another server.
 - Locally (or in any environment without ``MESOFORGE_TEST_DATABASE_DSN``
   set, e.g. this development sandbox with no docker group membership),
   ``postgres_dsn`` falls back to the ``pgserver`` pip package -- a

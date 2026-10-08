@@ -107,7 +107,7 @@ baselines, observations and generated reports. Do not commit credentials or data
 The examples use single-line `uv run --locked` commands to avoid shell-continuation
 differences. Windows PowerShell sets variables with `$env:NAME = 'value'`; POSIX
 shells use `export NAME='value'`. Direct `uv` commands do not require Make.
-CI runs Ubuntu. Windows can use the locked environment and native services;
+Windows can use the locked environment and native services;
 WSL/Docker is not required by the application. Availability of native dependencies
 and server binaries still depends on the local environment.
 
@@ -1322,7 +1322,8 @@ without it the fixture starts ephemeral pgserver. Set `MESOFORGE_TEST_S3_ENDPOIN
 may delete their test data. Do not point them at retained operational evidence.
 
 The retained Phase 2 acceptance workflow is heavier than offline scientific tests.
-CI uses PostgreSQL 16, MinIO, migrations and coverage. `make test-all` and
+GitHub Actions checks are not configured; the validation commands above remain
+available for explicit operator use. `make test-all` and
 `make coverage` include service-backed tests and are not offline-only shortcuts.
 Migration downgrade/upgrade round trips belong only in disposable databases.
 
