@@ -9,7 +9,7 @@ from datetime import timedelta
 
 import pytest
 
-from mesoforge.guidance.http_fetch import FetchError, fetch_with_range
+from mesoforge.guidance.http_fetch import FetchError, fetch_with_range, fetch_with_retry
 from mesoforge.guidance.selected_objects import SelectedObjectError, SelectedObjectTransport
 from mesoforge.guidance.sources.ifs import IFS_RETRY_POLICY
 from tests.support.phase1_fixture_transports import FakeHttpResponse, FixedClock
@@ -455,3 +455,60 @@ def test_unlatched_shadow_view_keeps_acquiring_after_a_provider_failure():
     with pytest.raises(SelectedObjectError, match="HTTP 503"):
         latched.get(latched_evidence["index"]["url"])  # The default view stays latched.
     assert len(latched_underlying.calls) == 1
+
+
+@pytest.mark.parametrize("method", ["get", "head"])
+@pytest.mark.parametrize("changed_identity", [False, True])
+def test_opted_metadata_retries_recover_but_never_override_object_identity(
+    monkeypatch, method, changed_identity
+):
+    evidence = probe(MetadataTransport("IFS"), "IFS").evidence
+    underlying = AcquisitionTransport("IFS")
+    clock = RetryClock(DECISION + timedelta(minutes=2))
+    sleeper = RecordingSleeper(clock)
+    wrapper = SelectedObjectTransport(
+        underlying, [evidence], decision_time=DECISION, clock=clock, retry_metadata=True
+    )
+    original = getattr(underlying, method)
+    calls = []
+
+    def temporary_outage(url, **kwargs):
+        calls.append(url)
+        if len(calls) == 1:
+            return FakeHttpResponse(503, {"Retry-After": "1"})
+        response = original(url, **kwargs)
+        if changed_identity:
+            return FakeHttpResponse(
+                response.status_code, {**response.headers, "ETag": '"changed"'}, response.content
+            )
+        return response
+
+    monkeypatch.setattr(underlying, method, temporary_outage)
+    url = evidence["index" if method == "get" else "grib"]["url"]
+
+    def fetch():
+        return fetch_with_retry(
+            wrapper,
+            clock,
+            sleeper,
+            method=method,
+            urls_by_endpoint=[("selected", url)],
+            retry_policy=IFS_RETRY_POLICY,
+            cycle_deadline=DECISION,
+        )
+
+    if changed_identity:
+        with pytest.raises(FetchError):
+            fetch()
+        with pytest.raises(SelectedObjectError, match="ETag differs"):
+            wrapper.assert_complete()
+        assert [row["status"] for row in wrapper.validations] == ["retryable", "failed"]
+    else:
+        fetch()
+        acquire(wrapper, evidence)
+        wrapper.assert_complete()
+        assert wrapper.failed_reason is None
+        assert sleeper.sleeps == [1.0]
+    assert calls.count(url) == 2
+    if changed_identity:
+        assert len(calls) == 2  # The identity failure latches before another provider request.

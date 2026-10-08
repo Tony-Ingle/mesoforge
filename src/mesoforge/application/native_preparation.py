@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -33,7 +34,7 @@ from mesoforge.application.spatial_coverage import native_bbox_bounds, plan_regi
 from mesoforge.catalog.configuration import Phase2Configuration
 from mesoforge.catalog.domains import BoundingBox
 from mesoforge.common.horizon import ForecastHorizon
-from mesoforge.guidance.http_fetch import fetch_with_range
+from mesoforge.guidance.http_fetch import FetchError, fetch_with_range, fetch_with_retry
 from mesoforge.guidance.interfaces import Clock, HttpTransport, Sleeper
 from mesoforge.guidance.normalization import rotate_wind_to_earth_relative
 from mesoforge.guidance.runtime import SystemClock, SystemSleeper
@@ -369,12 +370,23 @@ def prepare_native_selected(
     owned = BoundedHttpTransport(body_budget=budget) if transport is None else None
     transport = transport or owned
     assert transport is not None
-    pinned = SelectedObjectTransport(
-        transport,
-        probes,
-        decision_time=datetime.fromisoformat(selection["decision_time"]),
-        clock=clock,
-    )
+    selections = {
+        model: SelectedObjectTransport(
+            transport,
+            [probe for probe in probes if probe["model"] == model],
+            decision_time=datetime.fromisoformat(selection["decision_time"]),
+            clock=clock,
+            retry_metadata=model == "IFS",
+        )
+        for model in sorted({probe["model"] for probe in probes})
+    }
+    discovery_selection = deepcopy(selection)
+    source_shortfalls = deepcopy(selection.get("source_shortfalls", {}))
+    unavailable: set[str] = set()
+
+    def validations() -> list[dict[str, Any]]:
+        return [record for selected in selections.values() for record in selected.validations]
+
     inputs: list[dict[str, Any]] = []
     prepared_files: list[dict[str, Any]] = [{} for _ in areas]
     frames: list[dict[str, list[xr.Dataset]]] = [{} for _ in areas]
@@ -382,54 +394,101 @@ def prepare_native_selected(
     try:
         for probe in sorted(probes, key=lambda item: (item["model"], item["source_lead_hours"])):
             model, lead = probe["model"], probe["source_lead_hours"]
+            if model in unavailable:
+                continue
+            pinned = selections[model]
             cycle = datetime.fromisoformat(probe["cycle"])
             # Preserve the existing RAP/IFS half-second request pacing; the
             # native path must not bypass it by fetching pinned ranges directly.
             request_interval = RAP_REQUEST_INTERVAL_SECONDS if model in {"RAP", "IFS"} else 0
-            if request_interval:
-                sleeper.sleep(request_interval)
-            index_response = pinned.get(probe["index"]["url"])
-            if request_interval:
-                sleeper.sleep(request_interval)
-            pinned.head(probe["grib"]["url"])
-            index_file = f"raw/{model}-f{lead:03d}.idx"
-            index_digest = _write(source / index_file, index_response.content)
             messages: list[dict[str, Any]] = []
             payloads: dict[str, bytes] = {}
-            acquired_ranges: set[tuple[int, int]] = set()
-            for message in selected_messages(probe):
-                variable = message["canonical_variable_id"]
-                start, end = message["byte_start"], message["byte_end_exclusive"]
-                if request_interval and (start, end) not in acquired_ranges:
-                    sleeper.sleep(request_interval)
-                fetched = fetch_with_range(
-                    pinned,
-                    clock,
-                    sleeper,
-                    endpoint=probe["selected_endpoint"],
-                    url=probe["grib"]["url"],
-                    range_header=f"bytes={start}-{end - 1}",
-                    byte_start=start,
-                    byte_end=end,
-                    retry_policy=IFS_RETRY_POLICY,
-                    cycle_deadline=clock.now() - timedelta(microseconds=1),
-                    expected_length=end - start,
-                    full_object_length=probe["grib"]["content_length"],
-                )
-                acquired_ranges.add((start, end))
-                filename = f"raw/{model}-f{lead:03d}-{variable}.grib2"
-                digest = _write(source / filename, fetched.payload)
-                payloads[variable] = fetched.payload
-                messages.append(
-                    {
-                        "canonical_variable_id": variable,
-                        "raw_file": filename,
-                        "raw_sha256": digest,
-                        "raw_bytes": len(fetched.payload),
-                        "byte_start": start,
-                        "byte_end": end,
-                    }
-                )
+            try:
+                metadata = {}
+                for method, kind in (("get", "index"), ("head", "grib")):
+                    if request_interval:
+                        sleeper.sleep(request_interval)
+                    if model == "IFS":
+                        fetched_metadata = fetch_with_retry(
+                            pinned,
+                            clock,
+                            sleeper,
+                            method=method,
+                            urls_by_endpoint=[(probe["selected_endpoint"], probe[kind]["url"])],
+                            retry_policy=IFS_RETRY_POLICY,
+                            cycle_deadline=clock.now() - timedelta(microseconds=1),
+                        )
+                        metadata[kind] = fetched_metadata.payload
+                    else:
+                        metadata[kind] = getattr(pinned, method)(probe[kind]["url"]).content
+                index_file = f"raw/{model}-f{lead:03d}.idx"
+                index_digest = _write(source / index_file, metadata["index"])
+                acquired_ranges: set[tuple[int, int]] = set()
+                for message in selected_messages(probe):
+                    variable = message["canonical_variable_id"]
+                    start, end = message["byte_start"], message["byte_end_exclusive"]
+                    if request_interval and (start, end) not in acquired_ranges:
+                        sleeper.sleep(request_interval)
+                    fetched = fetch_with_range(
+                        pinned,
+                        clock,
+                        sleeper,
+                        endpoint=probe["selected_endpoint"],
+                        url=probe["grib"]["url"],
+                        range_header=f"bytes={start}-{end - 1}",
+                        byte_start=start,
+                        byte_end=end,
+                        retry_policy=IFS_RETRY_POLICY,
+                        cycle_deadline=clock.now() - timedelta(microseconds=1),
+                        expected_length=end - start,
+                        full_object_length=probe["grib"]["content_length"],
+                    )
+                    acquired_ranges.add((start, end))
+                    filename = f"raw/{model}-f{lead:03d}-{variable}.grib2"
+                    digest = _write(source / filename, fetched.payload)
+                    payloads[variable] = fetched.payload
+                    messages.append(
+                        {
+                            "canonical_variable_id": variable,
+                            "raw_file": filename,
+                            "raw_sha256": digest,
+                            "raw_bytes": len(fetched.payload),
+                            "byte_start": start,
+                            "byte_end": end,
+                        }
+                    )
+            except FetchError as exc:
+                # Only audited retryable HTTP exhaustion is availability loss.
+                # Changed object identities, invalid bytes/GRIBs, and unknown
+                # transport exceptions remain fatal, including for optional IFS.
+                attempts = pinned.validations
+                if (
+                    model != "IFS"
+                    or pinned.failed_reason is not None
+                    or not attempts
+                    or attempts[-1]["status"] != "retryable"
+                ):
+                    if pinned.failed_reason is not None:
+                        pinned.assert_complete()
+                    raise
+                unavailable.add(model)
+                source_shortfalls[model] = {
+                    "stage": "preparation",
+                    "status": "unavailable",
+                    "selected_cycle": probe["cycle"],
+                    "source_lead_hours": lead,
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "terminal_request": attempts[-1],
+                    "object_validation": attempts,
+                    "withdrawn_inputs": [row for row in inputs if row["model"] == model],
+                    "partial_messages": messages,
+                }
+                inputs[:] = [row for row in inputs if row["model"] != model]
+                for region in range(len(areas)):
+                    frames[region].pop(model, None)
+                    qpf[region].pop(model, None)
+                payloads.clear()
+                continue
             temperature = next(
                 message for message in messages if message["canonical_variable_id"] == TEMPERATURE
             )
@@ -442,7 +501,7 @@ def prepare_native_selected(
                     "valid_time": probe["valid_time"],
                     "index_file": index_file,
                     "index_sha256": index_digest,
-                    "index_bytes": len(index_response.content),
+                    "index_bytes": len(metadata["index"]),
                     "source_grib_url": probe["grib"]["url"],
                     "source_index_url": probe["index"]["url"],
                     "endpoint": probe["selected_endpoint"],
@@ -475,7 +534,22 @@ def prepare_native_selected(
             del fetched
             # Full provider grids and message payloads are released after this lead;
             # only small native crops remain in memory.
-        pinned.assert_complete()
+        for model, selected in selections.items():
+            if model not in unavailable:
+                selected.assert_complete()
+        if unavailable:
+            # Preserve the immutable discovery file and its full selection while
+            # identifying which selected sources actually completed preparation.
+            selection = deepcopy(selection)
+            for model in unavailable:
+                selection["selected_cycles"].pop(model)
+                selection["coverage"]["models"].pop(model)
+                selection["models"][model].update(
+                    status="unavailable_after_discovery", selected_cycle=None
+                )
+            selection["source_shortfalls"] = source_shortfalls
+        if not {"GFS", "IFS", "NBM"}.intersection(frames[0]):
+            raise ValueError("Native preparation lacks a complete long-range state source")
         if not native_window_usable(
             datetime.fromisoformat(selection["target_reference_time"]),
             len(selection["horizon_hours"]),
@@ -487,13 +561,15 @@ def prepare_native_selected(
         evidence = {
             "selection_sha256": hashlib.sha256(selection_path.read_bytes()).hexdigest(),
             "selection": selection,
-            "object_validation": pinned.validations,
+            "object_validation": validations(),
             "preparation_code_sha256": {
                 "application/native_preparation.py": hashlib.sha256(
                     Path(__file__).read_bytes()
                 ).hexdigest()
             },
         }
+        if unavailable:
+            evidence["discovery_selection"] = discovery_selection
         coverage_rows = []
         for region, destination in enumerate(destinations):
             for model, parts in frames[region].items():
@@ -595,21 +671,19 @@ def prepare_native_selected(
             "shadows": {},
             "current_model_set": evidence,
             "coverage": coverage,
-            "downloaded_bytes": pinned.downloaded_bytes
+            "downloaded_bytes": getattr(transport, "downloaded_bytes", None)
             or sum(path.stat().st_size for path in (source / "raw").iterdir()),
             "retained_raw_bytes": sum(
                 path.stat().st_size for path in (source / "raw").glob("*.grib2")
             ),
-            "source_shortfalls": selection["source_shortfalls"],
+            "source_shortfalls": source_shortfalls,
         }
         _write(directory / "preparation.json", json.dumps(report, indent=2).encode())
         return report
     except Exception as exc:
         _write(
             directory / "failure.json",
-            json.dumps(
-                {"error": str(exc), "object_validation": pinned.validations}, indent=2
-            ).encode(),
+            json.dumps({"error": str(exc), "object_validation": validations()}, indent=2).encode(),
         )
         raise
     finally:

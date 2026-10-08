@@ -1,5 +1,6 @@
 """Extended native acquisition contracts without provider calls or fabricated hours."""
 
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from unittest.mock import Mock
@@ -221,28 +222,92 @@ def test_background_crossing_hour_keeps_full_prospective_view_without_relabeling
         native_window_usable(TARGET, 126, TARGET.replace(tzinfo=None))
 
 
-def test_discovery_retention_and_conditional_acquisition_work_offline(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "outage",
+    [
+        None,
+        "index503",
+        "head503",
+        "range503",
+        "late_index503",
+        "etag",
+        "framing",
+        "gfs503",
+        "only_ifs503",
+    ],
+)
+def test_discovery_retention_and_conditional_acquisition_work_offline(
+    tmp_path, monkeypatch, outage
+):
     """Only HTTP and the separately tested GRIB decoder are fixtures here."""
     import re
     from email.utils import format_datetime
 
     from mesoforge.application import native_preparation
+    from mesoforge.guidance.http_fetch import FetchError
+    from mesoforge.guidance.selected_objects import SelectedObjectError
     from mesoforge.guidance.sources.current_availability import probe_temperature
     from tests.support.phase1_fixture_transports import FakeHttpResponse
     from tests.unit.guidance.test_acquisition_v2 import _grib2_message
+    from tests.unit.guidance.test_current_availability import inventory
 
     clock = FixedClock(TARGET + timedelta(minutes=20))
-    cycle = TARGET.replace(hour=6)
     modified = format_datetime(TARGET, usegmt=True)
     body = _grib2_message(b"N")
 
     class Transport:
         def __init__(self):
             self.range_calls = 0
+            self.preparing = False
+            self.ifs_ranges = 0
+            self.failed_requests = []
 
         def get(self, url, *, headers=None, timeout=None):
+            if "/ifs/" in url and outage and "/20260911/00z/" in url:
+                lead = int(re.search(r"-(\d+)h-oper", url)[1])
+                metadata = {
+                    "Last-Modified": modified,
+                    "ETag": '"native-object"',
+                    "Content-Length": str(len(body)),
+                }
+                is_index = url.endswith(".index")
+                fail = (
+                    is_index
+                    and outage in {"index503", "only_ifs503"}
+                    or is_index
+                    and outage == "late_index503"
+                    and self.ifs_ranges > 0
+                    or not is_index
+                    and outage == "range503"
+                )
+                if self.preparing and fail:
+                    self.failed_requests.append(("GET", url))
+                    return FakeHttpResponse(503, {"Retry-After": "1"})
+                if is_index:
+                    return FakeHttpResponse(
+                        200,
+                        metadata,
+                        inventory(
+                            "IFS",
+                            date="20260911",
+                            time="0000",
+                            step=str(lead),
+                            _offset=0,
+                            _length=len(body),
+                        ),
+                    )
+                self.ifs_ranges += 1
+                return FakeHttpResponse(
+                    206,
+                    {**metadata, "Content-Range": f"bytes 0-{len(body) - 1}/{len(body)}"},
+                    b"bad!" + body[4:] if outage == "framing" else body,
+                )
             if "gfs." not in url or "20260911/06/" not in url:
                 return FakeHttpResponse(404, {})
+            if outage == "only_ifs503":
+                return FakeHttpResponse(404, {})
+            if self.preparing and outage == "gfs503":
+                return FakeHttpResponse(503, {})
             lead = int(re.search(r"\.f(\d+)", url)[1])
             metadata = {
                 "Last-Modified": modified,
@@ -263,11 +328,16 @@ def test_discovery_retention_and_conditional_acquisition_work_offline(tmp_path, 
             )
 
         def head(self, url, *, headers=None, timeout=None):
+            if self.preparing and "/ifs/" in url and outage == "head503":
+                self.failed_requests.append(("HEAD", url))
+                return FakeHttpResponse(503, {"Retry-After": "1"})
             return FakeHttpResponse(
                 200,
                 {
                     "Last-Modified": modified,
-                    "ETag": '"native-object"',
+                    "ETag": '"changed-object"'
+                    if self.preparing and "/ifs/" in url and outage == "etag"
+                    else '"native-object"',
                     "Content-Length": str(len(body)),
                 },
             )
@@ -282,13 +352,20 @@ def test_discovery_retention_and_conditional_acquisition_work_offline(tmp_path, 
         sleeper=RecordingSleeper(clock),
         probe=probe_temperature,
     )
-    assert selection["status"] == "selected" and set(selection["selected_cycles"]) == {"GFS"}
+    expected_models = {"IFS"} if outage == "only_ifs503" else {"GFS", "IFS"} if outage else {"GFS"}
+    assert (
+        selection["status"] == "selected" and set(selection["selected_cycles"]) == expected_models
+    )
     retained, _, probes = load_native_selection(selection_path / "selection.json", clock=clock)
     assert retained == selection
+    selection_bytes = (selection_path / "selection.json").read_bytes()
+    gfs_probes = [item for item in probes if item["model"] == "GFS"]
+    transport.preparing = True
 
     def normalized(payloads, **kwargs):
         assert payloads["air_temperature_2m"] == body
         lead = kwargs["lead"]
+        cycle = kwargs["cycle"]
         time = np.datetime64((cycle + timedelta(hours=lead)).replace(tzinfo=None), "ns")
         start = time - np.timedelta64(1, "h")
         data = np.zeros((1, 2, 2))
@@ -321,7 +398,7 @@ def test_discovery_retention_and_conditional_acquisition_work_offline(tmp_path, 
                 "y": [45, 47],
             },
             attrs={
-                "model": "GFS",
+                "model": kwargs["model"],
                 "data_kind": "real_prepared_guidance",
                 "target_reference_time": TARGET.isoformat(),
                 "crs_wkt2": pyproj.CRS.from_epsg(4326).to_wkt(),
@@ -332,6 +409,25 @@ def test_discovery_retention_and_conditional_acquisition_work_offline(tmp_path, 
         return ds, {"status": "unavailable", "start": str(start), "end": str(time), "parents": []}
 
     monkeypatch.setattr(native_preparation, "normalize_native_frame", normalized)
+    if outage in {"etag", "framing", "gfs503", "only_ifs503"}:
+        expected = {
+            "etag": "ETag differs",
+            "framing": "boundary integrity",
+            "gfs503": "HTTP 503",
+            "only_ifs503": "complete long-range state source",
+        }[outage]
+        with pytest.raises((SelectedObjectError, FetchError, ValueError), match=expected):
+            native_preparation.prepare_native_selected(
+                [{"lat": 45.80268, "lon": -93.07952}],
+                selection_path / "selection.json",
+                tmp_path / "prepared",
+                transport=transport,
+                clock=clock,
+                sleeper=RecordingSleeper(clock),
+            )
+        assert not (tmp_path / "prepared/preparation.json").exists()
+        assert (selection_path / "selection.json").read_bytes() == selection_bytes
+        return
     report = native_preparation.prepare_native_selected(
         [{"lat": 45.80268, "lon": -93.07952}],
         selection_path / "selection.json",
@@ -340,13 +436,28 @@ def test_discovery_retention_and_conditional_acquisition_work_offline(tmp_path, 
         clock=clock,
         sleeper=RecordingSleeper(clock),
     )
-    assert transport.range_calls == len(probes)
+    assert transport.range_calls == len(gfs_probes)
     source = tmp_path / "prepared/control/source"
     manifest = json.loads((source / "manifest.json").read_bytes())
     assert manifest["forecast_horizon"] == FIVE_DAY_HORIZON.payload()
     assert set(manifest["prepared_files"]) == {"GFS"}
-    assert len(manifest["inputs"]) == len(probes)
-    assert report["retained_raw_bytes"] == len(probes) * len(body)
+    assert len(manifest["inputs"]) == len(gfs_probes)
+    assert report["retained_raw_bytes"] == (len(gfs_probes) + transport.ifs_ranges) * len(body)
+    if outage:
+        assert len(transport.failed_requests) == 3
+        shortfall = report["source_shortfalls"]["IFS"]
+        assert shortfall["selected_cycle"] == selection["selected_cycles"]["IFS"]
+        assert shortfall["terminal_request"]["status_code"] == 503
+        assert shortfall["terminal_request"]["url"] == transport.failed_requests[-1][1]
+        assert len(shortfall["withdrawn_inputs"]) == (1 if outage == "late_index503" else 0)
+        assert report["current_model_set"]["discovery_selection"] == selection
+        assert (
+            report["current_model_set"]["selection_sha256"]
+            == hashlib.sha256(selection_bytes).hexdigest()
+        )
+        assert "IFS" not in report["current_model_set"]["selection"]["selected_cycles"]
+        assert (selection_path / "selection.json").read_bytes() == selection_bytes
+        assert not (source / "IFS.nc").exists()
     for record in manifest["inputs"]:
         assert (source / record["raw_file"]).read_bytes() == body
         assert record["grib_available_at"] == "2026-09-11T10:00:00Z"
@@ -391,6 +502,8 @@ def test_discovery_retention_and_conditional_acquisition_work_offline(tmp_path, 
     assert coverage_for(snapshot, TARGET)["usable"]
     assert snapshot["contributors"]["GFS"]["cycle"] == "2026-09-11T06:00:00Z"
     assert snapshot["contributors"]["NBM"]["cycle"] is None
+    assert snapshot["contributors"]["IFS"]["status"] == "unavailable"
+    assert snapshot["contributors"]["IFS"]["cycle"] is None
     # Tampered metadata cannot redirect a retained temperature byte range.
     bad = json.loads((selection_path / "selection.json").read_bytes())
     bad["models"]["GFS"]["candidates"][-1]["probes"][0]["selected_message"]["byte_start"] = 1

@@ -61,6 +61,7 @@ class SelectedObjectTransport:
     Identity failures remain fatal even if an adapter's retry engine catches them.
     Transient HTTP range responses reach that existing bounded retry engine without
     poisoning the selected identity; they never satisfy acquisition completeness.
+    Metadata retries require explicit opt-in by a caller using that retry engine.
     """
 
     def __init__(
@@ -71,6 +72,7 @@ class SelectedObjectTransport:
         decision_time: datetime,
         clock: Clock,
         latch_failures: bool = True,
+        retry_metadata: bool = False,
     ) -> None:
         if decision_time.tzinfo is None or decision_time.utcoffset() is None:
             raise ValueError("decision_time must be timezone aware")
@@ -81,6 +83,7 @@ class SelectedObjectTransport:
         # without it a zero-weight shadow keeps acquiring its other selected objects
         # and each failure stays recorded and explicit.
         self.latch_failures = latch_failures
+        self.retry_metadata = retry_metadata
         self.failed_reason: str | None = None
         self._records: list[dict[str, Any]] = []
         self._indexes: dict[str, dict[str, Any]] = {}
@@ -295,18 +298,17 @@ class SelectedObjectTransport:
             record.update(status_code=response.status_code, headers=dict(response.headers))
             expected_status = 200 if is_index or method == "head" else 206
             if (
-                method == "get"
-                and requested_range is not None
-                and response.status_code in RETRYABLE_STATUS_CODES
-            ):
+                method == "get" and requested_range is not None or self.retry_metadata
+            ) and response.status_code in RETRYABLE_STATUS_CODES:
                 # A temporary server/rate-limit response does not establish a changed
                 # object identity. Keep its audit evidence and let fetch_with_range
                 # apply its existing attempt/backoff/Retry-After contract. No error
                 # body, successful cache entry or acquired-message marker is retained.
-                # Direct index/HEAD calls keep their existing fail-closed semantics.
+                # Metadata callers must explicitly opt into the same retry boundary.
                 record.update(
                     status="retryable",
-                    reason=f"Selected range returned retryable HTTP {response.status_code}",
+                    reason=f"Selected {'range' if requested_range else 'metadata'} returned "
+                    f"retryable HTTP {response.status_code}",
                     completed_at=_iso(self.clock.now()),
                 )
                 return _Response(
