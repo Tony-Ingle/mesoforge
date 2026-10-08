@@ -786,6 +786,19 @@ class DailyCycle:
                 raise DailyError("daily_configuration_changed; inspect_existing_receipt")
             if self.record["status"] == "completed":
                 return {**self.record, "repeat": "completed_day_reused"}
+            if self.record["status"] == "failed":
+                previous = {
+                    "retried_at": iso(self.clock()),
+                    "phase": self.record.get("phase"),
+                    "reason": self.record.get("reason"),
+                }
+                if "worker_failure" in self.record:
+                    previous["worker_failure"] = self.record["worker_failure"]
+                self.record.setdefault("previous_failures", []).append(previous)
+            self.record.update(status="started", phase="preflight")
+            for stale in ("reason", "worker_failure", "finished_at"):
+                self.record.pop(stale, None)
+            self.save()
             try:
                 self.record["preflight"] = self.preflight()
                 if "forecast" not in self.record["phases"]:

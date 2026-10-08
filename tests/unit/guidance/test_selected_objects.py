@@ -9,7 +9,9 @@ from datetime import timedelta
 
 import pytest
 
+from mesoforge.guidance.http_fetch import FetchError, fetch_with_range
 from mesoforge.guidance.selected_objects import SelectedObjectError, SelectedObjectTransport
+from mesoforge.guidance.sources.ifs import IFS_RETRY_POLICY
 from tests.support.phase1_fixture_transports import FakeHttpResponse, FixedClock
 from tests.unit.guidance.test_current_availability import (
     DECISION,
@@ -17,6 +19,13 @@ from tests.unit.guidance.test_current_availability import (
     MetadataTransport,
     inventory,
     probe,
+)
+from tests.unit.guidance.test_http_fetch import (
+    FixedClock as RetryClock,
+)
+from tests.unit.guidance.test_http_fetch import (
+    RecordingSleeper,
+    _grib_message,
 )
 
 
@@ -189,13 +198,108 @@ def test_changed_or_unprovable_identity_fails_and_cannot_be_bypassed_by_retry(
     assert wrapper.validations[-1]["status"] == "failed"
 
 
-@pytest.mark.parametrize("status", [200, 404, 412, 503])
+@pytest.mark.parametrize("status", [200, 404, 412])
 def test_range_response_must_be_partial_success_for_the_conditional_request(status):
     wrapper, underlying, evidence = selected()
     underlying.ranged.status_code = status
     with pytest.raises(SelectedObjectError, match=f"HTTP {status}"):
         acquire(wrapper, evidence)
     assert wrapper.validations[-1]["request_headers"]["If-Match"] == '"grib-version"'
+
+
+class ScriptedRangeTransport(AcquisitionTransport):
+    def __init__(self, statuses, *, changed_etag=False):
+        super().__init__("IFS")
+        self.remaining = list(statuses)
+        self.changed_etag = changed_etag
+        self.ranged.content = _grib_message(b"\0" * 60)
+
+    def get(self, url, *, headers=None, timeout=None):
+        if headers and "Range" in headers:
+            self.ranged.status_code = self.remaining.pop(0)
+            self.ranged.headers["Retry-After"] = "2"
+            if self.changed_etag:
+                self.ranged.headers["ETag"] = '"changed-after-head"'
+        return super().get(url, headers=headers, timeout=timeout)
+
+
+def ranged_retry_fixture(statuses, *, changed_etag=False):
+    evidence = probe(MetadataTransport("IFS"), "IFS").evidence
+    underlying = ScriptedRangeTransport(statuses, changed_etag=changed_etag)
+    clock = RetryClock(DECISION + timedelta(minutes=2))
+    wrapper = SelectedObjectTransport(underlying, [evidence], decision_time=DECISION, clock=clock)
+    wrapper.get(evidence["index"]["url"])
+    wrapper.head(evidence["grib"]["url"])
+    sleeper = RecordingSleeper(clock)
+
+    def fetch():
+        return fetch_with_range(
+            wrapper,
+            clock,
+            sleeper,
+            endpoint="ifs",
+            url=evidence["grib"]["url"],
+            range_header="bytes=20-99",
+            byte_start=20,
+            byte_end=100,
+            retry_policy=IFS_RETRY_POLICY,
+            cycle_deadline=clock.now(),
+            expected_length=80,
+            full_object_length=200,
+        )
+
+    return wrapper, underlying, sleeper, fetch
+
+
+def test_transient_range_503_recovers_with_same_pinned_identity_and_existing_retry_budget():
+    # Live commissioning saw one S3 503 poison all later attempts. An HTTP error
+    # does not prove an identity change; only a subsequent fully checked 206 can
+    # acquire the selected message. Metadata remains pinned and is not fetched again.
+    wrapper, underlying, sleeper, fetch = ranged_retry_fixture([503, 206])
+    result = fetch()
+    wrapper.assert_complete()
+    assert result.payload == _grib_message(b"\0" * 60)
+    assert [attempt.status_code for attempt in result.attempts] == [503, 206]
+    assert sleeper.sleeps == [2]  # Existing Retry-After policy, no new retry loop.
+    assert len(underlying.calls) == 4  # Index + HEAD + two conditional range attempts.
+    assert all(
+        call[2] == {"Range": "bytes=20-99", "If-Match": '"grib-version"'}
+        for call in underlying.calls[2:]
+    )
+    assert [row["status"] for row in wrapper.validations] == [
+        "matched",
+        "matched",
+        "retryable",
+        "matched",
+    ]
+    assert wrapper.validations[2]["status_code"] == 503
+    assert wrapper.failed_reason is None and wrapper.failures == []
+
+
+def test_exhausted_transient_ranges_fail_incomplete_after_exact_existing_attempt_limit():
+    wrapper, underlying, sleeper, fetch = ranged_retry_fixture([503, 503, 503, 206])
+    with pytest.raises(FetchError, match="exhausted retries"):
+        fetch()
+    assert len(underlying.calls) == 2 + IFS_RETRY_POLICY.attempts_per_endpoint
+    assert underlying.remaining == [206]  # No extra attempt is invented.
+    assert sleeper.sleeps == [2, 2]
+    assert [row["status"] for row in wrapper.validations[2:]] == ["retryable"] * 3
+    with pytest.raises(SelectedObjectError, match="not acquired"):
+        wrapper.assert_complete()
+
+
+@pytest.mark.parametrize("failure", ["precondition", "etag"])
+def test_identity_failure_still_latches_without_contacting_provider_again(failure):
+    wrapper, underlying, _, fetch = ranged_retry_fixture(
+        [412 if failure == "precondition" else 206, 206], changed_etag=failure == "etag"
+    )
+    with pytest.raises(FetchError, match="exhausted retries"):
+        fetch()
+    assert len(underlying.calls) == 3  # Existing outer retry cannot bypass identity latch.
+    assert underlying.remaining == [206]
+    assert wrapper.validations[-1]["status"] == "failed"
+    with pytest.raises(SelectedObjectError, match="HTTP 412|ETag"):
+        wrapper.assert_complete()
 
 
 @pytest.mark.parametrize("range_header", [None, "bytes=0-199", "bytes=20-100", "bytes=20-"])

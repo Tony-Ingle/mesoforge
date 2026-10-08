@@ -651,6 +651,43 @@ def test_missing_backup_storage_fails_before_guidance_or_ai(tmp_path: Path) -> N
     assert cycle.calls == []
 
 
+def test_retry_reports_current_success_and_preserves_previous_failure_trace(tmp_path: Path) -> None:
+    config = configuration(tmp_path)
+    clock = Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC))
+    failed = FakeCycle(config, clock)
+    failure = {"phase": "backup-estimate", "exit_code": 1, "result": {"status": "failed"}}
+
+    def failed_preflight() -> dict[str, Any]:
+        failed.record["worker_failure"] = failure
+        raise daily.DailyError("temporary_preflight_failure")
+
+    failed.preflight = failed_preflight
+    with pytest.raises(daily.DailyError, match="temporary_preflight_failure"):
+        failed.execute()
+    assert failed.record["status"] == "failed"
+    retry = FakeCycle(config, clock)
+
+    def recovered_preflight() -> dict[str, Any]:
+        # Durable status must describe this attempt even while it is still running.
+        saved = json.loads(retry.receipt.read_bytes())
+        assert saved["status"] == "started" and saved["phase"] == "preflight"
+        assert "reason" not in saved and "worker_failure" not in saved
+        return {"status": "ready"}
+
+    retry.preflight = recovered_preflight
+    result = retry.execute()
+    assert result["status"] == "completed"
+    assert "reason" not in result and "worker_failure" not in result
+    assert result["previous_failures"] == [
+        {
+            "retried_at": "2026-07-15T11:05:00Z",
+            "phase": "preflight",
+            "reason": "temporary_preflight_failure",
+            "worker_failure": failure,
+        }
+    ]
+
+
 def test_recipient_changes_require_review_of_same_day_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

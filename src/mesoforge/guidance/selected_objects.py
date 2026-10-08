@@ -13,7 +13,7 @@ from typing import Any
 
 from mesoforge.common.errors import MesoForgeError
 from mesoforge.guidance.acquisition_v2 import parse_provider_availability
-from mesoforge.guidance.http_fetch import header, parse_content_range
+from mesoforge.guidance.http_fetch import RETRYABLE_STATUS_CODES, header, parse_content_range
 from mesoforge.guidance.interfaces import Clock, HttpResponse, HttpTransport
 from mesoforge.guidance.sources.current_availability import QPF_FIELD
 from mesoforge.guidance.sources.gfs import build_field_selector
@@ -59,6 +59,8 @@ class SelectedObjectTransport:
     Compound-field ranges are cached until their object is released; streaming
     preparation releases each fully decoded object. Acquisition owns raw retention.
     Identity failures remain fatal even if an adapter's retry engine catches them.
+    Transient HTTP range responses reach that existing bounded retry engine without
+    poisoning the selected identity; they never satisfy acquisition completeness.
     """
 
     def __init__(
@@ -292,6 +294,24 @@ class SelectedObjectTransport:
             )
             record.update(status_code=response.status_code, headers=dict(response.headers))
             expected_status = 200 if is_index or method == "head" else 206
+            if (
+                method == "get"
+                and requested_range is not None
+                and response.status_code in RETRYABLE_STATUS_CODES
+            ):
+                # A temporary server/rate-limit response does not establish a changed
+                # object identity. Keep its audit evidence and let fetch_with_range
+                # apply its existing attempt/backoff/Retry-After contract. No error
+                # body, successful cache entry or acquired-message marker is retained.
+                # Direct index/HEAD calls keep their existing fail-closed semantics.
+                record.update(
+                    status="retryable",
+                    reason=f"Selected range returned retryable HTTP {response.status_code}",
+                    completed_at=_iso(self.clock.now()),
+                )
+                return _Response(
+                    response.status_code, MappingProxyType(dict(response.headers)), b""
+                )
             if response.status_code != expected_status:
                 raise SelectedObjectError(
                     f"Selected object returned HTTP {response.status_code}; "
