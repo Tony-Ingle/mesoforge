@@ -30,9 +30,18 @@ case "$*" in
     *" start guidance-worker"*) test "${FAIL_AT:-}" != restart ;;
     *"local_backup estimate"*)
         printf '{"status":"estimated","backup_bytes":%s}\n' "${ESTIMATE_BYTES:-1}" ;;
-    *"pg_dump -Fc"*) test "${FAIL_AT:-}" != dump; printf 'database dump\n' ;;
-    *"--entrypoint pg_restore postgres --list"*) cat >/dev/null; printf 'dump list\n' ;;
-    *"pg_restore --list"*) cat >/dev/null; printf 'dump list\n' ;;
+    *"pg_dump -Fc"*)
+        test "${FAIL_AT:-}" != dump
+        case "${FAIL_AT:-}" in
+            empty_dump) : ;;
+            malformed_dump) printf 'invalid dump\n' ;;
+            *) printf 'PGDMP\000\001retained database dump\n' ;;
+        esac ;;
+    *"--entrypoint pg_restore postgres --list"*|*"pg_restore --list"*)
+        magic=$(dd bs=1 count=5 2>/dev/null)
+        [ "$magic" = PGDMP ] || { echo 'invalid or empty custom dump input' >&2; exit 1; }
+        cat >/dev/null
+        printf 'dump list\n' ;;
     *"pg_restore --exit-on-error"*) cat >/dev/null ;;
     *"information_schema.tables"*) echo "${TABLE_COUNT:-0}" ;;
     *"export-objects"*)
@@ -62,11 +71,18 @@ esac
 
 @pytest.fixture
 def shell() -> str:
-    # Git's POSIX shell lets Windows run these failure tests without WSL or Docker.
-    bash = shutil.which("bash") or "C:/Program Files/Git/bin/bash.exe"
-    if not Path(bash).is_file():
+    # Prefer dash to exercise its asynchronous stdin behavior on Linux. Git Bash
+    # lets Windows run the same failure tests without WSL or Docker.
+    git_dash = Path("C:/Program Files/Git/usr/bin/dash.exe")
+    executable = (
+        shutil.which("dash")
+        or (str(git_dash) if git_dash.is_file() else None)
+        or shutil.which("bash")
+        or "C:/Program Files/Git/bin/bash.exe"
+    )
+    if not Path(executable).is_file():
         pytest.skip("POSIX shell is unavailable")
-    return bash
+    return executable
 
 
 @pytest.fixture
@@ -91,13 +107,18 @@ def harness(tmp_path: Path) -> tuple[Path, dict[str, str]]:
         b"retained guidance"
     )
     (runtime / "latest_baseline.json").write_text('{"baseline_id":"retained"}', encoding="utf-8")
+    shell_tools = Path("C:/Program Files/Git/usr/bin")
+    executable_paths = [str(binaries)]
+    if os.name == "nt" and shell_tools.is_dir():
+        executable_paths.append(str(shell_tools))
+    executable_paths.append(os.environ["PATH"])
     env = {
         **os.environ,
-        "PATH": str(binaries) + os.pathsep + os.environ["PATH"],
+        "PATH": os.pathsep.join(executable_paths),
         "DOCKER_LOG": (tmp_path / "docker.log").as_posix(),
         "FAKE_RUNTIME": runtime.as_posix(),
         "RUNNING_GUIDANCE": "1",
-        "MESOFORGE_BACKUP_PYTHON": sys.executable,
+        "MESOFORGE_BACKUP_PYTHON": Path(sys.executable).as_posix(),
         "MESOFORGE_GUIDANCE_MIN_FREE_GB": "0",
     }
     return hosted, env
@@ -117,7 +138,9 @@ def run_script(
     )
 
 
-@pytest.mark.parametrize("failure", ["dump", "export", "tar", "restart"])
+@pytest.mark.parametrize(
+    "failure", ["dump", "empty_dump", "malformed_dump", "export", "tar", "restart"]
+)
 def test_backup_failure_never_reports_complete_and_restarts_guidance(
     shell: str, harness: tuple[Path, dict[str, str]], tmp_path: Path, failure: str
 ) -> None:
@@ -141,6 +164,8 @@ def test_backup_retains_guidance_and_publishes_only_after_restart(
     backup = next((tmp_path / "backups").iterdir())
     assert not backup.name.endswith(".incomplete")
     assert (backup / "SHA256SUMS").is_file()
+    assert (backup / "postgres.dump").read_bytes() == b"PGDMP\x00\x01retained database dump\n"
+    assert (backup / "postgres.list").read_text() == "dump list\n"
     with tarfile.open(backup / "runtime.tar.gz") as archive:
         assert "./guidance/snapshots/retained/source/array.bin" in archive.getnames()
     if os.name != "nt":

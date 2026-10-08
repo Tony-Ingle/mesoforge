@@ -27,6 +27,7 @@ from typing import Any
 # Host orchestration needs only these stdlib modules, not a second scientific venv.
 ROOT = Path(__file__).resolve().parents[2]
 DOCKER = shutil.which("docker") or "/usr/bin/docker"
+DAILY_LOCATIONS = ("minneapolis", "grasston")
 sys.path.insert(0, str(ROOT / "src"))
 from mesoforge.application.disk_admission import DiskPolicy  # noqa: E402
 from mesoforge.application.forecast_schedule import ForecastSchedule  # noqa: E402
@@ -132,19 +133,26 @@ class DailyCycle:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         sleep: Callable[[float], None] = time.sleep,
         disk_free: Callable[[Path], int] = lambda p: shutil.disk_usage(p).free,
+        location_id: str = "minneapolis",
     ) -> None:
+        if location_id not in DAILY_LOCATIONS:
+            raise DailyError("unsupported_daily_location")
         self.config, self.clock, self.sleep, self.disk_free = config, clock, sleep, disk_free
+        self.location_id = location_id
+        self.workflow_slot = "daily"
+        self.forecast_time = config["forecast_time"] if location_id == "minneapolis" else "08:15"
+        self.delivery_time = config["delivery_time"] if location_id == "minneapolis" else "09:30"
         self.state_root = Path(config["state_root"])
-        self.schedule = ForecastSchedule("America/Chicago", (config["forecast_time"],))
+        self.schedule = ForecastSchedule("America/Chicago", (self.forecast_time,))
         now = clock()
         if now.tzinfo is None or now.utcoffset() is None:
             raise DailyError("aware_runtime_clock_required")
         self.day = now.astimezone(self.schedule.zone).date()
         self.slot = self.schedule.slots_on(self.day)[0]
-        self.delivery = ForecastSchedule("America/Chicago", (config["delivery_time"],)).slots_on(
+        self.delivery = ForecastSchedule("America/Chicago", (self.delivery_time,)).slots_on(
             self.day
         )[0]
-        self.directory = self.state_root / self.day.isoformat()
+        self.directory = self.state_root / self.day.isoformat() / location_id / self.workflow_slot
         self.receipt = self.directory / "result.json"
         self.record: dict[str, Any] = {}
         self.location: dict[str, Any] = {}
@@ -168,6 +176,8 @@ class DailyCycle:
         existing = self.state_root if self.state_root.exists() else self.state_root.parent
         return {
             "local_date": self.day.isoformat(),
+            "location_id": self.location_id,
+            "workflow_slot": self.workflow_slot,
             "forecast_slot": iso(self.slot),
             "delivery_not_before": iso(self.delivery),
             "disk": DiskPolicy.from_environment().report(self.disk_free(existing)),
@@ -184,13 +194,10 @@ class DailyCycle:
         locations = [
             row
             for row in load_locations(ROOT / "configs/locations.json")
-            if isinstance(row, dict) and row.get("id") == "minneapolis"
+            if isinstance(row, dict) and row.get("id") == self.location_id
         ]
-        if len(locations) != 1 or (locations[0]["lat"], locations[0]["lon"]) != (
-            44.98861,
-            -93.25553,
-        ):
-            raise DailyError("maintained_minneapolis_registry_mismatch")
+        if len(locations) != 1:
+            raise DailyError("maintained_location_registry_mismatch")
         self.recipients = location_email_recipients(locations[0])
         self.location = {**locations[0], "email_recipients": self.recipients}
         selection = self.directory / "locations.json"
@@ -198,19 +205,32 @@ class DailyCycle:
         # The host receipt directory stays private. This non-secret file is bound
         # directly into uid10001 containers and must be readable even with umask077.
         selection.chmod(0o644)
-        # Same selection/root/horizon for both roles, independent secret mounts intact.
-        services = {}
+        guidance_selection = self.directory / "guidance-locations.json"
+        shared_locations = [
+            row
+            for row in load_locations(ROOT / "configs/locations.json")
+            if isinstance(row, dict) and row.get("id") in DAILY_LOCATIONS
+        ]
+        if {row["id"] for row in shared_locations} != set(DAILY_LOCATIONS):
+            raise DailyError("shared_guidance_registry_incomplete")
+        write_json(guidance_selection, {"locations": shared_locations})
+        guidance_selection.chmod(0o644)
+        # One shared prepared footprint, but only this location's baseline/issuance.
+        services: dict[str, Any] = {}
         for role in ("guidance-worker", "forecast-worker", "delivery"):
             services[role] = {
                 "restart": "no",
                 "environment": {
                     "MESOFORGE_PROSPECTIVE_ROOT": self.runtime,
                     "MESOFORGE_FORECAST_TIMEZONE": "America/Chicago",
-                    "MESOFORGE_FORECAST_TIMES": self.config["forecast_time"],
+                    "MESOFORGE_FORECAST_TIMES": self.forecast_time,
                     "MESOFORGE_FORECAST_HORIZON_HOURS": "120",
                 },
                 "volumes": [f"{selection}:/run/mesoforge/locations.json:ro"],
             }
+        services["guidance-worker"]["volumes"].append(
+            f"{guidance_selection}:/run/mesoforge/guidance-locations.json:ro"
+        )
         host_user = getattr(os, "getuid", lambda: 1000)()
         host_group = getattr(os, "getgid", lambda: 1000)()
         services["admin"] = {
@@ -422,7 +442,15 @@ class DailyCycle:
             "guidance",
             "guidance-worker",
             "mesoforge.application.guidance_worker",
-            ["once", *self.common, "--forecast-horizon-hours", "120"],
+            [
+                "once",
+                *self.common,
+                "--forecast-horizon-hours",
+                "120",
+                "--guidance-config",
+                "/run/mesoforge/guidance-locations.json",
+                "--no-hourly-probe",
+            ],
         )
         state = self.command(
             "guidance-status",
@@ -462,7 +490,7 @@ class DailyCycle:
         if result.get("status") != "completed" or result.get("baseline") != baseline_id:
             raise DailyError("forecast_not_completed_on_pinned_baseline")
         rows = result.get("results", [])
-        if len(rows) != 1 or rows[0].get("location", {}).get("id") != "minneapolis":
+        if len(rows) != 1 or rows[0].get("location", {}).get("id") != self.location_id:
             raise DailyError("forecast_location_mismatch")
         row = rows[0]
         if row.get("status") not in {"issued", "skipped_already_issued"}:
@@ -543,8 +571,8 @@ class DailyCycle:
         write_json(
             receipts,
             {
-                path.parent.name: read_json(path)
-                for path in sorted(self.state_root.glob("????-??-??/result.json"))
+                path.relative_to(self.state_root).as_posix(): read_json(path)
+                for path in sorted(self.state_root.rglob("result.json"))
             },
         )
         deployment = self.directory / "backup-deployment.json"
@@ -555,8 +583,8 @@ class DailyCycle:
                 "runtime_root": self.runtime,
                 "runtime_archive_root": "/var/lib/mesoforge/runtime",
                 "location": self.location,
-                "forecast_time": self.config["forecast_time"],
-                "delivery_time": self.config["delivery_time"],
+                "forecast_time": self.forecast_time,
+                "delivery_time": self.delivery_time,
                 "approved_template": self.config["approved_template"],
                 "retention_cycles": self.config.get("retention_cycles", {}),
             },
@@ -772,10 +800,15 @@ class DailyCycle:
                 ).encode()
             ).hexdigest()
             retained = read_json(self.receipt)
+            legacy = self.state_root / self.day.isoformat() / "result.json"
+            if retained is None and self.location_id == "minneapolis" and legacy.exists():
+                raise DailyError("legacy_daily_receipt_requires_inspection; no_repeat_paid_work")
             if self.receipt.exists() and retained is None:
                 raise DailyError("daily_receipt_unreadable; do_not_repeat_paid_work")
             self.record = retained or {
                 "local_date": self.day.isoformat(),
+                "location_id": self.location_id,
+                "workflow_slot": self.workflow_slot,
                 "config_digest": identity,
                 "started_at": iso(self.clock()),
                 "location": self.location,
@@ -824,12 +857,12 @@ class DailyCycle:
                     if self.fresh(readiness)["baseline_snapshot_id"] != baseline_id:
                         raise DailyError("baseline_changed_after_daily_pin")
                 forecast = self.phase("forecast", lambda: self.forecast(baseline_id))
-                pdf = f"{self.runtime}/delivery/daily-{self.day.isoformat()}.pdf"
+                pdf = f"{self.runtime}/delivery/{self.location_id}-{self.day.isoformat()}.pdf"
                 args = [
                     "--issued-id",
                     forecast["issued_forecast_id"],
                     "--location",
-                    "minneapolis",
+                    self.location_id,
                     "--config",
                     "/run/mesoforge/locations.json",
                     "--pdf",
@@ -887,10 +920,11 @@ class DailyCycle:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--location", choices=DAILY_LOCATIONS, default="minneapolis")
     parser.add_argument("operation", choices=("run", "status"))
     args = parser.parse_args(argv)
     try:
-        cycle = DailyCycle(load_config(args.config))
+        cycle = DailyCycle(load_config(args.config), location_id=args.location)
         if args.operation == "run":
             # No daemon/scheduler is installed. GHA has its own explicit enable gate.
             signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))

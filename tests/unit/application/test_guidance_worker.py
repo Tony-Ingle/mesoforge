@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -516,6 +517,88 @@ def test_configured_location_outside_the_prepared_footprint_requires_refresh(
     harness = Harness(tmp_path)
     publish_prepared(harness.root, harness.hour() - timedelta(hours=1), locations=LOCATIONS[:2])
     assert harness.worker().refresh_reasons(LOCATIONS, START) == ["configured_locations_changed"]
+
+
+def test_shared_guidance_prepares_once_for_independent_location_baselines(tmp_path: Path) -> None:
+    shared = [LOCATIONS[0], LOCATIONS[2]]
+    config = tmp_path / "shared.json"
+    config.write_text(json.dumps({"locations": shared}), "utf-8")
+    harness = Harness(
+        tmp_path,
+        clock=START.replace(hour=11),
+        guidance_config=config,
+        hourly_probe=False,
+        schedule=ForecastSchedule("America/Chicago", ("07:15",)),
+    )
+    write_config(harness.root, shared[:1])
+    refresh_locations, build_locations = [], []
+
+    def refresh(config: Path, guidance_root: Path, probe: Path | None) -> dict:
+        refresh_locations.append(json.loads(config.read_text("utf-8"))["locations"])
+        pointer = publish_prepared(harness.root, harness.hour(), locations=shared)
+        return {"status": "published", "snapshot_id": pointer["snapshot_id"]}
+
+    def build(
+        guidance_root: Path, baseline_root: Path, locations: list[Any], **kwargs: Any
+    ) -> dict:
+        build_locations.append((locations, kwargs["prepared_pointer"]["snapshot_id"]))
+        identity = publish_baseline(
+            harness.root, kwargs["prepared_pointer"]["snapshot_id"], locations=locations
+        )
+        return {
+            "status": "published",
+            "baseline_snapshot_id": identity,
+            "manifest": {"coverage": {"failed_locations": [], "reference_times": []}},
+            "timings": {},
+            "artifact_bytes": 10,
+        }
+
+    harness.deps.refresh, harness.deps.build = refresh, build
+    harness.deps.discover = lambda _: pytest.fail("Compatible shared Guidance must not be probed")
+    first = harness.worker().poll_once()
+    first_pointer = (harness.root / "guidance/latest_complete.json").read_bytes()
+    first_baseline = first["build"]["baseline_snapshot_id"]
+    first_path = harness.root / "baseline/baselines" / first_baseline / "baseline.json"
+    first_payload = first_path.read_bytes()
+    write_config(harness.root, shared[1:])
+    harness.clock.advance(hours=2)
+    harness.settings = replace(
+        harness.settings, schedule=ForecastSchedule("America/Chicago", ("08:30",))
+    )
+    second = harness.worker().poll_once()
+    assert first["categories"] == second["categories"] == []
+    assert refresh_locations == [shared]
+    assert second["refresh"]["decision"] == "none"
+    assert [rows for rows, _ in build_locations] == [shared[:1], shared[1:]]
+    assert build_locations[0][1] == build_locations[1][1]
+    assert first_baseline != second["build"]["baseline_snapshot_id"]
+    assert first_path.read_bytes() == first_payload
+    assert (harness.root / "guidance/latest_complete.json").read_bytes() == first_pointer
+    public = harness.settings.public()
+    assert public["guidance_config"] == str(config)
+    args = worker_module.build_parser().parse_args(
+        ["once", "--guidance-config", str(config), "--config", str(harness.settings.config)]
+    )
+    assert args.guidance_config == config and args.config == harness.settings.config
+
+
+@pytest.mark.parametrize(
+    "shared",
+    [[], [LOCATIONS[2]], [LOCATIONS[0], {"lat": 999, "lon": -93}]],
+)
+def test_invalid_shared_guidance_config_stops_before_provider_or_build(
+    tmp_path: Path, shared: list[dict]
+) -> None:
+    harness = Harness(tmp_path)
+    write_config(harness.root, LOCATIONS[:1])
+    config = tmp_path / "shared.json"
+    config.write_text(json.dumps({"locations": shared}), "utf-8")
+    harness.settings = replace(harness.settings, guidance_config=config)
+    harness.deps.discover = lambda _: pytest.fail("Invalid config must fail before provider calls")
+    outcome = harness.worker().poll_once()
+    assert outcome["categories"] == ["invalid_configuration"]
+    assert outcome["guidance_locations"]["status"] == "invalid"
+    assert not harness.refresh_calls and not harness.build_calls
 
 
 def test_partial_provider_probe_and_provider_outage_are_categorized(tmp_path: Path) -> None:

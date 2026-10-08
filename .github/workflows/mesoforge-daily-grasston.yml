@@ -1,11 +1,11 @@
-name: MesoForge daily Minneapolis outlook
+name: MesoForge daily Grasston outlook
 
 # This workflow is deliberately dormant until the owner enables the repository
-# variable MESOFORGE_DAILY_ENABLED=true after deployment/backup prerequisites.
+# variable MESOFORGE_DAILY_GRASSTON_ENABLED=true after deployment/backup prerequisites.
 # GitHub evaluates scheduled workflows on the default branch, not this feature branch.
 "on":
   schedule:
-    - cron: "5 6 * * *"
+    - cron: "15 8 * * *"
       timezone: America/Chicago
   workflow_dispatch:
     inputs:
@@ -19,10 +19,11 @@ name: MesoForge daily Minneapolis outlook
 permissions:
   contents: read
 
-# The host's persistent lock/journal also protects manual invocations and restarts.
+# Both location workflows share this group; the host's persistent lock also
+# protects manual invocations and restarts. Receipts remain location-specific.
 # Never cancel a running forecast to start another paid forecast.
 concurrency:
-  group: mesoforge-daily-minneapolis
+  group: mesoforge-daily-host
   cancel-in-progress: false
 
 jobs:
@@ -31,7 +32,7 @@ jobs:
       github.repository == 'Tony-Ingle/mesoforge' &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
       ((github.event_name == 'workflow_dispatch' && inputs.operation == 'status') ||
-      vars.MESOFORGE_DAILY_ENABLED == 'true')
+      vars.MESOFORGE_DAILY_GRASSTON_ENABLED == 'true')
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 240
     steps:
@@ -61,14 +62,14 @@ jobs:
             run|status) ;;
             *) echo "::error::Unsupported operation"; exit 1 ;;
           esac
-          python3 deploy/hosted/daily_cycle.py --config /etc/mesoforge/daily.json "$OPERATION"
+          python3 deploy/hosted/daily_cycle.py --config /etc/mesoforge/daily.json --location grasston "$OPERATION"
 
       - name: Publish daily status even after phase failure
         if: ${{ always() && steps.checkout.outcome == 'success' }}
         shell: bash
         run: |
           {
-            printf '## MesoForge daily status\n\n```json\n'
-            python3 deploy/hosted/daily_cycle.py --config /etc/mesoforge/daily.json status
+            printf '## MesoForge Grasston daily status\n\n```json\n'
+            python3 deploy/hosted/daily_cycle.py --config /etc/mesoforge/daily.json --location grasston status
             printf '\n```\n'
           } >> "$GITHUB_STEP_SUMMARY"

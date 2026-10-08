@@ -1257,7 +1257,7 @@ development keeps the on-demand commands and `prospective_cycle`.
 
 ```mermaid
 flowchart LR
-    X[GitHub daily 06:05 America/Chicago; disabled] -. when .-> G
+    X[Independent GitHub location workflows; Chicago 06:05 / 08:15; disabled] -. when .-> G
     P[Model providers] --> G[Guidance/baseline worker: one poll then stop]
     G --> R[(Runtime volume: guidance/, baseline/, runs/, status/)]
     R --> F[Forecast/issuance worker: one run per trigger]
@@ -1270,7 +1270,7 @@ flowchart LR
     A --> S3
     DB --> D[Explicit saved-issuance PDF / SMTP command]
     S3 --> D
-    D --> E[SMTP provider; validated 120-hour outlook, release at 08:00]
+    D --> E[SMTP provider; configured recipients, location release time]
 ```
 
 [`guidance_worker`](src/mesoforge/application/guidance_worker.py) wraps the existing
@@ -1339,16 +1339,23 @@ Nothing prunes baselines, issuances, governance or verification evidence.
 
 ### Daily v1 handoff — implemented, not enabled
 
-The [daily workflow](.github/workflows/mesoforge-daily.yml) delegates to the small
-stdlib-only [host composition](deploy/hosted/daily_cycle.py). It invokes existing
-independent worker/delivery processes with separate role secrets, not a third
-forecast engine. The existing registry selects Minneapolis; a generated readonly
-selection is mounted into all three roles. This explicitly opts into the existing
-120-hour policy and leaves historical/default 36-hour workflows unchanged.
+The independent [Minneapolis](.github/workflows/mesoforge-daily-minneapolis.yml) and
+[Grasston](.github/workflows/mesoforge-daily-grasston.yml) workflows delegate to the small
+stdlib-only [host composition](deploy/hosted/daily_cycle.py), with an explicit
+`--location` binding. It invokes existing independent worker/delivery processes with
+separate role secrets, not a third forecast engine. Generated readonly selections
+scope each baseline/Forecast/delivery to its location; Guidance preparation receives
+both registry locations. Shared `state_root`, `runtime_root` and lock roots allow
+reuse of compatible same-morning prepared state, while baselines and receipts remain
+location-specific. The existing 120-hour policy is explicit; historical/default
+36-hour workflows remain unchanged.
 
-One IANA-zone GitHub trigger starts Guidance `once` at 06:05, then stops before
-Forecast preparation at 07:15. The resulting saved PDF is released to SMTP no earlier
-than 08:00. The lead time reflects measured Guidance (~50 minutes) and Forecast (~29 minutes
+The Minneapolis IANA-zone trigger starts Guidance `once` at 06:05, then stops before
+Forecast preparation at 07:15; SMTP release is no earlier than 08:00. Grasston starts
+at 08:15, reuses compatible prepared state, builds its own baseline, and prepares
+Forecast when ready with sufficient analysis headroom; SMTP release is no earlier than 09:30. Required
+readiness/headroom checks may move either Forecast later. These are America/Chicago
+wall times, including DST. The lead time reflects measured Guidance (~50 minutes) and Forecast (~29 minutes
 plus delivery readback), not a new scientific rule. GitHub dispatch and runtime can
 delay delivery. A late/failed Guidance phase does not silently reuse yesterday's
 baseline. The daily admission requires normal readiness, a 120-hour baseline prepared
@@ -1356,7 +1363,8 @@ and published after 06:00 that local day, and a reference view covering the fore
 slot. Same-morning already-complete state may be reused after a successful normal
 Guidance check; this is reported as reuse, not new publication.
 
-GHA concurrency and a persistent host/day receipt protect the operator pipeline.
+Both workflows share one GHA concurrency group and persistent host lock. Receipts
+are scoped by local date/location/`daily` slot, so one location cannot complete another.
 Guidance and Forecast share the existing persistent OS lock at
 `status/guidance-worker.lock` through [`worker_lock`](src/mesoforge/application/worker_lock.py).
 Forecast takes it after readiness and before heavy work, inside the existing PostgreSQL
@@ -1365,20 +1373,21 @@ from publishing. `--expected-baseline-id` rejects a changed handoff before extra
 Compose sets `MESOFORGE_WORKER_LOCK_ROOT` to the shared volume root so new-image
 workers with different runtime sub-roots also serialize. The unset/default contract
 retains the original runtime-root lock for development/historical commands. The host
-additionally checks for an already running worker in the live Compose project. It
-does not kill other workloads; old images must not be run concurrently.
+additionally checks for an already running worker on the host, including other Compose
+projects. It does not kill other workloads; old images must not be run concurrently.
 
 The compact daily receipt records phase intent/completion, the exact baseline and
 issuance, verification/AI outcomes, PDF digest, delivery results and sampled host
 resources. It complements authoritative issuance/SMTP locks rather than replacing
-them. Completed phases are reused for one local day; an uncertain interrupted forecast
+them. Completed phases are reused for one location/day; an uncertain interrupted forecast
 cannot trigger another paid desk automatically. Email retry uses only the saved
 issuance. Failed/ambiguous SMTP intents remain suppressed. Candidate background errors
 are retained warnings; required active failures still prevent handoff. Current AI
 fallback/validation and scientific cutoff behavior remain unchanged.
 
-The workflow is restricted to the repository/default branch and existing `vps` runner,
-with `MESOFORGE_DAILY_ENABLED=true` required for scheduled/manual runs. Status remains
+Both workflows are restricted to the repository/default branch and existing `vps` runner,
+with independent `MESOFORGE_DAILY_MINNEAPOLIS_ENABLED=true` and
+`MESOFORGE_DAILY_GRASSTON_ENABLED=true` flags required for that location's scheduled/manual run. Status remains
 read-only while disabled. No timer, recurring workflow execution, automatic retry loop,
 deployment or migration is enabled by this commit. Legacy systemd examples are an
 alternative, never an additional scheduler. Owner enablement also approves the exact
@@ -1666,13 +1675,14 @@ capacity under live acquisition. The application image isolates native ecCodes
 library loading and tests both ecCodes/Psycopg import orders through normal shutdown.
 
 **FUTURE.** Verification-derived replacement of provisional priors, additional
-long-range field/event policies, recurring PDF/email,
+long-range field/event policies, unattended operation enablement,
 multi-host publication or shared object-backed guidance, continuous observation/MRMS
 polling and safe complete-history pruning remain prerequisites or future work.
 Current local file locks are not a distributed publication system. The
 development HTTP interface (`mesoforge.api`) is a local read/calculation surface,
-not part of the hosted stack or an authenticated public service. Existing CI
-validates code; it is not the forecast scheduler. Hermes orchestration remains paused.
+not part of the hosted stack or an authenticated public service. Repository validation
+checks code; the guarded daily workflow schedules existing workers. Hermes orchestration
+remains paused.
 
 ## O. Current versus future
 
@@ -1704,7 +1714,7 @@ validates code; it is not the forecast scheduler. Hermes orchestration remains p
 | Scheduled hosted operation | Implemented; supervised Linux proofs complete, unattended operation not enabled | One image, two forecast roles, internal services; scheduler chooses when, MesoForge keeps all meteorology |
 | Guidance retention planning/pins | Partially implemented | Verified-backup-bound expiry of old unreferenced native payloads; manifests/baseline history protected |
 | 36-/120-hour outlook/PDF and SMTP | Implemented | Saved-final-issuance renderer and immutable delivery audit; separate complete-calendar-day fixture gate remains strict |
-| Recurring delivery | Future | No unattended email enabled |
+| Recurring delivery | Implemented, disabled | Independent once-daily location workflows; recurring operation needs owner enablement |
 
 ## P. Architectural debt and retained boundaries
 
@@ -1713,9 +1723,10 @@ validates code; it is not the forecast scheduler. Hermes orchestration remains p
 - Background builds materialize every configured domain/reference view; this costs
   time and storage. Incremental affected-field computation is not implemented.
 - Baseline source references currently depend on retained local paths/documents,
-  so hosted operation is single-host with one runtime volume. Conservative retention
-  protects complete and failed generations; cycle-count preferences cannot yet bound history.
-  Dependency closure must be established before raw/prepared scientific data expires.
+  so hosted operation is single-host with one runtime volume. Retention preserves lineage
+  documents and baseline grids. Verified-backup-bound native payload expiry can bound
+  eligible superseded arrays; failed/unresolved generations and permanent scientific
+  artifacts continue growing.
 - The five-day product uses explicitly approved provisional priors. Their measured
   skill and unresolved later-hour p-type/thunder/winter/visibility policies remain
   scientific work; the PDF never fills those missing components.

@@ -54,8 +54,21 @@ def configuration(tmp_path: Path) -> dict[str, Any]:
 
 
 class FakeCycle(daily.DailyCycle):
-    def __init__(self, config: dict[str, Any], clock: Clock, *, free: int = 40 * 1024**3) -> None:
-        super().__init__(config, clock=clock, sleep=clock.sleep, disk_free=lambda _: free)
+    def __init__(
+        self,
+        config: dict[str, Any],
+        clock: Clock,
+        *,
+        free: int = 40 * 1024**3,
+        location_id: str = "minneapolis",
+    ) -> None:
+        super().__init__(
+            config,
+            clock=clock,
+            sleep=clock.sleep,
+            disk_free=lambda _: free,
+            location_id=location_id,
+        )
         self.test_clock = clock
         self.calls: list[tuple[str, str, str, list[str]]] = []
         self.hook: Any = None
@@ -118,7 +131,7 @@ class FakeCycle(daily.DailyCycle):
                 "baseline": "baseline-for-this-local-day",
                 "results": [
                     {
-                        "location": {"id": "minneapolis"},
+                        "location": {"id": self.location_id},
                         "status": "issued",
                         "issued_forecast_id": "existing-authoritative-issuance",
                         "ai_desk": {"completion_reason": "provider_failure", "accepted_edits": 0},
@@ -189,7 +202,10 @@ def test_one_serial_cycle_per_chicago_day_across_cst_cdt(
     )
     assert "--scheduled" not in forecast_args and "--reference-time" not in forecast_args
     guidance_args = cycle.calls[0][3]
-    assert guidance_args[0] == "once" and "--no-hourly-probe" not in guidance_args
+    assert guidance_args[0] == "once" and "--no-hourly-probe" in guidance_args
+    assert guidance_args[guidance_args.index("--guidance-config") + 1] == (
+        "/run/mesoforge/guidance-locations.json"
+    )
     assert "--forecast-horizon-hours" in guidance_args and "120" in guidance_args
     assert (
         result["phases"]["forecast"]["result"]["results"][0]["ai_desk"]["completion_reason"]
@@ -232,9 +248,53 @@ def test_same_minneapolis_only_selection_reaches_every_role(tmp_path: Path) -> N
         assert row["restart"] == "no"
         assert row["environment"]["MESOFORGE_FORECAST_HORIZON_HOURS"] == "120"
         assert row["environment"]["MESOFORGE_FORECAST_TIMES"] == "07:15"
-        assert row["volumes"] == [
+        assert row["volumes"][:1] == [
             f"{cycle.directory / 'locations.json'}:/run/mesoforge/locations.json:ro"
         ]
+
+
+def test_locations_have_independent_receipts_and_delivery_but_shared_runtime(
+    tmp_path: Path,
+) -> None:
+    config = configuration(tmp_path)
+    clock = Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC))
+    minneapolis = FakeCycle(config, clock)
+    minneapolis.execute()
+    clock.value = datetime(2026, 7, 15, 13, 15, tzinfo=UTC)
+    grasston = FakeCycle(config, clock, location_id="grasston")
+    result = grasston.execute()
+    assert result["status"] == "completed"
+    assert result["location_id"] == "grasston"
+    assert result["workflow_slot"] == "daily"
+    assert result["delivery"]["status"] == "no_recipients"
+    assert "forecast" in [call[0] for call in grasston.calls]
+    assert not any(call[0].startswith("email-") for call in grasston.calls)
+    assert grasston.receipt != minneapolis.receipt
+    assert grasston.state_root == minneapolis.state_root
+    assert grasston.runtime == minneapolis.runtime
+    assert grasston.directory.parts[-3:] == ("2026-07-15", "grasston", "daily")
+    assert daily.iso(grasston.slot) == "2026-07-15T13:15:00Z"
+    assert daily.iso(grasston.delivery) == "2026-07-15T14:30:00Z"
+    selected = json.loads((grasston.directory / "locations.json").read_text())
+    assert [row["id"] for row in selected["locations"]] == ["grasston"]
+    for cycle in (minneapolis, grasston):
+        shared = json.loads((cycle.directory / "guidance-locations.json").read_text())
+        assert [row["id"] for row in shared["locations"]] == ["minneapolis", "grasston"]
+        args = next(row[3] for row in cycle.calls if row[0] == "guidance")
+        assert "--guidance-config" in args and "--no-hourly-probe" in args
+    repeated = FakeCycle(config, clock, location_id="grasston")
+    assert repeated.execute()["repeat"] == "completed_day_reused"
+    assert repeated.calls == []
+
+
+def test_legacy_same_day_receipt_stops_before_repeating_paid_work(tmp_path: Path) -> None:
+    cycle = FakeCycle(configuration(tmp_path), Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC)))
+    legacy = cycle.state_root / cycle.day.isoformat() / "result.json"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(json.dumps({"status": "completed"}))
+    with pytest.raises(daily.DailyError, match="legacy_daily_receipt_requires_inspection"):
+        cycle.execute()
+    assert cycle.calls == []
     for _, _, _, args in cycle.calls:
         if "--config" in args:
             assert args[args.index("--config") + 1] == "/run/mesoforge/locations.json"

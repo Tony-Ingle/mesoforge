@@ -73,11 +73,13 @@
   baseline and calls `forecast_from_baseline`, never refreshing guidance. Keep their
   decisions on existing contracts, with no provider logic or science of their own.
   Workers never migrate schema or change governance; `operations migrate` is the one
-  explicit schema step. Automatic policy promotion and recurring delivery remain future work.
+  explicit schema step. Automatic policy promotion remains future work. Recurring delivery
+  is implemented but owner-gated and currently disabled.
   Schedulers decide WHEN; MesoForge owns meteorology. Do not put forecast science in
   scheduler, Compose or GHA YAML.
-- Daily v1 orchestration is one Minneapolis Guidance `once`, then a pinned forecast,
-  then saved PDF/email. Keep the GHA opt-in disabled without owner authorization;
+- Daily v1 has independent Minneapolis/Grasston workflows sharing prepared Guidance
+  and the host/runtime lock, with location-scoped receipts, baselines and PDF/email.
+  Keep each GHA opt-in disabled without owner authorization;
   do not install a competing timer. Shared runtime locks, fresh-baseline handoff and
   local-day receipts must prevent overlap or repeat paid work. Disk warnings never
   authorize deletion of unresolved scientific dependencies or runner state.

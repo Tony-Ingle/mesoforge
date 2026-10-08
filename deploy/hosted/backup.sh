@@ -26,8 +26,12 @@ cd "$here"
 # Background + wait is deliberate: POSIX shells handle TERM immediately while
 # waiting, instead of postponing the trap until a large foreground copy finishes.
 run_owned() {
-    "$@" <&0 &
+    # dash gives asynchronous commands /dev/null on stdin before redirections.
+    # Preserve the caller's redirected dump on a separate descriptor first.
+    exec 3<&0
+    "$@" <&3 3<&- &
     active_pid=$!
+    exec 3<&-
     result=0
     wait "$active_pid" || result=$?
     active_pid=

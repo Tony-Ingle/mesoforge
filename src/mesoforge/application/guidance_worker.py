@@ -118,6 +118,8 @@ class WorkerSettings:
     # False refreshes only for coverage, footprint and pre-slot reasons (less bandwidth).
     hourly_probe: bool = True
     schedule: ForecastSchedule = field(default_factory=ForecastSchedule)
+    # Shared preparation footprint; the baseline still uses only ``config``.
+    guidance_config: Path | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.forecast_horizon, ForecastHorizon):
@@ -155,6 +157,9 @@ class WorkerSettings:
     def public(self) -> dict[str, Any]:
         values = asdict(self)
         values["root"], values["config"] = str(self.root), str(self.config)
+        values["guidance_config"] = (
+            str(self.guidance_config) if self.guidance_config is not None else None
+        )
         values["schedule"] = asdict(self.schedule)
         values["forecast_horizon"] = self.forecast_horizon.payload()
         return values
@@ -528,6 +533,25 @@ class GuidanceWorker:
         self._clear_probes()
         locations, invalid = _valid_locations(self.settings.config)
         outcome["locations"] = {"valid": len(locations), "invalid": invalid}
+        guidance_locations = locations
+        if self.settings.guidance_config is not None:
+            try:
+                guidance_locations, guidance_invalid = _valid_locations(
+                    self.settings.guidance_config
+                )
+                if guidance_invalid or not guidance_locations:
+                    raise ValueError("Shared Guidance configuration requires valid locations")
+                if not {_coordinates(row) for row in locations} <= {
+                    _coordinates(row) for row in guidance_locations
+                }:
+                    raise ValueError(
+                        "Shared Guidance configuration must include baseline locations"
+                    )
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                categories.append("invalid_configuration")
+                outcome["guidance_locations"] = {"status": "invalid", "error": _error(exc)}
+                return
+            outcome["guidance_locations"] = {"status": "valid", "count": len(guidance_locations)}
         database = True
         with self.phase("schema"):
             try:
@@ -551,7 +575,7 @@ class GuidanceWorker:
         self.state["disk"] = self.settings.disk_policy.report(free)
         if self.state["disk"]["status"] == "warning":
             self.log("disk_warning", **self.state["disk"])
-        outcome["refresh"] = self._refresh_step(locations, free, categories)
+        outcome["refresh"] = self._refresh_step(guidance_locations, free, categories)
         if self._stopping(outcome):
             return
         governance, snapshot = None, None
@@ -1333,6 +1357,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("command", choices=("run", "once", "status", "health", "discover"))
     parser.add_argument("--root", type=Path, default=_default_root())
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument(
+        "--guidance-config",
+        type=Path,
+        help="Shared preparation location collection; --config selects baseline domains only",
+    )
     parser.add_argument("--interval-seconds", type=int, default=300)
     parser.add_argument(
         "--forecast-horizon-hours",
@@ -1394,6 +1423,7 @@ def main(argv: list[str] | None = None) -> int:
         settings = WorkerSettings(
             root=args.root,
             config=args.config,
+            guidance_config=args.guidance_config,
             interval_seconds=args.interval_seconds,
             forecast_horizon=ForecastHorizon(args.forecast_horizon_hours),
             refresh=args.refresh,

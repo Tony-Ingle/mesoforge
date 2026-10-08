@@ -1,0 +1,75 @@
+name: MesoForge daily Minneapolis outlook
+
+# This workflow is deliberately dormant until the owner enables the repository
+# variable MESOFORGE_DAILY_MINNEAPOLIS_ENABLED=true after deployment/backup prerequisites.
+# GitHub evaluates scheduled workflows on the default branch, not this feature branch.
+"on":
+  schedule:
+    - cron: "5 6 * * *"
+      timezone: America/Chicago
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "status is read-only; run attempts today's bounded daily pipeline"
+        required: true
+        default: status
+        type: choice
+        options: [status, run]
+
+permissions:
+  contents: read
+
+# Both location workflows share this group; the host's persistent lock also
+# protects manual invocations and restarts. Receipts remain location-specific.
+# Never cancel a running forecast to start another paid forecast.
+concurrency:
+  group: mesoforge-daily-host
+  cancel-in-progress: false
+
+jobs:
+  daily:
+    if: >-
+      github.repository == 'Tony-Ingle/mesoforge' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      ((github.event_name == 'workflow_dispatch' && inputs.operation == 'status') ||
+      vars.MESOFORGE_DAILY_MINNEAPOLIS_ENABLED == 'true')
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 240
+    steps:
+      - name: Require the existing MesoForge runner
+        env:
+          ACTUAL_RUNNER: ${{ runner.name }}
+        shell: bash
+        run: |
+          if [ "$ACTUAL_RUNNER" != "vps" ]; then
+            echo "::error::This workflow requires the existing MesoForge vps runner."
+            exit 1
+          fi
+
+      - name: Read the approved default-branch code
+        id: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          clean: false
+
+      - name: Run the serial daily pipeline or inspect status
+        env:
+          OPERATION: ${{ github.event_name == 'workflow_dispatch' && inputs.operation || 'run' }}
+        shell: bash
+        run: |
+          case "$OPERATION" in
+            run|status) ;;
+            *) echo "::error::Unsupported operation"; exit 1 ;;
+          esac
+          python3 deploy/hosted/daily_cycle.py --config /etc/mesoforge/daily.json --location minneapolis "$OPERATION"
+
+      - name: Publish daily status even after phase failure
+        if: ${{ always() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          {
+            printf '## MesoForge Minneapolis daily status\n\n```json\n'
+            python3 deploy/hosted/daily_cycle.py --config /etc/mesoforge/daily.json --location minneapolis status
+            printf '\n```\n'
+          } >> "$GITHUB_STEP_SUMMARY"
