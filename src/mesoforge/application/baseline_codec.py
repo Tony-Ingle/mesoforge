@@ -10,11 +10,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterator
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 from mesoforge.common.identifiers import Digest
+from mesoforge.contracts.serialization import (
+    canonical_json_bytes,
+    canonical_json_chunks,
+    canonical_json_scalar,
+)
 
 _MINIMUM_BYTES = 256
 _REFERENCE_KEYS = frozenset({"$metadata", "$source"})
@@ -69,6 +75,11 @@ def _bytes(value: Any) -> bytes:
     return json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
     ).encode()
+
+
+def _canonical_key_order(item: tuple[str, Any]) -> bytes:
+    # The pinned JCS encoder orders object members by UTF-16 code units.
+    return item[0].encode("utf-16_be")
 
 
 def _pointer(value: Any, pointer: str) -> Any:
@@ -149,47 +160,132 @@ class CompactCodec:
         """Factor repeated metadata without altering values, intervals or policies."""
         if not isinstance(grid, dict):
             raise ValueError("Baseline grid must be a JSON object")
-
-        def visit(value: Any, key: str = "") -> Any:
-            if not isinstance(value, (dict, list)):
-                return value
-            if isinstance(value, dict) and _REFERENCE_KEYS.intersection(value):
-                raise ValueError("Unencoded baseline grid contains reserved reference keys")
-            factor = key in _METADATA_KEYS
-            if factor:
-                raw = _bytes(value)
-                factor = len(raw) >= _MINIMUM_BYTES
-                source = self._source_index.get(hashlib.sha256(raw).hexdigest()) if factor else None
-                if source is not None:
-                    self._source_references += 1
-                    return {"$source": list(source)}
-            encoded = (
-                {child_key: visit(child, child_key) for child_key, child in value.items()}
-                if isinstance(value, dict)
-                else [visit(child, key) for child in value]
-            )
-            if factor:
-                digest = hashlib.sha256(_bytes(encoded)).hexdigest()
-                if digest not in self._metadata_index:
-                    self._metadata_index[digest] = len(self._metadata)
-                    self._metadata.append(encoded)
-                self._metadata_references += 1
-                return {"$metadata": self._metadata_index[digest]}
-            return encoded
-
-        result: dict[str, Any] = visit(grid)
+        result: dict[str, Any] = self._visit(grid, "")
         return result
 
-    def export_tables(self) -> dict[str, Any]:
-        """Save once after encoding every reference view in this baseline."""
+    def _visit(self, value: Any, key: str) -> Any:
+        """Factor one value under its parent ``key``; the unchanged ``encode`` rule."""
+        if not isinstance(value, (dict, list)):
+            return value
+        if isinstance(value, dict) and _REFERENCE_KEYS.intersection(value):
+            raise ValueError("Unencoded baseline grid contains reserved reference keys")
+        factor = key in _METADATA_KEYS
+        if factor:
+            raw = _bytes(value)
+            factor = len(raw) >= _MINIMUM_BYTES
+            source = self._source_index.get(hashlib.sha256(raw).hexdigest()) if factor else None
+            if source is not None:
+                self._source_references += 1
+                return {"$source": list(source)}
+        encoded = (
+            {child_key: self._visit(child, child_key) for child_key, child in value.items()}
+            if isinstance(value, dict)
+            else [self._visit(child, key) for child in value]
+        )
+        if factor:
+            digest = hashlib.sha256(_bytes(encoded)).hexdigest()
+            if digest not in self._metadata_index:
+                self._metadata_index[digest] = len(self._metadata)
+                self._metadata.append(encoded)
+            self._metadata_references += 1
+            return {"$metadata": self._metadata_index[digest]}
+        return encoded
+
+    def encode_canonical(self, value: dict[str, Any]) -> Iterator[str]:
+        """Stream the canonical text of ``encode(normalized)`` from a live object graph.
+
+        ``normalized`` means ``json.loads(canonical_json_bytes(value))``: members in
+        canonical order, integral floats read back as ints, tuples as lists. A saved
+        120-hour issuance cannot afford that complete copy, its canonical text and a
+        third encoded graph at once. Here every metadata-keyed subtree is normalized
+        on its own and factored through the unchanged ``encode`` rule, while the
+        remaining structure is written in canonical order directly from the caller's
+        objects, whose scalars serialize identically either way. A metadata object
+        shared by many cells/hours (one decoded block) is factored once. The result
+        text equals ``canonical_json_bytes(encode(normalized))``; the caller's values
+        are never modified and the metadata table grows exactly as with ``encode``.
+        """
+        if not isinstance(value, dict):
+            raise ValueError("Baseline grid must be a JSON object")
+        memo: dict[int, tuple[Any, Any]] = {}
+        return self._stream(value, "", memo)
+
+    def _stream(self, value: Any, key: str, memo: dict[int, tuple[Any, Any]]) -> Iterator[str]:
+        if isinstance(value, dict):
+            if key in _METADATA_KEYS:
+                yield from canonical_json_chunks(self._factor_live(value, key, memo))
+                return
+            if _REFERENCE_KEYS.intersection(value):
+                raise ValueError("Unencoded baseline grid contains reserved reference keys")
+            if not value:
+                yield "{}"
+                return
+            if any(not isinstance(child_key, str) for child_key in value):
+                raise TypeError("Canonical baseline encoding requires string keys")
+            separator = "{"
+            for child_key, child in sorted(value.items(), key=_canonical_key_order):
+                yield f"{separator}{canonical_json_scalar(child_key)}:"
+                separator = ","
+                yield from self._stream(child, child_key, memo)
+            yield "}"
+        elif isinstance(value, (list, tuple)):
+            if key in _METADATA_KEYS:
+                yield from canonical_json_chunks(self._factor_live(value, key, memo))
+                return
+            if not value:
+                yield "[]"
+                return
+            separator = "["
+            for child in value:
+                yield separator
+                separator = ","
+                yield from self._stream(child, key, memo)
+            yield "]"
+        else:
+            yield canonical_json_scalar(value)
+
+    def _factor_live(self, value: Any, key: str, memo: dict[int, tuple[Any, Any]]) -> Any:
+        """Normalize one live metadata-keyed container and factor it exactly once.
+
+        The memo keeps each live object referenced, so its identity stays unique for
+        the whole stream; only caller-owned objects are memoized, never the transient
+        normalized copies.
+        """
+        cached = memo.get(id(value))
+        if cached is not None and cached[0] is value:
+            encoded = cached[1]
+            if isinstance(encoded, dict) and "$metadata" in encoded:
+                self._metadata_references += 1
+            elif isinstance(encoded, dict) and "$source" in encoded:
+                self._source_references += 1
+            return encoded
+        if isinstance(value, dict) and _REFERENCE_KEYS.intersection(value):
+            raise ValueError("Unencoded baseline grid contains reserved reference keys")
+        normalized = json.loads(canonical_json_bytes(value))
+        encoded = self._visit(normalized, key)
+        memo[id(value)] = (value, encoded)
+        return encoded
+
+    def export_tables(self, *, copy: bool = True) -> dict[str, Any]:
+        """Save once after encoding every reference view in this baseline.
+
+        ``copy=False`` exposes the live tables to a caller that owns this codec and
+        only serializes them immediately; it must neither mutate nor retain them.
+        """
+        if not copy:
+            return {"source_documents": self._descriptors, "metadata": self._metadata}
         return {
             "source_documents": deepcopy(self._descriptors),
             "metadata": deepcopy(self._metadata),
         }
 
     @classmethod
-    def from_tables(cls, tables: dict[str, Any]) -> CompactCodec:
-        """Verify retained source documents without rebuilding the encoding index."""
+    def from_tables(cls, tables: dict[str, Any], *, consume: bool = False) -> CompactCodec:
+        """Verify retained sources without rebuilding the encoding index.
+
+        ``consume=True`` transfers freshly loaded tables to this codec. The caller
+        must relinquish them; the default keeps independent public ownership.
+        """
         if (
             not isinstance(tables, dict)
             or set(tables) != {"source_documents", "metadata"}
@@ -198,17 +294,26 @@ class CompactCodec:
             raise ValueError("Invalid baseline metadata tables")
         codec = cls.__new__(cls)
         codec._initialize(tables["source_documents"])
-        codec._metadata = deepcopy(tables["metadata"])
+        codec._metadata = tables["metadata"] if consume else deepcopy(tables["metadata"])
         return codec
 
-    def decode(self, encoded: dict[str, Any]) -> dict[str, Any]:
-        """Reconstruct an independently owned grid; never calculate a forecast."""
+    def decode(self, encoded: dict[str, Any], *, consume: bool = False) -> dict[str, Any]:
+        """Reconstruct an owned grid; never calculate a forecast.
+
+        ``consume=True`` transfers a freshly loaded encoded grid, resolving its
+        containers in place instead of holding two full numerical grids at once.
+        Retained metadata/source tables are always isolated from the result.
+        """
         cache: dict[int, Any] = {}
         resolving: set[int] = set()
         source_memo: dict[int, Any] = {}
 
-        def visit(value: Any) -> Any:
+        def visit(value: Any, *, owned: bool = False) -> Any:
             if isinstance(value, list):
+                if owned:
+                    for index, child in enumerate(value):
+                        value[index] = visit(child, owned=True)
+                    return value
                 return [visit(child) for child in value]
             if not isinstance(value, dict):
                 return value
@@ -245,11 +350,15 @@ class CompactCodec:
                     cache[index] = visit(self._metadata[index])
                     resolving.remove(index)
                 return cache[index]
+            if owned:
+                for key, child in value.items():
+                    value[key] = visit(child, owned=True)
+                return value
             return {key: visit(child) for key, child in value.items()}
 
         if not isinstance(encoded, dict):
             raise ValueError("Compact baseline grid must be a JSON object")
-        result = visit(encoded)
+        result = visit(encoded, owned=consume)
         if not isinstance(result, dict):
             raise ValueError("Decoded baseline grid must be a JSON object")
         # All other dicts/lists, including cached metadata, were constructed by

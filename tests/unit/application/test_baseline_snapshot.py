@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import multiprocessing
@@ -34,6 +35,31 @@ from tests.unit.application.test_snapshot_issuance import REQUEST, fixture_forec
 
 LOCATIONS = [FIRST, LAST]
 REFERENCES = [TARGET, TARGET + timedelta(hours=1)]
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+def test_artifact_stream_read_preserves_content_and_checks_digest_before_parsing(
+    tmp_path, monkeypatch, compressed
+):
+    value = {"positive": 0.125, "zero": 0.0, "missing": None, "text": "MesoForge °F"}
+    raw = canonical_json_bytes(value)
+    payload = gzip.compress(raw, mtime=0) if compressed else raw
+    path = tmp_path / "artifact.json.gz"
+    path.write_bytes(payload)
+    descriptor = {
+        "file": path.name,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "encoding": "json+gzip" if compressed else "json",
+    }
+    forbidden = Mock(side_effect=AssertionError("Do not hold complete compressed/expanded bytes"))
+    monkeypatch.setattr(Path, "read_bytes", forbidden)
+    monkeypatch.setattr(gzip, "decompress", forbidden)
+    assert baselines.read_artifact(tmp_path, descriptor) == value
+    parser = Mock(side_effect=AssertionError("Digest mismatch must fail before JSON parsing"))
+    monkeypatch.setattr(baselines.json, "load", parser)
+    with pytest.raises(prepared.SnapshotError, match="digest differs"):
+        baselines.read_artifact(tmp_path, {**descriptor, "sha256": "0" * 64})
+    parser.assert_not_called()
 
 
 @pytest.fixture(scope="module")

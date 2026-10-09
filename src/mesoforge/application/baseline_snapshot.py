@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import io
 import json
 import os
 from dataclasses import dataclass
@@ -52,12 +53,18 @@ def _artifact_path(directory: Path, descriptor: dict[str, Any]) -> Path:
 
 def read_artifact(directory: Path, descriptor: dict[str, Any]) -> Any:
     path = _artifact_path(directory, descriptor)
-    payload = path.read_bytes()
-    if hashlib.sha256(payload).hexdigest() != descriptor["sha256"]:
-        raise SnapshotError(f"Baseline artifact digest differs: {path.name}")
-    if descriptor.get("encoding") == "json+gzip":
-        payload = gzip.decompress(payload)
-    return json.loads(payload)
+    # Hash and parse the same open artifact without retaining both compressed and
+    # expanded byte strings beside the decoded JSON text and object graph.
+    with path.open("rb") as stream:
+        if hashlib.file_digest(stream, "sha256").hexdigest() != descriptor["sha256"]:
+            raise SnapshotError(f"Baseline artifact digest differs: {path.name}")
+        stream.seek(0)
+        if descriptor.get("encoding") == "json+gzip":
+            with gzip.GzipFile(fileobj=stream, mode="rb") as compressed:
+                with io.TextIOWrapper(compressed, encoding="utf-8") as text:
+                    return json.load(text)
+        with io.TextIOWrapper(stream, encoding="utf-8") as text:
+            return json.load(text)
 
 
 def write_artifact(directory: Path, filename: str, value: Any) -> dict[str, Any]:
@@ -226,7 +233,7 @@ class BaselineView:
                 "add it to the background build configuration"
             )
         encoded = read_artifact(self.pinned.directory, domain["artifact"])
-        grid = self.pinned.codec.decode(encoded)
+        grid = self.pinned.codec.decode(encoded, consume=True)
         if grid["geometry"] != domain["geometry"]:
             raise SnapshotError("Restored baseline geometry differs from declared coverage")
         if horizon_for(grid) != horizon_for(self.pinned.manifest):
@@ -264,7 +271,9 @@ def load_baseline(root: Path, *, pointer: dict[str, Any] | None = None) -> Pinne
     if problems or manifest["information_cutoff"]["status"] != "proven":
         raise SnapshotError("Baseline source information has unresolved cutoff limitations")
     tables = read_artifact(directory, manifest["metadata_file"])
-    return PinnedBaseline(pointer, manifest, directory, CompactCodec.from_tables(tables))
+    return PinnedBaseline(
+        pointer, manifest, directory, CompactCodec.from_tables(tables, consume=True)
+    )
 
 
 def current_manifest(root: Path) -> dict[str, Any] | None:

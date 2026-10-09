@@ -258,3 +258,87 @@ def test_unknown_issued_forecast_is_explicitly_missing(memory_service) -> None:
     service, _, _ = memory_service
     with pytest.raises(NotFound):
         service.read(uuid4())
+
+
+def _reference_encoding(saved: dict[str, Any]) -> tuple[bytes, Digest]:
+    """The original whole-document algorithm: canonicalize, re-parse, encode, compress."""
+    from mesoforge.application.baseline_codec import CompactCodec
+    from mesoforge.application.issuance_encoding import ENCODING
+
+    logical = canonical_json_bytes(saved)
+    codec = CompactCodec([])
+    payload = codec.encode(json.loads(logical))
+    envelope = {
+        "schema": ENCODING,
+        "forecast_payload_digest": str(Digest.of_bytes(logical)),
+        "payload": payload,
+        "tables": codec.export_tables(),
+    }
+    return gzip.compress(canonical_json_bytes(envelope), mtime=0), Digest.of_bytes(logical)
+
+
+def _reversed_members(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _reversed_members(value[key]) for key in reversed(list(value))}
+    if isinstance(value, list):
+        return [_reversed_members(item) for item in value]
+    return value
+
+
+def test_compact_issuance_bytes_equal_the_whole_document_reference_encoding() -> None:
+    from tests.unit.presentation.test_forecast_product import rolling_saved
+
+    saved = rolling_saved()
+    expected = _reference_encoding(saved)
+    assert encode_issuance(saved) == expected
+    # Insertion order and integral-float readback (1.0 as 1) cannot change the bytes.
+    readback = _reversed_members(json.loads(canonical_json_bytes(saved)))
+    assert readback == saved and list(readback) != list(saved)
+    assert encode_issuance(readback) == expected
+
+
+def test_compact_issuance_streams_without_whole_document_buffers(monkeypatch) -> None:
+    import tracemalloc
+
+    import jcs
+
+    from mesoforge.application.baseline_codec import CompactCodec
+    from mesoforge.contracts import serialization
+    from tests.unit.presentation.test_forecast_product import rolling_saved
+
+    saved = rolling_saved()
+    assert len(canonical_json_bytes(saved)) > 1_000_000
+    if tracemalloc.is_tracing():
+        pytest.skip("An outer memory profiler owns tracemalloc; do not reset its state")
+    tracemalloc.start()
+    try:
+        expected = _reference_encoding(saved)
+        _, reference_peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    canonicalize = jcs.canonicalize
+
+    def bounded(value: Any, utf8: bool = True) -> Any:
+        result = canonicalize(value, utf8)
+        assert len(result) < 65536, "Only one metadata subtree may be canonicalized at a time"
+        return result
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("Issuance storage must stream, never buffer the whole document")
+
+    monkeypatch.setattr(jcs, "canonicalize", bounded)
+    monkeypatch.setattr(serialization, "parse_canonical_json", forbidden)
+    monkeypatch.setattr(CompactCodec, "encode", forbidden)
+    monkeypatch.setattr(gzip, "compress", forbidden)
+    monkeypatch.setattr(gzip, "decompress", forbidden)
+    tracemalloc.start()
+    try:
+        payload, digest = encode_issuance(saved)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert (payload, digest) == expected
+    # The whole-document algorithm held the canonical text, its re-parsed copy and a
+    # third encoded graph at once; streaming must need well under half of that.
+    assert 2 * peak < reference_peak, (peak, reference_peak)
+    assert decode_issuance(payload, expected_logical_digest=digest) == saved
