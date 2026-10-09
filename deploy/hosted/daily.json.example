@@ -11,6 +11,6 @@
   "forecast_time": "07:15",
   "forecast_min_remaining_minutes": 40,
   "delivery_time": "08:00",
-  "retention_cycles": {"hrrr": 4, "rap": 4, "gfs": 3, "ifs": 3, "nbm": 4, "gefs": 3, "ecmwf-ens": 3},
+  "retention_cycles": {"hrrr": 1, "rap": 1, "gfs": 1, "ifs": 1, "nbm": 1, "gefs": 1, "ecmwf-ens": 1},
   "approved_template": "mesoforge-120-hour-presentation.v1"
 }

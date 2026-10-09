@@ -1159,6 +1159,7 @@ and acquired GEFS/ECMWF ensemble generations three. Configure `retention_cycles`
 `daily.json`, or `--keep-hrrr`, `--keep-rap`, `--keep-gfs`, `--keep-ifs`, `--keep-nbm`,
 `--keep-gefs`, `--keep-ecmwf-ens` on the operator command. These are storage settings,
 not weights. Whole bundles stay protected if any contributor is inside its window.
+The shipped `daily.json.example` configures one recent cycle per model for the v1 host.
 
 `--status` and `--dry-run` show KEEP/DELETE/PINNED/CURRENT/RECOVERY/IN-FLIGHT/UNRESOLVED
 with reasons, bytes and exact candidate digests. `--apply --backup-receipt RECEIPT`
@@ -1196,9 +1197,13 @@ local filesystem, not capacity reserved on an external database/object service.
 The daily pipeline calls [backup.sh](deploy/hosted/backup.sh) after delivery attempts.
 It uses the existing `pg_dump -Fc`/`pg_restore --list`, checksummed object export and
 complete runtime archive; retains daily receipts and non-secret deployment metadata;
-and holds the shared worker lock across creation and validation. The
-preflight estimates the complete recovery copy without assuming compression savings;
-it refuses work if that copy would cross the central disk reserve. Interrupted copies
+and holds the shared worker lock across creation and validation. Daily preflight
+requires only the central disk reserve and records the latest verified backup as the
+recovery checkpoint; it does not require room for a replacement copy. After delivery
+the backup step estimates the complete recovery copy without assuming compression
+savings and, if that copy would cross the reserve, records `backup_skipped_low_space`,
+keeps the previous verified backup and skips retention without failing the issued
+forecast or its delivery evidence. Interrupted copies
 stop only their own named client/export containers, never PostgreSQL or MinIO. The
 [`local_backup`](src/mesoforge/application/local_backup.py) validator rereads archive
 bytes, verifies every exported object and proves planned deletion bytes exist in the

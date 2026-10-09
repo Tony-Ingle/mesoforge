@@ -526,8 +526,7 @@ class DailyCycle:
             raise DailyError("email_not_accepted; issuance_preserved; inspect_delivery_audit")
         return result
 
-    def preflight(self) -> dict[str, Any]:
-        """Verify local recovery storage before acquisition or paid forecast work."""
+    def _backup_root(self) -> Path:
         root = Path(self.config["backup_root"])
         # Host orchestration supports Debian's Python 3.11; junction inspection
         # exists only on 3.12+. Linux symlinks remain explicitly rejected.
@@ -538,9 +537,54 @@ class DailyCycle:
             raise DailyError("backup_root_must_not_follow_links")
         root.mkdir(parents=True, exist_ok=True)
         root.chmod(0o700)
+        return root
+
+    def latest_verified_backup(self) -> dict[str, Any] | None:
+        """The newest verified same-host backup, read only; it is never touched here."""
+        root = Path(self.config["backup_root"])
+        latest: dict[str, Any] | None = None
+        for path in sorted(root.glob("*/local-backup-receipt.json")) if root.is_dir() else []:
+            receipt = read_json(path)
+            if not isinstance(receipt, dict) or receipt.get("status") != "verified":
+                continue
+            verified_at = parse_instant(receipt.get("verified_at"))
+            if verified_at is None or (latest is not None and verified_at <= latest["_at"]):
+                continue
+            latest = {
+                "host_directory": str(path.parent),
+                "backup_id": receipt.get("backup_id"),
+                "verified_at": receipt.get("verified_at"),
+                "bytes": receipt.get("bytes"),
+                "_at": verified_at,
+            }
+        if latest is not None:
+            del latest["_at"]
+        return latest
+
+    def preflight(self) -> dict[str, Any]:
+        """Verify local recovery storage before acquisition or paid forecast work.
+
+        The storage reserve is the only capacity gate for heavy work. A replacement
+        full backup is not sized here: it is attempted after a successful day when
+        space allows, and the latest verified same-host backup stays the recovery
+        checkpoint until then.
+        """
+        root = self._backup_root()
         report = DiskPolicy.from_environment().report(self.disk_free(root))
         if not report["heavy_work_admitted"]:
             raise DailyError("backup_disk_reserve_reached")
+        return {
+            "recovery": "same_host",
+            "off_host": False,
+            "disk": report,
+            "recovery_checkpoint": self.latest_verified_backup(),
+            "replacement_backup": "after_delivery_if_space_allows",
+        }
+
+    def backup_capacity(self) -> dict[str, Any]:
+        """Whether a replacement full backup fits now without crossing the reserve."""
+        root = self._backup_root()
+        report = DiskPolicy.from_environment().report(self.disk_free(root))
         estimate = self.command(
             "backup-estimate",
             "guidance-worker",
@@ -550,13 +594,30 @@ class DailyCycle:
         required = estimate.get("backup_bytes")
         if estimate.get("status") != "estimated" or type(required) is not int or required < 0:
             raise DailyError("backup_size_unproven")
-        if self.disk_free(root) - required < report["min_free_bytes"]:
-            raise DailyError("backup_would_cross_disk_reserve; no_new_heavy_work")
-        return {"recovery": "same_host", "off_host": False, "disk": report, "estimate": estimate}
+        free = self.disk_free(root)
+        fits = bool(report["heavy_work_admitted"]) and free - required >= report["min_free_bytes"]
+        return {
+            "fits": fits,
+            "disk": report,
+            "estimate": estimate,
+            "free_bytes": free,
+            "required_bytes": required,
+        }
 
     def backup(self) -> dict[str, Any]:
-        """Use the committed full recovery procedure, then validate every saved byte."""
-        self.preflight()
+        """Use the committed full recovery procedure, then validate every saved byte.
+
+        Without room for a replacement above the reserve, the backup is skipped and
+        the previous verified backup remains the recovery checkpoint; the issued
+        forecast and its delivery evidence are not invalidated by that.
+        """
+        capacity = self.backup_capacity()
+        if not capacity["fits"]:
+            return {
+                "status": "backup_skipped_low_space",
+                **capacity,
+                "retained_backup": self.latest_verified_backup(),
+            }
         self.no_heavy_worker()
         fingerprint = self.record["maintenance"]["fingerprint"]
         plan = self.command(
@@ -774,15 +835,23 @@ class DailyCycle:
         fingerprint = hashlib.sha256(json.dumps(outcomes, sort_keys=True).encode()).hexdigest()
         self.record["maintenance"] = {"fingerprint": fingerprint}
 
-        def verified_backup() -> dict[str, Any]:
+        def verified_or_skipped_backup() -> dict[str, Any]:
             result = self.backup()
-            if result.get("status") != "verified":
+            if result.get("status") not in {"verified", "backup_skipped_low_space"}:
                 raise DailyError("backup_not_verified; retention_skipped")
             return result
 
-        backup = self.phase(f"backup-{fingerprint}", verified_backup)
+        backup = self.phase(f"backup-{fingerprint}", verified_or_skipped_backup)
         self.record["maintenance"]["backup"] = backup
-        retention = self.phase(f"retention-{fingerprint}", partial(self.retention, backup))
+        if backup.get("status") == "verified":
+            retention = self.phase(f"retention-{fingerprint}", partial(self.retention, backup))
+        else:
+            # Cleanup needs a newly verified backup; the previous checkpoint stays as is.
+            retention = {
+                "status": "retention_skipped_no_new_verified_backup",
+                "backup_status": backup.get("status"),
+                "retained_backup": backup.get("retained_backup"),
+            }
         self.record["maintenance"]["retention"] = retention
         self.save()
 
