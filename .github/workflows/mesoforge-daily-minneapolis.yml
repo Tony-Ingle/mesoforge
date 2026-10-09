@@ -5,8 +5,7 @@ name: MesoForge daily Minneapolis outlook
 # GitHub evaluates scheduled workflows on the default branch, not this feature branch.
 "on":
   schedule:
-    - cron: "5 6 * * *"
-      timezone: America/Chicago
+    - cron: "15 12 * * *"
   workflow_dispatch:
     inputs:
       operation:

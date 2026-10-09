@@ -5,8 +5,7 @@ name: MesoForge daily Grasston outlook
 # GitHub evaluates scheduled workflows on the default branch, not this feature branch.
 "on":
   schedule:
-    - cron: "15 8 * * *"
-      timezone: America/Chicago
+    - cron: "15 11 * * *"
   workflow_dispatch:
     inputs:
       operation:
