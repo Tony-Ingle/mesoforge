@@ -266,9 +266,10 @@ def test_locations_have_independent_receipts_and_delivery_but_shared_runtime(
     assert result["status"] == "completed"
     assert result["location_id"] == "grasston"
     assert result["workflow_slot"] == "daily"
-    assert result["delivery"]["status"] == "no_recipients"
+    # Grasston now has one configured recipient, so its own delivery runs and completes.
+    assert result["delivery"] == {"status": "completed", "recipient_count": 1, "errors": {}}
     assert "forecast" in [call[0] for call in grasston.calls]
-    assert not any(call[0].startswith("email-") for call in grasston.calls)
+    assert [call[0] for call in grasston.calls if call[0].startswith("email-")] == ["email-0"]
     assert grasston.receipt != minneapolis.receipt
     assert grasston.state_root == minneapolis.state_root
     assert grasston.runtime == minneapolis.runtime
@@ -804,8 +805,35 @@ def test_bad_retention_configuration_fails_before_work(tmp_path: Path, counts: o
         daily.load_config(path)
 
 
+def write_verified_backup(root: Path, backup_id: str, verified_at: str) -> Path:
+    """A prior same-host recovery checkpoint exactly as the validator records it."""
+    directory = root / f"mesoforge-{backup_id}"
+    directory.mkdir(parents=True)
+    receipt = directory / "local-backup-receipt.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "status": "verified",
+                "backup_id": backup_id,
+                "verified_at": verified_at,
+                "bytes": 10_730_044_884,
+                "runtime_coverage": "complete_retained_runtime",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return receipt
+
+
+class ActualBackupCycle(FakeCycle):
+    """Offline boundaries, but the real preflight, backup and maintenance decisions."""
+
+    preflight = daily.DailyCycle.preflight
+    backup = daily.DailyCycle.backup
+
+
 @pytest.mark.parametrize("legacy_host_python", [False, True])
-def test_actual_backup_preflight_uses_local_storage_reserve(
+def test_actual_backup_preflight_uses_local_storage_reserve_without_sizing_a_new_backup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_host_python: bool
 ) -> None:
     if legacy_host_python:
@@ -814,31 +842,138 @@ def test_actual_backup_preflight_uses_local_storage_reserve(
     cycle = daily.DailyCycle(
         config,
         clock=Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC)),
-        disk_free=lambda _: 40 * 1024**3,
+        disk_free=lambda _: 28 * 1024**3,
     )
-    calls: list[tuple[str, str, str, list[str]]] = []
-
-    def estimate(phase: str, role: str, module: str, args: list[str]) -> dict[str, Any]:
-        calls.append((phase, role, module, args))
-        return {"status": "estimated", "backup_bytes": 5 * 1024**3}
-
-    monkeypatch.setattr(cycle, "command", estimate)
+    monkeypatch.setattr(
+        cycle, "command", lambda *_: pytest.fail("Preflight must not run any container work")
+    )
     assert not Path(config["backup_root"]).exists()
     result = cycle.preflight()
     assert result["recovery"] == "same_host" and result["off_host"] is False
-    assert result["estimate"]["backup_bytes"] == 5 * 1024**3
-    assert calls == [
-        (
-            "backup-estimate",
-            "guidance-worker",
-            "mesoforge.application.local_backup",
-            ["estimate", "--runtime-root", "/var/lib/mesoforge/runtime"],
-        )
-    ]
+    assert result["disk"]["heavy_work_admitted"] is True
+    assert result["recovery_checkpoint"] is None
+    assert result["replacement_backup"] == "after_delivery_if_space_allows"
+    assert "estimate" not in result
     assert Path(config["backup_root"]).is_dir()
+    write_verified_backup(Path(config["backup_root"]), "older", "2026-07-13T22:00:00Z")
+    write_verified_backup(Path(config["backup_root"]), "newest", "2026-07-14T22:00:00Z")
+    unverified = Path(config["backup_root"]) / "mesoforge-incomplete"
+    unverified.mkdir()
+    (unverified / "local-backup-receipt.json").write_text('{"status": "failed"}', "utf-8")
+    assert cycle.preflight()["recovery_checkpoint"] == {
+        "host_directory": str(Path(config["backup_root"]) / "mesoforge-newest"),
+        "backup_id": "newest",
+        "verified_at": "2026-07-14T22:00:00Z",
+        "bytes": 10_730_044_884,
+    }
     cycle.disk_free = lambda _: 19 * 1024**3
     with pytest.raises(daily.DailyError, match="backup_disk_reserve"):
         cycle.preflight()
+
+
+def test_below_reserve_still_refuses_heavy_work_before_any_container(tmp_path: Path) -> None:
+    cycle = ActualBackupCycle(
+        configuration(tmp_path), Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC)), free=19 * 1024**3
+    )
+    with pytest.raises(daily.DailyError, match="backup_disk_reserve_reached"):
+        cycle.execute()
+    assert cycle.calls == []
+    assert cycle.record["phases"] == {}
+
+
+def test_forecast_admitted_above_reserve_even_when_replacement_backup_would_not_fit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = configuration(tmp_path)
+    receipt = write_verified_backup(Path(config["backup_root"]), "prior", "2026-07-14T22:00:00Z")
+    before = receipt.read_bytes()
+    cycle = ActualBackupCycle(
+        config, Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC)), free=28 * 1024**3
+    )
+    # 28 GiB free admits heavy work, but a 13.75 GB replacement copy would leave
+    # less than the 20 GiB reserve: exactly the deployed refusal before this change.
+    cycle.hook = lambda phase: (
+        {"status": "estimated", "backup_bytes": 13_751_885_422}
+        if phase == "backup-estimate"
+        else None
+    )
+    monkeypatch.setattr(
+        daily.subprocess, "Popen", lambda *_, **__: pytest.fail("No backup copy may start")
+    )
+    result = cycle.execute()
+    assert result["status"] == "completed"
+    phases = [row[0] for row in cycle.calls]
+    assert "forecast" in phases and phases.count("backup-estimate") == 1
+    assert phases[-1] == "backup-estimate"
+    assert not any(name in phases for name in ("retention-dry-run", "backup", "retention"))
+    assert cycle.record["preflight"]["recovery_checkpoint"]["backup_id"] == "prior"
+    assert cycle.record["phases"]["forecast"]["status"] == "completed"
+    assert cycle.record["phases"]["email-0"]["result"]["status"] == "accepted"
+    backup = cycle.record["maintenance"]["backup"]
+    assert backup["status"] == "backup_skipped_low_space"
+    assert backup["fits"] is False and backup["required_bytes"] == 13_751_885_422
+    assert backup["free_bytes"] == 28 * 1024**3
+    assert backup["retained_backup"]["backup_id"] == "prior"
+    assert cycle.record["maintenance"]["retention"] == {
+        "status": "retention_skipped_no_new_verified_backup",
+        "backup_status": "backup_skipped_low_space",
+        "retained_backup": backup["retained_backup"],
+    }
+    assert not any(name.startswith("retention-") for name in cycle.record["phases"])
+    assert receipt.read_bytes() == before
+    assert sorted(path.name for path in Path(config["backup_root"]).iterdir()) == [
+        "mesoforge-prior"
+    ]
+
+
+def test_replacement_backup_capacity_uses_the_unchanged_reserve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = configuration(tmp_path)
+    reserve = daily.DiskPolicy.from_environment().min_free_bytes
+    assert reserve == 20 * 1024**3
+    cycle = daily.DailyCycle(
+        config, clock=Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC)), disk_free=lambda _: 0
+    )
+    monkeypatch.setattr(
+        cycle, "command", lambda *_: {"status": "estimated", "backup_bytes": 5 * 1024**3}
+    )
+    for free, fits in (
+        (40 * 1024**3, True),
+        (reserve + 5 * 1024**3, True),
+        (reserve + 5 * 1024**3 - 1, False),
+        (19 * 1024**3, False),
+    ):
+        cycle.disk_free = lambda _, free=free: free
+        assert cycle.backup_capacity()["fits"] is fits, free
+
+
+def test_example_configuration_keeps_one_recent_cycle_per_model(tmp_path: Path) -> None:
+    example = json.loads((ROOT / "deploy/hosted/daily.json.example").read_text("utf-8"))
+    models = ("hrrr", "rap", "gfs", "ifs", "nbm", "gefs", "ecmwf-ens")
+    assert example["retention_cycles"] == dict.fromkeys(models, 1)
+    value = {**configuration(tmp_path), "retention_cycles": example["retention_cycles"]}
+    path = tmp_path / "daily-one-cycle.json"
+    path.write_text(json.dumps(value), encoding="utf-8")
+    cycle = daily.DailyCycle(
+        daily.load_config(path), clock=Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC))
+    )
+    assert cycle.retention_args() == [
+        "--keep-ecmwf-ens",
+        "1",
+        "--keep-gefs",
+        "1",
+        "--keep-gfs",
+        "1",
+        "--keep-hrrr",
+        "1",
+        "--keep-ifs",
+        "1",
+        "--keep-nbm",
+        "1",
+        "--keep-rap",
+        "1",
+    ]
 
 
 def test_actual_backup_preflight_refuses_links(
@@ -1193,27 +1328,22 @@ def test_analysis_headroom_configuration_is_explicit_and_bounded(
         daily.load_config(path)
 
 
-def test_projected_backup_overflow_stops_cycle_before_guidance_or_paid_forecast(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_projected_backup_overflow_never_blocks_guidance_or_the_paid_forecast(
+    tmp_path: Path,
 ) -> None:
-    cycle = daily.DailyCycle(
-        configuration(tmp_path),
-        clock=Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC)),
-        disk_free=lambda _: 40 * 1024**3,
+    cycle = ActualBackupCycle(
+        configuration(tmp_path), Clock(datetime(2026, 7, 15, 11, 5, tzinfo=UTC)), free=40 * 1024**3
     )
-    calls: list[str] = []
-
-    def command(phase: str, role: str, module: str, args: list[str]) -> dict[str, Any]:
-        calls.append(phase)
-        assert phase == "backup-estimate"
-        return {"status": "estimated", "backup_bytes": 21 * 1024**3}
-
-    monkeypatch.setattr(cycle, "command", command)
-    with pytest.raises(daily.DailyError, match="backup_would_cross_disk_reserve"):
-        cycle.execute()
-    assert calls == ["backup-estimate"]
-    assert cycle.record["phases"] == {}
-    assert cycle.record["status"] == "failed"
+    cycle.hook = lambda phase: (
+        {"status": "estimated", "backup_bytes": 21 * 1024**3}
+        if phase == "backup-estimate"
+        else None
+    )
+    assert cycle.execute()["status"] == "completed"
+    phases = [row[0] for row in cycle.calls]
+    assert phases.index("forecast") < phases.index("backup-estimate")
+    assert cycle.record["maintenance"]["backup"]["status"] == "backup_skipped_low_space"
+    assert cycle.record["maintenance"]["backup"]["retained_backup"] is None
 
 
 @pytest.mark.parametrize(
@@ -1235,8 +1365,11 @@ def test_unproven_backup_size_fails_closed(
         disk_free=lambda _: 40 * 1024**3,
     )
     monkeypatch.setattr(cycle, "command", lambda *_: estimate)
+    monkeypatch.setattr(
+        daily.subprocess, "Popen", lambda *_, **__: pytest.fail("No backup copy may start")
+    )
     with pytest.raises(daily.DailyError, match="backup_size_unproven"):
-        cycle.preflight()
+        cycle.backup()
 
 
 def test_heavy_role_admission_is_host_wide_without_touching_any_container(
