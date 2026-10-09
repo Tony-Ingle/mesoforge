@@ -25,24 +25,25 @@ def workflow(location: str) -> dict[str, Any]:
 
 
 @pytest.mark.parametrize(
-    ("location", "cron", "winter_hour", "summer_hour"),
-    [("minneapolis", "5 6 * * *", 12, 11), ("grasston", "15 8 * * *", 14, 13)],
+    ("location", "cron", "winter_local", "summer_local"),
+    [
+        ("minneapolis", "15 12 * * *", "06:15", "07:15"),
+        ("grasston", "15 11 * * *", "05:15", "06:15"),
+    ],
 )
-def test_one_daily_location_schedule_preserves_cst_and_cdt_wall_clock(
-    location: str, cron: str, winter_hour: int, summer_hour: int
+def test_one_daily_location_schedule_is_a_fixed_utc_cron(
+    location: str, cron: str, winter_local: str, summer_local: str
 ) -> None:
+    # GitHub evaluates plain crons in UTC; the local wall clock shifts across CST/CDT.
     events = workflow(location)["on"]
     assert set(events) == {"schedule", "workflow_dispatch"}
-    assert events["schedule"] == [{"cron": cron, "timezone": "America/Chicago"}]
-    zone = ZoneInfo(events["schedule"][0]["timezone"])
-    minute, hour, day, month, weekday = events["schedule"][0]["cron"].split()
+    assert events["schedule"] == [{"cron": cron}]
+    minute, hour, day, month, weekday = cron.split()
     assert (day, month, weekday) == ("*", "*", "*")
-    for date, expected_utc_hour in (("2026-01-15", winter_hour), ("2026-07-15", summer_hour)):
-        local = datetime.fromisoformat(date).replace(
-            hour=int(hour), minute=int(minute), tzinfo=zone
-        )
-        assert local.astimezone(UTC).hour == expected_utc_hour
-        assert local.astimezone(UTC).minute == int(minute)
+    zone = ZoneInfo("America/Chicago")
+    for date, expected_local in (("2026-01-15", winter_local), ("2026-07-15", summer_local)):
+        fired = datetime.fromisoformat(date).replace(hour=int(hour), minute=int(minute), tzinfo=UTC)
+        assert fired.astimezone(zone).strftime("%H:%M") == expected_local
 
 
 @pytest.mark.parametrize("location", LOCATIONS)

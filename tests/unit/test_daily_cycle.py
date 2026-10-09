@@ -266,9 +266,10 @@ def test_locations_have_independent_receipts_and_delivery_but_shared_runtime(
     assert result["status"] == "completed"
     assert result["location_id"] == "grasston"
     assert result["workflow_slot"] == "daily"
-    assert result["delivery"]["status"] == "no_recipients"
+    # Grasston now has one configured recipient, so its own delivery runs and completes.
+    assert result["delivery"] == {"status": "completed", "recipient_count": 1, "errors": {}}
     assert "forecast" in [call[0] for call in grasston.calls]
-    assert not any(call[0].startswith("email-") for call in grasston.calls)
+    assert [call[0] for call in grasston.calls if call[0].startswith("email-")] == ["email-0"]
     assert grasston.receipt != minneapolis.receipt
     assert grasston.state_root == minneapolis.state_root
     assert grasston.runtime == minneapolis.runtime
