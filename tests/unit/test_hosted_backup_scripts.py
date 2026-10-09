@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -26,8 +28,20 @@ case "$*" in
             *"guidance-worker"*) test "${RUNNING_GUIDANCE:-0}" = 0 || echo guidance ;;
         esac ;;
     *" start guidance-worker"*) test "${FAIL_AT:-}" != restart ;;
-    *"pg_dump -Fc"*) test "${FAIL_AT:-}" != dump; printf 'database dump\n' ;;
-    *"pg_restore --list"*) cat >/dev/null; printf 'dump list\n' ;;
+    *"local_backup estimate"*)
+        printf '{"status":"estimated","backup_bytes":%s}\n' "${ESTIMATE_BYTES:-1}" ;;
+    *"pg_dump -Fc"*)
+        test "${FAIL_AT:-}" != dump
+        case "${FAIL_AT:-}" in
+            empty_dump) : ;;
+            malformed_dump) printf 'invalid dump\n' ;;
+            *) printf 'PGDMP\000\001retained database dump\n' ;;
+        esac ;;
+    *"--entrypoint pg_restore postgres --list"*|*"pg_restore --list"*)
+        magic=$(dd bs=1 count=5 2>/dev/null)
+        [ "$magic" = PGDMP ] || { echo 'invalid or empty custom dump input' >&2; exit 1; }
+        cat >/dev/null
+        printf 'dump list\n' ;;
     *"pg_restore --exit-on-error"*) cat >/dev/null ;;
     *"information_schema.tables"*) echo "${TABLE_COUNT:-0}" ;;
     *"export-objects"*)
@@ -37,6 +51,11 @@ case "$*" in
         printf '{"bucket":"test","objects":[]}\n' > "$target/objects-manifest.json" ;;
     *"--entrypoint tar"*)
         test "${FAIL_AT:-}" != tar
+        if [ "${SLOW_TAR:-0}" = 1 ]; then
+            echo "$PPID" > "$PARENT_PID_FILE"
+            trap 'echo stopped > "$CHILD_STOPPED_FILE"; exit 143' TERM
+            while :; do sleep 0.05; done
+        fi
         case "$*" in
             *" -czf "*) tar -C "$FAKE_RUNTIME" -czf - . ;;
             *" -tzf "*) tar -tzf - ;;
@@ -52,11 +71,18 @@ esac
 
 @pytest.fixture
 def shell() -> str:
-    # Git's POSIX shell lets Windows run these failure tests without WSL or Docker.
-    bash = shutil.which("bash") or "C:/Program Files/Git/bin/bash.exe"
-    if not Path(bash).is_file():
+    # Prefer dash to exercise its asynchronous stdin behavior on Linux. Git Bash
+    # lets Windows run the same failure tests without WSL or Docker.
+    git_dash = Path("C:/Program Files/Git/usr/bin/dash.exe")
+    executable = (
+        shutil.which("dash")
+        or (str(git_dash) if git_dash.is_file() else None)
+        or shutil.which("bash")
+        or "C:/Program Files/Git/bin/bash.exe"
+    )
+    if not Path(executable).is_file():
         pytest.skip("POSIX shell is unavailable")
-    return bash
+    return executable
 
 
 @pytest.fixture
@@ -65,6 +91,11 @@ def harness(tmp_path: Path) -> tuple[Path, dict[str, str]]:
     hosted.mkdir(parents=True)
     for name in ("backup.sh", "restore.sh"):
         shutil.copyfile(ROOT / "deploy" / "hosted" / name, hosted / name)
+    module = tmp_path / "repository/src/mesoforge/application"
+    module.mkdir(parents=True)
+    shutil.copyfile(
+        ROOT / "src/mesoforge/application/disk_admission.py", module / "disk_admission.py"
+    )
     binaries = tmp_path / "bin"
     binaries.mkdir()
     docker = binaries / "docker"
@@ -76,12 +107,19 @@ def harness(tmp_path: Path) -> tuple[Path, dict[str, str]]:
         b"retained guidance"
     )
     (runtime / "latest_baseline.json").write_text('{"baseline_id":"retained"}', encoding="utf-8")
+    shell_tools = Path("C:/Program Files/Git/usr/bin")
+    executable_paths = [str(binaries)]
+    if os.name == "nt" and shell_tools.is_dir():
+        executable_paths.append(str(shell_tools))
+    executable_paths.append(os.environ["PATH"])
     env = {
         **os.environ,
-        "PATH": str(binaries) + os.pathsep + os.environ["PATH"],
+        "PATH": os.pathsep.join(executable_paths),
         "DOCKER_LOG": (tmp_path / "docker.log").as_posix(),
         "FAKE_RUNTIME": runtime.as_posix(),
         "RUNNING_GUIDANCE": "1",
+        "MESOFORGE_BACKUP_PYTHON": Path(sys.executable).as_posix(),
+        "MESOFORGE_GUIDANCE_MIN_FREE_GB": "0",
     }
     return hosted, env
 
@@ -100,7 +138,9 @@ def run_script(
     )
 
 
-@pytest.mark.parametrize("failure", ["dump", "export", "tar", "restart"])
+@pytest.mark.parametrize(
+    "failure", ["dump", "empty_dump", "malformed_dump", "export", "tar", "restart"]
+)
 def test_backup_failure_never_reports_complete_and_restarts_guidance(
     shell: str, harness: tuple[Path, dict[str, str]], tmp_path: Path, failure: str
 ) -> None:
@@ -124,10 +164,71 @@ def test_backup_retains_guidance_and_publishes_only_after_restart(
     backup = next((tmp_path / "backups").iterdir())
     assert not backup.name.endswith(".incomplete")
     assert (backup / "SHA256SUMS").is_file()
+    assert (backup / "postgres.dump").read_bytes() == b"PGDMP\x00\x01retained database dump\n"
+    assert (backup / "postgres.list").read_text() == "dump list\n"
     with tarfile.open(backup / "runtime.tar.gz") as archive:
         assert "./guidance/snapshots/retained/source/array.bin" in archive.getnames()
     if os.name != "nt":
         assert backup.stat().st_mode & 0o077 == 0
+
+
+def test_backup_estimate_refuses_copy_that_would_cross_reserve(
+    shell: str, harness: tuple[Path, dict[str, str]], tmp_path: Path
+) -> None:
+    result = run_script(
+        shell, harness, "backup.sh", tmp_path / "backups", ESTIMATE_BYTES=str(1024**5)
+    )
+    assert result.returncode != 0
+    assert "cross disk reserve" in result.stderr
+    log = Path(harness[1]["DOCKER_LOG"]).read_text("utf-8")
+    assert "pg_dump -Fc" not in log and "export-objects" not in log
+    assert "--entrypoint tar" not in log
+    assert "start guidance-worker" in log
+    assert "Backup complete:" not in result.stdout
+
+
+def test_backup_term_stops_only_its_owned_copy_containers_before_return(
+    shell: str, harness: tuple[Path, dict[str, str]], tmp_path: Path
+) -> None:
+    hosted, environment = harness
+    parent_file = tmp_path / "parent.pid"
+    stopped = tmp_path / "child-stopped"
+    process = subprocess.Popen(
+        [shell, (hosted / "backup.sh").as_posix(), (tmp_path / "backups").as_posix()],
+        env={
+            **environment,
+            "SLOW_TAR": "1",
+            "PARENT_PID_FILE": parent_file.as_posix(),
+            "CHILD_STOPPED_FILE": stopped.as_posix(),
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 15
+    try:
+        while not parent_file.exists():
+            assert process.poll() is None
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        pid = parent_file.read_text().strip()
+        assert pid.isdecimal()
+        subprocess.run([shell, "-c", f"kill -TERM {pid}"], check=True, timeout=10)
+        stdout, stderr = process.communicate(timeout=10)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=10)
+    assert process.returncode != 0
+    assert "Backup complete:" not in stdout
+    assert "Backup incomplete:" in stderr
+    assert stopped.is_file()
+    commands = Path(environment["DOCKER_LOG"]).read_text().splitlines()
+    stops = [line for line in commands if line.startswith("stop --time 10 ")]
+    assert len(stops) == 5  # estimate, dump, list, objects, runtime
+    assert all(line.split()[-1].startswith("mesoforge-") for line in stops)
+    assert not any(line in {"stop postgres", "stop minio"} for line in commands)
+    assert commands[-1] == "compose start guidance-worker"
 
 
 @pytest.mark.parametrize(

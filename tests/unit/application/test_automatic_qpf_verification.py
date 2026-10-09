@@ -21,6 +21,7 @@ from mesoforge.common.identifiers import Digest
 from mesoforge.storage.json import CanonicalJsonSerializer
 from mesoforge.verification.issued_qpf import FIELD
 from tests.unit.application.test_issued_qpf_verification import case as case
+from tests.unit.verification.test_horizon_verification import extended_saved_forecast
 from tests.unit.verification.test_issued_qpf import (
     CUTOFF,
     LAT,
@@ -91,6 +92,41 @@ def test_missing_product_retries_then_matches_and_reuses_without_fetch(case):
     assert [r["verification_ids"] for r in repeat["results"]] == [[i] for i in ids]
     resolver.assert_not_called()
     assert case.issuer.read(case.record.issued_forecast_id) == original
+
+
+def test_hour_120_accumulates_progressively_and_repeat_skips_reads_and_acquisition(case):
+    saved = extended_saved_forecast()
+    extended = case.issuer.issue(saved["forecast"], batch_run_id=uuid4(), location_index=0)
+    assert extended.forecast_horizon_hours == 120
+    assert extended.payload_digest != extended.content_digest
+    resolver = Mock(return_value=retained(case))
+    first = run(case, resolver)
+    assert first["summary"] == {"matched": 4}  # Legacy and extended issuance, two stages each.
+    extended_facts = [
+        case.service.read(row["verification_id"])["result"]
+        for row in first["results"]
+        if row["issued_forecast_id"] == str(extended.issued_forecast_id)
+    ]
+    assert len(extended_facts) == 2
+    assert all(
+        fact["issued_forecast_digest"] == str(extended.payload_digest) for fact in extended_facts
+    )
+    reader = Mock(side_effect=AssertionError("completed opportunities need no issuance read"))
+    case.issuer.read = reader
+    resolver.reset_mock()
+    repeated = run(case, resolver)
+    assert repeated["summary"] == {"already_existing": 4}
+    resolver.assert_not_called()
+    reader.assert_not_called()
+    analysis = case.service.analyze_window(
+        latitude=LAT,
+        longitude=LON,
+        start_valid_time=VALID,
+        end_valid_time=VALID + timedelta(hours=1),
+        stages=("baseline", "final_issued"),
+    )
+    assert analysis["eligible_issued_stage_opportunities"] == 4
+    assert analysis["stages"]["baseline"]["by_exact_lead_hours"]["120"]["n"] == 1
 
 
 def test_old_observation_missing_fact_does_not_suppress_retry(case):

@@ -29,6 +29,7 @@ from mesoforge.application.issuance import (
 )
 from mesoforge.catalog.configuration import load_configuration_source
 from mesoforge.common.errors import IntegrityError, NotFound
+from mesoforge.common.horizon import horizon_for
 from mesoforge.common.identifiers import ArtifactId, Digest, IssuedForecastId
 from mesoforge.storage.json import CanonicalJsonSerializer
 from mesoforge.storage.postgres.database import resolve_database_dsn
@@ -171,7 +172,7 @@ class IssuedQpfVerificationService:
             saved,
             valid_time,
             stage=stage,
-            issued_forecast_digest=record.content_digest,
+            issued_forecast_digest=record.payload_digest,
             extraction=extraction,
             extraction_reference=reference,
             verification_cutoff=cutoff,
@@ -398,9 +399,14 @@ class IssuedQpfVerificationService:
                     continue
             record = records_by_id.get(fact["issued_forecast_id"])
             exclusion = None
+            try:
+                duration = horizon_for(fact).duration_hours
+            except ValueError:
+                duration = None
             if (
                 record is None
-                or fact["issued_forecast_digest"] != str(record.content_digest)
+                or duration != record.forecast_horizon_hours
+                or fact["issued_forecast_digest"] != str(record.payload_digest)
                 or fact["latitude"] != record.latitude
                 or fact["longitude"] != record.longitude
                 or datetime.fromisoformat(fact["issued_at"]) != record.issued_at
@@ -421,7 +427,7 @@ class IssuedQpfVerificationService:
         cutoff = as_of if as_of is not None else self.clock()
         potential = 0
         for record in records:
-            for lead in range(1, 37):
+            for lead in range(1, record.forecast_horizon_hours + 1):
                 end = record.target_reference_time + timedelta(hours=lead)
                 if (
                     window.start <= end < window.end
@@ -443,7 +449,8 @@ class IssuedQpfVerificationService:
             "evidence_cutoff": as_of.isoformat() if as_of is not None else None,
             "evidence_cutoff_exclusions": dict(sorted(as_of_exclusions.items())),
             "opportunity_inventory_basis": (
-                "issuance metadata horizons 1..36; field/interval validity assessed by facts"
+                "declared issuance metadata horizon (legacy 36 h); "
+                "field/interval validity assessed by facts"
             ),
             "storage": {
                 "fact_payload_bytes": sum(m.byte_size for m in manifests),

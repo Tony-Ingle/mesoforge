@@ -17,6 +17,7 @@ from mesoforge.application.snowfall_forecast import SNOW, extract_snowfall_contr
 from mesoforge.application.thunder import extract_thunder_contributors
 from mesoforge.application.visibility import extract_visibility_contributors
 from mesoforge.forecasting.cloud_cover import CLOUD
+from mesoforge.forecasting.provisional_policy import POP6, PROVISIONAL_MULTIMODEL_POLICY
 from tests.unit.application.test_cloud_cover import cloud_view
 from tests.unit.application.test_ice import ice_view
 from tests.unit.application.test_precipitation_type import run as type_result
@@ -25,6 +26,45 @@ from tests.unit.application.test_snowfall_amount_forecast import amount_view
 from tests.unit.application.test_snowfall_forecast import snow_view
 from tests.unit.application.test_thunder import thunder_view
 from tests.unit.application.test_visibility import visibility_view
+from tests.unit.forecasting.test_surface import configuration as configuration
+
+
+def test_provisional_report_describes_saved_policies_and_native_probability_events(configuration):
+    from tests.unit.application.test_native_surface_inputs import native_prepared_120
+
+    forecast = native_prepared_120(configuration).point_column(latitude=46.0, longitude=-93.0)
+    hour = forecast["hours"][5]
+    field = hour["surface"]["fields"][POP6]
+    field.update(value=0.35, status="available", weights={"NBM": 0.7, "GEFS": 0.3})
+    hour["surface"]["probability_guidance"] = {
+        "contributors": [
+            {
+                **field,
+                "source_id": "NBM_6H",
+                "event_id": "native-six-hour",
+                "source_cycle": "2026-10-08T00:00:00Z",
+                "source_lead_hours": 12,
+            }
+        ],
+        "comparisons": [],
+    }
+    original = deepcopy(forecast)
+    report = build_hourly_report(forecast)
+    text = render_hourly_report(report)
+    assert len(report["hours"]) == 120 and forecast == original
+    assert "provisional field-specific multi-model policies" in text
+    assert hour["surface"]["fields"]["air_temperature_2m"]["policy"] in text
+    assert field["policy"] in text and field["policy_family"] == PROVISIONAL_MULTIMODEL_POLICY
+    assert "HRRR/GFS 70/30" not in text
+    assert "RAP/IFS are zero-weight shadows" not in text
+    assert "baseline uses only eligible saved NBM" not in text
+    assert "### Active native six-hour precipitation probability" in text
+    assert "2026-10-08T06:00:00Z | 2026-10-08T12:00:00Z | > 0.254 kg/m^2 | 35" in text
+    assert "GEFS 0.3, NBM 0.7" in text
+    assert "### Native-period probability evidence" in text
+    assert "IFS 24-hour guidance remains comparison evidence" in text
+    assert "All contributors below have zero active weight" not in text
+    assert "native multi-hour amounts remain in the saved canonical QPF event collection" in text
 
 
 @pytest.mark.parametrize(

@@ -19,6 +19,12 @@ import xarray as xr
 from mesoforge.alignment.station_frame import StationAlignmentError, align_station_to_model
 from mesoforge.application.cloud_cover import CloudView, extract_cloud_contributors
 from mesoforge.application.ice import IceView, extract_ice_contributors
+from mesoforge.application.native_surface_inputs import (
+    QPF,
+    extract_native_inputs,
+    extract_native_qpf,
+    qpf_partition,
+)
 from mesoforge.application.precipitation_type import PTYPE, TypeView, extract_precipitation_type
 from mesoforge.application.prepared_qpf import read_qpf_inputs, required_qpf_leads
 from mesoforge.application.probability_contributors import (
@@ -45,14 +51,21 @@ from mesoforge.application.thunder import THUNDER, ThunderView, extract_thunder_
 from mesoforge.application.visibility import VisibilityView, extract_visibility_contributors
 from mesoforge.catalog.configuration import Phase2BlendConfiguration, _lists_to_tuples
 from mesoforge.catalog.domains import BoundingBox
+from mesoforge.common.horizon import horizon_for
 from mesoforge.forecasting.field_blend import BlendState, FieldBlendEngine
+from mesoforge.forecasting.provisional_policy import (
+    POP6,
+    PROVISIONAL_MULTIMODEL_POLICY,
+    provisional_policy,
+)
 from mesoforge.forecasting.recipes import (
     DEFAULT_CONFIGURATION,
     ContributorConfiguration,
+    RecipeContributor,
     with_qpf_fields,
     with_surface_fields,
 )
-from mesoforge.guidance.coverage import REQUIRED_HOURS, is_prepared_window
+from mesoforge.guidance.coverage import is_prepared_window
 
 _DATA_KIND = "synthetic_demonstration"
 _NOTICE = "Synthetic demonstration data; not a current weather forecast."
@@ -66,6 +79,12 @@ _VARIABLE = "air_temperature_2m"
 # Owner-approved demonstration weights throughout hours 1..36, not optimized
 # weights or the Phase 2 table's 60/40 HRRR/GFS row for hours 19..36.
 _CRS = pyproj.CRS.from_epsg(4326)
+
+
+def _recipe_contributors(configuration: ContributorConfiguration) -> tuple[RecipeContributor, ...]:
+    if configuration.control_recipe is None:
+        raise ValueError("Native policy configuration has no historical fixed recipe")
+    return configuration.control_recipe.contributors
 
 
 class ReferenceCoverageError(ValueError):
@@ -233,6 +252,16 @@ def _load_source_manifest(
         raise ValueError("Real prepared guidance requires manifest.json")
     payload = path.read_bytes()
     manifest = json.loads(payload)
+    source_directory = directory
+    if "source_directory" in manifest:
+        source_directory = Path(manifest["source_directory"]).resolve()
+        if (
+            source_directory != directory.resolve()
+            and source_directory.parent != directory.resolve().parent
+        ):
+            raise ValueError(
+                "Shared raw source directory must be within the same prepared region bundle"
+            )
     try:
         if (
             manifest["data_kind"] != _REAL_KIND
@@ -245,24 +274,34 @@ def _load_source_manifest(
             raise ValueError("Real guidance manifest contains duplicate source times")
         for row in entries.values():
             for prefix in ("raw", "index"):
-                _verify_file(directory, row[f"{prefix}_file"], row[f"{prefix}_sha256"])
+                _verify_file(source_directory, row[f"{prefix}_file"], row[f"{prefix}_sha256"])
             extras = row.get("extra_messages", [])
             variables = [extra["canonical_variable_id"] for extra in extras]
-            if len(variables) != len(set(variables)) or not set(variables) <= set(FIELD_UNITS) - {
-                _VARIABLE
-            }:
+            extra_fields = set(FIELD_UNITS) - {_VARIABLE}
+            if horizon_for(manifest).duration_hours == 120:
+                extra_fields.update(
+                    {
+                        "cloud_area_fraction",
+                        POP,
+                        QPF,
+                        QPF + "_equivalent_parent",
+                        "wind_speed_10m",
+                        "wind_from_direction_10m",
+                    }
+                )
+            if len(variables) != len(set(variables)) or not set(variables) <= extra_fields:
                 raise ValueError(f"{row['model']}: invalid or duplicate extra field evidence")
             for extra in extras:
-                _verify_file(directory, extra["raw_file"], extra["raw_sha256"])
-                if (directory / extra["raw_file"]).stat().st_size != extra["raw_bytes"]:
+                _verify_file(source_directory, extra["raw_file"], extra["raw_sha256"])
+                if (source_directory / extra["raw_file"]).stat().st_size != extra["raw_bytes"]:
                     raise ValueError("Retained extra field byte count disagrees")
-        if manifest.get("qpf_fields"):
+        if manifest.get("qpf_fields") and horizon_for(manifest).duration_hours != 120:
             qpf_rows = [
                 row
                 for row in manifest.get("qpf_inputs", [])
                 if models is None or row["model"] in models
             ]
-            read_qpf_inputs(directory, qpf_rows)
+            read_qpf_inputs(source_directory, qpf_rows)
             for row in qpf_rows:
                 dataset = guidance[row["model"]]
                 leads = tuple(
@@ -270,7 +309,11 @@ def _load_source_manifest(
                 )
                 if row["cycle"] != _iso(dataset.forecast_reference_time.values[()]) or row[
                     "source_lead_hours"
-                ] not in required_qpf_leads(row["model"], leads):
+                ] not in (
+                    leads
+                    if horizon_for(manifest).duration_hours == 120
+                    else required_qpf_leads(row["model"], leads)
+                ):
                     raise ValueError(
                         "Retained QPF parent cycle/lead disagrees with prepared guidance"
                     )
@@ -406,11 +449,25 @@ class PreparedPointForecast:
             raise ReferenceCoverageError(
                 f"Reference {_iso(reference)} precedes the prepared window start {_iso(prepared)}"
             )
-        if self._prepared_horizons is None and not is_prepared_window(self._horizons):
+        horizon = horizon_for(self._manifest or {})
+        native = horizon.duration_hours == 120
+        if (
+            self._prepared_horizons is None
+            and not native
+            and not is_prepared_window(self._horizons)
+        ):
             raise ReferenceCoverageError("Reference views require a complete prepared window")
-        horizons = tuple(range(1, REQUIRED_HOURS + 1))
+        horizons = horizon.leads
         required = [reference + np.timedelta64(hour, "h") for hour in horizons]
-        for model, valid_times in self.prepared_valid_times().items():
+        if native:
+            prepared_hours = self._prepared_horizons or self._horizons
+            if reference + np.timedelta64(horizon.duration_hours, "h") > prepared + np.timedelta64(
+                max(prepared_hours), "h"
+            ):
+                raise ReferenceCoverageError(
+                    "Requested reference exceeds the retained native preparation window"
+                )
+        for model, valid_times in () if native else self.prepared_valid_times().items():
             held = set(valid_times)
             missing = [_iso(valid) for valid in required if valid not in held]
             if missing:
@@ -430,6 +487,11 @@ class PreparedPointForecast:
 
     @property
     def notice(self) -> str:
+        if horizon_for(self._manifest or {}).duration_hours == 120:
+            return (
+                "Provisional field-specific multi-model forecast; transparent role/lead priors, "
+                "not skill-optimized weights. Native horizons and event intervals are preserved."
+            )
         if self._surface_configuration is not None:
             return (
                 "Real prepared surface guidance: temperature retains the 70/30 demonstration "
@@ -455,13 +517,29 @@ class PreparedPointForecast:
         configuration: ContributorConfiguration = DEFAULT_CONFIGURATION,
         shadow_directories: Mapping[str, Path] | None = None,
     ) -> PreparedPointForecast:
-        if configuration.control_recipe.field != _VARIABLE:
+        if (
+            configuration.control_recipe is not None
+            and configuration.control_recipe.field != _VARIABLE
+        ):
             raise ValueError("Prepared point forecasts require a temperature control recipe")
         guidance: dict[str, xr.Dataset] = {}
         projections: dict[str, pyproj.CRS] = {}
         kinds: set[str] = set()
         target: np.datetime64 | None = None
         definitions = configuration.model_map()
+        declared_manifest = (
+            json.loads((directory / "manifest.json").read_bytes())
+            if (directory / "manifest.json").is_file()
+            else {}
+        )
+        native = horizon_for(declared_manifest).duration_hours == 120
+        if native:
+            from mesoforge.forecasting.recipes import PROVISIONAL_CONFIGURATION
+
+            if configuration not in (DEFAULT_CONFIGURATION, PROVISIONAL_CONFIGURATION):
+                raise ValueError("Native preparation requires its registered provisional policy")
+            configuration = PROVISIONAL_CONFIGURATION
+            definitions = configuration.model_map()
         attached = dict(shadow_directories or {})
         for model in attached:
             if model not in definitions or definitions[model].status not in (
@@ -472,7 +550,15 @@ class PreparedPointForecast:
                 raise ValueError(
                     f"{model}: shadow data requires a registered shadow/evaluated/deprecated model"
                 )
-        active_models = tuple(item.model for item in configuration.control_recipe.contributors)
+        active_models = (
+            tuple(
+                model
+                for model in ("HRRR", "RAP", "GFS", "IFS", "NBM")
+                if model in declared_manifest.get("prepared_files", {})
+            )
+            if native
+            else tuple(item.model for item in _recipe_contributors(configuration))
+        )
         for model in active_models:
             path = directory / f"{model}.nc"
             if not path.exists():
@@ -489,8 +575,13 @@ class PreparedPointForecast:
                 if not isinstance(wkt, str) or not wkt:
                     raise ValueError(f"{model}: real guidance requires crs_wkt2")
                 crs = pyproj.CRS.from_wkt(wkt)
-                if (definitions[model].grid_type == "projected" and not crs.is_projected) or (
-                    definitions[model].grid_type == "geographic" and not crs.is_geographic
+                grid_type = (
+                    ("projected" if model in ("HRRR", "RAP", "NBM") else "geographic")
+                    if native
+                    else definitions[model].grid_type
+                )
+                if (grid_type == "projected" and not crs.is_projected) or (
+                    grid_type == "geographic" and not crs.is_geographic
                 ):
                     raise ValueError(f"{model}: incorrect native projection")
                 projections[model] = crs
@@ -527,13 +618,22 @@ class PreparedPointForecast:
                 _lists_to_tuples(policy)
             )
         horizons = tuple(manifest.get("target_horizon_hours", (1, 2, 3))) if manifest else (1, 2, 3)
-        if horizons != (1, 2, 3) and not is_prepared_window(horizons):
+        if native and (
+            horizons != tuple(range(1, len(horizons) + 1)) or not 120 <= len(horizons) <= 126
+        ):
+            raise ValueError(
+                "Native preparation requires a declared complete 120-hour window "
+                "and bounded reference buffer"
+            )
+        if not native and horizons != (1, 2, 3) and not is_prepared_window(horizons):
             raise ValueError(
                 "Prepared temperature horizons must be a 1..36 to 1..42 window "
                 "or the retained 1..3 slice"
             )
         shadow_views: dict[str, list[_ShadowView]] = {}
         for model, definition in definitions.items():
+            if native:
+                continue
             if definition.status not in ("shadow", "evaluated", "deprecated"):
                 continue
             views = shadow_views[model] = []
@@ -594,8 +694,22 @@ class PreparedPointForecast:
 
     def check_coordinate(self, latitude: float, longitude: float) -> None:
         validate_coordinate(latitude, longitude)
-        for contributor in self._configuration.control_recipe.contributors:
-            model = contributor.model
+        native = horizon_for(self._manifest or {}).duration_hours == 120
+        if native:
+            if any(
+                point_in_grid(
+                    latitude, longitude, self._projections[model], data.x.values, data.y.values
+                )
+                for model, data in self._guidance.items()
+            ):
+                return
+            raise CoverageRequiredError("No retained native source covers this coordinate")
+        models = (
+            self._guidance
+            if horizon_for(self._manifest or {}).duration_hours == 120
+            else {row.model for row in _recipe_contributors(self._configuration)}
+        )
+        for model in models:
             dataset = self._guidance.get(model)
             if dataset is None:
                 continue
@@ -619,7 +733,16 @@ class PreparedPointForecast:
 
     def covers_area(self, area: BoundingBox) -> bool:
         """Geometry only: missing values/times remain forecast missingness, not coverage."""
-        active_models = {item.model for item in self._configuration.control_recipe.contributors}
+        if horizon_for(self._manifest or {}).duration_hours == 120:
+            return any(
+                bbox_in_grid(area, self._projections[model], data.x.values, data.y.values)
+                for model, data in self._guidance.items()
+            )
+        active_models = (
+            set(self._guidance)
+            if horizon_for(self._manifest or {}).duration_hours == 120
+            else {item.model for item in _recipe_contributors(self._configuration)}
+        )
         if not active_models.issubset(self._guidance):
             return False
         for model in active_models:
@@ -686,7 +809,14 @@ class PreparedPointForecast:
             for model, views in self._shadow_views.items()
         }
         surface_datasets = {
-            model: (dataset, self._projections[model], self._manifest)
+            model: (
+                dataset,
+                self._projections[model],
+                self._manifest
+                if self.data_kind == _REAL_KIND
+                or horizon_for(self._manifest or {}).duration_hours != 120
+                else None,
+            )
             for model, dataset in self._guidance.items()
         }
         surface_datasets.update(
@@ -706,150 +836,177 @@ class PreparedPointForecast:
             ),
             None,
         )
+        native = horizon_for(self._manifest or {}).duration_hours == 120
+        if native and "NBM" in surface_datasets:
+            nbm_ds, nbm_crs, nbm_manifest = surface_datasets["NBM"]
+            if nbm_manifest is not None:
+                pop_view = (nbm_ds, nbm_crs, nbm_manifest)
         engine = FieldBlendEngine(
             contributors=self._configuration,
             phase2=self._surface_configuration,
             policy_overrides=self._policy_overrides,
+            policy_family=PROVISIONAL_MULTIMODEL_POLICY if native else None,
         )
         hours: list[dict[str, Any]] = []
         for horizon in self._horizons:
+            shadow_sources: list[dict[str, Any]]
             valid_time = self._target_reference_time + np.timedelta64(horizon, "h")
-            sources: list[dict[str, Any]] = []
-            shadow_sources: list[dict[str, Any]] = []
-            weights = {
-                item.model: item.weight for item in self._configuration.control_recipe.contributors
-            }
-            shadow_models = {
-                model
-                for model, definition in self._configuration.model_map().items()
-                if definition.status in ("shadow", "evaluated", "deprecated")
-            }
-            for model, weight in (
-                *weights.items(),
-                *((model, 0.0) for model in sorted(shadow_models)),
-            ):
-                source_reasons: list[str] = []
-                source: dict[str, Any] = {
-                    "model": model,
-                    "cycle": None,
-                    "source_lead_hours": None,
-                    "weight": weight,
-                    "temperature": {"value": None, "unit": "K"},
-                    "missing_reasons": source_reasons,
-                }
-                is_shadow = model in shadow_models
-                source_manifest = self._manifest
-                dataset = self._guidance.get(model)
-                crs = self._projections.get(model)
-                if is_shadow:
-                    shadow_sources.append(source)
-                    view = selected_shadows[model]
-                    dataset, crs = (view.dataset, view.crs) if view else (None, None)
-                    metadata = view.metadata if view else {}
-                    source["data_kind"] = metadata.get("data_kind")
-                    if "prepared_sha256" in metadata:
-                        source["prepared_sha256"] = metadata["prepared_sha256"]
-                    if "manifest_sha256" in metadata:
-                        source["manifest_sha256"] = metadata["manifest_sha256"]
-                    source_manifest = metadata.get("manifest")
-                else:
-                    sources.append(source)
-                if dataset is None:
-                    source_reasons.append(
-                        f"{model}: no prepared shadow region covers the forecast coordinate"
-                        if is_shadow and self._shadow_views[model]
-                        else f"{model}: prepared guidance file is missing"
-                    )
-                    continue
-                cycle = cast(
-                    np.datetime64,
-                    dataset["forecast_reference_time"].values.astype("datetime64[ns]")[()],
-                )
-                source["cycle"] = _iso(cycle)
-                if not np.any(dataset["source_valid_time"].values == valid_time):
-                    source_reasons.append(f"{model}: no guidance for this valid time")
-                    continue
-                source["source_lead_hours"] = int((valid_time - cycle) / np.timedelta64(1, "h"))
-                if source_manifest is not None:
-                    evidence = next(
-                        row
-                        for row in source_manifest["inputs"]
-                        if row["model"] == model and row["valid_time"] == _iso(valid_time)
-                    )
-                    source.update(
-                        raw_sha256=evidence["raw_sha256"],
-                        source_url=evidence["source_grib_url"],
-                        prepared_sha256=source_manifest["prepared_files"][model]["sha256"],
-                    )
-                    if is_shadow:
-                        # Retain the exact per-message evidence without changing the
-                        # active control's source dictionary or manifest identity.
-                        source["acquisition"] = deepcopy(evidence)
-                        if "source_metadata" in source_manifest:
-                            source["source_metadata"] = deepcopy(source_manifest["source_metadata"])
-                    if not is_shadow and (
-                        "cycle_selection" in source_manifest
-                        or "current_model_set" in source_manifest
-                    ):
-                        source["acquisition"] = {
-                            key: evidence[key]
-                            for key in (
-                                "raw_bytes",
-                                "index_sha256",
-                                "index_bytes",
-                                "source_index_url",
-                                "byte_start",
-                                "byte_end",
-                                "endpoint",
-                                "grib_retrieved_at",
-                                "index_retrieved_at",
-                                "grib_available_at",
-                                "index_available_at",
-                                "grib_last_modified",
-                                "index_last_modified",
-                                "etag",
-                            )
-                        }
-                try:
-                    aligned = align_station_to_model(
-                        dataset,
-                        crs=cast(pyproj.CRS, crs),
-                        station_latitude=latitude,
-                        station_longitude=longitude,
-                        canonical_variable_id=_VARIABLE,
-                        target_horizon_hours=(horizon,),
-                        target_reference_time=self._target_reference_time,
-                    )
-                except StationAlignmentError:
-                    source_reasons.append(
-                        f"{model}: grid coverage or finite corner values are unavailable"
-                    )
-                    continue
-                if horizon not in aligned or not math.isfinite(aligned[horizon].value):
-                    source_reasons.append(f"{model}: no finite temperature for this valid time")
-                    continue
-                source["temperature"]["value"] = aligned[horizon].value
-            reasons = [reason for source in sources for reason in source["missing_reasons"]]
-            state = BlendState(
-                horizon=horizon,
-                contributors={
-                    source["model"]: {_VARIABLE: source["temperature"]["value"]}
-                    for source in sources
-                },
-            )
-            surface_contributors: dict[str, dict[str, Any]] = {}
-            if self._surface_configuration is not None:
-                selection = (self._manifest or {}).get("current_model_set", {}).get("selection")
-                state, surface_contributors = extract_surface_inputs(
-                    datasets=surface_datasets,
-                    temperature_sources=[*sources, *shadow_sources],
+            if native:
+                state, surface_contributors, sources = extract_native_inputs(
+                    surface_datasets,
+                    reference=self._target_reference_time,
+                    horizon=horizon,
                     latitude=latitude,
                     longitude=longitude,
-                    horizon=horizon,
-                    target_reference_time=self._target_reference_time,
-                    selection=selection,
                 )
-            temperature = engine.blend_field(_VARIABLE, state)["value"]
+                shadow_sources = []
+                reasons = []
+            else:
+                sources = []
+                shadow_sources = []
+                weights = {
+                    item.model: item.weight for item in _recipe_contributors(self._configuration)
+                }
+                shadow_models = {
+                    model
+                    for model, definition in self._configuration.model_map().items()
+                    if definition.status in ("shadow", "evaluated", "deprecated")
+                }
+                for model, weight in (
+                    *weights.items(),
+                    *((model, 0.0) for model in sorted(shadow_models)),
+                ):
+                    source_reasons: list[str] = []
+                    source: dict[str, Any] = {
+                        "model": model,
+                        "cycle": None,
+                        "source_lead_hours": None,
+                        "weight": weight,
+                        "temperature": {"value": None, "unit": "K"},
+                        "missing_reasons": source_reasons,
+                    }
+                    is_shadow = model in shadow_models
+                    source_manifest = self._manifest
+                    dataset = self._guidance.get(model)
+                    crs = self._projections.get(model)
+                    if is_shadow:
+                        shadow_sources.append(source)
+                        view = selected_shadows[model]
+                        dataset, crs = (view.dataset, view.crs) if view else (None, None)
+                        metadata = view.metadata if view else {}
+                        source["data_kind"] = metadata.get("data_kind")
+                        if "prepared_sha256" in metadata:
+                            source["prepared_sha256"] = metadata["prepared_sha256"]
+                        if "manifest_sha256" in metadata:
+                            source["manifest_sha256"] = metadata["manifest_sha256"]
+                        source_manifest = metadata.get("manifest")
+                    else:
+                        sources.append(source)
+                    if dataset is None:
+                        source_reasons.append(
+                            f"{model}: no prepared shadow region covers the forecast coordinate"
+                            if is_shadow and self._shadow_views[model]
+                            else f"{model}: prepared guidance file is missing"
+                        )
+                        continue
+                    cycle = cast(
+                        np.datetime64,
+                        dataset["forecast_reference_time"].values.astype("datetime64[ns]")[()],
+                    )
+                    source["cycle"] = _iso(cycle)
+                    if not np.any(dataset["source_valid_time"].values == valid_time):
+                        source_reasons.append(f"{model}: no guidance for this valid time")
+                        continue
+                    source["source_lead_hours"] = int((valid_time - cycle) / np.timedelta64(1, "h"))
+                    if source_manifest is not None:
+                        evidence = next(
+                            row
+                            for row in source_manifest["inputs"]
+                            if row["model"] == model and row["valid_time"] == _iso(valid_time)
+                        )
+                        source.update(
+                            raw_sha256=evidence["raw_sha256"],
+                            source_url=evidence["source_grib_url"],
+                            prepared_sha256=source_manifest["prepared_files"][model]["sha256"],
+                        )
+                        if is_shadow:
+                            # Retain the exact per-message evidence without changing the
+                            # active control's source dictionary or manifest identity.
+                            source["acquisition"] = deepcopy(evidence)
+                            if "source_metadata" in source_manifest:
+                                source["source_metadata"] = deepcopy(
+                                    source_manifest["source_metadata"]
+                                )
+                        if not is_shadow and (
+                            "cycle_selection" in source_manifest
+                            or "current_model_set" in source_manifest
+                        ):
+                            source["acquisition"] = {
+                                key: evidence[key]
+                                for key in (
+                                    "raw_bytes",
+                                    "index_sha256",
+                                    "index_bytes",
+                                    "source_index_url",
+                                    "byte_start",
+                                    "byte_end",
+                                    "endpoint",
+                                    "grib_retrieved_at",
+                                    "index_retrieved_at",
+                                    "grib_available_at",
+                                    "index_available_at",
+                                    "grib_last_modified",
+                                    "index_last_modified",
+                                    "etag",
+                                )
+                            }
+                    try:
+                        aligned = align_station_to_model(
+                            dataset,
+                            crs=cast(pyproj.CRS, crs),
+                            station_latitude=latitude,
+                            station_longitude=longitude,
+                            canonical_variable_id=_VARIABLE,
+                            target_horizon_hours=(horizon,),
+                            target_reference_time=self._target_reference_time,
+                        )
+                    except StationAlignmentError:
+                        source_reasons.append(
+                            f"{model}: grid coverage or finite corner values are unavailable"
+                        )
+                        continue
+                    if horizon not in aligned or not math.isfinite(aligned[horizon].value):
+                        source_reasons.append(f"{model}: no finite temperature for this valid time")
+                        continue
+                    source["temperature"]["value"] = aligned[horizon].value
+                reasons = [reason for source in sources for reason in source["missing_reasons"]]
+                state = BlendState(
+                    horizon=horizon,
+                    contributors={
+                        source["model"]: {_VARIABLE: source["temperature"]["value"]}
+                        for source in sources
+                    },
+                )
+                surface_contributors = {}
+                if self._surface_configuration is not None:
+                    selection = (self._manifest or {}).get("current_model_set", {}).get("selection")
+                    state, surface_contributors = extract_surface_inputs(
+                        datasets=surface_datasets,
+                        temperature_sources=[*sources, *shadow_sources],
+                        latitude=latitude,
+                        longitude=longitude,
+                        horizon=horizon,
+                        target_reference_time=self._target_reference_time,
+                        selection=selection,
+                    )
+            temperature_field = engine.blend_field(_VARIABLE, state)
+            temperature = temperature_field["value"]
+            if native:
+                for source in sources:
+                    source["weight"] = temperature_field.get("weights", {}).get(
+                        source["model"], 0.0
+                    )
+                reasons = list(temperature_field["missing_reasons"])
             hours.append(
                 {
                     "horizon_hours": horizon,
@@ -866,7 +1023,7 @@ class PreparedPointForecast:
                     "source_validation": state.source_validation,
                     "contributors": surface_contributors,
                 }
-                if self._pop_guidance is not None:
+                if self._pop_guidance is not None or native:
                     pop, native_pop = extract_probability_hour(
                         pop_view,
                         latitude=latitude,
@@ -875,17 +1032,21 @@ class PreparedPointForecast:
                         target_reference_time=self._target_reference_time,
                         policy=self._surface_configuration.pop_policy,
                         unavailable_reason=(
-                            self._pop_guidance.get("reason")
+                            (self._pop_guidance or {}).get("reason")
                             or "NBM: no prepared probability region covers this coordinate"
                         ),
                     )
                     hours[-1]["surface"]["fields"][POP] = pop
-                    hours[-1]["surface"]["contributors"]["NBM"] = {
+                    nbm_pop_contributor = {
                         "model": "NBM",
                         "role": "field_source",
                         "native_supported_fields": [POP],
                         "fields": {POP: native_pop},
                     }
+                    if native:
+                        hours[-1]["surface"]["contributors"]["NBM"]["fields"][POP] = native_pop
+                    else:
+                        hours[-1]["surface"]["contributors"]["NBM"] = nbm_pop_contributor
                     if self._probability_views:
                         hours[-1]["surface"]["probability_guidance"] = (
                             extract_probability_contributors(
@@ -896,6 +1057,13 @@ class PreparedPointForecast:
                                 active={**pop, "spatial_support": {"kind": "grid_point"}},
                             )
                         )
+                if native:
+                    probability_rows = (
+                        hours[-1]["surface"].get("probability_guidance", {}).get("contributors", [])
+                    )
+                    hours[-1]["surface"]["fields"][POP6] = self._probability_event(
+                        engine, probability_rows, valid_time=valid_time, horizon=horizon
+                    )
                 if self._type_guidance is not None:
                     evidence = extract_precipitation_type(
                         self._type_views,
@@ -933,7 +1101,8 @@ class PreparedPointForecast:
                     valid_time=_iso(valid_time),
                     source_status=(self._cloud_guidance or {}).get("source_status", {}),
                 )
-                hours[-1]["surface"]["fields"]["cloud_area_fraction"] = cloud["field"]
+                if not native:
+                    hours[-1]["surface"]["fields"]["cloud_area_fraction"] = cloud["field"]
                 if self._cloud_guidance is not None:
                     hours[-1]["surface"]["cloud_guidance"] = cloud
                 if self._visibility_guidance is not None:
@@ -982,6 +1151,16 @@ class PreparedPointForecast:
             "hours": hours,
             "contributor_configuration": contributor_configuration.model_dump(mode="json"),
         }
+        if native:
+            result["forecast_horizon"] = horizon_for(self._manifest or {}).payload()
+            result["field_policy_family"] = PROVISIONAL_MULTIMODEL_POLICY
+            result["qpf_intervals"] = self._qpf_events(
+                surface_datasets,
+                hours,
+                engine,
+                latitude=latitude,
+                longitude=longitude,
+            )
         if self._prepared_reference_time is not None:
             # A reference view: the guidance was prepared for an earlier window and is
             # read by absolute valid time; the request hour never rewrites that fact.
@@ -1086,3 +1265,137 @@ class PreparedPointForecast:
         if self._manifest is not None and "current_model_set" in self._manifest:
             result["current_model_set"] = deepcopy(self._manifest["current_model_set"])
         return result
+
+    def _probability_event(
+        self,
+        engine: FieldBlendEngine,
+        contributors: list[dict[str, Any]],
+        *,
+        valid_time: np.datetime64,
+        horizon: int,
+    ) -> dict[str, Any]:
+        """Deliver a native six-hour event only at its endpoint, never as hourly PoP."""
+        end = datetime.fromisoformat(_iso(valid_time))
+        if horizon < 6 or end.hour % 6:
+            return {
+                "value": None,
+                "unit": "1",
+                "valid_time": _iso(valid_time),
+                "status": "not_applicable",
+                "temporal_semantics": "probability",
+                "policy": provisional_policy(POP6).policy_id,
+                "policy_family": PROVISIONAL_MULTIMODEL_POLICY,
+                "missing_reasons": ["No complete native six-hour event ends at this forecast hour"],
+                "weights": {},
+            }
+        native = {}
+        contexts = {}
+        for model, identity in (("NBM", "NBM_6H"), ("GEFS", "GEFS_6H")):
+            rows = [
+                row
+                for row in contributors
+                if row.get("source_id") == identity and row.get("event_id") is not None
+            ]
+            if len(rows) != 1:
+                continue  # Absent/ambiguous evidence cannot supply a probability.
+            native[model] = rows[0]
+            contexts[model] = {
+                "cycle": rows[0]["source_cycle"],
+                "reference_time": _iso(self._target_reference_time),
+                "source_lead_hours": rows[0]["source_lead_hours"],
+            }
+        return engine.blend_field(
+            POP6,
+            BlendState(
+                horizon=horizon,
+                contributors={},
+                probabilities=native,
+                source_context=contexts,
+                probability_interval=(_iso(valid_time - np.timedelta64(6, "h")), _iso(valid_time)),
+            ),
+        )
+
+    def _qpf_events(
+        self,
+        datasets: dict[str, tuple[xr.Dataset, pyproj.CRS, dict[str, Any] | None]],
+        hours: list[dict[str, Any]],
+        engine: FieldBlendEngine,
+        *,
+        latitude: float,
+        longitude: float,
+    ) -> list[dict[str, Any]]:
+        """One canonical partition: exact hourly events, then coarser native totals.
+
+        Coarse events have no hourly allocation. Their covered hourly field slots
+        are explicitly unavailable and cannot be edited as hourly amounts.
+        """
+        field = "liquid_equivalent_precipitation_amount_1h"
+        rows = []
+        for start, end in qpf_partition(
+            datasets, reference=self._target_reference_time, duration_hours=len(hours)
+        ):
+            lead = int((end - self._target_reference_time) / np.timedelta64(1, "h"))
+            if end - start == np.timedelta64(1, "h"):
+                item = deepcopy(hours[lead - 1]["surface"]["fields"][field])
+                item["contributors"] = {
+                    model: deepcopy(source["fields"][field])
+                    for model, source in hours[lead - 1]["surface"]["contributors"].items()
+                    if field in source["fields"]
+                }
+            else:
+                native = {
+                    model: extract_native_qpf(
+                        model, entry, start=start, end=end, latitude=latitude, longitude=longitude
+                    )
+                    for model, entry in datasets.items()
+                }
+                contexts = {
+                    model: {
+                        "cycle": _iso(entry[0].forecast_reference_time.values[()]),
+                        "reference_time": _iso(self._target_reference_time),
+                        "source_lead_hours": int(
+                            (end - entry[0].forecast_reference_time.values[()])
+                            / np.timedelta64(1, "h")
+                        ),
+                    }
+                    for model, entry in datasets.items()
+                }
+                state = BlendState(
+                    horizon=lead,
+                    contributors={},
+                    precipitation=native,
+                    source_context=contexts,
+                    precipitation_interval=(_iso(start), _iso(end)),
+                )
+                item = {**engine.blend_field(field, state), "contributors": native}
+                first = int((start - self._target_reference_time) / np.timedelta64(1, "h"))
+                for hour in hours[first:lead]:
+                    hour["surface"]["fields"][field].update(
+                        value=None,
+                        weights={},
+                        status="unavailable",
+                        missing_reasons=[
+                            "Canonical QPF is a coarser exact accumulation; no hourly allocation"
+                        ],
+                        containing_interval={
+                            "interval_start": _iso(start),
+                            "interval_end": _iso(end),
+                        },
+                    )
+            item.update(
+                interval_start=_iso(start),
+                interval_end=_iso(end),
+                interval_closure="left_open_right_closed",
+                temporal_semantics="accumulation",
+            )
+            rows.append(item)
+        from mesoforge.common.qpf_intervals import validate_qpf_intervals
+
+        validate_qpf_intervals(
+            rows,
+            start=datetime.fromisoformat(_iso(self._target_reference_time)),
+            end=datetime.fromisoformat(
+                _iso(self._target_reference_time + np.timedelta64(len(hours), "h"))
+            ),
+        )
+        return rows

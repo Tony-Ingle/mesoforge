@@ -17,7 +17,7 @@ from mesoforge.common.identifiers import Digest
 from mesoforge.contracts.forecast_variants import NO_EVIDENCE_STATES
 from mesoforge.contracts.serialization import canonical_json_bytes
 from mesoforge.verification.metrics import _compute_scalar_metrics
-from mesoforge.verification.model_comparison import LEAD_BUCKETS, lead_bucket
+from mesoforge.verification.model_comparison import analytical_lead_bucket, analytical_lead_buckets
 from mesoforge.verification.qpf_analysis import _observation_signature
 
 SCHEMA_VERSION = "mesoforge.variant-evaluation.v1"
@@ -119,7 +119,7 @@ def _control(field: str, sample: Mapping[str, Any]) -> dict[str, Any]:
         "baseline_snapshot": sample.get("baseline_snapshot", {}),
         "unit": "K" if field == TEMPERATURE else "mm",
         "lead_hours": lead,
-        "lead_bucket": lead_bucket(lead),
+        "lead_bucket": analytical_lead_bucket(lead),
     }
 
 
@@ -435,7 +435,7 @@ def evaluate_variants(
             **_comparison(paired, identifier),
             "by_lead_bucket": {
                 bucket: _comparison([r for r in paired if r["lead_bucket"] == bucket], identifier)
-                for bucket in LEAD_BUCKETS
+                for bucket in analytical_lead_buckets(r["lead_hours"] for r in paired)
             },
             "by_location": {
                 location: _comparison([r for r in paired if _location(r) == location], identifier)
@@ -711,7 +711,8 @@ def evaluate_pair(
             "decision_dates_utc": decision_dates,
             "valid_dates_utc": dict(sorted(Counter(r["valid_time"][:10] for r in common).items())),
             "lead_buckets": {
-                bucket: sum(r["lead_bucket"] == bucket for r in common) for bucket in LEAD_BUCKETS
+                bucket: sum(r["lead_bucket"] == bucket for r in common)
+                for bucket in analytical_lead_buckets(r["lead_hours"] for r in common)
             },
             "locations": dict(sorted(Counter(_location(r) for r in common).items())),
             "observation_sources": dict(
@@ -724,7 +725,7 @@ def evaluate_pair(
         },
         "by_lead_bucket": {
             bucket: _pair_metrics([r for r in common if r["lead_bucket"] == bucket])
-            for bucket in LEAD_BUCKETS
+            for bucket in analytical_lead_buckets(r["lead_hours"] for r in common)
         },
         "overall": {
             **_pair_metrics(common),

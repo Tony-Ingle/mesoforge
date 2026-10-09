@@ -205,6 +205,19 @@ def test_no_history_gives_zero_counts_and_reads_only_metadata(monkeypatch):
     json.dumps(result)  # JSON-serializable without special encoders
 
 
+def test_mixed_horizon_status_enumerates_each_issuance_and_keeps_late_hours_pending():
+    legacy = record(TARGET)
+    extended = record(TARGET).model_copy(update={"forecast_horizon_hours": 120})
+    uow = FakeUnitOfWork([legacy, extended], [fact(extended, 72)])
+    result = status(uow, now=TARGET + timedelta(hours=72, minutes=15))
+    assert result["hours"]["total"] == 156
+    assert result["hours"]["pending"] == 48
+    assert result["hours"]["verified"] == 1
+    assert result["verified_by_lead_bucket"]["37-72"] == 1
+    assert result["verified_by_lead_bucket"]["73-120"] == 0
+    json.dumps(result)  # JSON-serializable without special encoders
+
+
 def test_hours_move_from_pending_to_eligible_to_verified(monkeypatch):
     monkeypatch.setattr(module, "compute_configuration_digest", lambda c: CONFIGURATION_DIGEST)
     issued = record(TARGET)

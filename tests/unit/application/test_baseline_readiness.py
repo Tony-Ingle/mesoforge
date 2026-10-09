@@ -12,6 +12,7 @@ import pytest
 from mesoforge.application import baseline_readiness as module
 from mesoforge.application.baseline_readiness import baseline_readiness
 from mesoforge.application.prepared_snapshot import SnapshotError
+from mesoforge.common.horizon import FIVE_DAY_HORIZON
 from tests.unit.application import test_baseline_snapshot as baseline_tests
 from tests.unit.application.test_batch_forecast import FIRST, LAST
 from tests.unit.application.test_prepared_temperature import TARGET
@@ -72,12 +73,21 @@ def test_ready_baseline_reports_operator_identity(tmp_path: Path, pinned: dict) 
     assert report["ready"] is True and report["reasons"] == []
     facts = report["baseline"]
     assert facts["baseline_snapshot_id"] == "b1"
+    assert facts["forecast_horizon_hours"] == 36
     assert facts["contributor_state_id"] == "p1"
     assert facts["published_at"] == "2026-07-01T12:40:00Z"
     assert facts["information_cutoff"] == "2026-07-01T12:30:00Z"
     assert facts["age_seconds"] == 1800.0
     assert facts["reference_times"] == {"first": "2026-07-01T12:00:00Z", "last": REFERENCE}
     assert report["blend_revocation"] == "not_checked"
+    assert pinned["calls"] == [POINTER]
+
+
+def test_readiness_reports_pinned_long_horizon_without_rebuilding(tmp_path, pinned):
+    pinned["manifest"]["forecast_horizon"] = FIVE_DAY_HORIZON.payload()
+    report = check(tmp_path)
+    assert report["ready"]
+    assert report["baseline"]["forecast_horizon_hours"] == 120
     assert pinned["calls"] == [POINTER]
 
 

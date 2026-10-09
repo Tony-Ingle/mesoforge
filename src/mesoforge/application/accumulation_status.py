@@ -16,7 +16,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from mesoforge.application.automatic_verification import ELIGIBILITY_MARGIN
-from mesoforge.application.issuance import ISSUED_HORIZON_HOURS
 from mesoforge.application.issued_temperature_verification import (
     VERIFICATION_ARTIFACT_TYPE,
     VERIFICATION_SCHEMA_VERSION,
@@ -28,7 +27,11 @@ from mesoforge.contracts.artifacts import ArtifactManifest
 from mesoforge.contracts.serialization import canonical_json_bytes
 from mesoforge.storage.postgres.database import resolve_database_dsn
 from mesoforge.storage.postgres.repositories import PostgresUnitOfWork
-from mesoforge.verification.model_comparison import LEAD_BUCKETS, lead_bucket
+from mesoforge.verification.model_comparison import (
+    LEAD_BUCKETS,
+    analytical_lead_bucket,
+    analytical_lead_buckets,
+)
 
 SCHEMA_VERSION = "mesoforge.accumulation-status.v1"
 HOUR_STATES = (
@@ -40,7 +43,8 @@ HOUR_STATES = (
 STATUS_POLICY: dict[str, Any] = {
     "id": "mesoforge-accumulation-status.v1",
     "hours": (
-        "Each saved version holds horizons 1..36 valid at target_reference_time + horizon, "
+        "Each saved version holds its declared horizon (legacy 36 h), "
+        "valid at target_reference_time + horizon, "
         "so hours are enumerated from issuance metadata without reading forecast payloads."
     ),
     "verified": (
@@ -188,7 +192,6 @@ def accumulation_status(
 
     index, skipped_facts = _fact_index(facts)
     windows = _coverage(sources)
-    first, last = ISSUED_HORIZON_HOURS
     totals: Counter[str] = Counter()
     buckets: Counter[str] = Counter(dict.fromkeys(LEAD_BUCKETS, 0))
     matched_keys: set[tuple[str, datetime]] = set()
@@ -197,14 +200,14 @@ def accumulation_status(
     for record in sorted(records, key=lambda r: (r.issued_at, str(r.issued_forecast_id))):
         counts: Counter[str] = Counter(dict.fromkeys(HOUR_STATES, 0))
         target = _instant(record.target_reference_time)
-        for horizon in range(first, last + 1):
+        for horizon in range(1, record.forecast_horizon_hours + 1):
             valid = target + timedelta(hours=horizon)
             key = (str(record.issued_forecast_id), valid)
             matches = index.get(key, [])
             if matches:
                 state = "verified"
                 matched_keys.add(key)
-                buckets[lead_bucket(horizon)] += 1
+                buckets[analytical_lead_bucket(horizon)] += 1
                 if len(matches) > 1:
                     hours_with_multiple_facts += 1
             elif valid + ELIGIBILITY_MARGIN > evaluated_at:
@@ -253,7 +256,12 @@ def accumulation_status(
             "eligible": total_hours - totals["pending"],
             **{state: totals[state] for state in HOUR_STATES},
         },
-        "verified_by_lead_bucket": {bucket: buckets[bucket] for bucket in LEAD_BUCKETS},
+        "verified_by_lead_bucket": {
+            bucket: buckets[bucket]
+            for bucket in analytical_lead_buckets(
+                lead for record in records for lead in range(1, record.forecast_horizon_hours + 1)
+            )
+        },
         "verification_facts": {
             "count": sum(len(matches) for matches in index.values()),
             "earliest_registered_at": _iso(registered[0]) if registered else None,

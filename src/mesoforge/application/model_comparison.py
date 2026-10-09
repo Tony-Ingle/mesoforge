@@ -224,6 +224,11 @@ def compare_verified(
         require_raw_temperature_control(temperature_control_stage(forecast))
         resolved, contributor_evidence = resolver.resolve(saved, hour)
         configuration = _configuration(forecast)
+        if configuration.control_recipe is None:
+            raise ValueError(
+                "This report compares historical fixed temperature recipes; "
+                "provisional multi-model forecasts require recorded field/stage evaluation"
+            )
         ineligible_models = {
             source["model"]: forecast_eligibility_reasons(
                 {

@@ -28,7 +28,7 @@ from mesoforge.guidance.index_parsing import (
 )
 from mesoforge.guidance.interfaces import Clock, HttpResponse, HttpTransport, Sleeper
 from mesoforge.guidance.precipitation import compute_bucket_start
-from mesoforge.guidance.sources import gfs, hrrr_phase2, ifs, rap
+from mesoforge.guidance.sources import gfs, hrrr_phase2, ifs, nbm, rap
 
 SURFACE_FIELDS = (
     "air_temperature_2m",
@@ -120,6 +120,29 @@ class _RecordingTransport:
 def _endpoints(
     model: str, cycle: datetime, lead: int, configuration: Phase2Configuration
 ) -> tuple[tuple[str, str, str, RetryPolicy], ...]:
+    if model == "NBM":
+        nbm_settings = configuration.nbm
+        return tuple(
+            (
+                endpoint,
+                nbm.build_index_url(
+                    nbm_settings,
+                    endpoint=endpoint,
+                    cycle_date=cycle.date(),
+                    cycle_hour=cycle.hour,
+                    forecast_hour=lead,
+                ),
+                nbm.build_grib_url(
+                    nbm_settings,
+                    endpoint=endpoint,
+                    cycle_date=cycle.date(),
+                    cycle_hour=cycle.hour,
+                    forecast_hour=lead,
+                ),
+                nbm_settings.retry_policy,
+            )
+            for endpoint in nbm_settings.endpoint_order
+        )
     if model == "IFS":
         return (
             (
@@ -205,7 +228,7 @@ def _select(
             raise _TemperatureAbsentError(str(exc)) from exc
         return rows, row, None
     rows = parse_index_rows(payload.decode("utf-8"))
-    source = hrrr_phase2 if model == "HRRR" else gfs
+    source = hrrr_phase2 if model == "HRRR" else nbm if model == "NBM" else gfs
     selector = source.build_field_selector("air_temperature_2m", forecast_hour=lead)
     if not any(re.search(selector, row.descriptor) for row in rows):
         if any(":TMP:2 m above ground:" in row.descriptor for row in rows):
@@ -353,6 +376,7 @@ def probe_temperature(
     decision_time: datetime,
     surface_fields: bool = False,
     qpf_fields: bool = False,
+    native_fields: bool = False,
 ) -> TemperatureProbeResult:
     """Check one native lead with index GET + GRIB HEAD, never a GRIB GET.
 
@@ -370,7 +394,8 @@ def probe_temperature(
     cycle, decision_time = cycle.astimezone(UTC), decision_time.astimezone(UTC)
     if cycle.minute or cycle.second or cycle.microsecond or cycle > decision_time:
         raise ValueError("cycle must identify an exact UTC hour at/before decision time")
-    if type(lead) is not int or lead < 1:
+    minimum_lead = 0 if native_fields and model == "IFS" else 1
+    if type(lead) is not int or lead < minimum_lead:
         raise ValueError("lead must be a positive integer")
     endpoints = _endpoints(model, cycle, lead, configuration)
     evidence: dict[str, Any] = {
@@ -482,6 +507,14 @@ def probe_temperature(
                 qpf_messages, missing_qpf = _qpf_messages(model, index.payload, cycle, lead, length)
                 attempt.update(qpf_messages=qpf_messages, missing_qpf=missing_qpf)
                 evidence.update(qpf_messages=qpf_messages, missing_qpf=missing_qpf)
+            if native_fields:
+                from mesoforge.guidance.sources.native_fields import selected_native_fields
+
+                extra_messages, missing_fields = selected_native_fields(
+                    model, index.payload, cycle, lead, length
+                )
+                attempt.update(extra_messages=extra_messages, missing_fields=missing_fields)
+                evidence.update(extra_messages=extra_messages, missing_fields=missing_fields)
             return TemperatureProbeResult(True, None, evidence, index.payload, payloads)
     except (FetchError, GribIndexError, ifs.IfsIndexError, UnicodeDecodeError, ValueError) as exc:
         attempted = evidence["endpoints"]

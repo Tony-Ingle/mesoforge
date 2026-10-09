@@ -325,3 +325,26 @@ def test_gefs_first_message_header_range_must_be_exact():
             clock=_FakeClock(CYCLE + timedelta(hours=12)),
             sleeper=_FakeSleeper(),
         )
+
+
+def test_probability_cutoff_rejects_later_object_before_grid_download():
+    transport, start, end = _responses("GEFS_6H", b"")
+    with pytest.raises(ValueError, match="pinned information cutoff"):
+        source.acquire_product(
+            "GEFS_6H",
+            CYCLE,
+            start,
+            end,
+            transport=transport,
+            clock=_FakeClock(CYCLE + timedelta(hours=12)),
+            sleeper=_FakeSleeper(),
+            information_cutoff=CYCLE + timedelta(hours=6),
+        )
+    assert len(transport.calls) == 1  # HEAD only, no index or model-body request.
+
+
+def test_nbm_six_hour_event_alignment_is_valid_utc_not_lead_modulo():
+    cycle = CYCLE.replace(hour=13)
+    assert "f125" in source.product_url("NBM_6H", cycle, 119, 125)
+    with pytest.raises(ValueError, match="UTC valid"):
+        source.product_url("NBM_6H", cycle, 120, 126)

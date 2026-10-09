@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 from mesoforge.forecasting.recipes import (
@@ -34,6 +34,21 @@ def lead_bucket(horizon: Any) -> str:
 
 
 _lead_bucket = lead_bucket
+
+
+def analytical_lead_bucket(horizon: Any) -> str:
+    """Descriptive grouping only; never extends approved correction eligibility."""
+    if type(horizon) is not int or not 1 <= horizon <= 120:
+        raise ValueError("analysis requires an integer target horizon from 1 through 120")
+    if horizon <= 36:
+        return lead_bucket(horizon)
+    return "37-72" if horizon <= 72 else "73-120"
+
+
+def analytical_lead_buckets(horizons: Iterable[int]) -> tuple[str, ...]:
+    """Keep historical report keys; add longer descriptive groups when represented."""
+    present = {analytical_lead_bucket(horizon) for horizon in horizons}
+    return LEAD_BUCKETS + tuple(bucket for bucket in ("37-72", "73-120") if bucket in present)
 
 
 def _prediction(temperature: Any, reasons: Any, label: str) -> dict[str, Any]:
@@ -128,6 +143,11 @@ def compare_hour(
     active = hour.get("sources")
     shadows = hour.get("shadow_sources", [])
     control_recipe = configuration.control_recipe
+    if control_recipe is None:
+        raise ValueError(
+            "Fixed-recipe temperature comparison does not apply to a provisional field policy; "
+            "use retained stage/field verification evidence"
+        )
     if control_recipe.field != "air_temperature_2m":
         raise ValueError("temperature comparison requires air_temperature_2m")
     weights = {item.model: item.weight for item in control_recipe.contributors}

@@ -16,9 +16,14 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
+from mesoforge.common.horizon import horizon_for
 from mesoforge.forecasting.periods import DAY_START, NIGHT_START
 from mesoforge.verification.metrics import _compute_scalar_metrics
-from mesoforge.verification.model_comparison import LEAD_BUCKETS, lead_bucket
+from mesoforge.verification.model_comparison import (
+    LEAD_BUCKETS,
+    analytical_lead_bucket,
+    analytical_lead_buckets,
+)
 
 SCHEMA_VERSION = "mesoforge.site-verification-analysis.v1"
 FACT_SCHEMA_VERSION = "issued-temperature-verification.v1"
@@ -34,7 +39,8 @@ CANONICALIZATION_POLICY: dict[str, Any] = {
     "usable_fact": (
         f"schema {FACT_SCHEMA_VERSION}, status verified, verification policy "
         f"{VERIFICATION_POLICY_ID}, not invalid, finite kelvin values, horizon equal to "
-        "valid_time - target_reference_time within 1..36 h, and a saved error equal to "
+        "valid_time - target_reference_time within the declared horizon (legacy 36 h), "
+        "and a saved error equal to "
         "forecast minus observation"
     ),
     "opportunity_key": ["issued_forecast_id", "valid_time", "verification_policy_id"],
@@ -190,6 +196,8 @@ ANALYSIS_POLICY: dict[str, Any] = {
     "lead_buckets": {
         "basis": "saved horizon_hours since target_reference_time",
         "buckets": list(LEAD_BUCKETS),
+        "long_range_analysis_only": ["37-72", "73-120"],
+        "correction_eligibility": "unchanged; approved buckets stop at 36 hours",
         "empty_bucket": "n = 0 with null metrics; nothing is extrapolated between buckets",
     },
     "time_of_day": {
@@ -288,8 +296,12 @@ def fact_exclusion_reason(fact: Mapping[str, Any]) -> str | None:
     if not all(_finite(value) for value in values):
         return "nonfinite_or_missing_values"
     horizon = fact.get("horizon_hours")
-    if type(horizon) is not int or not 1 <= horizon <= 36:
-        return "horizon_outside_1_to_36"
+    try:
+        duration = horizon_for(fact).duration_hours
+    except ValueError:
+        return "invalid_forecast_horizon"
+    if type(horizon) is not int or not 1 <= horizon <= duration:
+        return "horizon_outside_1_to_36" if duration == 36 else "horizon_outside_declared_window"
     if (valid - target).total_seconds() != horizon * 3600:
         return "horizon_inconsistent_with_times"
     forecast, observed, error = (float(cast(float, value)) for value in values)
@@ -452,7 +464,12 @@ def canonicalize(facts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
                 "target_reference_time": _iso(sample_key[0]),
                 "valid_time": _iso(sample_key[1]),
                 "horizon_hours": fact["horizon_hours"],
-                "lead_bucket": lead_bucket(fact["horizon_hours"]),
+                "lead_bucket": analytical_lead_bucket(fact["horizon_hours"]),
+                **(
+                    {"forecast_horizon": fact["forecast_horizon"]}
+                    if "forecast_horizon" in fact
+                    else {}
+                ),
                 "verification_policy_id": fact["verification_policy_id"],
                 "forecast_temperature_k": fact["forecast_temperature_k"],
                 "observation": dict(fact["observation"]),
@@ -718,6 +735,8 @@ def evaluate_evidence(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 def _correction_readiness(
     samples: Sequence[Mapping[str, Any]], lead_buckets: Mapping[str, Mapping[str, Any]]
 ) -> dict[str, Any]:
+    # Long leads are analytical evidence, not part of approved correction eligibility.
+    samples = [sample for sample in samples if sample["lead_bucket"] in LEAD_BUCKETS]
     valid_times = sorted(_instant(sample["valid_time"]) for sample in samples)
     span_hours = (valid_times[-1] - valid_times[0]).total_seconds() / 3600 if valid_times else None
     by_bucket = {
@@ -769,7 +788,7 @@ def analyze_facts(
     valid_times = sorted(sample["valid_time"] for sample in samples)
     lead_buckets = {
         bucket: describe([s["temperature_error_k"] for s in samples if s["lead_bucket"] == bucket])
-        for bucket in LEAD_BUCKETS
+        for bucket in analytical_lead_buckets(s["horizon_hours"] for s in samples)
     }
     return {
         "canonicalization": {key: value for key, value in canonical.items() if key != "samples"},
@@ -788,6 +807,13 @@ def analyze_facts(
             "observation_stations": sorted({s["observation"]["station_id"] for s in samples}),
         },
         "lead_buckets": lead_buckets,
+        "exact_lead_hours": {
+            str(lead): describe(
+                [s["temperature_error_k"] for s in samples if s["horizon_hours"] == lead]
+            )
+            for lead in sorted({s["horizon_hours"] for s in samples})
+        },
+        "long_range_correction_status": "no_policy_beyond_36_hours",
         "time_of_day": _time_of_day(samples, display_timezone),
         "stations": _stations(samples),
         "regime_readiness": _regime_readiness(samples),

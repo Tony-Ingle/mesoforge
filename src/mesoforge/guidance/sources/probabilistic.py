@@ -248,6 +248,10 @@ def _request(source_id: str, cycle: datetime, start_hour: int, end_hour: int) ->
         raise ValueError("Requested interval does not match the native probability product")
     if source_id != "NBM_6H" and cycle.hour not in (0, 6, 12, 18):
         raise ValueError("Probability cycle must be 00/06/12/18Z")
+    if source_id == "NBM_6H" and (end_hour > 264 or (cycle.hour + end_hour) % 6):
+        raise ValueError(
+            "NBM six-hour probability ends at six-hour UTC valid times through lead264"
+        )
     if source_id == "GEFS_6H" and (end_hour % 6 or end_hour > 384):
         raise ValueError("GEFS PQPF is published at six-hour leads through 384")
     if source_id == "REFS_1H" and end_hour > 60:
@@ -298,6 +302,7 @@ def acquire_product(
     transport: HttpTransport,
     clock: Clock,
     sleeper: Sleeper,
+    information_cutoff: datetime | None = None,
 ) -> Phase2LeadAcquisition:
     """Fetch only one native event, retaining its actual index or GRIB header evidence."""
     product = _request(source_id, cycle, start_hour, end_hour)
@@ -313,6 +318,17 @@ def acquire_product(
         retry_policy=IFS_RETRY_POLICY,
         cycle_deadline=deadline,
     )
+
+    def validate_availability(headers: dict[str, str], retrieved: datetime) -> None:
+        if information_cutoff is None:
+            return
+        if information_cutoff.tzinfo is None or information_cutoff.utcoffset() is None:
+            raise ValueError("Probability information cutoff must be timezone aware")
+        available = resolve_available_at(header(headers, "Last-Modified"), retrieved_at=retrieved)
+        if available > information_cutoff:
+            raise ValueError("Probability source availability follows pinned information cutoff")
+
+    validate_availability(head.headers, head.completed_at)
     length = int(header(head.headers, "Content-Length") or 0)
     if length <= 0:
         raise FetchError("Probability provider requires a positive full-object Content-Length")
@@ -406,6 +422,7 @@ def acquire_product(
             if source_id == "REFS_1H" and not row.line.endswith(":Neighborhood Probability"):
                 raise ValueError("REFS probability inventory spatial support mismatch")
             _, end = compute_message_byte_range(parsed, selected=row, full_object_length=length)
+    validate_availability(index.headers, index.completed_at)
     if end > length or end - row.byte_offset < 20:
         raise FetchError("Probability selected message exceeds provider object")
     fetched = fetch_with_range(

@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from mesoforge.application.local_surface_grid import extract_grid_point
+from mesoforge.common.horizon import LEGACY_HORIZON, horizon_for
 from mesoforge.common.identifiers import LearningPolicyId
 from mesoforge.contracts.policy_governance import GovernanceGrant
 from mesoforge.contracts.serialization import canonical_json_digest
@@ -40,6 +41,16 @@ def _digest(policy: dict[str, Any]) -> str:
     return str(
         canonical_json_digest({key: value for key, value in policy.items() if key != "digest"})
     )
+
+
+def _delta_for_lead(policy: dict[str, Any], lead: int) -> float | None:
+    """The approved correction buckets end at 36h, independently of forecast length."""
+    if type(lead) is not int or lead < 1:
+        raise ValueError("Correction lead must be a positive integer")
+    if lead > LEGACY_HORIZON.duration_hours:
+        return None
+    value: float | None = policy["lead_buckets"][lead_bucket(lead)]["delta_k"]
+    return value
 
 
 def propose_temperature_policy(
@@ -213,6 +224,13 @@ def apply_temperature_correction(
         "changes": [],
         "coherence": {"relationships": [], "changed_cell_hours": 0},
     }
+    horizon = horizon_for(forecast)
+    if horizon.duration_hours > LEGACY_HORIZON.duration_hours:
+        outcome["uncovered_leads"] = {
+            "status": "no_policy",
+            "reason": "Approved temperature correction evidence buckets end at hour 36",
+            "hours": list(horizon.leads[LEGACY_HORIZON.duration_hours :]),
+        }
     if policy is None:
         return forecast, outcome
     outcome["policy"] = {
@@ -247,7 +265,7 @@ def apply_temperature_correction(
         for cell in grid["cells"]:
             hours: list[dict[str, Any]] = []
             for hour in cell["hours"]:
-                delta = policy["lead_buckets"][lead_bucket(hour["horizon_hours"])]["delta_k"]
+                delta = _delta_for_lead(policy, hour["horizon_hours"])
                 value = hour["temperature"]["value"]
                 if not delta or value is None:
                     hours.append(hour)
@@ -311,7 +329,7 @@ def apply_temperature_correction(
                     "temperature": row["temperature"],
                     "baseline_temperature": original["temperature"],
                     "applied_delta_k": (
-                        policy["lead_buckets"][lead_bucket(row["horizon_hours"])]["delta_k"] or 0.0
+                        _delta_for_lead(policy, row["horizon_hours"]) or 0.0
                         if original["temperature"]["value"] is not None
                         else 0.0
                     ),

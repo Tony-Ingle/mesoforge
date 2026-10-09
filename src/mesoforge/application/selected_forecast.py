@@ -67,6 +67,10 @@ def _time(value: str) -> datetime:
 
 
 def selection_contributors(report: dict[str, Any]) -> ContributorConfiguration:
+    if report.get("native_preparation_policy") == "mesoforge.native-preparation.120h.v1":
+        from mesoforge.forecasting.recipes import PROVISIONAL_CONFIGURATION
+
+        return PROVISIONAL_CONFIGURATION
     surface, qpf = report.get("surface_fields", False), report.get("qpf_fields", False)
     if type(surface) is not bool or type(qpf) is not bool or (qpf and not surface):
         raise ValueError("Invalid surface/QPF selection flags")
@@ -79,6 +83,10 @@ def load_selection(
 ) -> tuple[dict[str, Any], Phase2Configuration, list[dict[str, Any]]]:
     """Validate complete current evidence and every retained selected inventory."""
     report = json.loads(selection_path.read_bytes())
+    if report.get("native_preparation_policy") == "mesoforge.native-preparation.120h.v1":
+        from mesoforge.application.native_discovery import load_native_selection
+
+        return load_native_selection(selection_path, clock=clock)
     try:
         decision = _time(report["decision_time"])
         target = _hour(_time(report["target_reference_time"]))
@@ -365,6 +373,20 @@ def prepare_selected(
     decision cutoff may be short or undiscovered, with an explicit per-model shortfall.
     """
     clock, sleeper = clock or SystemClock(), sleeper or SystemSleeper()
+    if (
+        json.loads(selection_path.read_bytes()).get("native_preparation_policy")
+        == "mesoforge.native-preparation.120h.v1"
+    ):
+        from mesoforge.application.native_preparation import prepare_native_selected
+
+        return prepare_native_selected(
+            locations,
+            selection_path,
+            output_directory,
+            transport=transport,
+            clock=clock,
+            sleeper=sleeper,
+        )
     selection, configuration, probes = load_selection(
         selection_path, clock=clock, require_complete_shadows=require_complete_shadows
     )

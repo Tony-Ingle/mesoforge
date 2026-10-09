@@ -19,6 +19,7 @@ from typing import Any
 
 from mesoforge.application.accumulation_status import _validate
 from mesoforge.application.weather_transitions import validate_display_timezone
+from mesoforge.common.horizon import horizon_for
 from mesoforge.contracts.artifacts import ArtifactManifest
 from mesoforge.contracts.issued_forecasts import IssuedForecastRecord
 from mesoforge.contracts.serialization import canonical_json_bytes
@@ -86,6 +87,7 @@ def _metadata_exclusion(
     try:
         target = datetime.fromisoformat(str(fact["target_reference_time"]))
         issued = datetime.fromisoformat(str(fact["issued_at"]))
+        duration = horizon_for(fact).duration_hours
     except (KeyError, TypeError, ValueError):
         return "payload_incomplete"
     if target.tzinfo is None or issued.tzinfo is None:
@@ -94,6 +96,8 @@ def _metadata_exclusion(
         return "target_reference_time_disagrees_with_issuance_metadata"
     if issued != record.issued_at:
         return "issued_at_disagrees_with_issuance_metadata"
+    if duration != record.forecast_horizon_hours:
+        return "forecast_horizon_disagrees_with_issuance_metadata"
     return None
 
 

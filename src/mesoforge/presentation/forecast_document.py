@@ -14,13 +14,17 @@ from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 from mesoforge.common.errors import IntegrityError
+from mesoforge.common.horizon import FIVE_DAY_HORIZON, horizon_for
+from mesoforge.common.qpf_intervals import summarize_qpf_intervals, validate_qpf_intervals
 from mesoforge.contracts.serialization import canonical_json_digest
 from mesoforge.forecasting.condition_wording import WORDING_POLICY
 from mesoforge.forecasting.conditions import RULESET_ID, _describe_hour
+from mesoforge.forecasting.probability_events import six_hour_events, six_hour_summary
 from mesoforge.forecasting.transitions import build_transitions
 
 DOCUMENT_POLICY = "mesoforge-five-local-day-presentation.v1"
 HOURS_DOCUMENT_POLICY = "mesoforge-36-hour-presentation.v1"
+ROLLING_DOCUMENT_POLICY = "mesoforge-120-hour-presentation.v1"
 _HOUR = timedelta(hours=1)
 
 
@@ -169,7 +173,7 @@ def _saved_revision(saved: dict[str, Any]) -> Any:
 def build_forecast_document(
     saved: dict[str, Any], *, location: dict[str, Any], days: int = 5, hours: int | None = None
 ) -> dict[str, Any]:
-    """Build an explicit 36-hour outlook or five complete local days from saved fields.
+    """Build a bounded hourly outlook or five complete local days from saved fields.
 
     The interval belongs to its local starting day: an amount ending at midnight
     closes the preceding day. Hourly instantaneous extrema use those same endpoint
@@ -180,15 +184,24 @@ def build_forecast_document(
     """
     if days != 5:
         raise ValueError("This product supports exactly five complete local days")
-    if hours not in (None, 36) or isinstance(hours, bool):
-        raise ValueError("The explicit hourly product supports exactly 36 hours")
+    if hours not in (None, 36, FIVE_DAY_HORIZON.duration_hours) or isinstance(hours, bool):
+        raise ValueError("The explicit hourly product supports exactly 36 or 120 hours")
     hourly_product = hours == 36
+    rolling_product = hours == FIVE_DAY_HORIZON.duration_hours
     zone = ZoneInfo(location.get("display_timezone", "UTC"))
     forecast = saved["forecast"]
     source_hours = forecast["hours"]
+    if rolling_product and (
+        horizon_for(forecast) != FIVE_DAY_HORIZON
+        or horizon_for(forecast.get("local_grid_baseline", {})) != FIVE_DAY_HORIZON
+        or len(source_hours) != FIVE_DAY_HORIZON.duration_hours
+    ):
+        raise ForecastCoverageError(
+            "The 120-hour product requires an explicit complete saved horizon"
+        )
     if hourly_product and len(source_hours) < 36:
         raise ForecastCoverageError("The 36-hour product requires all 36 saved forecast hours")
-    if not hourly_product and len(source_hours) < 119:
+    if not hourly_product and not rolling_product and len(source_hours) < 119:
         raise ForecastCoverageError(
             "Five complete local days are required; the saved forecast has "
             f"{len(source_hours)} hours. Presentation cannot extend its scientific horizon."
@@ -201,7 +214,13 @@ def build_forecast_document(
     ):
         raise IntegrityError("Saved hours must form the exact continuous reference-hour sequence")
     local_reference = reference.astimezone(zone)
-    if hourly_product:
+    if rolling_product:
+        # Equal elapsed forecast periods, not calendar days: local endpoints may
+        # shift by an hour at DST. Every scientific interval remains represented.
+        boundaries = [
+            (reference + _HOUR * index * 24).astimezone(zone) for index in range(days + 1)
+        ]
+    elif hourly_product:
         start, end = reference, reference + 36 * _HOUR
         boundaries = [local_reference]
         # Only local midnights strictly inside the saved 36-hour window split cards.
@@ -225,6 +244,13 @@ def build_forecast_document(
             "a rolling 120-hour window can include partial first/last days."
         )
     center = _validated_point(saved, location)
+    qpf_intervals = None
+    if "qpf_intervals" in forecast:
+        if center.get("qpf_intervals") != forecast["qpf_intervals"]:
+            raise IntegrityError("Saved point QPF intervals differ from final grid center")
+        qpf_intervals = validate_qpf_intervals(
+            forecast["qpf_intervals"], start=reference, end=times[-1]
+        )
     described = [
         _describe_hour(
             hour,
@@ -248,12 +274,27 @@ def build_forecast_document(
         )
         for left, right in zip(boundaries, boundaries[1:], strict=False)
     ]
-    for row in summaries:
+    for period_index, row in enumerate(summaries, 1):
         left, right = datetime.fromisoformat(row["start"]), datetime.fromisoformat(row["end"])
         row["partial_local_day"] = left.timetz().replace(tzinfo=None) != time(
             0
         ) or right.timetz().replace(tzinfo=None) != time(0)
+        if rolling_product:
+            row["forecast_period"] = period_index
     summary = _daily_summary(display_hours, boundaries[0], boundaries[-1])
+    pop6_events = six_hour_events(source_hours)
+    if pop6_events:
+        for row in [*summaries, summary]:
+            row["native_six_hour_pop"] = six_hour_summary(
+                pop6_events, start=_time(row["start"]), end=_time(row["end"])
+            )
+    if qpf_intervals is not None:
+        for row in [*summaries, summary]:
+            amount = summarize_qpf_intervals(
+                qpf_intervals, start=_time(row["start"]), end=_time(row["end"])
+            )
+            row["qpf_kg_m2"] = amount["total_kg_m2"]
+            row["qpf_event_coverage"] = amount
     # Reuse the existing deterministic transition detector/rendering unchanged.
     transitions = build_transitions(
         {
@@ -281,17 +322,27 @@ def build_forecast_document(
         ai_status = "AI assessment not available"
     available_highs = [day["high_k"] for day in summaries if day["high_k"] is not None]
     available_lows = [day["low_k"] for day in summaries if day["low_k"] is not None]
-    span_label = "36 hours" if hourly_product else "five days"
+    span_label = "36 hours" if hourly_product else "120 hours" if rolling_product else "five days"
     headline = "Your 36-hour weather outlook" if hourly_product else "Your five-day weather outlook"
     if len(available_highs) == len(summaries) and len(available_lows) == len(summaries):
         low = (min(available_lows) - 273.15) * 1.8 + 32
         high = (max(available_highs) - 273.15) * 1.8 + 32
         headline = f"Temperatures from {low:.0f} to {high:.0f} F across {span_label}"
     return {
-        "document_policy": HOURS_DOCUMENT_POLICY if hourly_product else DOCUMENT_POLICY,
-        "product_title": "36-Hour Weather Outlook" if hourly_product else "5-Day Forecast",
+        "document_policy": HOURS_DOCUMENT_POLICY
+        if hourly_product
+        else ROLLING_DOCUMENT_POLICY
+        if rolling_product
+        else DOCUMENT_POLICY,
+        "product_title": "36-Hour Weather Outlook"
+        if hourly_product
+        else "5-Day Weather Outlook"
+        if rolling_product
+        else "5-Day Forecast",
         "summary_kind": "covered_local_day_portions"
         if hourly_product
+        else "five_elapsed_24_hour_forecast_periods"
+        if rolling_product
         else "five_complete_local_days",
         "issued_forecast_id": saved["issued_forecast_id"],
         "issued_payload_digest": str(canonical_json_digest(saved)),
@@ -308,6 +359,27 @@ def build_forecast_document(
         "source_valid_start": _iso(reference),
         "source_valid_end": _iso(times[-1]),
         "hours": display_hours,
+        **({"six_hour_pop_events": pop6_events} if pop6_events else {}),
+        **(
+            {
+                "qpf_intervals": [
+                    {
+                        key: row[key]
+                        for key in (
+                            "interval_start",
+                            "interval_end",
+                            "interval_closure",
+                            "value",
+                            "unit",
+                        )
+                    }
+                    for row in qpf_intervals
+                    if _time(row["interval_start"]) < end and _time(row["interval_end"]) > start
+                ]
+            }
+            if qpf_intervals is not None
+            else {}
+        ),
         "days": summaries,
         "summary": summary,
         "headline": headline,
@@ -321,11 +393,25 @@ def build_forecast_document(
         "revision": _saved_revision(saved),
         "notes": [
             "High/low are extrema of hourly forecast samples, including overnight hours.",
-            "Cards cover only their stated intervals; partial dates do not imply "
+            "Each card covers 24 elapsed forecast hours, not a complete local calendar day. "
+            "Local clock times account for daylight-saving changes."
+            if rolling_product
+            else "Cards cover only their stated intervals; partial dates do not imply "
             "full-day coverage.",
             "Precipitation chance is the maximum native hourly PoP, not a daily probability. "
             "Each hourly event is more than 0.01 inches of liquid precipitation.",
-            "Liquid totals sum exact, consecutive hourly intervals. Missing hours "
+            *(
+                [
+                    "Six-hour PoP is the maximum available whole six-hour event chance, "
+                    "not an hourly or daily probability. Native windows are never redistributed."
+                ]
+                if pop6_events
+                else []
+            ),
+            "Liquid totals sum whole native events only. Events crossing a card boundary "
+            "are shown on the timing chart but never split; affected card totals are unavailable."
+            if qpf_intervals is not None
+            else "Liquid totals sum exact, consecutive hourly intervals. Missing hours "
             "make the interval total unavailable; they are never treated as zero.",
             "Wind is the vector mean of hourly U/V. Conditions show the most frequent "
             "approved hourly wording; transitions describe changes separately.",

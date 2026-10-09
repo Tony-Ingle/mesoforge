@@ -44,6 +44,7 @@ from mesoforge.application.spatial_coverage import (
     UnsupportedCoordinateError,
     validate_coordinate,
 )
+from mesoforge.common.horizon import horizon_for
 from mesoforge.forecasting.coherence import (
     collect_baseline_coherence,
     framework_metadata,
@@ -59,7 +60,9 @@ def _iso(value: datetime) -> str:
 
 def _references(manifest: dict[str, Any]) -> list[datetime]:
     first = datetime.fromisoformat(manifest["coverage"]["reference_time"])
-    last = datetime.fromisoformat(manifest["coverage"]["last_valid_time"]) - timedelta(hours=36)
+    last = datetime.fromisoformat(manifest["coverage"]["last_valid_time"]) - timedelta(
+        hours=horizon_for(manifest).duration_hours
+    )
     references = []
     while first <= last:
         if coverage_for(manifest, first)["usable"]:
@@ -70,7 +73,8 @@ def _references(manifest: dict[str, Any]) -> list[datetime]:
 
 def _availability(grid: dict[str, Any], reference: datetime) -> dict[str, Any]:
     """Validate structural time coverage; missing weather is retained, not repaired."""
-    expected = [_iso(reference + timedelta(hours=hour)) for hour in range(1, 37)]
+    horizon = horizon_for(grid)
+    expected = [_iso(reference + timedelta(hours=hour)) for hour in horizon.leads]
     counts: dict[str, dict[str, int]] = {}
     geometry = grid["geometry"]
     if len(grid["cells"]) != len(geometry["x_m"]) * len(geometry["y_m"]):
@@ -91,6 +95,10 @@ def _availability(grid: dict[str, Any], reference: datetime) -> dict[str, Any]:
     for cell in grid["cells"]:
         if [hour["valid_time"] for hour in cell["hours"]] != expected:
             raise SnapshotError("Calculated baseline has incomplete or unordered valid times")
+        try:
+            horizon.validate_hour_rows(cell["hours"], reference)
+        except ValueError as exc:
+            raise SnapshotError("Calculated baseline has inconsistent horizon coverage") from exc
         for hour in cell["hours"]:
             fields = hour.get("surface", {}).get("fields", {})
             if set(fields) != expected_fields:
@@ -164,8 +172,11 @@ def build_baseline(
     references = sorted(
         set(reference_times if reference_times is not None else _references(prepared_manifest))
     )
+    horizon = horizon_for(prepared_manifest)
     if not references:
-        raise SnapshotError("Prepared state has no complete 36-hour reference view")
+        raise SnapshotError(
+            f"Prepared state has no complete {horizon.duration_hours}-hour reference view"
+        )
     for reference in references:
         coverage = coverage_for(prepared_manifest, reference)
         if not coverage["usable"]:
@@ -233,6 +244,8 @@ def build_baseline(
             build_seconds += time.perf_counter() - clock
             clock = time.perf_counter()
             grid = forecast["local_grid_baseline"]
+            if horizon_for(grid) != horizon or horizon_for(forecast) != horizon:
+                raise SnapshotError("Calculated baseline horizon differs from prepared contract")
             availability = _availability(grid, reference)
             # Missing peripheral coverage remains ordinary missingness. Every
             # actually calculated cell/hour must complete current required rules;
@@ -252,7 +265,7 @@ def build_baseline(
                     "longitude": longitude,
                     "reference_time": _iso(reference),
                     "first_valid_time": _iso(reference + timedelta(hours=1)),
-                    "last_valid_time": _iso(reference + timedelta(hours=36)),
+                    "last_valid_time": _iso(reference + timedelta(hours=horizon.duration_hours)),
                     "geometry": grid["geometry"],
                     "grid_version": grid["version"],
                     "grid_policy": grid["policy"],
@@ -296,8 +309,13 @@ def build_baseline(
             "content_digest": row["content_digest"],
             "head_event_id": row["head_event_id"],
         }
-    manifest = {
+    manifest: dict[str, Any] = {
         "schema_version": BASELINE_SCHEMA,
+        **(
+            {"forecast_horizon": horizon.payload()}
+            if "forecast_horizon" in prepared_manifest
+            else {}
+        ),
         "baseline_snapshot_id": identity,
         "kind": "mesoforge_numerical_baseline",
         "code_revision": code_revision,
@@ -350,7 +368,7 @@ def build_baseline(
         "artifacts": artifacts,
         "completeness": {
             "status": "complete",
-            "meaning": "All declared grids and 36-hour views saved; "
+            "meaning": f"All declared grids and {horizon.duration_hours}-hour views saved; "
             "field missingness remains explicit",
         },
     }

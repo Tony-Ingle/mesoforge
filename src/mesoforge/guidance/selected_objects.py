@@ -13,7 +13,7 @@ from typing import Any
 
 from mesoforge.common.errors import MesoForgeError
 from mesoforge.guidance.acquisition_v2 import parse_provider_availability
-from mesoforge.guidance.http_fetch import header, parse_content_range
+from mesoforge.guidance.http_fetch import RETRYABLE_STATUS_CODES, header, parse_content_range
 from mesoforge.guidance.interfaces import Clock, HttpResponse, HttpTransport
 from mesoforge.guidance.sources.current_availability import QPF_FIELD
 from mesoforge.guidance.sources.gfs import build_field_selector
@@ -55,9 +55,13 @@ class SelectedObjectTransport:
     """Allow only selected inventories and message ranges, with identity checks.
 
     Successful index GETs and object HEADs are cached within this preparation.
-    Every GRIB range GET is conditional on the discovery ETag and checked again;
-    no GRIB body is cached here. Existing acquisition owns raw retention/decoding.
+    Every GRIB range GET is conditional on the discovery ETag and checked again.
+    Compound-field ranges are cached until their object is released; streaming
+    preparation releases each fully decoded object. Acquisition owns raw retention.
     Identity failures remain fatal even if an adapter's retry engine catches them.
+    Transient HTTP range responses reach that existing bounded retry engine without
+    poisoning the selected identity; they never satisfy acquisition completeness.
+    Metadata retries require explicit opt-in by a caller using that retry engine.
     """
 
     def __init__(
@@ -68,6 +72,7 @@ class SelectedObjectTransport:
         decision_time: datetime,
         clock: Clock,
         latch_failures: bool = True,
+        retry_metadata: bool = False,
     ) -> None:
         if decision_time.tzinfo is None or decision_time.utcoffset() is None:
             raise ValueError("decision_time must be timezone aware")
@@ -78,6 +83,7 @@ class SelectedObjectTransport:
         # without it a zero-weight shadow keeps acquiring its other selected objects
         # and each failure stays recorded and explicit.
         self.latch_failures = latch_failures
+        self.retry_metadata = retry_metadata
         self.failed_reason: str | None = None
         self._records: list[dict[str, Any]] = []
         self._indexes: dict[str, dict[str, Any]] = {}
@@ -86,6 +92,7 @@ class SelectedObjectTransport:
         self._ranges: dict[str, dict[str, dict[str, Any]]] = {}
         self._range_cache: dict[tuple[str, str], _Response] = {}
         self._acquired: set[tuple[str, str]] = set()
+        self._released: set[str] = set()
         if not probes:
             raise ValueError("At least one selected temperature probe is required")
         for original in probes:
@@ -178,6 +185,29 @@ class SelectedObjectTransport:
     def validations(self) -> list[dict[str, Any]]:
         return deepcopy(self._records)
 
+    @property
+    def cached_range_bytes(self) -> int:
+        """Bytes held solely for within-object shared-message reuse."""
+        return sum(len(response.content) for response in self._range_cache.values())
+
+    def release_completed_object(self, url: str) -> None:
+        """Release one acquired object's bytes after all region decoders finish.
+
+        Immutable validation digests and acquisition completeness remain. A
+        released object cannot be requested again through this preparation;
+        replay must use its retained raw file, never a new provider response.
+        """
+        if url not in self._gribs:
+            self._fail("Cannot release an object absent from the pinned selection")
+        expected = {(url, byte_range) for byte_range in self._ranges[url]}
+        if not expected.issubset(self._acquired):
+            raise SelectedObjectError("Cannot release an incompletely acquired selected object")
+        for key in expected:
+            self._range_cache.pop(key, None)
+        self._cache.pop(("get", self._gribs[url]["index"]["url"]), None)
+        self._cache.pop(("head", url), None)
+        self._released.add(url)
+
     def _fail(self, reason: str) -> None:
         self.failed_reason = reason
         raise SelectedObjectError(reason)
@@ -215,6 +245,8 @@ class SelectedObjectTransport:
         if is_index and method != "get":
             self._fail("Only index GET and GRIB HEAD/range GET are permitted")
         probe = (self._indexes if is_index else self._gribs)[url]
+        if probe["grib"]["url"] in self._released:
+            self._fail("Selected object was released; replay its retained raw evidence")
         expected = probe["index" if is_index else "grib"]
         message = probe["selected_message"]
         request_headers = dict(headers or {})
@@ -265,6 +297,23 @@ class SelectedObjectTransport:
             )
             record.update(status_code=response.status_code, headers=dict(response.headers))
             expected_status = 200 if is_index or method == "head" else 206
+            if (
+                method == "get" and requested_range is not None or self.retry_metadata
+            ) and response.status_code in RETRYABLE_STATUS_CODES:
+                # A temporary server/rate-limit response does not establish a changed
+                # object identity. Keep its audit evidence and let fetch_with_range
+                # apply its existing attempt/backoff/Retry-After contract. No error
+                # body, successful cache entry or acquired-message marker is retained.
+                # Metadata callers must explicitly opt into the same retry boundary.
+                record.update(
+                    status="retryable",
+                    reason=f"Selected {'range' if requested_range else 'metadata'} returned "
+                    f"retryable HTTP {response.status_code}",
+                    completed_at=_iso(self.clock.now()),
+                )
+                return _Response(
+                    response.status_code, MappingProxyType(dict(response.headers)), b""
+                )
             if response.status_code != expected_status:
                 raise SelectedObjectError(
                     f"Selected object returned HTTP {response.status_code}; "

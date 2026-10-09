@@ -28,12 +28,15 @@ from mesoforge.application.precipitation_type import POLICY as PTYPE_POLICY
 from mesoforge.application.prepared_temperature import _code_identity, _iso
 from mesoforge.application.selected_forecast import selection_contributors
 from mesoforge.application.spatial_preparation import PreparedRegions, load_prepared
+from mesoforge.catalog.native_horizons import native_field_contract
+from mesoforge.common.horizon import horizon_for
 from mesoforge.common.identifiers import PreparedSnapshotId
 from mesoforge.forecasting.cloud_cover import CLOUD_ACTIVE_POLICY
+from mesoforge.forecasting.provisional_policy import POP6, PROVISIONAL_MODELS, provisional_policy
 from mesoforge.forecasting.recipes import DEFAULT_CONFIGURATION
 from mesoforge.forecasting.thunder import ACTIVE_POLICY as THUNDER_ACTIVE_POLICY
 from mesoforge.guidance.acquisition_v2 import parse_provider_availability
-from mesoforge.guidance.coverage import COVERAGE_POLICY, REQUIRED_HOURS, window_hours
+from mesoforge.guidance.coverage import COVERAGE_POLICY, window_hours
 
 SNAPSHOT_SCHEMA = "mesoforge.prepared-snapshot.v1"
 POINTER_SCHEMA = "mesoforge.latest-complete-pointer.v1"
@@ -76,7 +79,8 @@ def current_field_policies(selection: dict[str, Any]) -> dict[str, Any]:
     """Identities of the temporary policies the snapshot serves; not a blend design."""
     blend = selection["source_configuration"]["blend_configuration"]
     control = DEFAULT_CONFIGURATION.control_recipe
-    return {
+    assert control is not None
+    policies = {
         "air_temperature_2m": {
             "policy": f"{control.name}/{control.version}",
             "contributors": [row.model for row in control.contributors],
@@ -113,6 +117,27 @@ def current_field_policies(selection: dict[str, Any]) -> dict[str, Any]:
             "status": "temporary_agreement_rule",
         },
     }
+    if horizon_for(selection).duration_hours == 120:
+        policies.pop("surface_scalar_vector")
+        for field in (
+            "air_temperature_2m",
+            "dew_point_temperature_2m",
+            "wind_10m",
+            "wind_gust_10m",
+            "liquid_equivalent_precipitation_amount_1h",
+            "cloud_area_fraction",
+        ):
+            policies[field] = {
+                "policy": provisional_policy(field).policy_id,
+                "contributors": list(PROVISIONAL_MODELS),
+                "status": "provisional_role_lead_priors",
+            }
+        policies[POP6] = {
+            "policy": provisional_policy(POP6).policy_id,
+            "contributors": ["NBM", "GEFS"],
+            "status": "provisional_exact_six_hour_role_priors",
+        }
+    return policies
 
 
 def _sha256_file(path: Path) -> str:
@@ -144,6 +169,8 @@ def _event_coverage(descriptor: dict[str, Any]) -> dict[str, Any]:
 def _pop_coverage(
     preparation: dict[str, Any], hours: tuple[int, ...], target: datetime
 ) -> dict[str, Any]:
+    if horizon_for(preparation["current_model_set"]["selection"]).duration_hours == 120:
+        return _native_field_coverage(preparation, "NBM", "probability_of_precipitation_1h")
     guidance = preparation.get("pop_guidance") or {
         "status": "unavailable",
         "reason": "not prepared",
@@ -186,6 +213,31 @@ def _pop_coverage(
     }
 
 
+def _native_field_coverage(preparation: dict[str, Any], model: str, field: str) -> dict[str, Any]:
+    """Report retained native message times, distinct from interpolated field coverage."""
+    path = _control_manifest(Path(preparation["directory"]))
+    payload = path.read_bytes()
+    retained = json.loads(payload)
+    times = [
+        row["valid_time"]
+        for row in retained["inputs"]
+        if row["model"] == model
+        and any(
+            message.get("canonical_variable_id") == field
+            for message in [row, *row.get("extra_messages", [])]
+        )
+    ]
+    return {
+        "status": "partial" if times else "unavailable",
+        "cycle": preparation["current_model_set"]["selection"]["selected_cycles"].get(model),
+        "valid_times": times,
+        "missing_valid_times": {},
+        "coverage_semantics": "native_message_times; finite point availability is field-specific",
+        "manifest_sha256": hashlib.sha256(payload).hexdigest(),
+        "directory": str(path.parent),
+    }
+
+
 def _attachment_coverage(
     preparation: dict[str, Any], key: str, *, by: str
 ) -> dict[str, dict[str, Any]]:
@@ -213,21 +265,27 @@ def build_snapshot_manifest(
     preparation_bytes = preparation_path.read_bytes()
     preparation = json.loads(preparation_bytes)
     selection = preparation["current_model_set"]["selection"]
+    native = horizon_for(selection).duration_hours == 120
     hours = window_hours(selection)
     target = datetime.fromisoformat(selection["target_reference_time"]).astimezone(UTC)
     supported = [_iso(target + timedelta(hours=hour)) for hour in hours]
     control = Path(preparation["directory"])
     contributors: dict[str, Any] = {}
-    for model in ACTIVE_DETERMINISTIC:
+    for model in PROVISIONAL_MODELS if native else ACTIVE_DETERMINISTIC:
         contributors[model] = {
             "kind": CONTRIBUTOR_KINDS[model],
             "usage": "active_current_policy",
-            "cycle": selection["selected_cycles"][model],
-            "valid_times": list(selection["models"][model]["valid_times"]),
+            "cycle": selection["selected_cycles"].get(model),
+            "valid_times": list(selection["models"][model].get("valid_times", [])),
             "products": _control_products(preparation),
         }
+        if native:
+            contributors[model].update(
+                status="retained" if selection["selected_cycles"].get(model) else "unavailable",
+                shortfall=selection.get("source_shortfalls", {}).get(model),
+            )
     shortfalls = preparation.get("shadow_shortfalls", {})
-    for model in SHADOW_DETERMINISTIC:
+    for model in () if native else SHADOW_DETERMINISTIC:
         shadow = preparation["shadows"][model]
         contributors[model] = {
             "kind": CONTRIBUTOR_KINDS[model],
@@ -265,6 +323,10 @@ def build_snapshot_manifest(
         "cloud_area_fraction": cloud.get("NBM", dict(absent)),
         "probability_of_thunder_1h": thunder.get("NBM_1H", dict(absent)),
     }
+    if native:
+        nbm_products["cloud_area_fraction"] = _native_field_coverage(
+            preparation, "NBM", "cloud_area_fraction"
+        )
     for product in nbm_products.values():
         product.setdefault(
             "status",
@@ -276,6 +338,7 @@ def build_snapshot_manifest(
         )
         product["usage"] = "active_current_policy"
     contributors["NBM"] = {
+        **(contributors["NBM"] if native else {}),
         "kind": CONTRIBUTOR_KINDS["NBM"],
         "usage": "active_current_policy_for_listed_products",
         "products": nbm_products,
@@ -289,8 +352,14 @@ def build_snapshot_manifest(
         "thunder_longer_periods": {s: row for s, row in thunder.items() if s != "NBM_1H"},
         "visibility": visibility,
     }
-    manifest = {
+    if native:
+        evidence["probability_sources"] = preparation.get("probability_sources", [])
+        evidence["probability_source_shortfalls"] = preparation.get(
+            "probability_source_run", {}
+        ).get("request_failures", [])
+    manifest: dict[str, Any] = {
         "schema_version": SNAPSHOT_SCHEMA,
+        **({"forecast_horizon": horizon_for(selection).payload()} if native else {}),
         "snapshot_id": snapshot_id,
         "kind": "prepared_contributor_snapshot",
         "description": (
@@ -342,8 +411,12 @@ def build_snapshot_manifest(
         "completeness": {
             "required_deterministic": all(
                 contributors[model]["valid_times"] == supported for model in ACTIVE_DETERMINISTIC
-            ),
-            "shadows": {model: contributors[model]["status"] for model in SHADOW_DETERMINISTIC},
+            )
+            if not native
+            else False,
+            "shadows": {model: contributors[model]["status"] for model in SHADOW_DETERMINISTIC}
+            if not native
+            else {},
             "nbm_active_products": {name: row["status"] for name, row in nbm_products.items()},
         },
         "prepared_run": {
@@ -359,6 +432,18 @@ def build_snapshot_manifest(
         "code_identity": _identity(),
         "refresh": {"steps": steps, "downloaded_bytes": downloaded_bytes},
     }
+    if native:
+        manifest["coverage"]["usability_rule"] = {
+            "required_complete": [],
+            "reported": list(nbm_products),
+            "rule": (
+                "Each target state time requires at least one eligible native or bracketed "
+                "retained temperature source; other fields preserve missingness"
+            ),
+        }
+        manifest["completeness"]["required_deterministic"] = coverage_for(manifest, target)[
+            "usable"
+        ]
     return manifest
 
 
@@ -560,6 +645,8 @@ def _control_products(preparation: dict[str, Any]) -> list[str]:
         ]
     if selection.get("qpf_fields"):
         products.append("liquid_equivalent_precipitation_amount_1h")
+    if horizon_for(selection).duration_hours == 120:
+        products.append("cloud_area_fraction")
     return products
 
 
@@ -596,7 +683,8 @@ def coverage_for(manifest: dict[str, Any], reference_time: datetime) -> dict[str
     reference = reference_time.astimezone(UTC)
     if reference.minute or reference.second or reference.microsecond:
         raise ValueError("Reference time must be an exact UTC hour")
-    required = [_iso(reference + timedelta(hours=hour)) for hour in range(1, REQUIRED_HOURS + 1)]
+    horizon = horizon_for(manifest)
+    required = [_iso(reference + timedelta(hours=hour)) for hour in horizon.leads]
     prepared_reference = datetime.fromisoformat(manifest["coverage"]["reference_time"])
     contributors = manifest["contributors"]
     result: dict[str, Any] = {
@@ -613,6 +701,42 @@ def coverage_for(manifest: dict[str, Any], reference_time: datetime) -> dict[str
     }
     if reference < prepared_reference:
         result["reason"] = "Reference time precedes the prepared window"
+        return result
+    if horizon.duration_hours == 120:
+        missing = []
+        for valid in required:
+            available = []
+            for model in PROVISIONAL_MODELS:
+                contributor = contributors.get(model, {})
+                cycle = contributor.get("cycle")
+                if not cycle:
+                    continue
+                cycle_time = datetime.fromisoformat(cycle)
+                age_hours = (reference - cycle_time).total_seconds() / 3600
+                maximum_age = provisional_policy("air_temperature_2m").payload()[
+                    "maximum_cycle_age_hours"
+                ]
+                if not 0 <= age_hours <= maximum_age:
+                    continue
+                plan = native_field_contract(model, "air_temperature_2m").plan(
+                    cycle_time, datetime.fromisoformat(valid)
+                )
+                held = set(contributor.get("valid_times", []))
+                if plan.source_leads and all(
+                    _iso(datetime.fromisoformat(cycle) + timedelta(hours=lead)) in held
+                    for lead in plan.source_leads
+                ):
+                    available.append(model)
+            if not available:
+                missing.append(valid)
+        within_window = required[-1] <= manifest["coverage"]["last_valid_time"]
+        result["required_complete"] = {
+            "eligible_temperature_sources": not missing and within_window
+        }
+        result["usable"] = not missing and within_window
+        if not result["usable"]:
+            result["missing"] = {"eligible_temperature_sources": missing}
+            result["reason"] = "Native prepared sources do not cover this complete reference window"
         return result
     for model in manifest["coverage"]["usability_rule"]["required_complete"]:
         held = set(contributors[model]["valid_times"])
@@ -631,7 +755,7 @@ def coverage_for(manifest: dict[str, Any], reference_time: datetime) -> dict[str
         missing = [valid for valid in required if valid not in held]
         result["nbm_active_products"][name] = {
             "status": product["status"],
-            "covered_hours": REQUIRED_HOURS - len(missing),
+            "covered_hours": horizon.duration_hours - len(missing),
             "missing_valid_times": missing,
         }
     result["usable"] = all(result["required_complete"].values())

@@ -5,15 +5,24 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from mesoforge.catalog.contributors import (
     DEFAULT_MODEL_DEFINITIONS,
     SURFACE_MODEL_FIELDS,
     ModelDefinition,
 )
+from mesoforge.forecasting.provisional_policy import PROVISIONAL_MULTIMODEL_POLICY
 from mesoforge.forecasting.scalar_blend import Contribution, blend_scalar
 
 
@@ -63,20 +72,42 @@ class ContributorConfiguration(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     models: tuple[ModelDefinition, ...]
-    control_recipe: Recipe
+    control_recipe: Recipe | None
     comparison_recipes: tuple[Recipe, ...] = ()
+    field_policy_family: Literal["mesoforge.provisional-multimodel-120h.v1"] | None = None
 
     def model_map(self) -> dict[str, ModelDefinition]:
         return {model.model_id: model for model in self.models}
 
     def recipes(self) -> tuple[Recipe, ...]:
-        return (self.control_recipe, *self.comparison_recipes)
+        return (
+            (self.control_recipe, *self.comparison_recipes)
+            if self.control_recipe is not None
+            else ()
+        )
+
+    @model_serializer(mode="wrap")
+    def _historical_payload(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        payload: dict[str, Any] = handler(self)
+        if self.field_policy_family is None:
+            payload.pop("field_policy_family", None)
+        return payload
 
     @model_validator(mode="after")
     def _references(self) -> ContributorConfiguration:
         definitions = self.model_map()
         if not definitions or len(definitions) != len(self.models):
             raise ValueError("models must contain unique model IDs and must not be empty")
+        if self.field_policy_family is not None:
+            if self.control_recipe is not None or self.comparison_recipes:
+                raise ValueError("Provisional field policies cannot claim fixed scalar recipes")
+            if set(definitions) != {"HRRR", "RAP", "GFS", "IFS", "NBM"}:
+                raise ValueError(
+                    "Provisional contributor configuration must declare all five sources"
+                )
+            return self
+        if self.control_recipe is None:
+            raise ValueError("Legacy contributor configuration requires its control recipe")
         identities = [(recipe.name, recipe.version) for recipe in self.recipes()]
         if len(identities) != len(set(identities)):
             raise ValueError("recipe name/version identities must be unique")
@@ -109,6 +140,8 @@ class RecipeEvaluation:
 
 def with_surface_fields(configuration: ContributorConfiguration) -> ContributorConfiguration:
     """Enable registered native fields without changing recipes, weights or lifecycle status."""
+    if configuration.field_policy_family is not None:
+        return configuration
     return configuration.model_copy(
         update={
             "models": tuple(
@@ -123,6 +156,8 @@ def with_surface_fields(configuration: ContributorConfiguration) -> ContributorC
 
 def with_qpf_fields(configuration: ContributorConfiguration) -> ContributorConfiguration:
     """Register retained HRRR/GFS interval QPF without changing any recipe weights."""
+    if configuration.field_policy_family is not None:
+        return configuration
     field = "liquid_equivalent_precipitation_amount_1h"
     return configuration.model_copy(
         update={
@@ -181,4 +216,73 @@ DEFAULT_CONFIGURATION = ContributorConfiguration(
             ),
         ),
     ),
+)
+
+
+_PROVISIONAL_FIELDS = (
+    "air_temperature_2m",
+    "dew_point_temperature_2m",
+    "eastward_wind_10m",
+    "northward_wind_10m",
+    "cloud_area_fraction",
+    "liquid_equivalent_precipitation_amount",
+)
+_PROVISIONAL_CAPABILITIES: tuple[
+    tuple[str, str, str, str, tuple[int, ...], tuple[int, ...], Literal["projected", "geographic"]],
+    ...,
+] = (
+    ("HRRR", "NOAA/NCEP", "HRRR", "CONUS", tuple(range(24)), tuple(range(49)), "projected"),
+    ("RAP", "NOAA/NCEP", "RAP/WRF-ARW", "CONUS", tuple(range(24)), tuple(range(52)), "projected"),
+    (
+        "GFS",
+        "NOAA/NCEP",
+        "GFS",
+        "global",
+        (0, 6, 12, 18),
+        (*range(121), *range(123, 385, 3)),
+        "geographic",
+    ),
+    (
+        "IFS",
+        "ECMWF",
+        "IFS open-data oper/fc",
+        "global",
+        (0, 6, 12, 18),
+        (*range(0, 145, 3), *range(150, 361, 6)),
+        "geographic",
+    ),
+    (
+        "NBM",
+        "NOAA/NCEP",
+        "National Blend of Models",
+        "CONUS",
+        tuple(range(24)),
+        (*range(1, 49), *range(51, 193, 3), *range(198, 265, 6)),
+        "projected",
+    ),
+)
+PROVISIONAL_CONFIGURATION = ContributorConfiguration(
+    models=tuple(
+        ModelDefinition(
+            model_id=model,
+            provider=provider,
+            family=family,
+            domain=domain,
+            cycle_hours=cycles,
+            supported_leads=leads,
+            grid_type=grid,
+            supported_fields=(
+                *_PROVISIONAL_FIELDS,
+                *(
+                    ("wind_gust_10m_interval_maximum",)
+                    if model == "IFS"
+                    else ("wind_gust_10m", "liquid_equivalent_precipitation_amount_1h")
+                ),
+            ),
+            status="active",
+        )
+        for model, provider, family, domain, cycles, leads, grid in _PROVISIONAL_CAPABILITIES
+    ),
+    control_recipe=None,
+    field_policy_family=PROVISIONAL_MULTIMODEL_POLICY,
 )

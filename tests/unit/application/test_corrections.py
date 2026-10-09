@@ -13,6 +13,7 @@ from mesoforge.application.corrections import (
     validate_temperature_policy,
 )
 from mesoforge.application.local_surface_grid import build_local_surface_grid, extract_grid_point
+from mesoforge.common.horizon import FIVE_DAY_HORIZON, LEGACY_HORIZON
 from mesoforge.common.identifiers import GovernanceEventId
 from mesoforge.contracts.policy_governance import GovernanceGrant
 from mesoforge.contracts.serialization import canonical_json_bytes, canonical_json_digest
@@ -68,10 +69,10 @@ def _grant(role="operational", effective_from=None):
     )
 
 
-def _forecast():
+def _forecast(horizon=LEGACY_HORIZON):
     def column(*, latitude, longitude):
         hours = []
-        for horizon in range(1, 37):
+        for lead in horizon.leads:
             temp = 290.0 + (latitude - LAT)
             fields = {
                 TEMPERATURE: {
@@ -95,8 +96,8 @@ def _forecast():
             }
             hours.append(
                 {
-                    "horizon_hours": horizon,
-                    "valid_time": (DECISION + timedelta(hours=horizon)).isoformat(),
+                    "horizon_hours": lead,
+                    "valid_time": (DECISION + timedelta(hours=lead)).isoformat(),
                     "temperature": {"value": temp, "unit": "K"},
                     "surface": {"fields": fields, "contributors": {"HRRR": {TEMPERATURE: 291.0}}},
                     "missing_reasons": [],
@@ -107,10 +108,30 @@ def _forecast():
             "longitude": longitude,
             "hours": hours,
             "target_reference_time": DECISION.isoformat(),
+            **({"forecast_horizon": horizon.payload()} if horizon != LEGACY_HORIZON else {}),
         }
 
     grid = build_local_surface_grid(latitude=LAT, longitude=LON, calculate_column=column)
     return extract_grid_point(grid, latitude=LAT, longitude=LON, copy_grid=False)
+
+
+def test_longer_forecast_does_not_extend_approved_correction_buckets():
+    forecast = _forecast(FIVE_DAY_HORIZON)
+    result, overlay = apply_temperature_correction(
+        forecast, _policy(), analysis_cutoff=DECISION, grant=_grant()
+    )
+    assert overlay["status"] == "applied"
+    assert overlay["uncovered_leads"]["status"] == "no_policy"
+    assert overlay["uncovered_leads"]["hours"] == list(range(37, 121))
+    assert len(overlay["changes"]) == 49 * 6
+    assert result["hours"][0]["temperature"]["value"] == 289.0
+    for original, corrected in zip(
+        forecast["local_grid_baseline"]["cells"],
+        result["local_grid_baseline"]["cells"],
+        strict=True,
+    ):
+        assert corrected["hours"][36:] == original["hours"][36:]
+    assert all(row["applied_delta_k"] == 0 for row in overlay["point_values"][36:])
 
 
 def test_candidate_sign_buckets_and_insufficient_evidence_reuse_existing_governance():

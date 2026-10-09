@@ -62,18 +62,31 @@
 - `forecasting/coherence.py` owns finite ordering of current source checks, T/Td,
   RH and wind/gust operations. Registered future relationships are dependencies,
   not approved enforcement rules. Do not invent precipitation-family constraints.
-- Fixed weights, NBM active sources, HRRR/GFS p-type agreement and shadow roles
-  remain active until explicitly replaced. Generalized machinery does not authorize
-  new scientific policies or model promotion. Prove equivalence when replacing
-  scaffolding, then remove superseded execution rather than stack another path.
+- Historical/default 36-hour policies remain intact. Explicit 120-hour guidance uses
+  `mesoforge.provisional-multimodel-120h.v1`, the owner-approved field/lead/role prior,
+  never a skill claim. Preserve native expiry, eligibility, normalized weights and
+  adjacent-state interpolation provenance. Keep coarse QPF/probability events exact;
+  never split totals or probabilities into invented hourly values. Generalized machinery
+  alone does not authorize new science, model promotion or automatic learning.
 - Hosted operation is one image with two roles: `guidance_worker` decides only when
   to run `refresh_guidance`/`build_baseline`; `forecast_worker` pins one ready
   baseline and calls `forecast_from_baseline`, never refreshing guidance. Keep their
   decisions on existing contracts, with no provider logic or science of their own.
   Workers never migrate schema or change governance; `operations migrate` is the one
-  explicit schema step. Automatic policy promotion and recurring delivery remain future work.
+  explicit schema step. Automatic policy promotion remains future work. Recurring delivery
+  is implemented but owner-gated and currently disabled.
   Schedulers decide WHEN; MesoForge owns meteorology. Do not put forecast science in
   scheduler, Compose or GHA YAML.
+- Daily v1 has independent Minneapolis/Grasston workflows sharing prepared Guidance
+  and the host/runtime lock, with location-scoped receipts, baselines and PDF/email.
+  Keep each GHA opt-in disabled without owner authorization;
+  do not install a competing timer. Shared runtime locks, fresh-baseline handoff and
+  local-day receipts must prevent overlap or repeat paid work. Disk warnings never
+  authorize deletion of unresolved scientific dependencies or runner state.
+  Native payload expiry needs the exact verified local-backup plan and shared lock;
+  retain JSON/baseline replay dependencies and compact permanent evidence. Recipients
+  belong to configured locations. Same-host recovery is v1 policy; no paid off-host
+  service is required. Schedule enablement never implies authorization to merge.
 - Learning uses common immutable stage/variant lineage and the existing artifact
   store/evaluator. Local temperature correction is explicitly no-op unless an
   ACTIVE policy exists; candidates/shadows never promote themselves. Build candidate

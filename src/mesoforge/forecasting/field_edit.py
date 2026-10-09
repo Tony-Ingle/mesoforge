@@ -13,6 +13,7 @@ from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
+from mesoforge.common.qpf_intervals import validate_qpf_intervals
 from mesoforge.contracts.serialization import canonical_json_digest
 from mesoforge.forecasting.coherence import BASELINE_COHERENCE, DEW_POINT, QPF, RH, TEMPERATURE
 from mesoforge.forecasting.field_blend import FIELD_REGISTRY, field_edit_contract
@@ -78,6 +79,16 @@ def grid_values_digest(grid: dict[str, Any]) -> str:
                 "cells": [
                     {
                         "cell": cell_identity(cell),
+                        **(
+                            {
+                                "qpf_intervals": [
+                                    {key: row[key] for key in keys if key in row}
+                                    for row in cell["qpf_intervals"]
+                                ]
+                            }
+                            if "qpf_intervals" in cell
+                            else {}
+                        ),
                         "hours": [
                             {
                                 "valid_time": hour["valid_time"],
@@ -139,6 +150,27 @@ def validate_grid(grid: dict[str, Any]) -> dict[str, Any]:
         if not times or times != sorted(set(times)) or (timing is not None and times != timing):
             raise FieldEditError("Local-grid valid times are duplicated, unordered or unaligned")
         timing = times
+        if "qpf_intervals" in cell:
+            try:
+                events = validate_qpf_intervals(
+                    cell["qpf_intervals"], start=times[0] - timedelta(hours=1), end=times[-1]
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise FieldEditError("Invalid canonical QPF interval partition") from exc
+            hourly = {
+                _time(hour["valid_time"]): _fields(hour).get(QPF, {}) for hour in cell["hours"]
+            }
+            for event in events:
+                start, end = (_time(event[key]) for key in ("interval_start", "interval_end"))
+                if end - start == timedelta(hours=1):
+                    if event["value"] != hourly[end].get("value"):
+                        raise FieldEditError(
+                            "Canonical hourly QPF differs from its saved hourly field"
+                        )
+                elif any(
+                    hourly[time].get("value") is not None for time in times if start < time <= end
+                ):
+                    raise FieldEditError("Coarse QPF cannot be represented as hourly amounts")
         for hour in cell["hours"]:
             fields = _fields(hour)
             for name in (TEMPERATURE, QPF):
@@ -206,10 +238,37 @@ def validate_edit_scope(
         before = before_cells[identity]
         if cell is before:
             continue
-        if {k: v for k, v in cell.items() if k != "hours"} != {
-            k: v for k, v in before.items() if k != "hours"
+        if {k: v for k, v in cell.items() if k not in {"hours", "qpf_intervals"}} != {
+            k: v for k, v in before.items() if k not in {"hours", "qpf_intervals"}
         } or len(cell["hours"]) != len(before["hours"]):
             raise FieldEditError("Edited cell metadata differs from its parent")
+        old_events, new_events = before.get("qpf_intervals"), cell.get("qpf_intervals")
+        if old_events != new_events:
+            if (
+                not isinstance(old_events, list)
+                or not isinstance(new_events, list)
+                or len(old_events) != len(new_events)
+            ):
+                raise FieldEditError("Edited canonical QPF event inventory changed")
+            for old_event, new_event in zip(old_events, new_events, strict=True):
+                event_permitted = next(
+                    (
+                        fields
+                        for (cell_key, valid), fields in allowed.items()
+                        if cell_key == identity and _time(valid) == _time(old_event["interval_end"])
+                    ),
+                    set(),
+                )
+                if old_event != new_event and _time(old_event["interval_end"]) - _time(
+                    old_event["interval_start"]
+                ) != timedelta(hours=1):
+                    raise FieldEditError("Coarse QPF events are inspect-only")
+                if QPF not in event_permitted and old_event != new_event:
+                    raise FieldEditError("Canonical QPF changed outside accepted edit scope")
+                if {k: v for k, v in old_event.items() if k != "value"} != {
+                    k: v for k, v in new_event.items() if k != "value"
+                }:
+                    raise FieldEditError("Native QPF event metadata changed")
         for old, new in zip(before["hours"], cell["hours"], strict=True):
             if new is old:
                 continue
@@ -433,7 +492,22 @@ def apply_edit(
                 }
             )
             updated_hours.append(changed_hour)
-        updated_cells.append({**cell, "hours": updated_hours})
+        updated_cell = {**cell, "hours": updated_hours}
+        if field == QPF and "qpf_intervals" in cell:
+            hourly_changes = {
+                _time(row["valid_time"]): row["after"]
+                for row in changes
+                if row["cell_id"] == identity
+            }
+            updated_cell["qpf_intervals"] = [
+                {**event, "value": hourly_changes[_time(event["interval_end"])]}
+                if _time(event["interval_end"]) in hourly_changes
+                and _time(event["interval_end"]) - _time(event["interval_start"])
+                == timedelta(hours=1)
+                else event
+                for event in cell["qpf_intervals"]
+            ]
+        updated_cells.append(updated_cell)
     if not changes:
         raise FieldEditError("Edit is an exact no-op (including missing or zero-taper cells)")
     result_grid = {**grid, "cells": updated_cells}

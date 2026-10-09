@@ -22,6 +22,8 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from mesoforge.application.issuance import ForecastIssuanceService
+from mesoforge.application.location_config import load_locations as load_locations
+from mesoforge.application.location_config import location_email_recipients
 from mesoforge.application.prepared_temperature import _code_identity, prepare_locations
 from mesoforge.application.spatial_coverage import CoverageRequiredError, UnsupportedCoordinateError
 from mesoforge.application.spatial_preparation import ensure_coverage
@@ -96,30 +98,23 @@ def create_issuer(*, ensure_bucket: bool = True) -> ForecastIssuanceService:
     return ForecastIssuanceService(objects, lambda: PostgresUnitOfWork(dsn), code_identity=identity)
 
 
-def _reject_constant(value: str) -> None:
-    raise ValueError(f"Non-finite JSON number is not supported: {value}")
-
-
-def _json_float(value: str) -> float | str:
-    number = float(value)
-    # Preserve an overflowing numeral as text in its location error, not JSON Infinity.
-    return number if math.isfinite(number) else value
-
-
 def _coordinates(location: object) -> tuple[float, float]:
     message = (
         "Each location requires finite numeric lat and lon, with optional string id/name "
-        "and an optional string display_timezone."
+        "and optional display_timezone/email_recipients metadata."
     )
     if (
         not isinstance(location, dict)
-        or not {"lat", "lon"} <= set(location) <= {"lat", "lon", "id", "name", "display_timezone"}
+        or not {"lat", "lon"}
+        <= set(location)
+        <= {"lat", "lon", "id", "name", "display_timezone", "email_recipients"}
         or any(
             key in location and not isinstance(location[key], str)
             for key in ("id", "name", "display_timezone")
         )
     ):
         raise ValueError(message)
+    location_email_recipients(location)
     if any(type(location[key]) not in (int, float) for key in ("lat", "lon")):
         raise ValueError(message)
     try:
@@ -143,23 +138,6 @@ def location_display_timezone(location: dict[str, Any]) -> str | None:
     except (ValueError, ZoneInfoNotFoundError) as exc:
         raise ValueError(f"display_timezone must be a resolvable IANA zone, not {zone!r}") from exc
     return zone
-
-
-def load_locations(config_path: Path) -> list[Any]:
-    """Read the shared locations JSON format without accessing guidance or storage."""
-    config = json.loads(
-        config_path.read_text(encoding="utf-8-sig"),
-        parse_constant=_reject_constant,
-        parse_float=_json_float,
-    )
-    if (
-        not isinstance(config, dict)
-        or set(config) != {"locations"}
-        or not isinstance(config["locations"], list)
-    ):
-        raise ValueError("Config must be a JSON object containing a locations list.")
-
-    return config["locations"]
 
 
 def run_batch(
@@ -291,7 +269,13 @@ def run_batch(
 
 
 def validate_current_control(configuration: ContributorConfiguration) -> None:
-    """This application milestone permits shadow additions, not a new issued recipe."""
+    """Accept the explicit provisional registry or the unchanged historical control."""
+    if configuration.field_policy_family is not None:
+        from mesoforge.forecasting.recipes import PROVISIONAL_CONFIGURATION
+
+        if configuration != PROVISIONAL_CONFIGURATION:
+            raise ValueError("Provisional source registry differs from its versioned contract")
+        return
     if configuration.control_recipe != DEFAULT_CONFIGURATION.control_recipe:
         raise ValueError("Batch issuance must retain the approved HRRR/GFS 70/30 control recipe")
     models = configuration.model_map()

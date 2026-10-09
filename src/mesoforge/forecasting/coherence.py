@@ -210,7 +210,11 @@ class ValidatedSources:
 
 
 def _validate_sources(
-    state: BlendState, configuration: Phase2BlendConfiguration
+    state: BlendState,
+    configuration: Phase2BlendConfiguration,
+    *,
+    active_models: tuple[str, ...] = _ACTIVE_MODELS,
+    independent_missing_gust: bool = False,
 ) -> ValidatedSources:
     source_validation = state.source_validation
     dew_values: dict[str, float] = {}
@@ -219,7 +223,7 @@ def _validate_sources(
     gust_values: dict[str, float] = {}
     dew_reasons: list[str] = []
     wind_reasons: list[str] = []
-    for model in sorted(set(state.contributors) | set(_ACTIVE_MODELS)):
+    for model in sorted(set(state.contributors) | set(active_models)):
         source = state.contributors.get(model, {})
         source_temperature = source.get(TEMPERATURE)
         dew = source.get(DEW_POINT)
@@ -234,7 +238,7 @@ def _validate_sources(
                 check_dew_point_consistency(temperature_k=source_temperature, dew_point_k=dew)
             except ConsistencyError as exc:
                 source_dew_reasons.append(f"{model}: {exc}")
-        if model in _ACTIVE_MODELS:
+        if model in active_models:
             dew_reasons.extend(source_dew_reasons)
             if not source_dew_reasons:
                 assert dew is not None
@@ -267,7 +271,7 @@ def _validate_sources(
                 source_floor = validation.source_gust_floor_applied
             except GustDisqualificationError as exc:
                 source_wind_reasons.append(f"{model}: {exc}")
-        if model in _ACTIVE_MODELS:
+        if model in active_models:
             wind_reasons.extend(source_wind_reasons)
             if not source_wind_reasons:
                 assert u is not None and v is not None and validated_gust is not None
@@ -289,6 +293,23 @@ def _validate_sources(
                 "source_gust_floor_applied": source_floor,
             },
         }
+        # The explicit longer-range policy admits a valid vector whose source
+        # has no comparable instantaneous gust (e.g. IFS interval maximum).
+        # A present but materially inconsistent gust still rejects its coupled
+        # tuple through the existing kernel; no new gust floor is introduced.
+        if (
+            independent_missing_gust
+            and model in active_models
+            and gust is None
+            and _usable(u, -100.0, 100.0)
+            and _usable(v, -100.0, 100.0)
+        ):
+            assert u is not None and v is not None
+            u_values[model], v_values[model] = u, v
+            source_validation[model]["wind_gust"].update(
+                rejection_scope="instantaneous_gust_only_unavailable",
+                wind_available_without_instantaneous_gust=True,
+            )
     state.validated = ValidatedSources(
         dew_values, u_values, v_values, gust_values, dew_reasons, wind_reasons
     )
@@ -405,7 +426,7 @@ class CoherenceEngine:
             if target not in state.results:
                 blend_engine._blend_raw(target, state)
         if fields is None:
-            if state.precipitation:
+            if state.precipitation or state.precipitation_interval is not None:
                 blend_engine._blend_raw(QPF, state)
             self.report(state)  # A full state must prove every required operation completed.
             collector = _COLLECTOR.get()
@@ -443,7 +464,17 @@ class CoherenceEngine:
     ) -> dict[str, Any]:
         if engine.phase2 is None:
             raise CoherenceError("Prepared Phase 2 policy configuration required")
-        sources = _validate_sources(state, engine.phase2)
+        if engine.policy_family is not None:
+            from mesoforge.forecasting.provisional_policy import PROVISIONAL_MODELS
+
+            sources = _validate_sources(
+                state,
+                engine.phase2,
+                active_models=PROVISIONAL_MODELS,
+                independent_missing_gust=True,
+            )
+        else:
+            sources = _validate_sources(state, engine.phase2)
         rejected = any(
             row[kind]["status"] == "rejected"
             for row in state.source_validation.values()
@@ -453,7 +484,7 @@ class CoherenceEngine:
             row["wind_gust"]["source_gust_floor_applied"]
             for row in state.source_validation.values()
         )
-        return _event(
+        event = _event(
             "native_source_consistency",
             available=bool(sources.dew or sources.u),
             actions=[
@@ -464,6 +495,9 @@ class CoherenceEngine:
             refs=["surface/source_validation", "surface/contributors"],
             changed=["working_native_gust"] if floors else [],
         )
+        if engine.policy_family is not None:
+            event["policy_ids"].append("mesoforge.provisional-native-eligibility.v1")
+        return event
 
     def _blended_dew_point_consistency(
         self, engine: FieldBlendEngine, state: BlendState
@@ -574,6 +608,7 @@ class CoherenceAudit:
     outcomes: dict[str, Counter[str]] = field(default_factory=dict)
     actions: dict[str, Counter[str]] = field(default_factory=dict)
     relationship_seconds: dict[str, float] = field(default_factory=dict)
+    relationship_policies: dict[str, list[str]] = field(default_factory=dict)
     blend_seconds: float = 0.0
 
     @property
@@ -586,6 +621,10 @@ class CoherenceAudit:
         for identity, event in report["relationships"].items():
             self.outcomes.setdefault(identity, Counter())[event["status"]] += 1
             self.actions.setdefault(identity, Counter()).update(event["actions"])
+            policies = self.relationship_policies.setdefault(identity, [])
+            for policy in event["policy_ids"]:
+                if policy not in policies:
+                    policies.append(policy)
             self.relationship_seconds[identity] = (
                 self.relationship_seconds.get(identity, 0.0) + state.coherence_seconds[identity]
             )
@@ -610,7 +649,9 @@ class CoherenceAudit:
                 key: {
                     "outcomes": dict(sorted(self.outcomes.get(key, {}).items())),
                     "actions": dict(sorted(self.actions.get(key, {}).items())),
-                    "policy_ids": list(RELATIONSHIP_REGISTRY[key].policy_ids),
+                    "policy_ids": self.relationship_policies.get(
+                        key, list(RELATIONSHIP_REGISTRY[key].policy_ids)
+                    ),
                 }
                 for key in EXECUTION_ORDER
             },

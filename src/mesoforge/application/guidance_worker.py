@@ -8,7 +8,8 @@ Decisions use facts those workflows already publish:
   ``coverage_margin_hours`` are no longer usable (``coverage_for``), when configured
   coordinates lie outside the prepared footprint, in the hour before a scheduled
   issuance slot, or when an hourly discovery probe (the existing ``select_model_set``)
-  finds a newer cycle of a required contributor. Otherwise nothing is downloaded;
+  finds a newer cycle of a required contributor (or an eligible participating
+  contributor for the native five-day contract). Otherwise nothing is downloaded;
 * build when the latest baseline is missing, pins an older prepared snapshot, lacks
   resolved blend governance, was revoked, pins different governed blend heads, or
   lacks a configured coordinate that the prepared snapshot covers. A build-input
@@ -50,6 +51,12 @@ from mesoforge.application.batch_forecast import (
     location_display_timezone,
 )
 from mesoforge.application.code_revision import current_code_revision
+from mesoforge.application.disk_admission import (
+    DEFAULT_MIN_FREE_BYTES,
+    DEFAULT_WARN_FREE_BYTES,
+    GIB,
+    DiskPolicy,
+)
 from mesoforge.application.forecast_schedule import ForecastSchedule
 from mesoforge.application.prepared_snapshot import (
     SnapshotError,
@@ -59,6 +66,8 @@ from mesoforge.application.prepared_snapshot import (
 )
 from mesoforge.application.runtime_log import event, redact, redact_diagnostics
 from mesoforge.application.spatial_coverage import validate_coordinate
+from mesoforge.application.worker_lock import single_writer as single_writer
+from mesoforge.application.worker_lock import worker_lock_root
 from mesoforge.application.worker_status import (
     GUIDANCE_HEARTBEAT,
     GUIDANCE_STATUS,
@@ -72,9 +81,9 @@ from mesoforge.application.worker_status import (
     status_directory,
     write_json,
 )
+from mesoforge.common.horizon import LEGACY_HORIZON, ForecastHorizon, horizon_for
 from mesoforge.contracts.policy_governance import BLEND_POLICY, parse_scope
 from mesoforge.contracts.serialization import canonical_json_bytes
-from mesoforge.guidance.coverage import MAXIMUM_PREPARED_HOURS
 
 _ROOT = Path(__file__).resolve().parents[3]
 ROLE = "guidance-worker"
@@ -102,13 +111,29 @@ class WorkerSettings:
     max_refresh_attempts_per_hour: int = 2
     backoff_base_seconds: int = 300
     backoff_cap_seconds: int = 3600
-    min_free_bytes: int = 6 * 1024**3
-    coverage_hours: int = MAXIMUM_PREPARED_HOURS
+    min_free_bytes: int = DEFAULT_MIN_FREE_BYTES
+    warn_free_bytes: int = DEFAULT_WARN_FREE_BYTES
+    coverage_hours: int | None = None
+    forecast_horizon: ForecastHorizon = LEGACY_HORIZON
     # False refreshes only for coverage, footprint and pre-slot reasons (less bandwidth).
     hourly_probe: bool = True
     schedule: ForecastSchedule = field(default_factory=ForecastSchedule)
+    # Shared preparation footprint; the baseline still uses only ``config``.
+    guidance_config: Path | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.forecast_horizon, ForecastHorizon):
+            raise ValueError("forecast_horizon must be an explicit ForecastHorizon")
+        duration = self.forecast_horizon.duration_hours
+        if self.coverage_hours is None:
+            object.__setattr__(self, "coverage_hours", duration + 6)
+        if (
+            type(self.coverage_hours) is not int
+            or not duration <= self.coverage_hours <= duration + 6
+        ):
+            raise ValueError(
+                "Prepared coverage must span the forecast horizon plus at most six hours"
+            )
         if self.refresh not in {"auto", "off"}:
             raise ValueError("refresh must be 'auto' or 'off'")
         if self.interval_seconds < 10:
@@ -123,11 +148,20 @@ class WorkerSettings:
             raise ValueError("Backoff cap must be at least one hour and the poll interval")
         if self.backoff_base_seconds < 1 or self.min_free_bytes < 0:
             raise ValueError("Backoff base and free-space floor must be non-negative")
+        DiskPolicy(self.min_free_bytes, self.warn_free_bytes)
+
+    @property
+    def disk_policy(self) -> DiskPolicy:
+        return DiskPolicy(self.min_free_bytes, self.warn_free_bytes)
 
     def public(self) -> dict[str, Any]:
         values = asdict(self)
         values["root"], values["config"] = str(self.root), str(self.config)
+        values["guidance_config"] = (
+            str(self.guidance_config) if self.guidance_config is not None else None
+        )
         values["schedule"] = asdict(self.schedule)
+        values["forecast_horizon"] = self.forecast_horizon.payload()
         return values
 
 
@@ -163,7 +197,11 @@ def _error(exc: BaseException) -> str:
 
 
 def _reuse_probe(
-    source: Path, fallback: Callable[[Path], dict[str, Any]], clock: Callable[[], datetime]
+    source: Path,
+    fallback: Callable[[Path], dict[str, Any]],
+    clock: Callable[[], datetime],
+    *,
+    forecast_horizon: ForecastHorizon = LEGACY_HORIZON,
 ) -> Callable[[Path], dict[str, Any]]:
     """Discovery step that reuses this hour's probe evidence instead of rediscovering.
 
@@ -177,7 +215,11 @@ def _reuse_probe(
             target = datetime.fromisoformat(report["target_reference_time"])
         except (OSError, ValueError, KeyError):
             return fallback(directory)
-        if report.get("status") != "selected" or derive_reference_time(clock()) != target:
+        if (
+            report.get("status") != "selected"
+            or derive_reference_time(clock()) != target
+            or horizon_for(report) != forecast_horizon
+        ):
             return fallback(directory)
         shutil.copytree(source, directory)
         loaded: dict[str, Any] = json.loads((directory / "selection.json").read_text("utf-8"))
@@ -187,6 +229,14 @@ def _reuse_probe(
 
 
 def default_deps(settings: WorkerSettings) -> WorkerDeps:
+    assert settings.coverage_hours is not None
+    coverage_hours = settings.coverage_hours
+    horizon_options: dict[str, Any] = (
+        {"forecast_horizon": settings.forecast_horizon}
+        if settings.forecast_horizon != LEGACY_HORIZON
+        else {}
+    )
+
     def clock() -> datetime:
         return datetime.now(UTC)
 
@@ -204,16 +254,21 @@ def default_deps(settings: WorkerSettings) -> WorkerDeps:
     def discover(directory: Path) -> dict[str, Any]:
         from mesoforge.application.refresh_guidance import default_steps
 
-        return default_steps(coverage_hours=settings.coverage_hours).discover(directory)
+        return default_steps(coverage_hours=coverage_hours, **horizon_options).discover(directory)
 
     def refresh(config: Path, guidance_root: Path, probe: Path | None) -> dict[str, Any]:
         from mesoforge.application.refresh_guidance import default_steps, refresh_guidance
 
-        steps = default_steps(coverage_hours=settings.coverage_hours)
+        steps = default_steps(coverage_hours=coverage_hours, **horizon_options)
         if probe is not None:
-            steps = replace(steps, discover=_reuse_probe(probe, steps.discover, clock))
+            steps = replace(
+                steps,
+                discover=_reuse_probe(
+                    probe, steps.discover, clock, forecast_horizon=settings.forecast_horizon
+                ),
+            )
         return refresh_guidance(
-            config, guidance_root, coverage_hours=settings.coverage_hours, steps=steps
+            config, guidance_root, coverage_hours=coverage_hours, steps=steps, **horizon_options
         )
 
     def build(*args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -308,39 +363,6 @@ def _prepared_coordinates(directory: Path) -> set[tuple[float, float]]:
         return set()
 
 
-@contextmanager
-def single_writer(root: Path) -> Iterator[bool]:
-    """Hold an exclusive, non-blocking lock on the runtime root for this process."""
-    directory = status_directory(root)
-    directory.mkdir(parents=True, exist_ok=True)
-    with (directory / "guidance-worker.lock").open("a+b") as stream:
-        stream.seek(0)
-        try:
-            if sys.platform == "win32":
-                import msvcrt
-
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            stream.seek(0)
-            if sys.platform == "win32":
-                import msvcrt
-
-                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-
-
 class GuidanceWorker:
     def __init__(
         self,
@@ -353,6 +375,7 @@ class GuidanceWorker:
         if root.is_relative_to(_ROOT):
             raise ValueError("The runtime root must remain outside the repository")
         self.settings = replace(settings, root=root)
+        self.lock_root = worker_lock_root(root)
         self.deps = deps
         self.stream = stream
         self.status_path = status_directory(root) / GUIDANCE_STATUS
@@ -510,6 +533,25 @@ class GuidanceWorker:
         self._clear_probes()
         locations, invalid = _valid_locations(self.settings.config)
         outcome["locations"] = {"valid": len(locations), "invalid": invalid}
+        guidance_locations = locations
+        if self.settings.guidance_config is not None:
+            try:
+                guidance_locations, guidance_invalid = _valid_locations(
+                    self.settings.guidance_config
+                )
+                if guidance_invalid or not guidance_locations:
+                    raise ValueError("Shared Guidance configuration requires valid locations")
+                if not {_coordinates(row) for row in locations} <= {
+                    _coordinates(row) for row in guidance_locations
+                }:
+                    raise ValueError(
+                        "Shared Guidance configuration must include baseline locations"
+                    )
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                categories.append("invalid_configuration")
+                outcome["guidance_locations"] = {"status": "invalid", "error": _error(exc)}
+                return
+            outcome["guidance_locations"] = {"status": "valid", "count": len(guidance_locations)}
         database = True
         with self.phase("schema"):
             try:
@@ -530,8 +572,10 @@ class GuidanceWorker:
             free: int | None = d.disk_free(self.settings.root)
         except OSError:
             free = None
-        self.state["disk"] = {"free_bytes": free, "min_free_bytes": self.settings.min_free_bytes}
-        outcome["refresh"] = self._refresh_step(locations, free, categories)
+        self.state["disk"] = self.settings.disk_policy.report(free)
+        if self.state["disk"]["status"] == "warning":
+            self.log("disk_warning", **self.state["disk"])
+        outcome["refresh"] = self._refresh_step(guidance_locations, free, categories)
         if self._stopping(outcome):
             return
         governance, snapshot = None, None
@@ -593,6 +637,8 @@ class GuidanceWorker:
     def _usable_ahead(self, manifest: dict[str, Any], current: datetime) -> int:
         """-1 when the current hour is unusable, else consecutive usable later hours."""
         try:
+            if horizon_for(manifest) != self.settings.forecast_horizon:
+                return -1
             if not coverage_for(manifest, current)["usable"]:
                 return -1
             ahead = 0
@@ -676,7 +722,11 @@ class GuidanceWorker:
                     "provider_unavailable" if probe["status"] == "failed" else "provider_incomplete"
                 )
                 return {"decision": "none", "reasons": [], "probe": probe}
-            reasons = [f"newer_required_cycle:{model}" for model in probe["newer_required_cycles"]]
+            reasons = [
+                f"newer_{role}_cycle:{model}"
+                for role in ("required", "participating")
+                for model in probe.get(f"newer_{role}_cycles", [])
+            ]
             if not reasons:
                 return {"decision": "no_material_change", "reasons": [], "probe": probe}
             probe_selection = Path(probe.pop("selection_directory"))
@@ -696,7 +746,7 @@ class GuidanceWorker:
             free: int | None = self.deps.disk_free(self.settings.root)
         except OSError:
             free = None
-        self.state["disk"] = {"free_bytes": free, "min_free_bytes": self.settings.min_free_bytes}
+        self.state["disk"] = self.settings.disk_policy.report(free)
         blocked = (
             "disk_unavailable"
             if free is None
@@ -735,20 +785,29 @@ class GuidanceWorker:
         if summary["status"] == "selected":
             prepared = self._prepared()
             manifest = prepared[1] if prepared is not None else {}
-            required = (
-                manifest.get("coverage", {})
-                .get("usability_rule", {})
-                .get("required_complete", ["HRRR", "GFS"])
+            native = horizon_for(manifest).duration_hours == 120
+            compared = (
+                sorted(summary["selected_cycles"])
+                if native
+                else (
+                    manifest.get("coverage", {})
+                    .get("usability_rule", {})
+                    .get("required_complete", ["HRRR", "GFS"])
+                )
             )
             newer = []
-            for model in required:
+            for model in compared:
                 selected = summary["selected_cycles"].get(model)
                 held = manifest.get("contributors", {}).get(model, {}).get("cycle")
                 if selected and (
                     held is None or datetime.fromisoformat(selected) > datetime.fromisoformat(held)
                 ):
                     newer.append(model)
-            summary["newer_required_cycles"] = newer
+            # Native coverage requires available contributors, not one fixed
+            # mandatory source set. A newly available or newer eligible source
+            # still changes the inputs when no particular source is mandatory.
+            role = "participating" if native else "required"
+            summary[f"newer_{role}_cycles"] = newer
             summary["selection_directory"] = str(directory / "selection")
         self.state["refresh"]["last_probe"] = {
             key: value for key, value in summary.items() if key != "selection_directory"
@@ -848,6 +907,8 @@ class GuidanceWorker:
         if prepared is None:
             return None
         pointer, manifest, directory = prepared
+        if horizon_for(manifest) != self.settings.forecast_horizon:
+            return None
         heads = {
             parse_scope(key)["field"]: str(scope.head_event_id)
             for key, scope in snapshot.scopes.items()
@@ -861,6 +922,11 @@ class GuidanceWorker:
                     "coordinates": sorted(_coordinates(row) for row in locations),
                     "code_revision": self.code_revision,
                     "blend_heads": heads,
+                    **(
+                        {"forecast_horizon": self.settings.forecast_horizon.payload()}
+                        if self.settings.forecast_horizon != LEGACY_HORIZON
+                        else {}
+                    ),
                 }
             )
         ).hexdigest()
@@ -881,6 +947,8 @@ class GuidanceWorker:
         if baseline is None:
             return ["no_baseline"]
         reasons = []
+        if horizon_for(baseline) != self.settings.forecast_horizon:
+            reasons.append("forecast_horizon_changed")
         if baseline["prepared_snapshot"]["snapshot_id"] != prepared_pointer["snapshot_id"]:
             reasons.append("new_prepared_snapshot")
         if baseline.get("code_revision") != self.code_revision:
@@ -1160,7 +1228,7 @@ class GuidanceWorker:
         install_signals: bool = True,
         exit_process: Callable[[int], None] = os._exit,
     ) -> int:
-        with single_writer(self.settings.root) as owned:
+        with single_writer(self.lock_root) as owned:
             if not owned:
                 self.log("worker_busy", root=str(self.settings.root))
                 return 2
@@ -1208,7 +1276,13 @@ class GuidanceWorker:
                 while not self.stop.is_set():
                     outcome = self.poll_once()
                     if once:
-                        failures = set(outcome["categories"]) - {"provider_incomplete"}
+                        # Optional candidate shadows cannot invalidate a published
+                        # active baseline. Keep the warning in durable status;
+                        # callers still gate the active handoff on readiness.
+                        failures = set(outcome["categories"]) - {
+                            "provider_incomplete",
+                            "candidate_background_failed",
+                        }
                         status = 1 if failures else 0
                         break
                     delay = backoff_seconds(
@@ -1283,7 +1357,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("command", choices=("run", "once", "status", "health", "discover"))
     parser.add_argument("--root", type=Path, default=_default_root())
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument(
+        "--guidance-config",
+        type=Path,
+        help="Shared preparation location collection; --config selects baseline domains only",
+    )
     parser.add_argument("--interval-seconds", type=int, default=300)
+    parser.add_argument(
+        "--forecast-horizon-hours",
+        type=int,
+        choices=(36, 120),
+        default=int(os.environ.get("MESOFORGE_FORECAST_HORIZON_HOURS", "36")),
+        help="Explicit numerical horizon; 120 uses the approved provisional five-day policies",
+    )
     parser.add_argument(
         "--refresh",
         choices=("auto", "off"),
@@ -1295,7 +1381,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-refresh-attempts-per-hour", type=int, default=2)
     parser.add_argument("--backoff-base-seconds", type=int, default=300)
     parser.add_argument("--backoff-cap-seconds", type=int, default=3600)
-    parser.add_argument("--min-free-gb", type=float, default=6.0)
+    disk_policy = DiskPolicy.from_environment()
+    parser.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=disk_policy.min_free_bytes / GIB,
+        help="Refuse heavy Guidance work below this free GiB reserve (default 20)",
+    )
+    parser.add_argument(
+        "--warn-free-gb",
+        type=float,
+        default=disk_policy.warn_free_bytes / GIB,
+        help="Report an operator storage warning through this free GiB reserve (default 30)",
+    )
     parser.add_argument(
         "--no-hourly-probe",
         action="store_true",
@@ -1325,7 +1423,9 @@ def main(argv: list[str] | None = None) -> int:
         settings = WorkerSettings(
             root=args.root,
             config=args.config,
+            guidance_config=args.guidance_config,
             interval_seconds=args.interval_seconds,
+            forecast_horizon=ForecastHorizon(args.forecast_horizon_hours),
             refresh=args.refresh,
             coverage_margin_hours=args.coverage_margin_hours,
             latest_start_minute=args.latest_start_minute,
@@ -1333,6 +1433,7 @@ def main(argv: list[str] | None = None) -> int:
             backoff_base_seconds=args.backoff_base_seconds,
             backoff_cap_seconds=args.backoff_cap_seconds,
             min_free_bytes=int(args.min_free_gb * 1024**3),
+            warn_free_bytes=int(args.warn_free_gb * 1024**3),
             hourly_probe=not args.no_hourly_probe,
             schedule=ForecastSchedule.from_environment(),
         )

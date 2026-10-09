@@ -26,6 +26,7 @@ from mesoforge.application.spatial_coverage import (
     validate_coordinate,
 )
 from mesoforge.catalog.configuration import load_configuration_source
+from mesoforge.common.horizon import horizon_for
 from mesoforge.forecasting.recipes import DEFAULT_CONFIGURATION, ContributorConfiguration
 from mesoforge.guidance.runtime import SystemClock
 
@@ -400,19 +401,23 @@ def attach_pop_guidance(
     probability_sources: list[dict[str, Any]] | None = None,
 ) -> PreparedPointForecast | PreparedRegions:
     """Load one shared field source before forecasts; never acquire from a grid node."""
+    regions = prepared.regions if isinstance(prepared, PreparedRegions) else [prepared]
     if descriptor is None:
-        if probability_sources:
+        if not probability_sources:
+            return prepared
+        # Native120 stores its hourly NBM fields inside the combined source
+        # dataset. Independent exact-event evidence must not require the legacy
+        # separate hourly-PoP artifact (nor fabricate that artifact when absent).
+        if any(horizon_for(region._manifest or {}).duration_hours != 120 for region in regions):
             raise ValueError("Probability shadows require the active NBM PoP attachment")
-        return prepared
     from mesoforge.application.prepared_pop import load_pop_guidance
 
-    regions = prepared.regions if isinstance(prepared, PreparedRegions) else [prepared]
     if any(region._surface_configuration is None for region in regions):
         raise ValueError("Probability guidance requires the existing surface-grid forecast")
     target = regions[0]._target_reference_time
     if any(region._target_reference_time != target for region in regions):
         raise ValueError("Probability attachment requires one shared target reference time")
-    views = load_pop_guidance(descriptor, target_reference_time=target)
+    views = load_pop_guidance(descriptor, target_reference_time=target) if descriptor else []
     from mesoforge.application.prepared_probability_sources import load_probability_sources
 
     probability_views = load_probability_sources(

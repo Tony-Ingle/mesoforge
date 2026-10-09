@@ -14,7 +14,12 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.pdfgen.canvas import Canvas
 from reportlab.platypus import Paragraph
 
-from mesoforge.presentation.forecast_document import DOCUMENT_POLICY, HOURS_DOCUMENT_POLICY
+from mesoforge.common.horizon import FIVE_DAY_HORIZON
+from mesoforge.presentation.forecast_document import (
+    DOCUMENT_POLICY,
+    HOURS_DOCUMENT_POLICY,
+    ROLLING_DOCUMENT_POLICY,
+)
 
 _INK = "#152D3A"
 _MUTED = "#506874"
@@ -243,7 +248,8 @@ def _outlook(canvas: Canvas, document: dict[str, Any]) -> None:
     location = document["location"]
     name = str(location["name"])
     hourly = document["document_policy"] == HOURS_DOCUMENT_POLICY
-    title = "36-Hour Weather Outlook" if hourly else "5-Day Forecast"
+    rolling = document["document_policy"] == ROLLING_DOCUMENT_POLICY
+    title = document["product_title"]
     _text(canvas, title, _MARGIN, 111, 530, size=28, bold=True)
     # State is not inferred from arbitrary coordinates or embedded in science.
     _text(canvas, name, _MARGIN, 152, 530, size=17, bold=True, max_height=24)
@@ -263,7 +269,7 @@ def _outlook(canvas: Canvas, document: dict[str, Any]) -> None:
     _text(
         canvas,
         f"{start:%a %b %d, %I:%M %p %Z} - {end:%a %b %d, %I:%M %p %Z}"
-        if hourly
+        if hourly or rolling
         else f"{start:%A, %B %d} - {last_day:%A, %B %d, %Y}",
         _MARGIN,
         199,
@@ -272,17 +278,35 @@ def _outlook(canvas: Canvas, document: dict[str, Any]) -> None:
         color=_MUTED,
     )
     _text(canvas, document["headline"], _MARGIN, 231, 532, size=17, bold=True, max_height=46)
-    if hourly:
+    if hourly or rolling:
         summary = document["summary"]
         chance, gust = summary["maximum_hourly_pop"], summary["max_gust_mps"]
+        pop6 = summary.get("native_six_hour_pop")
+        chance_text = "Max hourly PoP: " + _value(
+            chance * 100 if chance is not None else None, unit="%"
+        )
+        if pop6 is not None:
+            six = pop6["maximum_available_six_hour_pop"]
+            chance_text = "PoP max: 1h " + _value(
+                chance * 100 if chance is not None else None, unit="%"
+            )
+            chance_text += " / 6h " + _value(six * 100 if six is not None else None, unit="%")
         metrics = [
-            "36h liquid: " + _amount(summary["qpf_kg_m2"]),
-            "Max hourly PoP: " + _value(chance * 100 if chance is not None else None, unit="%"),
+            ("36h liquid: " if hourly else "120h liquid: ") + _amount(summary["qpf_kg_m2"]),
+            chance_text,
             "Mean wind: " + _wind(summary),
             "Max gust: " + _value(gust / 0.44704 if gust is not None else None, unit=" mph"),
         ]
         for index, metric in enumerate(metrics):
-            _text(canvas, metric, _MARGIN + index * 133, 274, 126, size=8, max_height=22)
+            _text(
+                canvas,
+                metric,
+                _MARGIN + index * 133,
+                274 if hourly else 268,
+                126,
+                size=8,
+                max_height=22,
+            )
     gap, top, height = 8, 303 if hourly else 294, 219
     width = (532 - gap * (len(document["days"]) - 1)) / len(document["days"])
     for index, day in enumerate(document["days"]):
@@ -295,7 +319,7 @@ def _outlook(canvas: Canvas, document: dict[str, Any]) -> None:
         date = datetime.fromisoformat(day["date"])
         _text(
             canvas,
-            date.strftime("%a").upper(),
+            f"PERIOD {day['forecast_period']}" if rolling else date.strftime("%a").upper(),
             x + 10,
             top + 11,
             80,
@@ -303,7 +327,22 @@ def _outlook(canvas: Canvas, document: dict[str, Any]) -> None:
             color=_TEAL,
             bold=True,
         )
-        _text(canvas, date.strftime("%b %d"), x + 10, top + 27, 80, size=9, color=_MUTED)
+        if rolling:
+            period_start, period_end = (
+                datetime.fromisoformat(day[key]).astimezone(zone) for key in ("start", "end")
+            )
+            _text(
+                canvas,
+                f"{period_start:%b %d %H:%M %Z} to {period_end:%b %d %H:%M %Z}",
+                x + 10,
+                top + 27,
+                82,
+                size=6.4,
+                color=_MUTED,
+                max_height=18,
+            )
+        else:
+            _text(canvas, date.strftime("%b %d"), x + 10, top + 27, 80, size=9, color=_MUTED)
         high = _value(_f(day["high_k"]) if day["high_k"] is not None else None, unit="°")
         low = _value(_f(day["low_k"]) if day["low_k"] is not None else None, unit="°")
         temps = (
@@ -332,14 +371,27 @@ def _outlook(canvas: Canvas, document: dict[str, Any]) -> None:
             max_height=32,
         )
         chance = day["maximum_hourly_pop"]
-        _text(canvas, "Max hourly PoP", x + 10, top + 138, 82, size=7, color=_MUTED)
+        pop6 = day.get("native_six_hour_pop")
+        chance_text = _value(chance * 100 if chance is not None else None, unit="%")
+        if pop6 is not None:
+            six = pop6["maximum_available_six_hour_pop"]
+            chance_text += " / " + _value(six * 100 if six is not None else None, unit="%")
         _text(
             canvas,
-            _value(chance * 100 if chance is not None else None, unit="%"),
+            "Max PoP: 1h / 6h" if pop6 is not None else "Max hourly PoP",
+            x + 10,
+            top + 138,
+            82,
+            size=7,
+            color=_MUTED,
+        )
+        _text(
+            canvas,
+            chance_text,
             x + 10,
             top + 150,
             82,
-            size=10,
+            size=7 if pop6 is not None else 10,
             bold=True,
         )
         _text(canvas, "Liquid: " + _amount(day["qpf_kg_m2"]), x + 10, top + 168, 82, size=8)
@@ -397,11 +449,28 @@ def _outlook(canvas: Canvas, document: dict[str, Any]) -> None:
         if missing
         else ""
     )
-    note += "PoP is the highest hourly chance, not the probability for the whole day. "
+    note += (
+        "PoP maxima are labeled 1h or available 6h events, never daily probabilities. "
+        if document.get("six_hour_pop_events")
+        else "PoP is the highest hourly chance, not the probability for the whole day. "
+    )
     if hourly:
         note += "Cards cover only the stated hours, including partial dates. "
+    elif rolling:
+        note += "Cards cover 24 elapsed forecast hours, not calendar days; local times follow DST. "
+    if "qpf_intervals" in document:
+        note += "Liquid totals use whole native events; crossing events are not split. "
     note += "Liquid totals preserve small amounts. Forecasts can change as new guidance arrives."
-    _text(canvas, note, _MARGIN, 653, 532, size=8, color=_MUTED, max_height=38)
+    _text(
+        canvas,
+        note,
+        _MARGIN,
+        653,
+        532,
+        size=8,
+        color=_MUTED,
+        max_height=48 if "qpf_intervals" in document or document.get("six_hour_pop_events") else 38,
+    )
     _text(
         canvas,
         "AI desk: " + document["ai"]["display_status"],
@@ -427,11 +496,17 @@ def _chart(
     unit: str,
     fixed_range: tuple[float, float] | None = None,
     bars: bool = False,
+    event_intervals: list[dict[str, Any]] | None = None,
+    native_window_probabilities: list[dict[str, Any]] | None = None,
 ) -> None:
     left, width, height = 68.0, 495.0, 62.0
     _text(canvas, title, _MARGIN, top, 530, size=12, bold=True)
     plot_top = top + 32
     all_values = [value for _, values, _ in series for value in values if value is not None]
+    if native_window_probabilities:
+        all_values.extend(
+            row["value"] * 100 for row in native_window_probabilities if row["value"] is not None
+        )
     if fixed_range:
         low, high = fixed_range
     elif all_values:
@@ -447,10 +522,13 @@ def _chart(
     rows = document["hours"]
     count = len(rows)
     hourly = document["document_policy"] == HOURS_DOCUMENT_POLICY
+    rolling = document["document_policy"] == ROLLING_DOCUMENT_POLICY
     if bars and any(value is None for _, values, _ in series for value in values):
         _text(
             canvas,
-            "X = unavailable hour; zero = no bar",
+            "X = unavailable event; zero = no bar"
+            if event_intervals is not None
+            else "X = unavailable hour; zero = no bar",
             310,
             top + 17,
             260,
@@ -474,7 +552,17 @@ def _chart(
         previous: tuple[float, float] | None = None
         for i, value in enumerate(values):
             # Hourly amounts occupy (start,end]; instantaneous lines use valid time.
-            position = i + 1 if hourly and not bars else i + 0.5
+            position = i + 1 if (hourly or rolling) and not bars else i + 0.5
+            bar_width = width / count * 0.7
+            if event_intervals is not None:
+                reference = datetime.fromisoformat(document["valid_start"])
+                event = event_intervals[i]
+                begin, end = (
+                    (datetime.fromisoformat(event[key]) - reference).total_seconds() / 3600
+                    for key in ("interval_start", "interval_end")
+                )
+                position = (begin + end) / 2
+                bar_width = width / count * (end - begin) * 0.9
             x = left + width * position / count
             if value is None:
                 if bars:
@@ -493,9 +581,9 @@ def _chart(
             if bars:
                 bottom = _HEIGHT - plot_top - height
                 canvas.rect(
-                    x - width / count * 0.35,
+                    x - bar_width / 2,
                     bottom,
-                    width / count * 0.7,
+                    bar_width,
                     max(0, y - bottom),
                     stroke=0,
                     fill=1,
@@ -505,12 +593,33 @@ def _chart(
             else:
                 canvas.circle(x, y, 1.2, fill=1, stroke=0)
             previous = (x, y)
+    if native_window_probabilities:
+        _text(
+            canvas, "6h PoP, native window (%)", left + 178, top + 17, 290, size=7.5, color=_AMBER
+        )
+        reference = datetime.fromisoformat(document["valid_start"])
+        canvas.setStrokeColor(HexColor(_AMBER))
+        canvas.setLineWidth(2)
+        for event in native_window_probabilities:
+            probability = event["value"]
+            if probability is None:
+                continue
+            begin, end = (
+                (datetime.fromisoformat(event[key]) - reference).total_seconds() / 3600
+                for key in ("interval_start", "interval_end")
+            )
+            # Clip only the visible segment; the document retains both exact bounds.
+            first, last = max(0.0, begin), min(float(count), end)
+            if last <= first:
+                continue
+            y = _HEIGHT - plot_top - height + height * (probability * 100 - low) / (high - low)
+            canvas.line(left + width * first / count, y, left + width * last / count, y)
     if not all_values:
         _text(canvas, "Guidance unavailable", left + 170, plot_top + 29, 200, size=10, color=_MUTED)
-    if hourly:
+    if hourly or rolling:
         start = datetime.fromisoformat(document["valid_start"])
         zone = ZoneInfo(document["display_timezone"])
-        for elapsed in range(0, count + 1, 6):
+        for elapsed in range(0, count + 1, 24 if rolling else 6):
             local = (start + timedelta(hours=elapsed)).astimezone(zone)
             middle = left + width * elapsed / count
             _text(
@@ -589,17 +698,24 @@ def _detail(canvas: Canvas, document: dict[str, Any]) -> None:
         ],
         unit="%",
         fixed_range=(0, 100),
+        native_window_probabilities=document.get("six_hour_pop_events"),
     )
     # A second small amount strip uses its own axis; never rescale QPF into probability.
-    qpf = [row["qpf"] / 25.4 if row["qpf"] is not None else None for row in hours]
+    intervals = document.get("qpf_intervals")
+    qpf = (
+        [row["value"] / 25.4 if row["value"] is not None else None for row in intervals]
+        if intervals is not None
+        else [row["qpf"] / 25.4 if row["qpf"] is not None else None for row in hours]
+    )
     _chart(
         canvas,
         document,
         403,
         "Liquid precipitation amount",
-        [("Hourly liquid", qpf, _TEAL)],
+        [("Native event total" if intervals is not None else "Hourly liquid", qpf, _TEAL)],
         unit="in",
         bars=True,
+        event_intervals=intervals,
     )
     wind = [row["wind_speed"] / 0.44704 if row["wind_speed"] is not None else None for row in hours]
     gusts = [row["wind_gust"] / 0.44704 if row["wind_gust"] is not None else None for row in hours]
@@ -617,7 +733,9 @@ def _detail(canvas: Canvas, document: dict[str, Any]) -> None:
         x = _MARGIN + i * (sky_width + 8)
         _text(
             canvas,
-            datetime.fromisoformat(day["date"]).strftime("%a %d"),
+            f"Period {day['forecast_period']}"
+            if document["document_policy"] == ROLLING_DOCUMENT_POLICY
+            else datetime.fromisoformat(day["date"]).strftime("%a %d"),
             x,
             660,
             sky_width,
@@ -654,7 +772,7 @@ def _detail(canvas: Canvas, document: dict[str, Any]) -> None:
         "Sky timeline: pale = clearer, dark = cloudier, white = unavailable. "
         + (
             "Each strip covers the card's stated hours."
-            if document["document_policy"] == HOURS_DOCUMENT_POLICY
+            if document["document_policy"] in (HOURS_DOCUMENT_POLICY, ROLLING_DOCUMENT_POLICY)
             else "Each strip runs midnight to midnight."
         ),
         _MARGIN,
@@ -665,7 +783,9 @@ def _detail(canvas: Canvas, document: dict[str, Any]) -> None:
     )
     _text(
         canvas,
-        "Hourly chance refers to more than 0.01 in liquid. "
+        "Liquid bars span exact native events; height is the whole-event amount, not a rate."
+        if intervals is not None
+        else "Hourly chance refers to more than 0.01 in liquid. "
         "Card wind uses vector means; card gusts are maxima.",
         _MARGIN,
         709,
@@ -679,15 +799,24 @@ def _detail(canvas: Canvas, document: dict[str, Any]) -> None:
 def render_forecast_pdf(document: dict[str, Any]) -> bytes:
     """Render a verified product summary without retaining secrets or internal paths."""
     hourly = document.get("document_policy") == HOURS_DOCUMENT_POLICY
-    if document.get("document_policy") not in (DOCUMENT_POLICY, HOURS_DOCUMENT_POLICY):
+    rolling = document.get("document_policy") == ROLLING_DOCUMENT_POLICY
+    if document.get("document_policy") not in (
+        DOCUMENT_POLICY,
+        HOURS_DOCUMENT_POLICY,
+        ROLLING_DOCUMENT_POLICY,
+    ):
         raise ValueError("A validated forecast document is required")
     if hourly:
         if len(document["hours"]) != 36 or not 2 <= len(document["days"]) <= 3:
             raise ValueError("A 36-hour document must contain all 36 hours")
     elif len(document.get("days", [])) != 5:
         raise ValueError("A validated five-day forecast document is required")
+    if rolling and len(document["hours"]) != FIVE_DAY_HORIZON.duration_hours:
+        raise ValueError("A rolling five-day document must contain all 120 hours")
     for day in document["days"]:
-        if not hourly and day["hours"] not in (23, 24, 25):
+        if rolling and day["hours"] != 24:
+            raise ValueError("Rolling forecast periods must contain 24 elapsed hours")
+        if not hourly and not rolling and day["hours"] not in (23, 24, 25):
             raise ValueError("Only complete local calendar days can be rendered")
         if hourly and not 1 <= day["hours"] <= 25:
             raise ValueError("Invalid local-day interval")
@@ -698,7 +827,7 @@ def render_forecast_pdf(document: dict[str, Any]) -> bytes:
         raise ValueError("Invalid display name")
     stream = BytesIO()
     canvas = Canvas(stream, pagesize=(_WIDTH, _HEIGHT), invariant=1, pageCompression=1)
-    title = "36-Hour Weather Outlook" if hourly else "5-Day Forecast"
+    title = document["product_title"]
     canvas.setTitle("MesoForge " + title + " - " + name)
     canvas.setAuthor("MesoForge")
     canvas.setCreator("MesoForge deterministic forecast presentation")

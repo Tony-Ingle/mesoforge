@@ -9,7 +9,9 @@ from datetime import timedelta
 
 import pytest
 
+from mesoforge.guidance.http_fetch import FetchError, fetch_with_range, fetch_with_retry
 from mesoforge.guidance.selected_objects import SelectedObjectError, SelectedObjectTransport
+from mesoforge.guidance.sources.ifs import IFS_RETRY_POLICY
 from tests.support.phase1_fixture_transports import FakeHttpResponse, FixedClock
 from tests.unit.guidance.test_current_availability import (
     DECISION,
@@ -17,6 +19,13 @@ from tests.unit.guidance.test_current_availability import (
     MetadataTransport,
     inventory,
     probe,
+)
+from tests.unit.guidance.test_http_fetch import (
+    FixedClock as RetryClock,
+)
+from tests.unit.guidance.test_http_fetch import (
+    RecordingSleeper,
+    _grib_message,
 )
 
 
@@ -100,6 +109,18 @@ def test_qpf_parent_acquires_only_both_proved_gfs_candidates_and_reuses_objects(
         if "canonical_variable_id" in row
     )
     assert all(row.get("byte_start") != 0 for row in wrapper.validations)
+    proofs = wrapper.validations
+    assert wrapper.cached_range_bytes == 160
+    wrapper.release_completed_object(evidence["grib"]["url"])
+    assert wrapper.cached_range_bytes == 0
+    assert wrapper.validations == proofs
+    wrapper.assert_complete()
+    # A completed/released object is not re-fetched from a possibly changed
+    # provider. Its durable raw evidence is the only replay path.
+    before = len(underlying.calls)
+    with pytest.raises(SelectedObjectError, match="released"):
+        wrapper.get(evidence["grib"]["url"], headers={"Range": "bytes=40-99"})
+    assert len(underlying.calls) == before
 
 
 @pytest.mark.parametrize("model", ["HRRR", "GFS", "RAP", "IFS"])
@@ -177,13 +198,108 @@ def test_changed_or_unprovable_identity_fails_and_cannot_be_bypassed_by_retry(
     assert wrapper.validations[-1]["status"] == "failed"
 
 
-@pytest.mark.parametrize("status", [200, 404, 412, 503])
+@pytest.mark.parametrize("status", [200, 404, 412])
 def test_range_response_must_be_partial_success_for_the_conditional_request(status):
     wrapper, underlying, evidence = selected()
     underlying.ranged.status_code = status
     with pytest.raises(SelectedObjectError, match=f"HTTP {status}"):
         acquire(wrapper, evidence)
     assert wrapper.validations[-1]["request_headers"]["If-Match"] == '"grib-version"'
+
+
+class ScriptedRangeTransport(AcquisitionTransport):
+    def __init__(self, statuses, *, changed_etag=False):
+        super().__init__("IFS")
+        self.remaining = list(statuses)
+        self.changed_etag = changed_etag
+        self.ranged.content = _grib_message(b"\0" * 60)
+
+    def get(self, url, *, headers=None, timeout=None):
+        if headers and "Range" in headers:
+            self.ranged.status_code = self.remaining.pop(0)
+            self.ranged.headers["Retry-After"] = "2"
+            if self.changed_etag:
+                self.ranged.headers["ETag"] = '"changed-after-head"'
+        return super().get(url, headers=headers, timeout=timeout)
+
+
+def ranged_retry_fixture(statuses, *, changed_etag=False):
+    evidence = probe(MetadataTransport("IFS"), "IFS").evidence
+    underlying = ScriptedRangeTransport(statuses, changed_etag=changed_etag)
+    clock = RetryClock(DECISION + timedelta(minutes=2))
+    wrapper = SelectedObjectTransport(underlying, [evidence], decision_time=DECISION, clock=clock)
+    wrapper.get(evidence["index"]["url"])
+    wrapper.head(evidence["grib"]["url"])
+    sleeper = RecordingSleeper(clock)
+
+    def fetch():
+        return fetch_with_range(
+            wrapper,
+            clock,
+            sleeper,
+            endpoint="ifs",
+            url=evidence["grib"]["url"],
+            range_header="bytes=20-99",
+            byte_start=20,
+            byte_end=100,
+            retry_policy=IFS_RETRY_POLICY,
+            cycle_deadline=clock.now(),
+            expected_length=80,
+            full_object_length=200,
+        )
+
+    return wrapper, underlying, sleeper, fetch
+
+
+def test_transient_range_503_recovers_with_same_pinned_identity_and_existing_retry_budget():
+    # Live commissioning saw one S3 503 poison all later attempts. An HTTP error
+    # does not prove an identity change; only a subsequent fully checked 206 can
+    # acquire the selected message. Metadata remains pinned and is not fetched again.
+    wrapper, underlying, sleeper, fetch = ranged_retry_fixture([503, 206])
+    result = fetch()
+    wrapper.assert_complete()
+    assert result.payload == _grib_message(b"\0" * 60)
+    assert [attempt.status_code for attempt in result.attempts] == [503, 206]
+    assert sleeper.sleeps == [2]  # Existing Retry-After policy, no new retry loop.
+    assert len(underlying.calls) == 4  # Index + HEAD + two conditional range attempts.
+    assert all(
+        call[2] == {"Range": "bytes=20-99", "If-Match": '"grib-version"'}
+        for call in underlying.calls[2:]
+    )
+    assert [row["status"] for row in wrapper.validations] == [
+        "matched",
+        "matched",
+        "retryable",
+        "matched",
+    ]
+    assert wrapper.validations[2]["status_code"] == 503
+    assert wrapper.failed_reason is None and wrapper.failures == []
+
+
+def test_exhausted_transient_ranges_fail_incomplete_after_exact_existing_attempt_limit():
+    wrapper, underlying, sleeper, fetch = ranged_retry_fixture([503, 503, 503, 206])
+    with pytest.raises(FetchError, match="exhausted retries"):
+        fetch()
+    assert len(underlying.calls) == 2 + IFS_RETRY_POLICY.attempts_per_endpoint
+    assert underlying.remaining == [206]  # No extra attempt is invented.
+    assert sleeper.sleeps == [2, 2]
+    assert [row["status"] for row in wrapper.validations[2:]] == ["retryable"] * 3
+    with pytest.raises(SelectedObjectError, match="not acquired"):
+        wrapper.assert_complete()
+
+
+@pytest.mark.parametrize("failure", ["precondition", "etag"])
+def test_identity_failure_still_latches_without_contacting_provider_again(failure):
+    wrapper, underlying, _, fetch = ranged_retry_fixture(
+        [412 if failure == "precondition" else 206, 206], changed_etag=failure == "etag"
+    )
+    with pytest.raises(FetchError, match="exhausted retries"):
+        fetch()
+    assert len(underlying.calls) == 3  # Existing outer retry cannot bypass identity latch.
+    assert underlying.remaining == [206]
+    assert wrapper.validations[-1]["status"] == "failed"
+    with pytest.raises(SelectedObjectError, match="HTTP 412|ETag"):
+        wrapper.assert_complete()
 
 
 @pytest.mark.parametrize("range_header", [None, "bytes=0-199", "bytes=20-100", "bytes=20-"])
@@ -275,6 +391,11 @@ def test_completeness_requires_every_selected_message_not_just_metadata():
     wrapper.head(evidence["grib"]["url"])
     with pytest.raises(SelectedObjectError, match="not acquired"):
         wrapper.assert_complete()
+    with pytest.raises(SelectedObjectError, match="incompletely acquired"):
+        wrapper.release_completed_object(evidence["grib"]["url"])
+    acquire(wrapper, evidence)
+    wrapper.release_completed_object(evidence["grib"]["url"])
+    wrapper.assert_complete()
 
 
 @pytest.mark.parametrize("mutation", ["unavailable", "late", "cutoff", "weak_etag", "range"])
@@ -334,3 +455,60 @@ def test_unlatched_shadow_view_keeps_acquiring_after_a_provider_failure():
     with pytest.raises(SelectedObjectError, match="HTTP 503"):
         latched.get(latched_evidence["index"]["url"])  # The default view stays latched.
     assert len(latched_underlying.calls) == 1
+
+
+@pytest.mark.parametrize("method", ["get", "head"])
+@pytest.mark.parametrize("changed_identity", [False, True])
+def test_opted_metadata_retries_recover_but_never_override_object_identity(
+    monkeypatch, method, changed_identity
+):
+    evidence = probe(MetadataTransport("IFS"), "IFS").evidence
+    underlying = AcquisitionTransport("IFS")
+    clock = RetryClock(DECISION + timedelta(minutes=2))
+    sleeper = RecordingSleeper(clock)
+    wrapper = SelectedObjectTransport(
+        underlying, [evidence], decision_time=DECISION, clock=clock, retry_metadata=True
+    )
+    original = getattr(underlying, method)
+    calls = []
+
+    def temporary_outage(url, **kwargs):
+        calls.append(url)
+        if len(calls) == 1:
+            return FakeHttpResponse(503, {"Retry-After": "1"})
+        response = original(url, **kwargs)
+        if changed_identity:
+            return FakeHttpResponse(
+                response.status_code, {**response.headers, "ETag": '"changed"'}, response.content
+            )
+        return response
+
+    monkeypatch.setattr(underlying, method, temporary_outage)
+    url = evidence["index" if method == "get" else "grib"]["url"]
+
+    def fetch():
+        return fetch_with_retry(
+            wrapper,
+            clock,
+            sleeper,
+            method=method,
+            urls_by_endpoint=[("selected", url)],
+            retry_policy=IFS_RETRY_POLICY,
+            cycle_deadline=DECISION,
+        )
+
+    if changed_identity:
+        with pytest.raises(FetchError):
+            fetch()
+        with pytest.raises(SelectedObjectError, match="ETag differs"):
+            wrapper.assert_complete()
+        assert [row["status"] for row in wrapper.validations] == ["retryable", "failed"]
+    else:
+        fetch()
+        acquire(wrapper, evidence)
+        wrapper.assert_complete()
+        assert wrapper.failed_reason is None
+        assert sleeper.sleeps == [1.0]
+    assert calls.count(url) == 2
+    if changed_identity:
+        assert len(calls) == 2  # The identity failure latches before another provider request.

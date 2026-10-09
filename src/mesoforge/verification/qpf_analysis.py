@@ -14,9 +14,10 @@ from typing import Any
 
 import jcs
 
+from mesoforge.common.horizon import horizon_for
 from mesoforge.common.identifiers import Digest
 from mesoforge.verification.metrics import _compute_scalar_metrics
-from mesoforge.verification.model_comparison import LEAD_BUCKETS, lead_bucket
+from mesoforge.verification.model_comparison import analytical_lead_bucket, analytical_lead_buckets
 
 SCHEMA_VERSION = "mesoforge.qpf-verification-analysis.v1"
 CANONICALIZATION_POLICY = {
@@ -119,7 +120,8 @@ def _matched_reason(fact: Mapping[str, Any]) -> str | None:
         horizon = fact["lead_hours"]
         if not _finite(horizon) or horizon != int(horizon):
             return "invalid_forecast_lead"
-        lead_bucket(int(horizon))
+        if not 1 <= horizon <= horizon_for(fact).duration_hours:
+            return "forecast_lead_outside_declared_horizon"
         if (
             _instant(end) - _instant(fact["target_reference_time"])
         ).total_seconds() != horizon * 3600:
@@ -370,7 +372,7 @@ def canonicalize_qpf_facts(facts: Sequence[Mapping[str, Any]]) -> dict[str, Any]
                 "sample_id": str(Digest.of_bytes(_signature(list(key)))),
                 "canonical_fact_id": fact["artifact_id"],
                 "canonical_issued_forecast_id": fact["issued_forecast_id"],
-                "lead_bucket": lead_bucket(int(fact["lead_hours"])),
+                "lead_bucket": analytical_lead_bucket(int(fact["lead_hours"])),
                 "provenance": {
                     "versions": [
                         {
@@ -544,7 +546,8 @@ def _readiness(
     positive = sum(value > 0 for value in observed)
     zero = len(observed) - positive
     groups = {
-        bucket: sum(row["lead_bucket"] == bucket for row in samples) for bucket in LEAD_BUCKETS
+        bucket: sum(row["lead_bucket"] == bucket for row in samples)
+        for bucket in analytical_lead_buckets(int(row["lead_hours"]) for row in samples)
     }
     coverage = {
         model: {
@@ -661,7 +664,7 @@ def analyze_qpf_facts(
             },
             "by_lead_bucket": {
                 bucket: _metrics([row for row in selected if row["lead_bucket"] == bucket])
-                for bucket in LEAD_BUCKETS
+                for bucket in analytical_lead_buckets(int(row["lead_hours"]) for row in selected)
             },
             "by_location": {
                 location: _metrics([row for row in selected if _location(row) == location])
@@ -680,7 +683,8 @@ def analyze_qpf_facts(
             "Descriptive analysis-reference comparisons, not point-gauge truth or model ranking."
         ),
         "lead_bucket_policy": (
-            "1–6 / 7–18 / 19–36 h are provisional analysis organization, "
+            "1–6 / 7–18 / 19–36 h, with 37–72 / 73–120 h when represented, "
+            "are provisional analysis organization, "
             "not established QPF skill regimes."
         ),
         "canonicalization": canonical,

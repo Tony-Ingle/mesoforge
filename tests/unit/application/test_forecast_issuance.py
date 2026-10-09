@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import shutil
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -14,9 +15,13 @@ import pytest
 from pydantic import ValidationError
 
 from mesoforge.application.issuance import ForecastIssuanceService
+from mesoforge.application.issuance_encoding import decode_issuance, encode_issuance
 from mesoforge.application.point_forecast import PreparedPointForecast
 from mesoforge.common.errors import IntegrityError, NotFound
+from mesoforge.common.horizon import FIVE_DAY_HORIZON
+from mesoforge.common.identifiers import Digest
 from mesoforge.contracts.issued_forecasts import IssuedForecastRecord
+from mesoforge.contracts.serialization import canonical_json_bytes, canonical_json_digest
 from tests.support.in_memory_uow import InMemoryObjectStore, InMemoryUnitOfWorkFactory
 from tests.unit.application.test_prepared_temperature import (
     EXTENDED_HORIZONS,
@@ -26,6 +31,98 @@ from tests.unit.application.test_prepared_temperature import (
 
 ISSUED_AT = datetime(2026, 9, 10, 12, tzinfo=UTC)
 CODE_IDENTITY = {"git_commit": "a" * 40, "working_tree_dirty": False}
+
+
+def test_disk_fall_during_forecast_refuses_immutable_issuance(
+    memory_service, monkeypatch, tmp_path
+) -> None:
+    from types import SimpleNamespace
+
+    from mesoforge.application import disk_admission
+    from tests.unit.presentation.test_forecast_product import rolling_saved
+
+    service, factory, objects = memory_service
+    monkeypatch.setenv("MESOFORGE_PROSPECTIVE_ROOT", str(tmp_path))
+    monkeypatch.setattr(disk_admission.shutil, "disk_usage", lambda _: SimpleNamespace(free=0))
+    with pytest.raises(OSError, match="before persistence"):
+        service.issue(rolling_saved()["forecast"], batch_run_id=uuid4(), location_index=0)
+    assert not factory.issued_forecasts and not objects.objects
+
+
+def test_extended_issuance_retains_horizon_and_selects_late_hours_without_recalculation(
+    memory_service,
+) -> None:
+    from tests.unit.presentation.test_forecast_product import rolling_saved
+
+    forecast = rolling_saved()["forecast"]
+    service, factory, objects = memory_service
+    record = service.issue(forecast, batch_run_id=uuid4(), location_index=0)
+    assert record.forecast_horizon_hours == FIVE_DAY_HORIZON.duration_hours
+    saved = service.read(record.issued_forecast_id)
+    assert saved["forecast"] == forecast
+    assert saved["forecast_horizon_hours"] == FIVE_DAY_HORIZON.duration_hours
+    raw = objects.objects[record.content_digest]
+    assert raw.startswith(b"\x1f\x8b")
+    assert record.payload_digest == canonical_json_digest(saved)
+    assert record.content_digest == Digest.of_bytes(raw) != record.payload_digest
+    assert len(raw) < len(canonical_json_bytes(saved)) / 4
+    assert encode_issuance(saved) == (raw, record.payload_digest)
+    envelope = json.loads(gzip.decompress(raw))
+    assert envelope["tables"]["source_documents"] == []
+    before = dict(objects.objects)
+    selection = service.select_hours(
+        latitude=forecast["latitude"],
+        longitude=forecast["longitude"],
+        start_valid_time=record.target_reference_time + timedelta(hours=119),
+        end_valid_time=record.target_reference_time + timedelta(hours=121),
+    )
+    assert [row["hour"]["horizon_hours"] for row in selection["results"]] == [119, 120]
+    assert selection["version_scan"]["versions_read"] == 1
+    assert objects.objects == before and len(factory.issued_forecasts) == 1
+    # A corrupt searchable header cannot alter the immutable object's meaning.
+    factory.issued_forecasts[record.issued_forecast_id] = record.model_copy(
+        update={"forecast_horizon_hours": 36}
+    )
+    with pytest.raises(IntegrityError, match="horizon differs"):
+        service.read(record.issued_forecast_id)
+
+
+@pytest.mark.parametrize("tamper", ["schema", "checksum", "value", "external", "malformed"])
+def test_compact_issuance_rejects_tampering_without_external_file_reads(tamper, monkeypatch):
+    from tests.unit.presentation.test_forecast_product import rolling_saved
+
+    saved = rolling_saved()
+    raw, digest = encode_issuance(saved)
+    envelope = json.loads(gzip.decompress(raw))
+    if tamper == "schema":
+        envelope["schema"] = "future-unapproved-codec"
+    elif tamper == "checksum":
+        envelope["forecast_payload_digest"] = str(Digest.of_bytes(b"other issuance"))
+    elif tamper == "value":
+        envelope["payload"]["forecast"]["latitude"] += 1
+    elif tamper == "external":
+        envelope["tables"]["source_documents"] = [{"path": "private-file", "sha256": str(digest)}]
+    monkeypatch.setattr(Path, "read_bytes", lambda *_: pytest.fail("external source read"))
+    modified = (
+        b"unreadable" if tamper == "malformed" else gzip.compress(canonical_json_bytes(envelope))
+    )
+    with pytest.raises(IntegrityError, match="compact issued"):
+        decode_issuance(modified, expected_logical_digest=digest)
+
+
+def test_long_issuance_requires_explicit_horizon_and_exact_valid_time(memory_service) -> None:
+    from tests.unit.presentation.test_forecast_product import rolling_saved
+
+    service, factory, objects = memory_service
+    forecast = rolling_saved()["forecast"]
+    del forecast["forecast_horizon"]
+    with pytest.raises(ValueError, match=r"1..36"):
+        service.issue(forecast, batch_run_id=uuid4(), location_index=0)
+    forecast["forecast_horizon"] = FIVE_DAY_HORIZON.payload()
+    forecast["hours"][-1]["valid_time"] = forecast["hours"][-2]["valid_time"]
+    with pytest.raises(ValueError, match="exact lead"):
+        service.issue(forecast, batch_run_id=uuid4(), location_index=0)
+    assert not factory.issued_forecasts and not objects.objects
 
 
 @pytest.fixture(scope="module")
@@ -74,6 +171,15 @@ def test_two_issuances_preserve_every_field_and_are_distinct_even_at_the_same_ti
     assert first.content_digest != second.content_digest
     assert first.issued_at == second.issued_at == ISSUED_AT
     assert first.target_reference_time == TARGET
+    assert first.forecast_horizon_hours == 36
+    assert first.forecast_payload_digest is None
+    assert first.payload_digest == first.content_digest
+    legacy = first.model_dump()
+    del legacy["forecast_horizon_hours"]
+    assert IssuedForecastRecord.model_validate(legacy) == first
+    for duration in (True, 0, 37, 121):
+        with pytest.raises(ValidationError):
+            IssuedForecastRecord.model_validate({**legacy, "forecast_horizon_hours": duration})
     assert (first.latitude, first.longitude) == (45.8, -93.1)
     assert len(factory.issued_forecasts) == len(factory.stored_objects) == len(store.objects) == 2
     assert store.objects[first.content_digest] == first_bytes
@@ -93,6 +199,8 @@ def test_two_issuances_preserve_every_field_and_are_distinct_even_at_the_same_ti
         # Full equality covers all hours, values, units, cycles, weights, source/raw/
         # prepared checksums, valid times, notices and explicit missing reasons.
         assert envelope["forecast"] == original
+        assert "forecast_horizon_hours" not in envelope
+        assert canonical_json_bytes(envelope) == store.objects[record.content_digest]
         assert len(envelope["forecast"]["hours"]) == 36
     forecast["hours"][0]["temperature"]["value"] = -100.0
     assert service.read(first.issued_forecast_id)["forecast"] == original
@@ -150,3 +258,87 @@ def test_unknown_issued_forecast_is_explicitly_missing(memory_service) -> None:
     service, _, _ = memory_service
     with pytest.raises(NotFound):
         service.read(uuid4())
+
+
+def _reference_encoding(saved: dict[str, Any]) -> tuple[bytes, Digest]:
+    """The original whole-document algorithm: canonicalize, re-parse, encode, compress."""
+    from mesoforge.application.baseline_codec import CompactCodec
+    from mesoforge.application.issuance_encoding import ENCODING
+
+    logical = canonical_json_bytes(saved)
+    codec = CompactCodec([])
+    payload = codec.encode(json.loads(logical))
+    envelope = {
+        "schema": ENCODING,
+        "forecast_payload_digest": str(Digest.of_bytes(logical)),
+        "payload": payload,
+        "tables": codec.export_tables(),
+    }
+    return gzip.compress(canonical_json_bytes(envelope), mtime=0), Digest.of_bytes(logical)
+
+
+def _reversed_members(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _reversed_members(value[key]) for key in reversed(list(value))}
+    if isinstance(value, list):
+        return [_reversed_members(item) for item in value]
+    return value
+
+
+def test_compact_issuance_bytes_equal_the_whole_document_reference_encoding() -> None:
+    from tests.unit.presentation.test_forecast_product import rolling_saved
+
+    saved = rolling_saved()
+    expected = _reference_encoding(saved)
+    assert encode_issuance(saved) == expected
+    # Insertion order and integral-float readback (1.0 as 1) cannot change the bytes.
+    readback = _reversed_members(json.loads(canonical_json_bytes(saved)))
+    assert readback == saved and list(readback) != list(saved)
+    assert encode_issuance(readback) == expected
+
+
+def test_compact_issuance_streams_without_whole_document_buffers(monkeypatch) -> None:
+    import tracemalloc
+
+    import jcs
+
+    from mesoforge.application.baseline_codec import CompactCodec
+    from mesoforge.contracts import serialization
+    from tests.unit.presentation.test_forecast_product import rolling_saved
+
+    saved = rolling_saved()
+    assert len(canonical_json_bytes(saved)) > 1_000_000
+    if tracemalloc.is_tracing():
+        pytest.skip("An outer memory profiler owns tracemalloc; do not reset its state")
+    tracemalloc.start()
+    try:
+        expected = _reference_encoding(saved)
+        _, reference_peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    canonicalize = jcs.canonicalize
+
+    def bounded(value: Any, utf8: bool = True) -> Any:
+        result = canonicalize(value, utf8)
+        assert len(result) < 65536, "Only one metadata subtree may be canonicalized at a time"
+        return result
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("Issuance storage must stream, never buffer the whole document")
+
+    monkeypatch.setattr(jcs, "canonicalize", bounded)
+    monkeypatch.setattr(serialization, "parse_canonical_json", forbidden)
+    monkeypatch.setattr(CompactCodec, "encode", forbidden)
+    monkeypatch.setattr(gzip, "compress", forbidden)
+    monkeypatch.setattr(gzip, "decompress", forbidden)
+    tracemalloc.start()
+    try:
+        payload, digest = encode_issuance(saved)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert (payload, digest) == expected
+    # The whole-document algorithm held the canonical text, its re-parsed copy and a
+    # third encoded graph at once; streaming must need well under half of that.
+    assert 2 * peak < reference_peak, (peak, reference_peak)
+    assert decode_issuance(payload, expected_logical_digest=digest) == saved

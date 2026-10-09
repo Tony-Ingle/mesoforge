@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import io
 import json
 import os
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from mesoforge.application.baseline_codec import CompactCodec
+from mesoforge.application.disk_admission import require_runtime_capacity
 from mesoforge.application.local_surface_grid import extract_grid_point
 from mesoforge.application.prepared_snapshot import (
     SnapshotError,
@@ -25,6 +27,7 @@ from mesoforge.application.prepared_snapshot import (
     check_information_cutoff,
 )
 from mesoforge.application.spatial_coverage import CoverageRequiredError, validate_coordinate
+from mesoforge.common.horizon import horizon_for
 from mesoforge.contracts.serialization import canonical_json_bytes
 
 BASELINE_SCHEMA = "mesoforge.baseline-snapshot.v1"
@@ -50,18 +53,25 @@ def _artifact_path(directory: Path, descriptor: dict[str, Any]) -> Path:
 
 def read_artifact(directory: Path, descriptor: dict[str, Any]) -> Any:
     path = _artifact_path(directory, descriptor)
-    payload = path.read_bytes()
-    if hashlib.sha256(payload).hexdigest() != descriptor["sha256"]:
-        raise SnapshotError(f"Baseline artifact digest differs: {path.name}")
-    if descriptor.get("encoding") == "json+gzip":
-        payload = gzip.decompress(payload)
-    return json.loads(payload)
+    # Hash and parse the same open artifact without retaining both compressed and
+    # expanded byte strings beside the decoded JSON text and object graph.
+    with path.open("rb") as stream:
+        if hashlib.file_digest(stream, "sha256").hexdigest() != descriptor["sha256"]:
+            raise SnapshotError(f"Baseline artifact digest differs: {path.name}")
+        stream.seek(0)
+        if descriptor.get("encoding") == "json+gzip":
+            with gzip.GzipFile(fileobj=stream, mode="rb") as compressed:
+                with io.TextIOWrapper(compressed, encoding="utf-8") as text:
+                    return json.load(text)
+        with io.TextIOWrapper(stream, encoding="utf-8") as text:
+            return json.load(text)
 
 
 def write_artifact(directory: Path, filename: str, value: Any) -> dict[str, Any]:
     """Exclusive creation: completed or partially written files are never replaced."""
     raw = canonical_json_bytes(value)
     payload = gzip.compress(raw, compresslevel=6, mtime=0)
+    require_runtime_capacity()
     with (directory / filename).open("xb") as stream:
         stream.write(payload)
         stream.flush()
@@ -77,6 +87,7 @@ def write_artifact(directory: Path, filename: str, value: Any) -> dict[str, Any]
 
 def write_manifest(directory: Path, manifest: dict[str, Any]) -> tuple[Path, str]:
     payload = canonical_json_bytes(manifest)
+    require_runtime_capacity()
     path = directory / MANIFEST_FILE
     with path.open("xb") as stream:
         stream.write(payload)
@@ -129,6 +140,7 @@ def _resolve(root: Path, pointer: dict[str, Any]) -> tuple[dict[str, Any], Path]
     # New reports are publication facts, never an instruction to rerun the engine.
     if coherence.get("framework_version") and coherence.get("status") != "passed":
         raise SnapshotError("Baseline required coherence did not pass")
+    horizon_for(manifest)
     return manifest, directory
 
 
@@ -221,9 +233,11 @@ class BaselineView:
                 "add it to the background build configuration"
             )
         encoded = read_artifact(self.pinned.directory, domain["artifact"])
-        grid = self.pinned.codec.decode(encoded)
+        grid = self.pinned.codec.decode(encoded, consume=True)
         if grid["geometry"] != domain["geometry"]:
             raise SnapshotError("Restored baseline geometry differs from declared coverage")
+        if horizon_for(grid) != horizon_for(self.pinned.manifest):
+            raise SnapshotError("Restored baseline horizon differs from declared coverage")
         forecast = extract_grid_point(grid, latitude=latitude, longitude=longitude, copy_grid=False)
         if forecast["local_grid"]["sha256"] != domain["grid_sha256"]:
             raise SnapshotError("Restored baseline grid differs from its calculated identity")
@@ -257,7 +271,9 @@ def load_baseline(root: Path, *, pointer: dict[str, Any] | None = None) -> Pinne
     if problems or manifest["information_cutoff"]["status"] != "proven":
         raise SnapshotError("Baseline source information has unresolved cutoff limitations")
     tables = read_artifact(directory, manifest["metadata_file"])
-    return PinnedBaseline(pointer, manifest, directory, CompactCodec.from_tables(tables))
+    return PinnedBaseline(
+        pointer, manifest, directory, CompactCodec.from_tables(tables, consume=True)
+    )
 
 
 def current_manifest(root: Path) -> dict[str, Any] | None:

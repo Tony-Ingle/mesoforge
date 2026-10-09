@@ -26,6 +26,7 @@ from mesoforge.application.current_model_set import select_model_set
 from mesoforge.application.point_forecast import _iso as _iso64
 from mesoforge.application.prepared_cloud import prepare_cloud_run
 from mesoforge.application.prepared_precipitation_type import prepare_type_run
+from mesoforge.application.prepared_probability_sources import prepare_native_probability_sources
 from mesoforge.application.prepared_snapshot import (
     SnapshotError,
     build_snapshot_manifest,
@@ -45,6 +46,7 @@ from mesoforge.application.spatial_coverage import (
     validate_coordinate,
 )
 from mesoforge.catalog.configuration import load_configuration_source
+from mesoforge.common.horizon import LEGACY_HORIZON, ForecastHorizon, horizon_for
 from mesoforge.common.identifiers import PreparedSnapshotId
 from mesoforge.guidance.coverage import MAXIMUM_PREPARED_HOURS
 from mesoforge.guidance.runtime import SystemClock, SystemSleeper
@@ -66,9 +68,12 @@ class RefreshSteps:
     attach_cloud: Callable[[Path, Path], dict[str, Any]]
     attach_thunder: Callable[[Path, Path], dict[str, Any]]
     attach_visibility: Callable[[Path, Path], dict[str, Any]] | None = None
+    attach_probabilities: Callable[[Path, Path], dict[str, Any]] | None = None
 
 
-def default_steps(*, coverage_hours: int) -> RefreshSteps:
+def default_steps(
+    *, coverage_hours: int, forecast_horizon: ForecastHorizon = LEGACY_HORIZON
+) -> RefreshSteps:
     def discover(directory: Path) -> dict[str, Any]:
         configuration, _ = load_configuration_source(
             base_path=_ROOT / "configs/base.yaml",
@@ -79,6 +84,9 @@ def default_steps(*, coverage_hours: int) -> RefreshSteps:
         )
         assert configuration.phase2 is not None
         transport = BoundedHttpTransport()
+        horizon_options: dict[str, Any] = (
+            {"forecast_horizon": forecast_horizon} if forecast_horizon.duration_hours == 120 else {}
+        )
         try:
             return select_model_set(
                 directory,
@@ -90,6 +98,7 @@ def default_steps(*, coverage_hours: int) -> RefreshSteps:
                 qpf_fields=True,
                 coverage_hours=coverage_hours,
                 require_complete_shadows=False,
+                **horizon_options,
             )
         finally:
             transport.close()
@@ -103,6 +112,9 @@ def default_steps(*, coverage_hours: int) -> RefreshSteps:
         attach_cloud=prepare_cloud_run,
         attach_thunder=prepare_thunder_run,
         attach_visibility=prepare_visibility_run,
+        attach_probabilities=(
+            prepare_native_probability_sources if forecast_horizon.duration_hours == 120 else None
+        ),
     )
 
 
@@ -148,6 +160,7 @@ def refresh_guidance(
     coverage_hours: int = MAXIMUM_PREPARED_HOURS,
     steps: RefreshSteps | None = None,
     include_visibility: bool = True,
+    forecast_horizon: ForecastHorizon = LEGACY_HORIZON,
 ) -> dict[str, Any]:
     """Prepare everything the current policies need for the collection, then publish.
 
@@ -170,7 +183,12 @@ def refresh_guidance(
         json.dumps({"locations": locations}, indent=2) + "\n", encoding="utf-8"
     )
     log = _Log(directory / "refresh-log.json")
-    steps = steps or default_steps(coverage_hours=coverage_hours)
+    steps = steps or default_steps(
+        coverage_hours=coverage_hours,
+        **(
+            {"forecast_horizon": forecast_horizon} if forecast_horizon.duration_hours == 120 else {}
+        ),
+    )
     before = read_pointer(root)
     result: dict[str, Any] = {
         "snapshot_id": snapshot_id,
@@ -200,11 +218,14 @@ def refresh_guidance(
         )
         current = directory / "prepared"
         downloaded = int(preparation.get("downloaded_bytes", 0))
-        for name, function, target in (
+        attachments = (
             ("attach_precipitation_type", steps.attach_ptype, "ptype"),
             ("attach_cloud", steps.attach_cloud, "cloud"),
             ("attach_thunder", steps.attach_thunder, "thunder"),
-        ):
+        )
+        for name, function, target in attachments:
+            if target == "cloud" and horizon_for(selection).duration_hours == 120:
+                continue
             attached = log.run(name, partial(function, current, directory / target))
             current = directory / target
             downloaded += _attachment_bytes(attached, target)
@@ -218,6 +239,16 @@ def refresh_guidance(
             if attached is not None:
                 current = directory / "visibility"
                 downloaded += _attachment_bytes(attached, "visibility")
+        probabilities = steps.attach_probabilities
+        if horizon_for(selection).duration_hours == 120 and probabilities is not None:
+            attached = log.run(
+                "attach_native_probability_evidence",
+                partial(probabilities, current, directory / "probabilities"),
+                optional=True,
+            )
+            if attached is not None:
+                current = directory / "probabilities"
+                downloaded += int(attached["probability_source_run"]["downloaded_bytes"])
         preparation_path = current / "preparation.json"
         final = json.loads(preparation_path.read_text(encoding="utf-8"))
         validation = log.run("validate", lambda: _validate(final, locations))
@@ -290,7 +321,14 @@ def _validate(preparation: dict[str, Any], locations: list[Any]) -> dict[str, An
         model: [_iso64(value) for value in values]
         for model, values in prepared.prepared_valid_times().items()
     }
-    for model in ("HRRR", "GFS"):
+    models = (
+        tuple(selection["selected_cycles"])
+        if horizon_for(selection).duration_hours == 120
+        else ("HRRR", "GFS")
+    )
+    if horizon_for(selection).duration_hours == 120 and set(held) != set(models):
+        raise SnapshotError("Prepared native sources differ from selected available sources")
+    for model in models:
         if held[model] != list(selection["models"][model]["valid_times"]):
             raise SnapshotError(f"{model}: prepared valid times differ from the selection window")
     columns = []
@@ -321,8 +359,8 @@ def _validate(preparation: dict[str, Any], locations: list[Any]) -> dict[str, An
                 "last_valid_time": column["hours"][-1]["valid_time"],
             }
         )
-        if len(column["hours"]) != 36:
-            raise SnapshotError("Validation column does not hold 36 hours")
+        if len(column["hours"]) != horizon_for(selection).duration_hours:
+            raise SnapshotError("Validation column does not hold the declared forecast horizon")
     if not columns:
         raise SnapshotError("No configured location has usable prepared coverage")
     return {
@@ -337,11 +375,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True, help="Coordinates defining coverage")
     parser.add_argument("--root", type=Path, required=True, help="Guidance root outside Git")
+    parser.add_argument("--forecast-hours", type=int, choices=(36, 120), default=36)
     parser.add_argument(
         "--coverage-hours",
         type=int,
-        default=MAXIMUM_PREPARED_HOURS,
-        help="Prepared window length 36..42 (36 forecast hours plus refresh grace)",
+        default=None,
+        help="Prepared hours: forecast duration through duration+6; default duration+6",
     )
     parser.add_argument(
         "--no-visibility", action="store_true", help="Skip the evidence-only visibility step"
@@ -351,7 +390,8 @@ def main(argv: list[str] | None = None) -> int:
         result = refresh_guidance(
             args.config,
             args.root,
-            coverage_hours=args.coverage_hours,
+            coverage_hours=args.coverage_hours or args.forecast_hours + 6,
+            forecast_horizon=ForecastHorizon(args.forecast_hours),
             include_visibility=not args.no_visibility,
         )
     except Exception as exc:

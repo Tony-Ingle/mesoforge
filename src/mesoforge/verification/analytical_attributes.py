@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from datetime import timedelta
 from typing import Any
 
+from mesoforge.common.horizon import horizon_for
 from mesoforge.common.identifiers import ArtifactId, Digest
 from mesoforge.contracts.forecast_variants import VARIANT_SCHEMA, instant, validate_variant
 from mesoforge.contracts.serialization import canonical_json_bytes
@@ -135,7 +136,7 @@ def _raw_baseline_temperature(
         lead = forecast["horizon_hours"]
         if (
             type(lead) is not int
-            or not 1 <= lead <= 36
+            or not 1 <= lead <= horizon_for(context).duration_hours
             or valid - target != timedelta(hours=lead)
             or instant(stage["reference_time"]) != target
         ):
@@ -229,6 +230,11 @@ def build_analytical_attributes(fact: Mapping[str, Any]) -> dict[str, Any]:
         "target_reference_time": context.get("target_reference_time"),
         "valid_time": forecast.get("valid_time"),
         "horizon_hours": forecast.get("horizon_hours"),
+        **(
+            {"forecast_horizon": context["forecast_horizon"]}
+            if "forecast_horizon" in context
+            else {}
+        ),
         "forecast_temperature_k": _kelvin(forecast.get("temperature")),
         "forecast_stage": _forecast_stage(context),
         "raw_baseline_temperature": _raw_baseline_temperature(

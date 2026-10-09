@@ -226,7 +226,16 @@ def test_registry_selects_existing_policy_identities(
     configuration: Phase2BlendConfiguration,
 ) -> None:
     engine = FieldBlendEngine(contributors=DEFAULT_CONFIGURATION, phase2=configuration)
-    assert set(FIELD_REGISTRY) == {T, D, WIND, G, QPF, RH}
+    assert set(FIELD_REGISTRY) == {
+        T,
+        D,
+        WIND,
+        G,
+        QPF,
+        RH,
+        "cloud_area_fraction",
+        "probability_of_precipitation_6h",
+    }
     assert engine.policy_for(T) is DEFAULT_CONFIGURATION.control_recipe
     assert engine.policy_for(D) is configuration.scalar_vector_table
     assert engine.policy_for(WIND) is configuration.scalar_vector_table

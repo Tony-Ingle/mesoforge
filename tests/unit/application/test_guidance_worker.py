@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,6 +42,7 @@ from mesoforge.application.worker_status import (
     read_json,
     write_json,
 )
+from mesoforge.common.horizon import FIVE_DAY_HORIZON, LEGACY_HORIZON
 from mesoforge.contracts.policy_governance import blend_scope
 
 LOCATIONS = [
@@ -299,6 +301,57 @@ def test_settings_validation() -> None:
         WorkerSettings(root=Path("x"), interval_seconds=1)
 
 
+def test_hosted_horizon_is_explicit_and_legacy_prepared_state_cannot_satisfy_it(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("MESOFORGE_FORECAST_HORIZON_HOURS", raising=False)
+    assert worker_module.build_parser().parse_args(["once"]).forecast_horizon_hours == 36
+    monkeypatch.setenv("MESOFORGE_FORECAST_HORIZON_HOURS", "120")
+    assert worker_module.build_parser().parse_args(["once"]).forecast_horizon_hours == 120
+    legacy = WorkerSettings(root=tmp_path)
+    assert legacy.forecast_horizon == LEGACY_HORIZON and legacy.coverage_hours == 42
+    settings = WorkerSettings(root=tmp_path, forecast_horizon=FIVE_DAY_HORIZON)
+    assert settings.coverage_hours == 126
+    with pytest.raises(ValueError, match="Prepared coverage"):
+        WorkerSettings(root=tmp_path, forecast_horizon=FIVE_DAY_HORIZON, coverage_hours=42)
+    harness = Harness(tmp_path, forecast_horizon=FIVE_DAY_HORIZON)
+    pointer = publish_prepared(harness.root, harness.hour())
+    publish_baseline(harness.root, pointer["snapshot_id"])
+    worker = harness.worker()
+    assert "current_hour_not_covered" in worker.refresh_reasons(LOCATIONS, harness.clock())
+    assert worker.build_inputs(SimpleNamespace(scopes={}), LOCATIONS) is None
+
+
+@pytest.mark.parametrize("horizon", [LEGACY_HORIZON, FIVE_DAY_HORIZON])
+def test_default_dependencies_pass_one_explicit_horizon_to_existing_boundaries(
+    tmp_path, monkeypatch, horizon
+):
+    from unittest.mock import Mock
+
+    from mesoforge.application import refresh_guidance as refresh_module
+
+    discover = Mock(return_value={"status": "selected"})
+    steps = SimpleNamespace(discover=discover)
+    default = Mock(return_value=steps)
+    refresh = Mock(return_value={"status": "published"})
+    monkeypatch.setattr(refresh_module, "default_steps", default)
+    monkeypatch.setattr(refresh_module, "refresh_guidance", refresh)
+    settings = WorkerSettings(root=tmp_path, forecast_horizon=horizon)
+    deps = worker_module.default_deps(settings)
+    deps.discover(tmp_path / "probe")
+    deps.refresh(tmp_path / "locations.json", tmp_path / "guidance", None)
+    options = {"forecast_horizon": horizon} if horizon != LEGACY_HORIZON else {}
+    assert default.call_count == 2
+    default.assert_called_with(coverage_hours=horizon.duration_hours + 6, **options)
+    refresh.assert_called_once_with(
+        tmp_path / "locations.json",
+        tmp_path / "guidance",
+        coverage_hours=horizon.duration_hours + 6,
+        steps=steps,
+        **options,
+    )
+
+
 def test_first_poll_refreshes_and_builds_then_nothing_repeats_in_the_same_hour(
     tmp_path: Path,
 ) -> None:
@@ -371,6 +424,53 @@ def test_newer_required_cycle_refreshes_with_the_probe_selection_then_rebuilds(
     assert outcome["build"]["reasons"] == ["new_prepared_snapshot"]
 
 
+@pytest.mark.parametrize(
+    "native,selected,held,expected",
+    [
+        (True, {"NBM": "2026-07-01T07:00:00Z"}, None, ["newer_participating_cycle:NBM"]),
+        (
+            True,
+            {"GFS": "2026-07-01T06:00:00Z"},
+            "2026-07-01T00:00:00Z",
+            ["newer_participating_cycle:GFS"],
+        ),
+        (True, {"RAP": "2026-07-01T06:00:00Z"}, "2026-07-01T06:00:00Z", []),
+        (True, {}, "2026-07-01T06:00:00Z", []),
+        (False, {"NBM": "2026-07-01T07:00:00Z"}, None, []),
+    ],
+)
+def test_native_probe_refreshes_for_eligible_participating_cycles_without_required_set(
+    tmp_path: Path, monkeypatch, native: bool, selected: dict, held: str | None, expected: list
+) -> None:
+    horizon = FIVE_DAY_HORIZON if native else LEGACY_HORIZON
+    harness = Harness(tmp_path, forecast_horizon=horizon)
+    harness.discovered["selected_cycles"] = selected
+    worker = harness.worker()
+    manifest = {
+        "forecast_horizon": horizon.payload(),
+        "coverage": {"usability_rule": {"required_complete": [] if native else ["HRRR", "GFS"]}},
+        "contributors": {model: {"cycle": held} for model in ("HRRR", "RAP", "GFS", "IFS", "NBM")},
+    }
+    monkeypatch.setattr(worker, "_prepared", lambda: ({}, manifest, tmp_path))
+    # The existing coverage and spatial contracts already proved this state
+    # usable. Discovery must independently recognize changed native inputs.
+    monkeypatch.setattr(worker, "refresh_reasons", lambda locations, now: [])
+    calls = []
+
+    def refresh(reasons, locations, selection, categories):
+        calls.append(selection)
+        return {"reasons": reasons}
+
+    monkeypatch.setattr(worker, "_run_refresh", refresh)
+    result = worker._refresh_step(LOCATIONS, harness.free, [])
+    assert result["reasons"] == expected
+    assert len(calls) == bool(expected)
+    if calls:
+        assert (calls[0] / "selection.json").is_file()
+    else:
+        assert result["decision"] == "no_material_change"
+
+
 def test_reused_probe_is_copied_only_within_its_hour(tmp_path: Path) -> None:
     source = tmp_path / "probe"
     source.mkdir()
@@ -417,6 +517,88 @@ def test_configured_location_outside_the_prepared_footprint_requires_refresh(
     harness = Harness(tmp_path)
     publish_prepared(harness.root, harness.hour() - timedelta(hours=1), locations=LOCATIONS[:2])
     assert harness.worker().refresh_reasons(LOCATIONS, START) == ["configured_locations_changed"]
+
+
+def test_shared_guidance_prepares_once_for_independent_location_baselines(tmp_path: Path) -> None:
+    shared = [LOCATIONS[0], LOCATIONS[2]]
+    config = tmp_path / "shared.json"
+    config.write_text(json.dumps({"locations": shared}), "utf-8")
+    harness = Harness(
+        tmp_path,
+        clock=START.replace(hour=11),
+        guidance_config=config,
+        hourly_probe=False,
+        schedule=ForecastSchedule("America/Chicago", ("07:15",)),
+    )
+    write_config(harness.root, shared[:1])
+    refresh_locations, build_locations = [], []
+
+    def refresh(config: Path, guidance_root: Path, probe: Path | None) -> dict:
+        refresh_locations.append(json.loads(config.read_text("utf-8"))["locations"])
+        pointer = publish_prepared(harness.root, harness.hour(), locations=shared)
+        return {"status": "published", "snapshot_id": pointer["snapshot_id"]}
+
+    def build(
+        guidance_root: Path, baseline_root: Path, locations: list[Any], **kwargs: Any
+    ) -> dict:
+        build_locations.append((locations, kwargs["prepared_pointer"]["snapshot_id"]))
+        identity = publish_baseline(
+            harness.root, kwargs["prepared_pointer"]["snapshot_id"], locations=locations
+        )
+        return {
+            "status": "published",
+            "baseline_snapshot_id": identity,
+            "manifest": {"coverage": {"failed_locations": [], "reference_times": []}},
+            "timings": {},
+            "artifact_bytes": 10,
+        }
+
+    harness.deps.refresh, harness.deps.build = refresh, build
+    harness.deps.discover = lambda _: pytest.fail("Compatible shared Guidance must not be probed")
+    first = harness.worker().poll_once()
+    first_pointer = (harness.root / "guidance/latest_complete.json").read_bytes()
+    first_baseline = first["build"]["baseline_snapshot_id"]
+    first_path = harness.root / "baseline/baselines" / first_baseline / "baseline.json"
+    first_payload = first_path.read_bytes()
+    write_config(harness.root, shared[1:])
+    harness.clock.advance(hours=2)
+    harness.settings = replace(
+        harness.settings, schedule=ForecastSchedule("America/Chicago", ("08:30",))
+    )
+    second = harness.worker().poll_once()
+    assert first["categories"] == second["categories"] == []
+    assert refresh_locations == [shared]
+    assert second["refresh"]["decision"] == "none"
+    assert [rows for rows, _ in build_locations] == [shared[:1], shared[1:]]
+    assert build_locations[0][1] == build_locations[1][1]
+    assert first_baseline != second["build"]["baseline_snapshot_id"]
+    assert first_path.read_bytes() == first_payload
+    assert (harness.root / "guidance/latest_complete.json").read_bytes() == first_pointer
+    public = harness.settings.public()
+    assert public["guidance_config"] == str(config)
+    args = worker_module.build_parser().parse_args(
+        ["once", "--guidance-config", str(config), "--config", str(harness.settings.config)]
+    )
+    assert args.guidance_config == config and args.config == harness.settings.config
+
+
+@pytest.mark.parametrize(
+    "shared",
+    [[], [LOCATIONS[2]], [LOCATIONS[0], {"lat": 999, "lon": -93}]],
+)
+def test_invalid_shared_guidance_config_stops_before_provider_or_build(
+    tmp_path: Path, shared: list[dict]
+) -> None:
+    harness = Harness(tmp_path)
+    write_config(harness.root, LOCATIONS[:1])
+    config = tmp_path / "shared.json"
+    config.write_text(json.dumps({"locations": shared}), "utf-8")
+    harness.settings = replace(harness.settings, guidance_config=config)
+    harness.deps.discover = lambda _: pytest.fail("Invalid config must fail before provider calls")
+    outcome = harness.worker().poll_once()
+    assert outcome["categories"] == ["invalid_configuration"]
+    assert outcome["guidance_locations"]["status"] == "invalid"
+    assert not harness.refresh_calls and not harness.build_calls
 
 
 def test_partial_provider_probe_and_provider_outage_are_categorized(tmp_path: Path) -> None:
@@ -638,6 +820,30 @@ def test_registered_candidates_shadow_the_current_baseline_every_poll(tmp_path: 
     assert loaded
 
 
+@pytest.mark.parametrize("raised", [False, True])
+def test_once_candidate_failure_reports_warning_without_blocking_active_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raised: bool
+) -> None:
+    harness = Harness(tmp_path)
+    harness.governance.shadows = [SimpleNamespace(policy_artifact_id="art_candidate")]
+    monkeypatch.setattr(worker_module, "load_baseline", lambda *a, **k: "pinned")
+
+    def candidate(*args: Any, **kwargs: Any) -> dict:
+        if raised:
+            raise ValueError("Candidate computation failed")
+        return {"overlays": [], "failures": ["Candidate computation failed"]}
+
+    monkeypatch.setattr(harness.governance.learning, "background", candidate)
+    worker = harness.worker()
+    assert worker.run(once=True, install_signals=False) == 0
+    outcome = worker.state["polls"]["last"]
+    assert outcome["build"]["outcome"] == "published"
+    assert outcome["categories"] == ["candidate_background_failed"]
+    assert outcome["background"]["status"] == ("failed" if raised else "partial")
+    assert worker.state["readiness"]["ready"] is True
+    assert len(harness.refresh_calls) == len(harness.build_calls) == 1
+
+
 def test_interrupted_phase_counts_as_failure_after_restart(tmp_path: Path) -> None:
     harness = Harness(tmp_path)
     status = harness.root / "status" / GUIDANCE_STATUS
@@ -674,6 +880,18 @@ def test_single_writer_refuses_a_second_worker_on_the_same_root(tmp_path: Path) 
         assert owned
         assert harness.worker().run(once=True, install_signals=False) == 2
     assert any(row["event"] == "worker_busy" for row in harness.events())
+
+
+def test_guidance_respects_deployment_lock_from_a_different_runtime_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared = tmp_path / "host-runtime"
+    monkeypatch.setenv("MESOFORGE_WORKER_LOCK_ROOT", str(shared))
+    harness = Harness(tmp_path / "guidance")
+    with single_writer(shared) as owned:
+        assert owned
+        assert harness.worker().run(once=True, install_signals=False) == 2
+    assert not harness.refresh_calls and not harness.build_calls
 
 
 def test_single_writer_lock_excludes_an_independent_process_and_releases(tmp_path: Path) -> None:
@@ -1154,6 +1372,39 @@ def test_unknown_disk_capacity_does_not_allow_large_writes(tmp_path: Path) -> No
     harness.deps.disk_free = unavailable
     assert harness.worker().poll_once()["refresh"]["blocked_by"] == "disk_unavailable"
     assert not harness.refresh_calls
+
+
+@pytest.mark.parametrize("free_gib", [20, 30, 31])
+def test_operational_disk_warning_does_not_refresh_or_delete_for_storage(
+    tmp_path: Path, free_gib: int
+) -> None:
+    harness = Harness(tmp_path, hourly_probe=False)
+    publish_prepared(harness.root, harness.hour())
+    harness.free = free_gib * 1024**3
+    worker = harness.worker()
+    outcome = worker.poll_once()
+    assert not harness.refresh_calls
+    assert outcome["build"]["outcome"] == "published"
+    assert worker.state["disk"]["status"] == ("normal" if free_gib > 30 else "warning")
+    assert "disk_low" not in outcome["categories"]
+    assert ("disk_warning" in harness.stream.getvalue()) is (free_gib <= 30)
+
+
+def test_daily_guidance_default_refuses_below_twenty_gib_and_uses_shared_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = Harness(tmp_path)
+    harness.free = 20 * 1024**3 - 1
+    worker = harness.worker()
+    outcome = worker.poll_once()
+    assert outcome["refresh"]["blocked_by"] == "disk_low"
+    assert not harness.refresh_calls and not harness.build_calls
+    assert worker.state["disk"]["status"] == "refused"
+    monkeypatch.setenv("MESOFORGE_GUIDANCE_MIN_FREE_GB", "25")
+    monkeypatch.setenv("MESOFORGE_GUIDANCE_WARN_FREE_GB", "35")
+    args = worker_module.build_parser().parse_args(["once", "--root", str(harness.root)])
+    assert args.min_free_gb == 25
+    assert args.warn_free_gb == 35
 
 
 def test_persisted_worker_state_redacts_downstream_readiness_details(

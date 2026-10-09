@@ -86,7 +86,11 @@ def extract_probability_hour(
     native["normalization"] = deepcopy(
         json.loads(dataset.attrs.get("pop_metadata_json", "{}")).get(str(lead), {})
     )
-    inputs = [row for row in manifest.get("inputs", []) if row.get("source_lead_hours") == lead]
+    inputs = [
+        row
+        for row in manifest.get("inputs", [])
+        if row.get("source_lead_hours") == lead and row.get("model") == "NBM"
+    ]
     native["provenance"] = {
         "manifest_sha256": manifest.get("manifest_sha256"),
         "prepared_sha256": manifest.get("prepared_files", {}).get("NBM", {}).get("sha256"),

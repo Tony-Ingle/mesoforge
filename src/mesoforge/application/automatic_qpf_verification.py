@@ -80,7 +80,7 @@ def accumulate_window(
         if manifest.artifact_schema_version != SCHEMA or manifest.quality_state == "invalid":
             continue
         record = record_index.get(fact.get("issued_forecast_id"))
-        if record is None or fact.get("issued_forecast_digest") != str(record.content_digest):
+        if record is None or fact.get("issued_forecast_digest") != str(record.payload_digest):
             continue
         if (
             fact.get("status") == "verified"
@@ -115,7 +115,7 @@ def accumulate_window(
                 stage,
                 record.target_reference_time + timedelta(hours=lead),
             )
-            for lead in range(1, 37)
+            for lead in range(1, record.forecast_horizon_hours + 1)
             for stage in stages
             if window.start <= record.target_reference_time + timedelta(hours=lead) < window.end
         ]
@@ -163,7 +163,7 @@ def accumulate_window(
                     saved,
                     valid,
                     stage=stage,
-                    issued_forecast_digest=record.content_digest,
+                    issued_forecast_digest=record.payload_digest,
                     verification_cutoff=evaluation,
                 )
                 row: dict[str, Any] = {

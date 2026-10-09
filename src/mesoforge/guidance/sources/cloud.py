@@ -109,6 +109,15 @@ def cloud_url(model: str, cycle: datetime, lead: int) -> str:
     """Reuse already supported provider products and bounded cycle/lead validation."""
     if model not in SOURCES:
         raise ValueError(f"Unsupported total cloud source: {model}")
+    from mesoforge.catalog.native_horizons import native_field_contract
+
+    if lead not in native_field_contract(model, "cloud_area_fraction").native_leads(cycle):
+        raise ValueError("Cloud source lead is outside the native product schedule")
+    if model in {"GFS", "NBM"}:
+        day, hh = cycle.strftime("%Y%m%d"), cycle.strftime("%H")
+        if model == "GFS":
+            return f"https://noaa-gfs-bdp-pds.s3.amazonaws.com/gfs.{day}/{hh}/atmos/gfs.t{hh}z.pgrb2.0p25.f{lead:03d}"
+        return f"https://noaa-nbm-grib2-pds.s3.amazonaws.com/blend.{day}/{hh}/core/blend.t{hh}z.core.f{lead:03d}.co.grib2"
     return type_url(model, cycle, lead)
 
 

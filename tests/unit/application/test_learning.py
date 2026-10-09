@@ -665,7 +665,7 @@ def test_ai_storage_failure_cannot_update_report_or_overwrite_corrected_parent(l
     assert corrected["hours"] == forecast["hours"]
 
 
-@pytest.mark.parametrize("defect", ["pin", "checkpoint", "validation", "parent"])
+@pytest.mark.parametrize("defect", ["pin", "checkpoint", "validation", "parent", "qpf_point"])
 def test_ai_stage_rejects_unproven_or_substituted_controller_evidence(learning, defect):
     service, forecast = learning.service, learning.forecast
     corrected, report = service.local_stage(forecast)
@@ -677,8 +677,10 @@ def test_ai_stage_rejects_unproven_or_substituted_controller_evidence(learning, 
         desk["checkpoints"][-1]["values_digest"] = str(canonical_json_digest({"wrong": True}))
     elif defect == "validation":
         desk["validation"]["status"] = "invalid"
+    elif defect == "qpf_point":
+        final = {**corrected, "qpf_intervals": [{"value": 1, "unit": "kg/m^2"}]}
     else:
         final = {**corrected, "latitude": 30.0}
-    with pytest.raises(ValueError, match="pinned|checkpoint"):
+    with pytest.raises(ValueError, match="pinned|checkpoint|grid center"):
         service.ai_stage(corrected, final, desk, report)
     assert report["operational_stage"]["transformation_type"] == "deterministic_corrected"

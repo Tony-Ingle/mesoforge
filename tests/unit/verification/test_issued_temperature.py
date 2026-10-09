@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from mesoforge.common.horizon import FIVE_DAY_HORIZON
 from mesoforge.verification.issued_temperature import evaluate_temperature_verification
 
 _CUTOFF = datetime(2026, 9, 10, 14, tzinfo=UTC)
@@ -76,6 +77,24 @@ def _evaluate(match: dict[str, Any]) -> dict[str, Any]:
     return evaluate_temperature_verification(
         match, verification_cutoff=_CUTOFF, evaluated_at=_CUTOFF
     )
+
+
+def test_long_lead_temperature_preserves_matching_and_requires_declared_window(match):
+    valid = datetime.fromisoformat(match["forecast"]["valid_time"])
+    target = valid - timedelta(hours=120)
+    match["forecast"]["horizon_hours"] = 120
+    match["forecast_context"].update(
+        forecast_horizon=FIVE_DAY_HORIZON.payload(), target_reference_time=target.isoformat()
+    )
+    result = _evaluate(match)
+    assert result["status"] == "verified"
+    assert result["temperature_error"]["value"] == 2.25
+    assert result["match"]["forecast"]["horizon_hours"] == 120
+    del match["forecast_context"]["forecast_horizon"]
+    assert "forecast_reference_lead_inconsistent" in _evaluate(match)["reasons"]
+    match["forecast_context"]["forecast_horizon"] = FIVE_DAY_HORIZON.payload()
+    match["selected"]["observation_time"] = (valid + timedelta(minutes=16)).isoformat()
+    assert "observation_outside_15_minute_window" in _evaluate(match)["reasons"]
 
 
 @pytest.mark.parametrize(

@@ -6,6 +6,8 @@ import math
 from datetime import UTC, datetime
 from typing import Any
 
+from mesoforge.common.horizon import horizon_for
+
 
 def _instant(value: Any) -> datetime | None:
     try:
@@ -123,6 +125,22 @@ def evaluate_temperature_verification(
     issued_at = _instant(match.get("issued_at"))
     forecast_temperature = _temperature(forecast.get("temperature", {}))
     reasons.extend(forecast_eligibility_reasons(forecast, issued_at, cutoff=cutoff))
+    context = match.get("forecast_context") or {}
+    if "forecast_horizon" in context or "horizon_hours" in forecast:
+        try:
+            duration = horizon_for(context).duration_hours
+        except ValueError:
+            duration = 0
+        lead = forecast.get("horizon_hours")
+        target = _instant(context.get("target_reference_time"))
+        if (
+            type(lead) is not int
+            or not 1 <= lead <= duration
+            or target is None
+            or valid_time is None
+            or (valid_time - target).total_seconds() != lead * 3600
+        ):
+            reasons.append("forecast_reference_lead_inconsistent")
 
     selected = match.get("selected")
     if match.get("status") != "matched" or selected is None:
